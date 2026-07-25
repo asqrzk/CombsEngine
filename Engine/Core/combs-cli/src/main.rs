@@ -9,9 +9,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
-use combs_formats::{ModelSource, SafetensorsSource};
+use combs_formats::{ModelSource, open_model_source};
 use combs_runtime::{Engine, GenerationConfig};
 
+mod chew;
 mod serve;
 
 #[derive(Parser)]
@@ -84,13 +85,17 @@ enum Command {
     },
     /// Start an OpenAI-compatible HTTP server.
     Serve {
-        /// Path to the model directory (HF safetensors layout).
+        /// Path to the model directory (HF safetensors layout) or .gguf file.
         #[arg(long)]
         model: PathBuf,
         /// Port to listen on.
         #[arg(long, default_value_t = 8080)]
         port: u16,
     },
+    /// Scaffold a chat UI app (interactive or via flags).
+    ChewChatUi(chew::ChewArgs),
+    /// Scaffold a multi-agent debate UI app (interactive or via flags).
+    ChewDebateUi(chew::ChewArgs),
 }
 
 fn main() -> Result<()> {
@@ -101,6 +106,8 @@ fn main() -> Result<()> {
         Command::Pull { .. } => not_yet("pull", "Phase 5 (model store)"),
         Command::Convert { .. } => not_yet("convert", "Phase 5 (GGUF/burnpack adapters)"),
         Command::Serve { model, port } => cmd_serve(model, port),
+        Command::ChewChatUi(args) => chew::chew("chat-ui", args),
+        Command::ChewDebateUi(args) => chew::chew("debate-ui", args),
     }
 }
 
@@ -110,8 +117,7 @@ fn not_yet(cmd: &str, phase: &str) -> Result<()> {
 }
 
 fn cmd_serve(model: PathBuf, port: u16) -> Result<()> {
-    let source = SafetensorsSource::load(&model)
-        .with_context(|| format!("loading {}", model.display()))?;
+    let source = open_model_source(&model)?;
     let model_id = model
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -133,7 +139,7 @@ fn cmd_devices() -> Result<()> {
 }
 
 fn cmd_run(args: RunArgs) -> Result<()> {
-    let source = SafetensorsSource::load(&args.model)
+    let source = open_model_source(&args.model)
         .with_context(|| format!("loading {}", args.model.display()))?;
     let meta = source.metadata();
     eprintln!(

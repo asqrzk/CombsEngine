@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use combs_core::{CombsDevice, device_caps, init_device};
-use combs_formats::{ModelSource, SafetensorsSource};
+use combs_formats::{ModelSource, open_model_source};
 use combs_models::{CacheConfig, CacheKind};
 use combs_runtime::{Engine, SamplingParams};
 
@@ -145,7 +145,7 @@ pub unsafe extern "C" fn combs_engine_create(config_json: *const c_char) -> *mut
         let config: EngineConfigJson =
             serde_json::from_str(json).map_err(|e| format!("invalid engine config JSON: {e}"))?;
 
-        let source = SafetensorsSource::load(&config.model_dir)
+        let source = open_model_source(&config.model_dir)
             .map_err(|e| format!("loading model source: {e}"))?;
 
         let mut cache_config = CacheConfig::paged(

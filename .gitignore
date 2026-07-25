@@ -25,3 +25,8 @@ Engine/Js/**/node_modules/
 
 # Logs & temp
 *.log
+
+# UI build artifacts
+Engine/Ui/**/node_modules/
+Engine/Ui/**/dist/
+Engine/Ui/**/.svelte-kit/

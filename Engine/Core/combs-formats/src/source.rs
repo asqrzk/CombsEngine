@@ -66,12 +66,13 @@ impl std::fmt::Display for TensorDtype {
 /// A lazy view over one tensor's raw bytes inside a [`ModelSource`].
 ///
 /// The byte slice borrows from the source (e.g. an mmap region) — no copy is
-/// made until [`TensorReader::load_data`] is called.
+/// made until [`TensorReader::load_data`] is called. Format adapters that
+/// decode on open (e.g. GGUF quantization) use [`TensorReader::owned`].
 pub struct TensorReader<'a> {
     name: String,
     shape: Vec<usize>,
     dtype: TensorDtype,
-    data: &'a [u8],
+    data: std::borrow::Cow<'a, [u8]>,
 }
 
 impl<'a> TensorReader<'a> {
@@ -82,7 +83,17 @@ impl<'a> TensorReader<'a> {
             name,
             shape,
             dtype,
-            data,
+            data: std::borrow::Cow::Borrowed(data),
+        }
+    }
+
+    /// Creates a reader over owned (already-decoded) f32 bytes.
+    pub fn owned(name: String, shape: Vec<usize>, data: Vec<u8>) -> Self {
+        TensorReader {
+            name,
+            shape,
+            dtype: TensorDtype::F32,
+            data: std::borrow::Cow::Owned(data),
         }
     }
 
@@ -177,15 +188,34 @@ impl<'a> TensorReader<'a> {
     }
 
     /// The raw little-endian bytes, borrowing from the source (zero-copy).
-    pub fn raw_bytes(&self) -> &'a [u8] {
-        self.data
+    pub fn raw_bytes(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+/// Blanket forwarding so `Box<dyn ModelSource>` (returned by
+/// `open_model_source`) can be passed anywhere a `&dyn ModelSource` goes.
+impl<T: ModelSource + ?Sized> ModelSource for Box<T> {
+    fn metadata(&self) -> &crate::ModelMetadata {
+        (**self).metadata()
+    }
+    fn tensor_names(&self) -> Vec<String> {
+        (**self).tensor_names()
+    }
+    fn open_tensor(&self, name: &str) -> crate::Result<TensorReader<'_>> {
+        (**self).open_tensor(name)
+    }
+    fn tokenizer(&self) -> crate::Result<TokenizerSpec> {
+        (**self).tokenizer()
+    }
+    fn sampler_defaults(&self) -> Option<SamplerConfig> {
+        (**self).sampler_defaults()
     }
 }
 
 /// Default sampler parameters, typically from `generation_config.json`.
 #[derive(Debug, Clone, Default)]
-pub struct SamplerConfig {
-    /// Sampling temperature (1.0 = neutral, 0.0 = greedy).
+pub struct SamplerConfig {    /// Sampling temperature (1.0 = neutral, 0.0 = greedy).
     pub temperature: Option<f32>,
     /// Top-p (nucleus) threshold.
     pub top_p: Option<f32>,

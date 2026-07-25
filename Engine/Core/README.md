@@ -4,18 +4,19 @@ Cross-platform edge AI inference engine: Rust core (Burn 0.21 + CubeCL/wgpu),
 a stable C-ABI/JSON-FFI boundary, and a Deno/TypeScript application layer
 (`../Js`). This directory is the L0+L1 cargo workspace.
 
-**Phases 1–3 complete.** A HuggingFace safetensors Llama-family model (e.g.
-SmolLM2-135M) generates text on GPU (wgpu/Metal) via CLI, the C FFI, or the
-bundled OpenAI-compatible server — and the FFI library cross-builds for
-macOS (arm64/x86_64), iOS and Android from the same code (wgpu abstracts
-Metal/Vulkan/DX12).
+**Phases 1–5 complete.** Models load from HuggingFace safetensors dirs OR
+GGUF files (F32/F16/BF16/Q4_0/Q8_0) via `open_model_source` and generate on
+GPU (wgpu/Metal) via CLI, the C FFI, or the bundled OpenAI-compatible
+server — and the FFI library cross-builds for macOS (arm64/x86_64), iOS and
+Android from the same code (wgpu abstracts Metal/Vulkan/DX12). The CLI also
+scaffolds Svelte 5 chat/debate apps (`combs chew-chat-ui`/`chew-debate-ui`).
 
 ## Crate layout
 
 | Crate | Role |
 |---|---|
-| `combs-core` | Backend type aliases (`CombsBackend` = fused wgpu/CubeCL, f32), device helpers, `BufferPool` memory facade |
-| `combs-formats` | Format-agnostic `ModelSource` trait + mmap-backed safetensors adapter (HF `config.json` etc.) |
+| `combs-core` | Backend type aliases (`CombsBackend` = fused wgpu/CubeCL, f32), device helpers + `DeviceCaps`, `BufferPool` memory facade, `quant` (q4 dequant ops) |
+| `combs-formats` | Format-agnostic `ModelSource` trait + `open_model_source` dispatcher; safetensors adapter (HF dirs, mmap zero-copy) and **GGUF adapter** (v2/v3, ggml→HF name/dim mapping, Q4_0/Q8_0 dequant, GGUF-metadata tokenizer synthesis) |
 | `combs-models` | `GenerativeModel` contract (`embed`/`prefill`/`decode`/`create_kv_cache`), attention-facing `KVCache` trait with `PagedKVCache` (page arena + page table + free-page allocator, `popn` rollback) and `ContiguousKVCache` baseline, `CacheConfig`, Llama family, `ModelRegistry` |
 | `combs-runtime` | `Engine` (single-flight mpsc request queue + worker thread, chunked prefill, cancel flag, context budget vs cache capacity), `Sampler`s (greedy + seeded multinomial) with composable `LogitsProcessor`s (penalties, temperature, top-k/top-p), stop token/string detection, incremental detokenization, stats (TTFT, prefill/decode tok/s, cache pages used) |
 | `combs-cli` | `combs` binary (`run`, `serve`, `devices`) |

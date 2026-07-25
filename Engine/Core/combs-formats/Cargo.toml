@@ -17,3 +17,5 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+half.workspace = true
+serde_json.workspace = true

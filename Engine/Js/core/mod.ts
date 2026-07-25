@@ -13,6 +13,7 @@ export { Combs } from "./src/combs.ts";
 export type { CombsInitOptions } from "./src/combs.ts";
 export { FfiEngine, queryDeviceCaps } from "./src/engine.ts";
 export { RemoteEngine } from "./src/remote.ts";
+export { WorkerEngine } from "./src/worker.ts";
 export { ModelCache } from "./src/cache.ts";
 export { planEngineConfig, needsWeightSharding } from "./src/planner.ts";
 export { findPreset, listPresets, PRESETS } from "./src/presets.ts";

@@ -7,15 +7,33 @@
 //! mmap-backed, zero-copy views). GGUF / ONNX / litertlm adapters plug in
 //! here later by implementing the same trait.
 
+mod gguf;
 mod metadata;
 mod safetensors;
 mod source;
 mod tokenizer;
 
+pub use gguf::GgufSource;
 pub use metadata::ModelMetadata;
 pub use safetensors::SafetensorsSource;
 pub use source::{ModelSource, SamplerConfig, TensorDtype, TensorReader};
 pub use tokenizer::TokenizerSpec;
+
+use std::path::Path;
+
+/// Opens any supported model path: a `.gguf` file, or a directory in the
+/// HuggingFace safetensors layout. This is the single entry point the CLI,
+/// FFI and server use — format detection lives here.
+pub fn open_model_source(path: impl AsRef<Path>) -> Result<Box<dyn ModelSource>> {
+    let path = path.as_ref();
+    if path.is_file() && path.extension().is_some_and(|e| e == "gguf") {
+        return Ok(Box::new(GgufSource::load(path)?));
+    }
+    if path.is_dir() {
+        return Ok(Box::new(SafetensorsSource::load(path)?));
+    }
+    Err(FormatError::MissingFile(path.display().to_string()))
+}
 
 /// Errors produced by format adapters.
 #[derive(Debug, thiserror::Error)]
