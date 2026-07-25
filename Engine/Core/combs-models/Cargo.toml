@@ -1,0 +1,17 @@
+[package]
+name = "combs-models"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Combs Engine model architecture registry (Llama family)"
+
+[dependencies]
+burn.workspace = true
+combs-core = { path = "../combs-core" }
+combs-formats = { path = "../combs-formats" }
+thiserror.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+burn = { version = "0.21.0", default-features = false, features = ["ndarray", "std"] }
+tokenizers.workspace = true

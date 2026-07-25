@@ -1,0 +1,27 @@
+referencesExtracted
+
+documentations
+
+AGENTS.md
+
+.DS_Store
+
+# Rust build artifacts (multi-GB)
+Engine/Core/target/
+**/target/
+
+# Cross-platform bundled artifacts (rebuilt via `cargo xtask bundle`)
+Engine/Core/dist/
+
+# Downloaded model weights (re-pull via presets / combs pull)
+models/
+*.safetensors
+*.gguf
+*.bpk
+
+# Deno / JS
+Engine/Js/**/node_modules/
+**/.deno/
+
+# Logs & temp
+*.log

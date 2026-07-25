@@ -1,0 +1,7 @@
+{
+  "workspace": ["./core"],
+  "tasks": {
+    "check": "deno check core/mod.ts core/test/*.ts",
+    "test": "deno test --allow-ffi --allow-read --allow-env --allow-net core/test/"
+  }
+}
