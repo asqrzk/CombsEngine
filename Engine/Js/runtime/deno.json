@@ -1,0 +1,9 @@
+{
+  "name": "@combs/runtime",
+  "version": "0.1.0",
+  "exports": "./mod.ts",
+  "imports": {
+    "@combs/graph": "../graph/mod.ts",
+    "@combs/telemetry": "../telemetry/mod.ts"
+  }
+}

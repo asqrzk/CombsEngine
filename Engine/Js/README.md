@@ -1,52 +1,50 @@
 # Combs Engine — L2 Application Layer (Deno/TypeScript)
 
-`@combs/core` is the user-facing layer over the native engine: one
-`EngineClient` contract, multiple transports, model presets, a device
-planner, and a local model cache. Everything is configurable, and every
-default can be overridden at four levels: built-in defaults → preset →
-`combs.config.json` → per-call options.
+Six packages forming the user-facing layer over the native engine:
+
+| Package | Role |
+|---|---|
+| `@combs/core` | Engine client (FFI/remote transports), presets, ModelCache, DevicePlanner, layered config |
+| `@combs/graph` | LangGraph-equivalent graph engine: channels/reducers, StateGraph, superstep runner (concurrency, retry, abort), checkpointers (Memory/Deno KV/SQLite), HITL interrupt+resume, Command/Send, stream modes, time travel |
+| `@combs/agents` | Tools + ToolRegistry, ToolNode, createReactAgent, structured output (schema→prompt→validate→retry), memory stores (KV/SQLite), MCP client (stdio/WS), skills loader |
+| `@combs/runtime` | Parallelism infra: findFreePort, secure tokens, KeyedMutex/Semaphore, KV task queue, SQLite SessionStore, AgentServer (HTTP+WS per agent with auth), Orchestrator (delegation hub), AgentPool (subprocess spawning) |
+| `@combs/flows` | High-level factories: `createWorkflow` (loops/checks), `createRoleplayChat` (multi-agent turn-taking), `addMemory`/`withMemory` |
+| `@combs/telemetry` | Color scoped logging, OTel-shaped spans (console/JSONL/OTLP exporters), metrics — all flag-driven (`COMBS_LOG_LEVEL`, `COMBS_TELEMETRY`) |
 
 ## Quick start
 
 ```sh
 # Native library (from Engine/Core): cargo xtask build --release
-deno task test                                   # unit + FFI integration tests
-deno run --allow-ffi --allow-read --allow-env --allow-net examples/chat.ts
+deno task test                                   # all 33 tests
+deno run --allow-ffi --allow-read --allow-env --allow-net --unstable-kv examples/chat.ts
+deno run --allow-ffi --allow-read --allow-env --allow-net --unstable-kv examples/agent_demo.ts
+deno run --allow-ffi --allow-read --allow-write --allow-env --allow-net examples/orchestration_demo.ts
 ```
 
 ```ts
 import { Combs } from "@combs/core";
+import { createReactAgent, tool } from "@combs/agents";
 
-// Preset id → download (if needed) → device plan → load.
-const engine = await Combs.init("smollm2-135m");
-for await (const ev of engine.stream({ messages: [{ role: "user", content: "Hi" }] })) {
-  if (ev.type === "delta") console.log(ev.text);
-}
-engine.close();
-
-// Or a local model directory, with overrides:
-const e2 = await Combs.init({
-  model: "/path/to/model",
-  engine: { max_seq_len: 4096, kv_cache: "paged" },
-});
-
-// Or a remote `combs serve` instance (same contract):
-const e3 = Combs.remote("http://localhost:8080");
+const engine = await Combs.init("smollm2-135m");   // preset → cache → planner → engine
+const agent = createReactAgent({ engine, tools: [myTool], systemPrompt: "..." });
+const out = await agent.invoke({ messages: [{ role: "user", content: "..." }] },
+                               { threadId: "conv-1" });   // checkpointed, resumable
 ```
 
-## Architecture
+## Orchestration (agents on ports)
 
-| Module | Role |
-|---|---|
-| `types.ts` | `EngineClient` contract + all shared types |
-| `ffi.ts` | `Deno.dlopen` bindings (platform-aware lib resolution) |
-| `engine.ts` | `FfiEngine` — native in-process engine (`nonblocking` + `UnsafeCallback.threadSafe` streaming) |
-| `remote.ts` | `RemoteEngine` — OpenAI-compatible HTTP/SSE client |
-| `cache.ts` | `ModelCache` — streaming downloads into `~/.cache/combs/models` |
-| `presets.ts` | `ModelPreset` registry (smollm2 family; llama-arch only for now) |
-| `planner.ts` | `DevicePlanner` — device caps → `EngineConfig` (KV budget, prefill chunking, mobile detection) |
-| `config.ts` | layered config (defaults → preset → `combs.config.json` → per-call) |
-| `combs.ts` | `Combs.init()` high-level orchestration |
+```ts
+import { createAgentServer, Orchestrator } from "@combs/runtime";
+
+// Each server: free port found, auth token minted, HTTP + WS endpoints.
+const a = await createAgentServer({ name: "poet", handler });
+const orch = new Orchestrator();
+await orch.register({ name: "poet", url: a.url, token: a.token });
+const result = await orch.delegate("poet", { text: "..." });   // WS, serialized per agent
+```
+
+`AgentPool` spawns the same servers as isolated subprocesses (own engine
+instance per process; model written to the shared model store first).
 
 ## Configuration
 
@@ -61,8 +59,11 @@ const e3 = Combs.remote("http://localhost:8080");
 }
 ```
 
-Env vars: `COMBS_LIB` (native library path), `COMBS_HOME` (store root),
-`COMBS_CONFIG` (config file), `COMBS_KV`/`COMBS_ATTN` (core engine knobs).
+Env: `COMBS_LIB`, `COMBS_HOME`, `COMBS_CONFIG`, `COMBS_KV`, `COMBS_ATTN`,
+`COMBS_LOG_LEVEL`, `COMBS_TELEMETRY`, `COMBS_TELEMETRY_FILE`.
+
+Note: Deno KV APIs (checkpoints, memory, queues) require `--unstable-kv`.
+
 
 ## Cross-platform
 

@@ -14,7 +14,7 @@ import type { ModelPreset } from "./types.ts";
 export const PRESETS: readonly ModelPreset[] = [
   {
     id: "smollm2-135m",
-    hfRepo: "HuggingFaceTB/SmolLM2-135M",
+    hfRepo: "HuggingFaceTB/SmolLM2-135M-Instruct",
     files: [
       "config.json",
       "generation_config.json",
@@ -31,7 +31,7 @@ export const PRESETS: readonly ModelPreset[] = [
   },
   {
     id: "smollm2-360m",
-    hfRepo: "HuggingFaceTB/SmolLM2-360M",
+    hfRepo: "HuggingFaceTB/SmolLM2-360M-Instruct",
     files: [
       "config.json",
       "generation_config.json",
@@ -48,7 +48,7 @@ export const PRESETS: readonly ModelPreset[] = [
   },
   {
     id: "smollm2-1.7b",
-    hfRepo: "HuggingFaceTB/SmolLM2-1.7B",
+    hfRepo: "HuggingFaceTB/SmolLM2-1.7B-Instruct",
     files: [
       "config.json",
       "generation_config.json",

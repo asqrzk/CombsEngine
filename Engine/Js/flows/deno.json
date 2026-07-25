@@ -1,0 +1,12 @@
+{
+  "name": "@combs/flows",
+  "version": "0.1.0",
+  "exports": "./mod.ts",
+  "imports": {
+    "@combs/agents": "../agents/mod.ts",
+    "@combs/core": "../core/mod.ts",
+    "@combs/graph": "../graph/mod.ts",
+    "@combs/runtime": "../runtime/mod.ts",
+    "@combs/telemetry": "../telemetry/mod.ts"
+  }
+}

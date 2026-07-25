@@ -77,7 +77,7 @@ Deno.test("mergeSampling: later layers win, undefined is ignored", () => {
 });
 
 Deno.test("presets: lookup by id and repo", () => {
-  assertEquals(findPreset("smollm2-135m")?.hfRepo, "HuggingFaceTB/SmolLM2-135M");
-  assertEquals(findPreset("HuggingFaceTB/SmolLM2-360M")?.id, "smollm2-360m");
+  assertEquals(findPreset("smollm2-135m")?.hfRepo, "HuggingFaceTB/SmolLM2-135M-Instruct");
+  assertEquals(findPreset("HuggingFaceTB/SmolLM2-360M-Instruct")?.id, "smollm2-360m");
   assertEquals(findPreset("nonexistent"), undefined);
 });
