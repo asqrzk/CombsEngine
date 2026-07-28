@@ -1,7 +1,6 @@
-/** Chat session store: streaming messages, optional local persistence. */
+/** Chat session store: streaming messages, optional persistence (via proxy). */
 
-import { streamChat } from "./api";
-import { permissions } from "./permissions";
+import { deleteFile, readFile, streamChat, writeFile } from "./api";
 import type { UiConfig } from "./config";
 
 export interface ChatTurn {
@@ -10,7 +9,7 @@ export interface ChatTurn {
   streaming?: boolean;
 }
 
-const CHATS_KEY = "combs.chats";
+const CHATS_FILE = "chats.json";
 
 export class ChatStore {
   turns = $state<ChatTurn[]>([]);
@@ -20,21 +19,23 @@ export class ChatStore {
 
   constructor(private config: UiConfig) {
     if (config.features.save_chats) {
-      try {
-        this.turns = JSON.parse(localStorage.getItem(CHATS_KEY) ?? "[]");
-      } catch {
-        this.turns = [];
-      }
+      // Persisted by the proxy on the backend (permission-gated on write).
+      readFile(CHATS_FILE).then((raw) => {
+        if (!raw) return;
+        try {
+          this.turns = JSON.parse(raw);
+        } catch {
+          this.turns = [];
+        }
+      });
     }
   }
 
   private persist(): void {
     if (!this.config.features.save_chats) return;
-    permissions
-      .require("storage:chats", "save this chat on this device")
-      .then((ok) => {
-        if (ok) localStorage.setItem(CHATS_KEY, JSON.stringify(this.turns));
-      });
+    // Fire-and-forget; the proxy asks for storage:chats permission when
+    // needed and enforces it server-side.
+    void writeFile(CHATS_FILE, JSON.stringify(this.turns), "storage:chats");
   }
 
   async send(text: string): Promise<void> {
@@ -81,6 +82,6 @@ export class ChatStore {
 
   clear(): void {
     this.turns = [];
-    localStorage.removeItem(CHATS_KEY);
+    void deleteFile(CHATS_FILE, "storage:chats");
   }
 }

@@ -16,6 +16,8 @@
 import { getLogger } from "@combs/telemetry";
 import type { CompiledGraph } from "@combs/graph";
 import { checkBearer, findFreePort, generateToken } from "./primitives.ts";
+import type { KeyRing } from "./keys.ts";
+import type { Envelope } from "@combs/zerotrust";
 
 const log = getLogger("combs.runtime.server");
 
@@ -35,6 +37,13 @@ export interface AgentServerOptions {
   token?: string;
   /** Extra metadata reported by /info. */
   metadata?: Record<string, unknown>;
+  /**
+   * Zero-trust keyring. When set, the server exposes GET/POST /keys for
+   * the one-time peer exchange, and WS messages sealed as envelopes are
+   * opened before dispatch (replies are sealed back). Plaintext delegates
+   * still work for unkeyed legacy peers.
+   */
+  keyring?: KeyRing;
 }
 
 export interface AgentServerHandle {
@@ -103,12 +112,35 @@ export async function createAgentServer(options: AgentServerOptions): Promise<Ag
       })();
     }
 
+    // --- zero-trust key exchange (token-authed, one time per peer) -------
+    if (url.pathname === "/keys" && options.keyring) {
+      if (request.method === "GET") {
+        return Response.json(options.keyring.publicKeys());
+      }
+      if (request.method === "POST") {
+        return (async () => {
+          const keys = await request.json();
+          if (!keys?.signPub || !keys?.encPub || !keys?.fingerprint) {
+            return Response.json({ error: "need {signPub, encPub, fingerprint}" }, { status: 400 });
+          }
+          options.keyring!.addPeer(keys);
+          log.info("peer key registered", { name: options.name, peer: keys.fingerprint });
+          return Response.json({ ok: true });
+        })();
+      }
+    }
+
     if (url.pathname === "/ws") {
       const { socket, response } = Deno.upgradeWebSocket(request);
       sockets.add(socket);
       socket.onclose = () => sockets.delete(socket);
       socket.onmessage = async (ev) => {
-        let msg: { type: string; id?: string; input?: Record<string, unknown> };
+        let msg: {
+          type: string;
+          id?: string;
+          input?: Record<string, unknown>;
+          sealed?: Envelope;
+        };
         try {
           msg = JSON.parse(String(ev.data));
         } catch {
@@ -120,10 +152,22 @@ export async function createAgentServer(options: AgentServerOptions): Promise<Ag
             if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload));
           };
           try {
-            const result = await handler(msg.input ?? {}, (event) =>
-              send({ type: "event", id, event }),
+            // Zero-trust: sealed input is opened (sig + hash verified)
+            // before dispatch; events/results are sealed back to the
+            // same peer.
+            const peerFp = msg.sealed?.from;
+            const input = msg.sealed && options.keyring
+              ? await options.keyring.openFrom(msg.sealed) as Record<string, unknown>
+              : msg.input ?? {};
+            const sealBack = async (payload: unknown): Promise<Record<string, unknown>> =>
+              peerFp && options.keyring
+                ? { sealed: await options.keyring.sealFor(peerFp, payload) }
+                : payload as Record<string, unknown>;
+
+            const result = await handler(input, async (event) =>
+              send({ type: "event", id, ...(await sealBack({ event })) }),
             );
-            send({ type: "result", id, ok: true, data: result });
+            send({ type: "result", id, ok: true, ...(await sealBack({ data: result })) });
           } catch (err) {
             send({
               type: "result",

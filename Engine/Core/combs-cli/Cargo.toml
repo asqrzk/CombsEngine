@@ -22,3 +22,4 @@ serde_json.workspace = true
 tiny_http.workspace = true
 dialoguer.workspace = true
 console.workspace = true
+ureq.workspace = true

@@ -3,7 +3,9 @@
   "version": "0.1.0",
   "exports": "./mod.ts",
   "imports": {
-    "@combs/graph": "../graph/mod.ts",
-    "@combs/telemetry": "../telemetry/mod.ts"
+    "@combs/graph": "jsr:@combs/graph@^0.1.0",
+    "@combs/observe": "jsr:@combs/observe@^0.1.0",
+    "@combs/telemetry": "jsr:@combs/telemetry@^0.1.0",
+    "@combs/zerotrust": "jsr:@combs/zerotrust@^0.1.0"
   }
 }

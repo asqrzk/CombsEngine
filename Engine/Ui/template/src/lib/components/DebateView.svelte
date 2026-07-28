@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { UiConfig } from "../config";
-  import { DebateStore } from "../debate";
+  import { DebateStore } from "../debate.svelte";
   import Button from "./ui/Button.svelte";
   import Badge from "./ui/Badge.svelte";
   import Card from "./ui/Card.svelte";

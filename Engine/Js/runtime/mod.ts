@@ -14,3 +14,5 @@ export { createAgentServer } from "./src/server.ts";
 export type { AgentHandler, AgentServerHandle, AgentServerOptions } from "./src/server.ts";
 export { AgentPool, Orchestrator } from "./src/orchestrator.ts";
 export type { DelegateResult, SpawnAgentSpec } from "./src/orchestrator.ts";
+export { KeyRing } from "./src/keys.ts";
+export type { PeerKeys } from "./src/keys.ts";

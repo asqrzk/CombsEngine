@@ -1,7 +1,7 @@
 /** UiConfig — written by `combs chew` into combs.ui.json at the app root. */
 
 export interface UiConfig {
-  mode: "chat-ui" | "debate-ui";
+  mode: "chat-ui" | "debate-ui" | "roleplay-ui" | "multi-turn-ui";
   features: {
     reasoning: boolean;
     vision: boolean;

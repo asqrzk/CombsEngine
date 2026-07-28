@@ -3,10 +3,10 @@
   "version": "0.1.0",
   "exports": "./mod.ts",
   "imports": {
-    "@combs/agents": "../agents/mod.ts",
-    "@combs/core": "../core/mod.ts",
-    "@combs/graph": "../graph/mod.ts",
-    "@combs/runtime": "../runtime/mod.ts",
-    "@combs/telemetry": "../telemetry/mod.ts"
+    "@combs/agents": "jsr:@combs/agents@^0.1.0",
+    "@combs/core": "jsr:@combs/core@^0.1.0",
+    "@combs/graph": "jsr:@combs/graph@^0.1.0",
+    "@combs/runtime": "jsr:@combs/runtime@^0.1.0",
+    "@combs/telemetry": "jsr:@combs/telemetry@^0.1.0"
   }
 }

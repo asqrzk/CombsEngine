@@ -1,14 +1,16 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { loadConfig, type UiConfig } from "./lib/config";
-  import { themeStore } from "./lib/theme";
-  import { authStore } from "./lib/auth";
-  import { monitor } from "./lib/monitor";
+  import { themeStore } from "./lib/theme.svelte";
+  import { authStore } from "./lib/auth.svelte";
+  import { monitor } from "./lib/monitor.svelte";
   import TopBar from "./lib/components/TopBar.svelte";
   import AuthSetup from "./lib/components/AuthSetup.svelte";
   import PermissionDialog from "./lib/components/PermissionDialog.svelte";
   import ChatView from "./lib/components/ChatView.svelte";
   import DebateView from "./lib/components/DebateView.svelte";
+  import RoleplayView from "./lib/components/RoleplayView.svelte";
+  import MultiTurnView from "./lib/components/MultiTurnView.svelte";
 
   let config = $state<UiConfig | null>(null);
   let booted = $state(false);
@@ -25,7 +27,8 @@
 
   const needsAuth = $derived(
     booted && config?.authentication === true &&
-    (!authStore.identity || !authStore.identity.backedUp),
+    (!authStore.identity || !authStore.identity.backedUp ||
+      (!authStore.passkeyRegistered && !authStore.passkeySkipped)),
   );
 </script>
 
@@ -41,6 +44,10 @@
         <AuthSetup />
       {:else if config.mode === "debate-ui"}
         <DebateView {config} />
+      {:else if config.mode === "roleplay-ui"}
+        <RoleplayView {config} />
+      {:else if config.mode === "multi-turn-ui"}
+        <MultiTurnView {config} />
       {:else}
         <ChatView {config} />
       {/if}

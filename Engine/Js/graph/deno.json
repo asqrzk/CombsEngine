@@ -3,6 +3,6 @@
   "version": "0.1.0",
   "exports": "./mod.ts",
   "imports": {
-    "@combs/telemetry": "../telemetry/mod.ts"
+    "@combs/telemetry": "jsr:@combs/telemetry@^0.1.0"
   }
 }

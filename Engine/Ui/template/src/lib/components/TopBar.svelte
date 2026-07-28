@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { monitor } from "../monitor";
-  import { themeStore } from "../theme";
+  import { monitor } from "../monitor.svelte";
+  import { themeStore } from "../theme.svelte";
   import Badge from "./ui/Badge.svelte";
 </script>
 
@@ -13,7 +13,7 @@
       <span class="text-sm font-semibold tracking-tight">Combs</span>
     </div>
 
-    <div class="ml-auto flex items-center gap-2 text-xs">
+    <div class="ml-auto flex items-center gap-2 text-xs" class:opacity-40={!monitor.reachable}>
       <!-- realtime network monitor -->
       <Badge tone="muted" title="network down / up">
         ↓ {monitor.downLabel} · ↑ {monitor.upLabel}

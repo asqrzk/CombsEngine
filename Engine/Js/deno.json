@@ -1,7 +1,7 @@
 {
-  "workspace": ["./core", "./telemetry", "./graph", "./agents", "./runtime", "./flows"],
+  "workspace": ["./core", "./telemetry", "./graph", "./agents", "./runtime", "./flows", "./zerotrust", "./observe"],
   "tasks": {
-    "check": "deno check core/mod.ts telemetry/mod.ts graph/mod.ts agents/mod.ts runtime/mod.ts flows/mod.ts core/test/*.ts graph/test/*.ts agents/test/*.ts runtime/test/*.ts flows/test/*.ts",
-    "test": "deno test --allow-ffi --allow-read --allow-write --allow-env --allow-net --allow-run --unstable-kv core/test/ graph/test/ agents/test/ runtime/test/ flows/test/"
+    "check": "deno check core/mod.ts telemetry/mod.ts graph/mod.ts agents/mod.ts runtime/mod.ts flows/mod.ts core/test/*.ts graph/test/*.ts agents/test/*.ts runtime/test/*.ts flows/test/*.ts zerotrust/test/*.ts observe/test/*.ts",
+    "test": "deno test --allow-ffi --allow-read --allow-write --allow-env --allow-net --allow-run --unstable-kv core/test/ graph/test/ agents/test/ runtime/test/ flows/test/ zerotrust/test/ observe/test/"
   }
 }

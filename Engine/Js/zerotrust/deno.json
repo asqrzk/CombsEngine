@@ -1,0 +1,5 @@
+{
+  "name": "@combs/zerotrust",
+  "version": "0.1.0",
+  "exports": "./mod.js"
+}

@@ -1,0 +1,33 @@
+{
+  "name": "@combs-edge/combs-zerotrust",
+  "version": "0.1.7",
+  "description": "Zero-trust crypto core for Combs Engine — identity, sealed envelopes, at-rest keystore, capability tokens. Pure WebCrypto; browser, Node and Deno.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
+  "homepage": "https://github.com/asqrzk/CombsEngine",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/asqrzk/CombsEngine.git",
+    "directory": "Engine/Packages/npm/combs-zerotrust"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts"
+  ],
+  "keywords": [
+    "combs",
+    "zero-trust",
+    "webcrypto",
+    "aes-gcm",
+    "ecdh",
+    "e2e-encryption"
+  ]
+}

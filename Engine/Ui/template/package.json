@@ -4,9 +4,16 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "node server/dev.mjs",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "start": "node server/proxy.mjs --serve dist"
+  },
+  "dependencies": {
+    "@simplewebauthn/browser": "^13.3.0",
+    "@simplewebauthn/server": "^13.3.2",
+    "@combs-edge/combs-client": "^0.1.7",
+    "@combs-edge/combs-zerotrust": "^0.1.7"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5.0.0",

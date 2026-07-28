@@ -1,0 +1,119 @@
+# Builds the `combs` CLI + libcombs_ffi natively on each OS (no cross-linking
+# needed — every platform builds itself) and attaches the artifacts to a
+# GitHub Release. The npm/PyPI wrappers download these exact assets.
+#
+# Usage: tag a release and push it:
+#   git tag v0.1.0 && git push origin v0.1.0
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string (e.g. 0.1.0) for a manual build"
+        required: false
+        default: "0.0.0-dev"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14, platform: macos, arch: arm64 }   # Apple Silicon
+          - { os: macos-13, platform: macos, arch: x86_64 }  # Intel Mac
+          - { os: ubuntu-latest, platform: linux, arch: x86_64 }
+          - { os: windows-latest, platform: windows, arch: x86_64 }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: Engine/Core
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            Engine/Core/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Engine/Core/Cargo.lock') }}
+
+      - name: Build CLI + FFI library
+        run: cargo build --release -p combs-cli -p combs-ffi
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            V="${GITHUB_REF#refs/tags/v}"
+          else
+            V="${{ inputs.version || '0.0.0-dev' }}"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -e
+          V="${{ steps.ver.outputs.version }}"
+          NAME="combs-${V}-${{ matrix.platform }}-${{ matrix.arch }}"
+          STAGE="stage/$NAME"
+          mkdir -p "$STAGE"
+          cp target/release/combs "$STAGE/"
+          cp target/release/libcombs_ffi.* "$STAGE/" 2>/dev/null || true
+          cp combs-ffi/include/combs.h "$STAGE/" 2>/dev/null || true
+          tar -czf "${NAME}.tar.gz" -C stage "$NAME"
+          mkdir -p ../artifacts && mv "${NAME}.tar.gz" ../artifacts/
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $V = "${{ steps.ver.outputs.version }}"
+          $Name = "combs-$V-${{ matrix.platform }}-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Force "stage/$Name" | Out-Null
+          Copy-Item target/release/combs.exe "stage/$Name/"
+          Copy-Item target/release/combs_ffi.dll "stage/$Name/" -ErrorAction SilentlyContinue
+          Copy-Item combs-ffi/include/combs.h "stage/$Name/" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "stage/$Name" -DestinationPath "$Name.zip"
+          New-Item -ItemType Directory -Force ../artifacts | Out-Null
+          Move-Item "$Name.zip" ../artifacts/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: combs-${{ matrix.platform }}-${{ matrix.arch }}
+          path: Engine/artifacts/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**
+          generate_release_notes: true

@@ -8,8 +8,12 @@
  */
 
 import { getLogger } from "@combs/telemetry";
+import type { EventBus } from "@combs/observe";
+import { span as obsSpan } from "@combs/observe";
 import { KeyedMutex, Semaphore } from "./primitives.ts";
 import type { AgentServerHandle } from "./server.ts";
+import type { KeyRing } from "./keys.ts";
+import type { Envelope } from "@combs/zerotrust";
 
 const log = getLogger("combs.runtime.orch");
 
@@ -26,6 +30,10 @@ interface AgentConnection {
   url: string;
   token: string;
   ws?: WebSocket;
+  /** Peer's public-key fingerprint when zero-trust is active. */
+  peerFp?: string;
+  /** Serializes async envelope unsealing to preserve message order. */
+  chain: Promise<void>;
   pending: Map<string, {
     resolve: (r: DelegateResult) => void;
     events: unknown[];
@@ -39,17 +47,43 @@ export class Orchestrator {
   private locks = new KeyedMutex();
   /** Bounds total in-flight delegations across all agents. */
   readonly gate: Semaphore;
+  private keyring?: KeyRing;
+  private bus?: EventBus;
 
-  constructor(opts: { maxConcurrent?: number } = {}) {
+  constructor(opts: { maxConcurrent?: number; keyring?: KeyRing; bus?: EventBus } = {}) {
     this.gate = new Semaphore(opts.maxConcurrent ?? 16);
+    this.keyring = opts.keyring;
+    this.bus = opts.bus;
   }
 
-  /** Registers an already-running agent server (by URL + token). */
+  /** Registers an already-running agent server (by URL + token). When the
+   * orchestrator has a KeyRing, performs the one-time peer key exchange
+   * (GET/POST /keys) — afterwards all traffic is sealed envelopes. */
   async register(agent: { name: string; url: string; token: string; handle?: AgentServerHandle }): Promise<void> {
-    const conn: AgentConnection = { ...agent, pending: new Map() };
+    const conn: AgentConnection = { ...agent, pending: new Map(), chain: Promise.resolve() };
     this.agents.set(agent.name, conn);
+    if (this.keyring) {
+      const res = await fetch(`${agent.url}/keys`, {
+        headers: { authorization: `Bearer ${agent.token}` },
+      });
+      if (res.ok) {
+        const peer = await res.json();
+        this.keyring.addPeer(peer);
+        conn.peerFp = peer.fingerprint;
+        await fetch(`${agent.url}/keys`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${agent.token}`,
+          },
+          body: JSON.stringify(this.keyring.publicKeys()),
+        });
+        log.info("zero-trust channel keyed", { name: agent.name, peer: peer.fingerprint });
+      }
+    }
     await this.connect(conn);
     log.info("agent registered", { name: agent.name });
+    this.bus?.event("orchestrator", "agent.registered", { attrs: { name: agent.name, url: agent.url } });
   }
 
   private connect(conn: AgentConnection): Promise<void> {
@@ -68,23 +102,10 @@ export class Orchestrator {
         reject(new Error(`ws connect failed for ${conn.name}: ${e}`));
       };
       ws.onmessage = (ev) => {
-        let msg: { type: string; id?: string; ok?: boolean; data?: unknown; error?: string; event?: unknown };
-        try {
-          msg = JSON.parse(String(ev.data));
-        } catch {
-          return;
-        }
-        if ((msg.type === "event" || msg.type === "result") && msg.id) {
-          const slot = conn.pending.get(msg.id);
-          if (!slot) return;
-          if (msg.type === "event") {
-            slot.events.push(msg.event);
-            slot.onEvent?.(msg.event);
-          } else {
-            conn.pending.delete(msg.id);
-            slot.resolve({ ok: msg.ok ?? false, data: msg.data, error: msg.error, events: slot.events });
-          }
-        }
+        // Sealed messages need async unsealing; chain to preserve order.
+        conn.chain = conn.chain.then(() => this.handleMessage(conn, ev)).catch((e) => {
+          log.warn("message dropped", { name: conn.name, error: String(e) });
+        });
       };
       ws.onclose = () => {
         for (const [, slot] of conn.pending) {
@@ -94,6 +115,43 @@ export class Orchestrator {
         conn.ws = undefined;
       };
     });
+  }
+
+  private async handleMessage(conn: AgentConnection, ev: MessageEvent): Promise<void> {
+    let msg: {
+      type: string;
+      id?: string;
+      ok?: boolean;
+      data?: unknown;
+      error?: string;
+      event?: unknown;
+      sealed?: Envelope;
+    };
+    try {
+      msg = JSON.parse(String(ev.data));
+    } catch {
+      return;
+    }
+    if (msg.sealed) {
+      if (!this.keyring) return;
+      const payload = await this.keyring.openFrom(msg.sealed) as {
+        event?: unknown;
+        data?: unknown;
+      };
+      if (payload.event !== undefined) msg.event = payload.event;
+      if (payload.data !== undefined) msg.data = payload.data;
+    }
+    if ((msg.type === "event" || msg.type === "result") && msg.id) {
+      const slot = conn.pending.get(msg.id);
+      if (!slot) return;
+      if (msg.type === "event") {
+        slot.events.push(msg.event);
+        slot.onEvent?.(msg.event);
+      } else {
+        conn.pending.delete(msg.id);
+        slot.resolve({ ok: msg.ok ?? false, data: msg.data, error: msg.error, events: slot.events });
+      }
+    }
   }
 
   /** Delegates a task to an agent; resolves with the result + events. */
@@ -108,16 +166,38 @@ export class Orchestrator {
       await this.connect(conn);
     }
     const id = crypto.randomUUID();
+    // Zero-trust: seal the input when the channel is keyed — the agent
+    // only accepts it after signature + hash verification.
+    const body: Record<string, unknown> = { type: "delegate", id };
+    if (conn.peerFp && this.keyring) {
+      body.sealed = await this.keyring.sealFor(conn.peerFp, input);
+    } else {
+      body.input = input;
+    }
     const run = () =>
       new Promise<DelegateResult>((resolve) => {
         conn.pending.set(id, { resolve, events: [], onEvent: opts.onEvent });
-        conn.ws!.send(JSON.stringify({ type: "delegate", id, input }));
+        conn.ws!.send(JSON.stringify(body));
       });
+    const execute = () =>
+      this.bus
+        ? obsSpan(
+          this.bus,
+          "orchestrator",
+          "agent.delegate",
+          { input, attrs: { agent: name } },
+          async () => {
+            const result = await run();
+            if (!result.ok) throw new Error(result.error ?? "delegation failed");
+            return result;
+          },
+        )
+        : run();
     if (opts.serializePerAgent ?? true) {
       // One in-flight task per agent by default (GPU single-flight).
-      return this.locks.lock(name, () => this.gate.run(run));
+      return this.locks.lock(name, () => this.gate.run(execute));
     }
-    return this.gate.run(run);
+    return this.gate.run(execute);
   }
 
   /** Delegates the same input to several agents in parallel. */
@@ -182,6 +262,11 @@ export class AgentPool {
       stderr: "inherit",
     }).spawn();
     this.processes.set(spec.name, child);
+    const orch = this.orchestrator as unknown as { bus?: EventBus };
+    orch.bus?.event("orchestrator", "agent.spawn", { attrs: { name: spec.name, port, pid: child.pid } });
+    child.status.then((s) => {
+      orch.bus?.event("orchestrator", "agent.exit", { attrs: { name: spec.name, code: s.code } });
+    }).catch(() => {});
 
     // Wait for health, then register.
     const url = `http://127.0.0.1:${port}`;

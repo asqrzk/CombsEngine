@@ -13,6 +13,7 @@ use combs_formats::{ModelSource, open_model_source};
 use combs_runtime::{Engine, GenerationConfig};
 
 mod chew;
+mod pull;
 mod serve;
 
 #[derive(Parser)]
@@ -73,9 +74,9 @@ enum Command {
     Run(RunArgs),
     /// Print wgpu device information.
     Devices,
-    /// Download a model into the local store (Phase 3+).
+    /// Download a model into the local cache (~/.cache/combs/models).
     Pull {
-        /// HuggingFace repo id or URL.
+        /// Preset id (smollm2-135m) or HuggingFace repo (org/name).
         source: String,
     },
     /// Convert/repackage a model (Phase 5).
@@ -92,10 +93,26 @@ enum Command {
         #[arg(long, default_value_t = 8080)]
         port: u16,
     },
-    /// Scaffold a chat UI app (interactive or via flags).
-    ChewChatUi(chew::ChewArgs),
-    /// Scaffold a multi-agent debate UI app (interactive or via flags).
-    ChewDebateUi(chew::ChewArgs),
+    /// Scaffold a UI app from the embedded template (interactive or via flags).
+    Chew(ChewCommand),
+}
+
+#[derive(Args)]
+struct ChewCommand {
+    #[command(subcommand)]
+    mode: ChewMode,
+}
+
+#[derive(Subcommand)]
+enum ChewMode {
+    /// Scaffold a chat UI app.
+    ChatUi(chew::ChewArgs),
+    /// Scaffold a multi-agent debate UI app.
+    DebateUi(chew::ChewArgs),
+    /// Scaffold a two-role roleplay UI (each role on its own engine process).
+    RoleplayUi(chew::ChewArgs),
+    /// Scaffold a multi-turn chat UI with the Control Tower observability view.
+    MultiTurnUi(chew::ChewArgs),
 }
 
 fn main() -> Result<()> {
@@ -103,11 +120,19 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Run(args) => cmd_run(args),
         Command::Devices => cmd_devices(),
-        Command::Pull { .. } => not_yet("pull", "Phase 5 (model store)"),
+        Command::Pull { source } => {
+            let dir = pull::pull(&source)?;
+            println!("cached at: {}", dir.display());
+            Ok(())
+        }
         Command::Convert { .. } => not_yet("convert", "Phase 5 (GGUF/burnpack adapters)"),
         Command::Serve { model, port } => cmd_serve(model, port),
-        Command::ChewChatUi(args) => chew::chew("chat-ui", args),
-        Command::ChewDebateUi(args) => chew::chew("debate-ui", args),
+        Command::Chew(cmd) => match cmd.mode {
+            ChewMode::ChatUi(args) => chew::chew("chat-ui", args),
+            ChewMode::DebateUi(args) => chew::chew("debate-ui", args),
+            ChewMode::RoleplayUi(args) => chew::chew("roleplay-ui", args),
+            ChewMode::MultiTurnUi(args) => chew::chew("multi-turn-ui", args),
+        },
     }
 }
 
@@ -116,7 +141,21 @@ fn not_yet(cmd: &str, phase: &str) -> Result<()> {
     std::process::exit(2);
 }
 
+/// Resolves a --model argument: direct path, or a preset id in the local
+/// cache (see `combs pull`).
+fn resolve_model_arg(model: &PathBuf) -> Result<PathBuf> {
+    if model.exists() {
+        return Ok(model.clone());
+    }
+    let name = model.to_string_lossy();
+    if let Some(dir) = pull::cached_dir(&name) {
+        return Ok(dir);
+    }
+    anyhow::bail!("model '{name}' not found — download it first: combs pull {name}")
+}
+
 fn cmd_serve(model: PathBuf, port: u16) -> Result<()> {
+    let model = resolve_model_arg(&model)?;
     let source = open_model_source(&model)?;
     let model_id = model
         .file_name()
@@ -139,8 +178,9 @@ fn cmd_devices() -> Result<()> {
 }
 
 fn cmd_run(args: RunArgs) -> Result<()> {
-    let source = open_model_source(&args.model)
-        .with_context(|| format!("loading {}", args.model.display()))?;
+    let model = resolve_model_arg(&args.model)?;
+    let source = open_model_source(&model)
+        .with_context(|| format!("loading {}", model.display()))?;
     let meta = source.metadata();
     eprintln!(
         "model: {} ({} layers, hidden {}, vocab {}, {})",

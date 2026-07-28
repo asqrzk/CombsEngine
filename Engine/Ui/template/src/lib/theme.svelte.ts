@@ -1,13 +1,13 @@
-/** Theme store: dark / light / system, persisted, class-based. */
+/** Theme store: dark / light / system, persisted (encrypted), class-based. */
+
+import { secureGet, secureSet } from "./secureStore";
 
 export type Theme = "system" | "dark" | "light";
 
 const KEY = "combs.theme";
 
-function initial(preset: Theme): Theme {
-  const saved = localStorage.getItem(KEY);
-  if (saved === "dark" || saved === "light" || saved === "system") return saved;
-  return preset;
+function isTheme(v: string | null): v is Theme {
+  return v === "dark" || v === "light" || v === "system";
 }
 
 function systemDark(): boolean {
@@ -18,11 +18,18 @@ class ThemeStore {
   theme = $state<Theme>("system");
 
   init(preset: Theme): void {
-    this.theme = initial(preset);
+    this.theme = preset;
+    this.apply();
+    // encrypted read: upgrades the theme once the identity is available
+    void secureGet(KEY).then((saved) => {
+      if (isTheme(saved)) {
+        this.theme = saved;
+        this.apply();
+      }
+    });
     globalThis.matchMedia?.("(prefers-color-scheme: dark)").addEventListener("change", () => {
       this.apply();
     });
-    this.apply();
   }
 
   get dark(): boolean {
@@ -31,7 +38,7 @@ class ThemeStore {
 
   set(theme: Theme): void {
     this.theme = theme;
-    localStorage.setItem(KEY, theme);
+    void secureSet(KEY, theme); // encrypted at rest (fire-and-forget)
     this.apply();
   }
 

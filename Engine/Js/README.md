@@ -1,6 +1,6 @@
 # Combs Engine — L2 Application Layer (Deno/TypeScript)
 
-Six packages forming the user-facing layer over the native engine:
+Eight packages forming the user-facing layer over the native engine:
 
 | Package | Role |
 |---|---|
@@ -10,6 +10,7 @@ Six packages forming the user-facing layer over the native engine:
 | `@combs/runtime` | Parallelism infra: findFreePort, secure tokens, KeyedMutex/Semaphore, KV task queue, SQLite SessionStore, AgentServer (HTTP+WS per agent with auth), Orchestrator (delegation hub), AgentPool (subprocess spawning) |
 | `@combs/flows` | High-level factories: `createWorkflow` (loops/checks), `createRoleplayChat` (multi-agent turn-taking), `addMemory`/`withMemory` |
 | `@combs/telemetry` | Color scoped logging, OTel-shaped spans (console/JSONL/OTLP exporters), metrics — all flag-driven (`COMBS_LOG_LEVEL`, `COMBS_TELEMETRY`) |
+| `@combs/observe` | Realtime observability bus (isomorphic, zero runtime deps): EventBus, instrument middleware (`wrapEngine`/`instrumentFetch`/`span`), sinks (memory/NDJSON/WebSocket), secret redaction — powers the Control Tower |
 
 ## Quick start
 

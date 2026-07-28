@@ -33,6 +33,9 @@ export class DebateStore {
       this.currentAgent = agent.name;
       const entry: DebateTurn = { agent: agent.name, stance: agent.stance, content: "", streaming: true };
       this.turns.push(entry);
+      // Mutate ONLY through the $state proxy (indexed access) — writes via
+      // the raw `entry` reference are invisible to the reactive system.
+      const current = this.turns[this.turns.length - 1];
 
       const transcript = this.turns
         .slice(0, -1)
@@ -56,13 +59,13 @@ export class DebateStore {
         { model: this.config.model, temperature: 0.8, maxTokens: 180 },
         {
           onDelta: (d) => {
-            entry.content += d;
+            current.content += d;
           },
           onDone: () => {
-            entry.streaming = false;
+            current.streaming = false;
           },
           onError: (err) => {
-            entry.streaming = false;
+            current.streaming = false;
             failed = err;
           },
         },

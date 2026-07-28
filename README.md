@@ -35,7 +35,8 @@ Four layers. Compute lives exclusively in **L0** — every layer above is thin o
 ├─────────────────────────────────────────────────────────────┤
 │ L2 — Deno / TypeScript Framework   (Engine/Js)              │
 │     @combs/core · @combs/graph · @combs/agents ·            │
-│     @combs/runtime · @combs/flows · @combs/telemetry        │
+│     @combs/runtime · @combs/flows · @combs/telemetry ·      │
+│     @combs/observe · @combs/zerotrust                       │
 ├─────────────────────────────────────────────────────────────┤
 │ L1 — C ABI / JSON-FFI                (combs-ffi)            │
 │     combs_engine_create · combs_chat_completion_stream ·    │
@@ -77,14 +78,16 @@ Four layers. Compute lives exclusively in **L0** — every layer above is thin o
 | `@combs/runtime` | Agent HTTP/WS servers, orchestrator, agent pool, KV task queue, session stores |
 | `@combs/flows` | `createWorkflow` (steps/loops/checks), `createRoleplayChat`, `addMemory` |
 | `@combs/telemetry` | Scoped logging, OpenTelemetry-shaped spans, metrics |
+| `@combs/observe` | Realtime observability bus (isomorphic core) — EventBus, instrument middleware (`wrapEngine`/`instrumentFetch`/`span`), sinks (memory/NDJSON/WebSocket), redaction; powers the Control Tower |
 
 ### L3 — UI & Shells
 
 - **`combs chew`** — scaffolder (interactive or fully flag-driven) that stamps out a ready-to-build Svelte 5 app:
-  - 🔐 first-run Ed25519 keypair auth ritual (skippable)
+  - 🔐 first-run keypair auth ritual + device passkey (WebAuthn) for permission approvals
   - 🛡️ fine-grained network/storage permission grants ("allow once / this session / always")
   - 📊 realtime network + storage monitor
-  - 🌗 dark/light themes, responsive, chat & multi-agent debate views
+  - 🗼 **Control Tower** — realtime observability view (sources, runs, context, network, permissions) fed by `@combs/observe`
+  - 🌗 dark/light themes, responsive; **chat**, **debate**, **roleplay** (two engine processes), and **multi-turn** (chat + Control Tower) views
 - **Android** — JNI bridge + Kotlin `CombsEngine` API.
 - **iOS** — Swift wrapper over the C ABI.
 - **Web** — `combs-wasm` skeleton + `WorkerEngine` transport (WebGPU enablement in progress).

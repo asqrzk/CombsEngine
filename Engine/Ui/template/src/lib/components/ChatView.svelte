@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { UiConfig } from "../config";
-  import { ChatStore } from "../chat";
+  import { ChatStore } from "../chat.svelte";
   import Button from "./ui/Button.svelte";
   import Badge from "./ui/Badge.svelte";
 
