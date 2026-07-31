@@ -11,9 +11,14 @@
   import DebateView from "./lib/components/DebateView.svelte";
   import RoleplayView from "./lib/components/RoleplayView.svelte";
   import MultiTurnView from "./lib/components/MultiTurnView.svelte";
+  import OrchestrationView from "./lib/components/OrchestrationView.svelte";
+  import KvCacheView from "./lib/components/KvCacheView.svelte";
+  import DebateKvView from "./lib/components/DebateKvView.svelte";
+  import TowerView from "./lib/components/tower/TowerView.svelte";
 
   let config = $state<UiConfig | null>(null);
   let booted = $state(false);
+  let hash = $state("");
 
   onMount(async () => {
     config = await loadConfig();
@@ -25,11 +30,25 @@
     booted = true;
   });
 
+  onMount(() => {
+    hash = location.hash;
+    const onHash = () => (hash = location.hash);
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  });
+
   const needsAuth = $derived(
     booted && config?.authentication === true &&
     (!authStore.identity || !authStore.identity.backedUp ||
       (!authStore.passkeyRegistered && !authStore.passkeySkipped)),
   );
+  const towerCapable = $derived(
+    config?.mode === "multi-turn-ui" ||
+    config?.mode === "orchestration-observe-ui" ||
+    config?.mode === "kv-cache-ui" ||
+    config?.mode === "debate-kv-ui",
+  );
+  const showTowerPage = $derived(towerCapable && hash === "#tower");
 </script>
 
 {#if !booted || !config}
@@ -38,18 +57,36 @@
   </div>
 {:else}
   <div class="flex h-full flex-col">
-    <TopBar />
+    <TopBar mode={config.mode} {hash} />
     <main class="min-h-0 flex-1">
       {#if needsAuth}
         <AuthSetup />
-      {:else if config.mode === "debate-ui"}
-        <DebateView {config} />
-      {:else if config.mode === "roleplay-ui"}
-        <RoleplayView {config} />
-      {:else if config.mode === "multi-turn-ui"}
-        <MultiTurnView {config} />
       {:else}
-        <ChatView {config} />
+        <!-- Keep-alive: both panes stay MOUNTED (visibility toggled only), so
+             navigating to the tower and back never loses conversation state
+             or kills a running orchestration loop. -->
+        <div class="h-full" class:hidden={showTowerPage}>
+          {#if config.mode === "debate-ui"}
+            <DebateView {config} />
+          {:else if config.mode === "roleplay-ui"}
+            <RoleplayView {config} />
+          {:else if config.mode === "multi-turn-ui"}
+            <MultiTurnView {config} />
+          {:else if config.mode === "orchestration-observe-ui"}
+            <OrchestrationView {config} />
+          {:else if config.mode === "kv-cache-ui"}
+            <KvCacheView {config} />
+          {:else if config.mode === "debate-kv-ui"}
+            <DebateKvView {config} />
+          {:else}
+            <ChatView {config} />
+          {/if}
+        </div>
+        {#if towerCapable}
+          <div class="h-full" class:hidden={!showTowerPage}>
+            <TowerView />
+          </div>
+        {/if}
       {/if}
     </main>
   </div>

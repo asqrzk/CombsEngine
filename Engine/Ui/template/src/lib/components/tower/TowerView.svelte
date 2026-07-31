@@ -3,6 +3,14 @@
   import { tower, type ObsEvent } from "../../tower.svelte";
   import Badge from "../ui/Badge.svelte";
   import Button from "../ui/Button.svelte";
+  import StatsBar from "./StatsBar.svelte";
+
+  /**
+   * compact: forced single-column layout for embedding inside another view's
+   * side pane (multi-turn). Full-page mode (default) adapts across
+   * base / lg / xl breakpoints.
+   */
+  let { compact = false }: { compact?: boolean } = $props();
 
   onMount(() => tower.start());
 
@@ -14,6 +22,21 @@
     log: "muted",
     context: "muted",
   };
+
+  const gridClass = $derived(
+    compact
+      ? "grid-cols-1 grid-rows-[auto_minmax(0,1fr)_auto]"
+      : "grid-cols-1 grid-rows-[auto_minmax(0,1fr)_auto] " +
+        "lg:grid-cols-[200px_minmax(0,1fr)] lg:grid-rows-[minmax(0,1fr)_auto] " +
+        "xl:grid-cols-[220px_minmax(0,1fr)_320px] xl:grid-rows-[minmax(0,1fr)]",
+  );
+  const sourcesClass = $derived(
+    compact ? "max-h-28" : "max-h-28 lg:col-span-1 lg:max-h-none",
+  );
+  const inspectorClass = $derived(
+    (tower.selected ? "" : compact ? "hidden " : "hidden xl:block ") +
+    (compact ? "max-h-64" : "max-h-64 lg:col-span-2 xl:col-span-1 xl:max-h-none"),
+  );
 
   function fmtTs(ts: number): string {
     return new Date(ts).toLocaleTimeString([], { hour12: false }) +
@@ -34,7 +57,7 @@
   }
 </script>
 
-<div class="flex h-full flex-col gap-3 p-4">
+<div class="flex h-full flex-col gap-3 p-3 sm:p-4">
   <!-- header -->
   <div class="flex flex-wrap items-center gap-2">
     <h1 class="text-lg font-semibold">Control Tower</h1>
@@ -42,9 +65,9 @@
       {tower.connected ? "live" : "reconnecting…"}
     </Badge>
     <span class="text-xs text-[rgb(var(--muted))]">{tower.filtered.length} / {tower.events.length} events</span>
-    <div class="ml-auto flex items-center gap-2">
+    <div class="ml-auto flex min-w-0 flex-1 items-center justify-end gap-2 sm:flex-initial">
       <input
-        class="w-44 rounded-md border bg-transparent px-2 py-1 text-sm"
+        class="w-full max-w-44 rounded-md border bg-transparent px-2 py-1 text-sm"
         placeholder="filter…"
         bind:value={tower.textFilter}
       />
@@ -52,10 +75,12 @@
     </div>
   </div>
 
-  <div class="grid min-h-0 flex-1 grid-cols-1 gap-3 lg:grid-cols-[220px_1fr_340px]">
+  <StatsBar />
+
+  <div class="grid min-h-0 flex-1 gap-3 {gridClass}">
     <!-- sources -->
-    <div class="min-h-0 overflow-y-auto rounded-xl border bg-[rgb(var(--card))] p-3">
-      <div class="mb-2 text-xs font-semibold uppercase tracking-wide text-[rgb(var(--muted))]">Sources</div>
+    <div class="flex min-h-0 min-w-0 flex-col overflow-y-auto rounded-xl border bg-[rgb(var(--card))] p-2 lg:p-3 {sourcesClass}">
+      <div class="mb-2 hidden text-xs font-semibold uppercase tracking-wide text-[rgb(var(--muted))] {compact ? '' : 'lg:block'}">Sources</div>
       <button
         class="mb-1 w-full rounded-md px-2 py-1 text-left text-sm hover:bg-[rgb(var(--border))]"
         class:bg-[rgb(var(--border))]={tower.sourceFilter === null}
@@ -65,12 +90,12 @@
       </button>
       {#each tower.sourceList() as s}
         <button
-          class="mb-1 w-full rounded-md px-2 py-1 text-left text-sm hover:bg-[rgb(var(--border))]"
+          class="mb-1 w-full min-w-0 rounded-md px-2 py-1 text-left text-sm hover:bg-[rgb(var(--border))]"
           class:bg-[rgb(var(--border))]={tower.sourceFilter === s.id}
           onclick={() => (tower.sourceFilter = s.id)}
         >
-          <div class="font-medium">{s.id}</div>
-          <div class="text-xs text-[rgb(var(--muted))]">
+          <div class="truncate font-medium">{s.id}</div>
+          <div class="truncate text-xs text-[rgb(var(--muted))]">
             {#if s.state.port}:{s.state.port}{/if}
             {#if s.state.model} · {s.state.model}{/if}
           </div>
@@ -82,8 +107,8 @@
     </div>
 
     <!-- event stream -->
-    <div class="flex min-h-0 flex-col rounded-xl border bg-[rgb(var(--card))]">
-      <div class="flex items-center gap-1 border-b p-2">
+    <div class="flex min-h-0 min-w-0 flex-col rounded-xl border bg-[rgb(var(--card))]">
+      <div class="flex flex-wrap items-center gap-1 border-b p-2">
         {#each [null, "span.start", "span.end", "event", "metric", "context"] as k}
           <button
             class="rounded-md px-2 py-0.5 text-xs hover:bg-[rgb(var(--border))]"
@@ -97,14 +122,14 @@
       <div class="min-h-0 flex-1 overflow-y-auto p-2">
         {#each [...tower.filtered].reverse() as e (e.id)}
           <button
-            class="mb-1 flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-xs hover:bg-[rgb(var(--border))]"
+            class="mb-1 flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1 text-left text-xs hover:bg-[rgb(var(--border))]"
             class:bg-[rgb(var(--border))]={tower.selected?.id === e.id}
             onclick={() => tower.select(e)}
           >
-            <span class="text-[rgb(var(--muted))]">{fmtTs(e.ts)}</span>
+            <span class="shrink-0 text-[rgb(var(--muted))]">{fmtTs(e.ts)}</span>
             <Badge tone={KIND_TONE[e.kind] ?? "muted"}>{e.kind}</Badge>
-            <span class="font-medium">{e.source}</span>
-            <span>{e.name}</span>
+            <span class="shrink-0 font-medium">{e.source}</span>
+            <span class="truncate">{e.name}</span>
             {#if e.status === "error"}<Badge tone="red">err</Badge>{/if}
             <span class="truncate text-[rgb(var(--muted))]">{preview(e)}</span>
           </button>
@@ -115,18 +140,18 @@
       </div>
     </div>
 
-    <!-- detail inspector -->
-    <div class="min-h-0 overflow-y-auto rounded-xl border bg-[rgb(var(--card))] p-3">
+    <!-- detail inspector (below xl: only when an event is selected) -->
+    <div class="min-h-0 min-w-0 overflow-y-auto rounded-xl border bg-[rgb(var(--card))] p-3 {inspectorClass}">
       {#if tower.selected}
         {@const e = tower.selected}
-        <div class="mb-2 flex items-center justify-between">
-          <div class="text-sm font-semibold">{e.name}</div>
-          <button class="text-xs text-[rgb(var(--muted))]" onclick={() => tower.select(null)}>✕</button>
+        <div class="mb-2 flex items-center justify-between gap-2">
+          <div class="truncate text-sm font-semibold">{e.name}</div>
+          <button class="shrink-0 text-xs text-[rgb(var(--muted))]" onclick={() => tower.select(null)}>✕</button>
         </div>
         <div class="space-y-2 text-xs">
-          <div><span class="text-[rgb(var(--muted))]">source</span> {e.source}</div>
+          <div class="truncate"><span class="text-[rgb(var(--muted))]">source</span> {e.source}</div>
           <div><span class="text-[rgb(var(--muted))]">kind</span> {e.kind}</div>
-          {#if e.traceId}<div><span class="text-[rgb(var(--muted))]">trace</span> {e.traceId}</div>{/if}
+          {#if e.traceId}<div class="truncate"><span class="text-[rgb(var(--muted))]">trace</span> {e.traceId}</div>{/if}
           {#if e.status}<div><span class="text-[rgb(var(--muted))]">status</span> {e.status}</div>{/if}
           {#if e.error}<div class="text-red-500">{e.error}</div>{/if}
           {#if e.attrs && Object.keys(e.attrs).length}

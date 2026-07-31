@@ -16,7 +16,7 @@
  *   POST /api/files/<name>?scope=storage:chats   write body to data/<name> (gated)
  *   GET  /api/files/<name>         read it back
  *   DELETE /api/files/<name>?scope=…             delete (gated)
- *   GET  /api/monitor              {upBytes, downBytes, dataBytes}
+ *   GET  /api/monitor              {upBytes, downBytes, dataBytes, sys}
  *
  * Options: --port <n> (default 8787)   --serve <dir> (also serve static files)
  * Zero dependencies; Node >= 18.
@@ -33,6 +33,7 @@ import { handleAuthn } from "./authn.mjs";
 import { handleSandbox } from "./sandbox.mjs";
 import { handleEngine, stopAllEngines } from "./engine.mjs";
 import { bus as obsBus, handleObserve, handleObserveUpgrade, initObserve } from "./observe.mjs";
+import { getSysStats, startSysStats } from "./sysstats.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(HERE, "data");
@@ -298,7 +299,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true });
     }
     if (url.pathname.startsWith("/api/observe")) {
-      return handleObserve(req, res, url, send);
+      return await handleObserve(req, res, url, send, readBody);
     }
     if (url.pathname.startsWith("/api/sandbox/") && req.method === "POST") {
       return await handleSandbox(req, res, url, readBody, send, requirePermission);
@@ -308,7 +309,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname.startsWith("/api/files/")) return await handleFiles(req, res, url);
     if (url.pathname === "/api/monitor" && req.method === "GET") {
-      return send(res, 200, { upBytes, downBytes, dataBytes: await dataBytesCached() });
+      return send(res, 200, { upBytes, downBytes, dataBytes: await dataBytesCached(), sys: getSysStats() });
     }
     if (SERVE_DIR) return await serveStatic(res, url.pathname);
     send(res, 404, { error: "not found" });
@@ -319,6 +320,7 @@ const server = http.createServer(async (req, res) => {
 
 await initZeroTrust();
 await initObserve();
+startSysStats();
 process.on("exit", stopAllEngines);
 process.on("SIGINT", () => { stopAllEngines(); process.exit(0); });
 process.on("SIGTERM", () => { stopAllEngines(); process.exit(0); });

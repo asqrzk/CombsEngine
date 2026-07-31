@@ -101,6 +101,14 @@ pub trait KVCache<B: Backend>: Send {
     /// Total cached sequence length.
     fn seq_len(&self) -> usize;
 
+    /// Rolls back the last `n` cached tokens, returning how many were
+    /// actually dropped. Caches that cannot roll back (the contiguous
+    /// baseline) return 0 — callers gate prefix reuse on a nonzero result.
+    fn popn(&mut self, n: usize) -> usize {
+        let _ = n;
+        0
+    }
+
     /// Drops all cached state (session reset).
     fn reset(&mut self);
 
@@ -318,19 +326,6 @@ impl<B: Backend> PagedKVCache<B> {
         self.allocator.num_free()
     }
 
-    /// Rolls back the last `n` cached tokens, freeing trailing pages that
-    /// become fully unused. K/V content of popped positions is left in the
-    /// arena but is never read (writes always cover `seq_len..` densely).
-    pub fn popn(&mut self, n: usize) {
-        let n = n.min(self.seq_len);
-        self.seq_len -= n;
-        let keep = self.seq_len.div_ceil(self.config.page_size);
-        while self.table.len() > keep {
-            let page = self.table.pop().expect("table nonempty");
-            self.allocator.free_page(page);
-        }
-    }
-
     /// Ensures the page table covers `total` positions.
     fn ensure_pages(&mut self, total: usize) -> usize {
         let pages_needed = total.div_ceil(self.config.page_size);
@@ -437,6 +432,20 @@ impl<B: Backend> KVCache<B> for PagedKVCache<B> {
 
     fn seq_len(&self) -> usize {
         self.seq_len
+    }
+
+    /// Rolls back the last `n` cached tokens, freeing trailing pages that
+    /// become fully unused. K/V content of popped positions is left in the
+    /// arena but is never read (writes always cover `seq_len..` densely).
+    fn popn(&mut self, n: usize) -> usize {
+        let n = n.min(self.seq_len);
+        self.seq_len -= n;
+        let keep = self.seq_len.div_ceil(self.config.page_size);
+        while self.table.len() > keep {
+            let page = self.table.pop().expect("table nonempty");
+            self.allocator.free_page(page);
+        }
+        n
     }
 
     fn reset(&mut self) {

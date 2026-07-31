@@ -113,6 +113,12 @@ enum ChewMode {
     RoleplayUi(chew::ChewArgs),
     /// Scaffold a multi-turn chat UI with the Control Tower observability view.
     MultiTurnUi(chew::ChewArgs),
+    /// Scaffold a multi-agent orchestration UI (scenario + roles) watched from the Control Tower.
+    OrchestrationObserveUi(chew::ChewArgs),
+    /// Scaffold a chat UI demonstrating rolling-session KV cache reuse (live hit stats).
+    KvCacheUi(chew::ChewArgs),
+    /// Scaffold a debate UI whose agents each keep a named KV session (live hit stats).
+    DebateKvUi(chew::ChewArgs),
 }
 
 fn main() -> Result<()> {
@@ -132,6 +138,9 @@ fn main() -> Result<()> {
             ChewMode::DebateUi(args) => chew::chew("debate-ui", args),
             ChewMode::RoleplayUi(args) => chew::chew("roleplay-ui", args),
             ChewMode::MultiTurnUi(args) => chew::chew("multi-turn-ui", args),
+            ChewMode::OrchestrationObserveUi(args) => chew::chew("orchestration-observe-ui", args),
+            ChewMode::KvCacheUi(args) => chew::chew("kv-cache-ui", args),
+            ChewMode::DebateKvUi(args) => chew::chew("debate-kv-ui", args),
         },
     }
 }

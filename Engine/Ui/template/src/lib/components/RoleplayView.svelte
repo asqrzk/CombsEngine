@@ -37,7 +37,7 @@
   }
 </script>
 
-<div class="mx-auto flex h-[calc(100%-57px)] max-w-3xl flex-col px-4 py-4">
+<div class="mx-auto flex h-full max-w-3xl flex-col px-4 py-4">
   {#if rp.phase === "setup"}
     <Card>
       <h1 class="text-lg font-semibold">Define the two roles</h1>

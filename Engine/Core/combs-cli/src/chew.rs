@@ -1,6 +1,9 @@
 //! `combs chew` — interactive UI scaffolder (Firebase-CLI style).
 //!
-//! `combs chew chat-ui` / `combs chew debate-ui` walks the user through a
+//! `combs chew chat-ui` / `combs chew debate-ui` / `combs chew roleplay-ui` /
+//! `combs chew multi-turn-ui` / `combs chew orchestration-observe-ui` /
+//! `combs chew kv-cache-ui` / `combs chew debate-kv-ui` walks the user
+//! through a
 //! feature selection (SPACE to toggle, arrows to move, ENTER to confirm)
 //! and scaffolds a configured Svelte 5 app from `Engine/Ui/template` into
 //! the target directory. Every prompt has a flag equivalent
@@ -181,7 +184,7 @@ pub fn chew(mode: &str, args: ChewArgs) -> Result<()> {
     };
 
     // --- debate specifics ----------------------------------------------------
-    let debate = if mode == "debate-ui" {
+    let debate = if mode == "debate-ui" || mode == "debate-kv-ui" {
         Some(prompt_debate(&args, &theme)?)
     } else {
         None

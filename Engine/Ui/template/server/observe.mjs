@@ -9,8 +9,9 @@
  * proxy while preserving the exact ObsEvent shape the tower consumes.
  *
  * Endpoints (wired in proxy.mjs):
- *   GET /api/observe        → { events: [...recent], sources: {...} }
- *   GET /api/observe/ws     → WebSocket upgrade; every event broadcast live
+ *   GET  /api/observe       → { events: [...recent], sources: {...} }
+ *   POST /api/observe       → publish a client event (orchestration spans)
+ *   GET  /api/observe/ws    → WebSocket upgrade; every event broadcast live
  */
 
 import fs from "node:fs";
@@ -24,6 +25,8 @@ const LOG_FILE = path.join(DATA_DIR, "observe.ndjson");
 
 const SECRET_RE =
   /(api[_-]?key|authorization|bearer|password|secret|token|sk-[a-z0-9]{8,})/gi;
+// Keys that match SECRET_RE but are benign sampling parameters.
+const SAFE_KEYS = new Set(["max_tokens", "stop_token_ids"]);
 
 function scrub(v) {
   if (typeof v === "string") return v.replace(SECRET_RE, (m) => "•".repeat(Math.min(m.length, 12)));
@@ -31,7 +34,7 @@ function scrub(v) {
   if (v && typeof v === "object") {
     const out = {};
     for (const [k, val] of Object.entries(v)) {
-      out[k] = SECRET_RE.test(k) ? "***" : scrub(val);
+      out[k] = SECRET_RE.test(k) && !SAFE_KEYS.has(k) ? "***" : scrub(val);
       SECRET_RE.lastIndex = 0;
     }
     return out;
@@ -130,9 +133,56 @@ function encodeWs(str) {
   return Buffer.concat([header, payload]);
 }
 
-export function handleObserve(req, res, url, send) {
+const CLIENT_KINDS = new Set(["span.start", "span.end", "event", "metric", "log", "context"]);
+const MAX_FIELD = 8192; // clamp input/output/context JSON
+
+function clamp(v) {
+  if (v === undefined) return undefined;
+  try {
+    const s = JSON.stringify(v);
+    if (s.length <= MAX_FIELD) return v;
+    return { truncated: true, bytes: s.length };
+  } catch {
+    return { unserializable: true };
+  }
+}
+
+export async function handleObserve(req, res, url, send, readBody) {
   if (url.pathname === "/api/observe" && req.method === "GET") {
     return send(res, 200, { events: bus.snapshot().slice(-500) });
+  }
+  // Frontend-originated events (e.g. orchestration per-turn spans). The bus
+  // applies secret scrubbing, the ring, NDJSON and the WS broadcast.
+  if (url.pathname === "/api/observe" && req.method === "POST") {
+    let body;
+    try {
+      body = JSON.parse((await readBody(req)).toString("utf8") || "{}");
+    } catch {
+      return send(res, 400, { error: "invalid JSON" });
+    }
+    const { source, kind, name } = body;
+    if (typeof source !== "string" || !source.trim() || source.length > 120)
+      return send(res, 400, { error: "need source (1..120 chars)" });
+    if (typeof name !== "string" || !name.trim() || name.length > 120)
+      return send(res, 400, { error: "need name (1..120 chars)" });
+    if (!CLIENT_KINDS.has(kind))
+      return send(res, 400, { error: `kind must be one of ${[...CLIENT_KINDS].join(", ")}` });
+    const attrs = body.attrs && typeof body.attrs === "object" ? body.attrs : {};
+    const event = bus.publish({
+      source: source.trim(),
+      kind,
+      name: name.trim(),
+      traceId: typeof body.traceId === "string" ? body.traceId.slice(0, 120) : undefined,
+      spanId: typeof body.spanId === "string" ? body.spanId.slice(0, 120) : undefined,
+      parentSpanId: typeof body.parentSpanId === "string" ? body.parentSpanId.slice(0, 120) : undefined,
+      status: body.status === "ok" || body.status === "error" ? body.status : undefined,
+      error: typeof body.error === "string" ? body.error.slice(0, 500) : undefined,
+      attrs: { ...attrs, client: true },
+      input: clamp(body.input),
+      output: clamp(body.output),
+      context: clamp(body.context),
+    });
+    return send(res, 200, { ok: true, id: event.id });
   }
   return send(res, 404, { error: "unknown observe endpoint" });
 }

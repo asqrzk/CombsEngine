@@ -6,12 +6,14 @@
  * isolated inference contexts.
  *
  * Endpoints (wired in proxy.mjs):
- *   POST /api/engine/spawn  {model}  → {port, url} (idempotent per model)
- *   GET  /api/engine               → [{model, port, url}]
+ *   POST /api/engine/spawn  {model, tag?}  → {port, url} (idempotent per model+tag)
+ *   GET  /api/engine               → [{model, tag, port, url}]
  *   POST /api/engine/stop   {port} → {ok}
  *
  * The combs binary is resolved via COMBS_BIN, then PATH. Spawn requires
  * the `system:subprocess` permission (passkey dialog on the main tab).
+ * `tag` lets callers run MULTIPLE engines for the same model (e.g. one per
+ * orchestration role) — the registry key is `model:tag`.
  */
 
 import { spawn } from "node:child_process";
@@ -24,8 +26,22 @@ import { bus as obsBus } from "./observe.mjs";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(HERE, "data");
 
-/** model -> {model, port, url, child} */
+/** "model:tag" -> {model, tag, port, url, child} */
 const engines = new Map();
+
+function engineKey(model, tag) {
+  return `${model}:${tag ?? ""}`;
+}
+
+/** Live engine process registry — consumed by sysstats.mjs. */
+export function engineProcesses() {
+  return [...engines.values()].map((e) => ({
+    model: e.model,
+    tag: e.tag,
+    port: e.port,
+    pid: e.child?.pid ?? null,
+  }));
+}
 
 function combsBin() {
   return process.env.COMBS_BIN || "combs";
@@ -69,18 +85,18 @@ export async function handleEngine(req, res, url, readBody, send, requirePermiss
 
   if (action === "list" && req.method === "GET") {
     return send(res, 200, {
-      engines: [...engines.values()].map((e) => ({ model: e.model, port: e.port, url: e.url })),
+      engines: [...engines.values()].map((e) => ({ model: e.model, tag: e.tag, port: e.port, url: e.url })),
     });
   }
 
   const body = JSON.parse((await readBody(req)).toString("utf8") || "{}");
 
   if (action === "stop" && req.method === "POST") {
-    for (const [model, e] of engines) {
+    for (const [key, e] of engines) {
       if (e.port === body.port) {
         try { e.child.kill("SIGTERM"); } catch { /* dead */ }
-        engines.delete(model);
-        obsBus.event("proxy", "proxy.engine.stop", { attrs: { model, port: e.port } });
+        engines.delete(key);
+        obsBus.event("proxy", "proxy.engine.stop", { attrs: { model: e.model, tag: e.tag, port: e.port } });
         return send(res, 200, { ok: true });
       }
     }
@@ -93,19 +109,25 @@ export async function handleEngine(req, res, url, readBody, send, requirePermiss
 
   const { model } = body;
   if (!model) return send(res, 400, { error: "need {model}" });
+  // Optional instance tag: multiple engines for the SAME model (one per
+  // orchestration role). Sanitized — shows up in logs and the tower.
+  const tag = typeof body.tag === "string" && body.tag.trim()
+    ? body.tag.trim().replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 40)
+    : undefined;
+  const key = engineKey(model, tag);
 
-  // Idempotent: one engine per model per proxy.
-  const existing = engines.get(model);
+  // Idempotent: one engine per model+tag per proxy.
+  const existing = engines.get(key);
   if (existing) {
     if (await waitHealthy(existing.port, 1)) {
       return send(res, 200, { port: existing.port, url: existing.url, reused: true });
     }
-    engines.delete(model);
+    engines.delete(key);
   }
 
   // Spawning a subprocess is a privileged action — permission-checked
   // (passkey dialog on the main tab).
-  if (!(await requirePermission(res, "system:subprocess", `start a second engine for ${model} on a new port`))) {
+  if (!(await requirePermission(res, "system:subprocess", `start ${tag ? `engine '${tag}'` : "a second engine"} for ${model} on a new port`))) {
     return;
   }
 
@@ -122,7 +144,7 @@ export async function handleEngine(req, res, url, readBody, send, requirePermiss
   const child = spawn(combsBin(), ["serve", "--model", modelPath, "--port", String(port)], {
     stdio: ["ignore", logFd, logFd],
   });
-  child.on("exit", () => engines.delete(model));
+  child.on("exit", () => engines.delete(key));
 
   // A missing/misresolved binary fires an async 'error' (ENOENT) — without a
   // handler it is an UNHANDLED 'error' event that crashes the whole proxy.
@@ -142,18 +164,18 @@ export async function handleEngine(req, res, url, readBody, send, requirePermiss
   }
 
   const engineUrl = `http://localhost:${port}`;
-  const entry = { model, port, url: engineUrl, child };
-  engines.set(model, entry);
-  obsBus.event("proxy", "proxy.engine.spawn", { attrs: { model, port, url: engineUrl, pid: child.pid } });
-  obsBus.context("proxy", "proxy.engines", [...engines.values()].map((e) => ({ model: e.model, port: e.port, url: e.url })));
+  const entry = { model, tag, port, url: engineUrl, child };
+  engines.set(key, entry);
+  obsBus.event("proxy", "proxy.engine.spawn", { attrs: { model, tag, port, url: engineUrl, pid: child.pid } });
+  obsBus.context("proxy", "proxy.engines", [...engines.values()].map((e) => ({ model: e.model, tag: e.tag, port: e.port, url: e.url })));
 
   if (!(await waitHealthy(port))) {
     try { child.kill("SIGTERM"); } catch { /* dead */ }
-    engines.delete(model);
-    obsBus.event("proxy", "proxy.engine.spawn_failed", { status: "error", attrs: { model, port } });
+    engines.delete(key);
+    obsBus.event("proxy", "proxy.engine.spawn_failed", { status: "error", attrs: { model, tag, port } });
     return send(res, 502, { error: `engine did not come up — see server/data/engine-${port}.log` });
   }
-  obsBus.event("proxy", "proxy.engine.healthy", { attrs: { model, port, url: engineUrl } });
+  obsBus.event("proxy", "proxy.engine.healthy", { attrs: { model, tag, port, url: engineUrl } });
   send(res, 200, { port, url: engineUrl });
 }
 

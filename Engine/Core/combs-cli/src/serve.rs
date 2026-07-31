@@ -156,6 +156,14 @@ fn handle_chat(engine: &Arc<Engine>, model_id: &str, body: &str) -> HttpResponse
     if let Some(id) = engine.im_end_id() {
         config.stop_token_ids.push(id);
     }
+    // Optional named KV session (e.g. one per debate agent) — requests with
+    // the same id share a rolling prefix-reuse session.
+    if let Some(sid) = req.get("session_id").and_then(Value::as_str) {
+        let sid: String = sid.chars().take(64).collect();
+        if !sid.is_empty() {
+            config.session_id = Some(sid);
+        }
+    }
 
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let completion_id = format!("chatcmpl-combs-{}", now_unix());
@@ -180,6 +188,7 @@ fn handle_chat(engine: &Arc<Engine>, model_id: &str, body: &str) -> HttpResponse
                         "prompt_tokens": stats.prompt_tokens,
                         "completion_tokens": stats.generated_tokens,
                         "total_tokens": stats.prompt_tokens + stats.generated_tokens,
+                        "prompt_tokens_details": {"cached_tokens": stats.cached_tokens},
                     },
                 }),
             ),
@@ -193,19 +202,22 @@ fn handle_chat(engine: &Arc<Engine>, model_id: &str, body: &str) -> HttpResponse
     let model_id = model_id.to_string();
     let chunk_id = completion_id.clone();
     std::thread::spawn(move || {
-        let send_chunk = |delta: Value, finish: Option<&str>| -> bool {
-            let chunk = json!({
+        let send_chunk = |delta: Value, finish: Option<&str>, usage: Option<Value>| -> bool {
+            let mut chunk = json!({
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
                 "created": now_unix(),
                 "model": model_id,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
             });
+            if let Some(u) = usage {
+                chunk["usage"] = u;
+            }
             tx.send(format!("data: {chunk}\n\n")).is_ok()
         };
-        let _ = send_chunk(json!({"role": "assistant"}), None);
+        let _ = send_chunk(json!({"role": "assistant"}), None, None);
         let result = engine.generate(&tokens, &config, |_id, piece| {
-            let _ = send_chunk(json!({"content": piece}), None);
+            let _ = send_chunk(json!({"content": piece}), None, None);
         });
         match result {
             Ok(stats) => {
@@ -214,7 +226,13 @@ fn handle_chat(engine: &Arc<Engine>, model_id: &str, body: &str) -> HttpResponse
                 } else {
                     "stop"
                 };
-                let _ = send_chunk(json!({}), Some(finish));
+                let usage = json!({
+                    "prompt_tokens": stats.prompt_tokens,
+                    "completion_tokens": stats.generated_tokens,
+                    "total_tokens": stats.prompt_tokens + stats.generated_tokens,
+                    "prompt_tokens_details": {"cached_tokens": stats.cached_tokens},
+                });
+                let _ = send_chunk(json!({}), Some(finish), Some(usage));
             }
             Err(e) => {
                 let _ = tx.send(format!(

@@ -12,6 +12,34 @@ export interface MonitorState {
   storageUsed: number;
 }
 
+/** One spawned engine process, as sampled by the proxy's sysstats. */
+export interface EngineStat {
+  port: number;
+  pid: number | null;
+  model: string;
+  tag?: string;
+  cpuPct: number | null;
+  rssMb: number | null;
+}
+
+/** System stats sampled by the proxy (see server/sysstats.mjs). */
+export interface SysStats {
+  ts: number;
+  /** Proxy process CPU % (one core = 100). */
+  cpuPct: number;
+  /** System-wide CPU busy % (all cores aggregate). */
+  sysCpuPct: number;
+  loadAvg1: number;
+  cpus: number;
+  memUsedMb: number;
+  memTotalMb: number;
+  /** Proxy process resident memory. */
+  rssMb: number;
+  /** GPU busy % — null when the OS exposes no unprivileged counter. */
+  gpuPct: number | null;
+  engines: EngineStat[];
+}
+
 function format(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -21,6 +49,8 @@ function format(bytes: number): string {
 
 class Monitor {
   state = $state<MonitorState>({ downBytes: 0, upBytes: 0, storageUsed: 0 });
+  /** Latest system stats sample (cpu/mem/gpu/engines); null until first poll. */
+  sys = $state<SysStats | null>(null);
   /** False while the proxy is unreachable (counters stay stale-but-visible). */
   reachable = $state(true);
 
@@ -37,6 +67,7 @@ class Monitor {
           this.state.downBytes = m.downBytes ?? 0;
           this.state.upBytes = m.upBytes ?? 0;
           this.state.storageUsed = m.dataBytes ?? 0;
+          this.sys = m.sys ?? null;
           this.failures = 0;
           this.reachable = true;
         } else {

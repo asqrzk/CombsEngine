@@ -24,7 +24,7 @@
   }
 </script>
 
-<div class="mx-auto flex h-[calc(100%-57px)] max-w-3xl flex-col">
+<div class="mx-auto flex h-full max-w-3xl flex-col">
   <div class="flex-1 overflow-y-auto px-4 py-4" bind:this={scrollEl}>
     {#if chat.turns.length === 0}
       <div class="mt-16 text-center text-[rgb(var(--muted))]">

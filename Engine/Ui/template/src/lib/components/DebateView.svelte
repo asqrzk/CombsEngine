@@ -17,7 +17,7 @@
   });
 </script>
 
-<div class="mx-auto flex h-[calc(100%-57px)] max-w-3xl flex-col px-4 py-4">
+<div class="mx-auto flex h-full max-w-3xl flex-col px-4 py-4">
   <Card>
     <div class="flex flex-wrap items-center gap-2">
       <h1 class="text-lg font-semibold">{config.debate?.topic ?? "Debate"}</h1>

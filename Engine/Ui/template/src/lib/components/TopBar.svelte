@@ -2,16 +2,43 @@
   import { monitor } from "../monitor.svelte";
   import { themeStore } from "../theme.svelte";
   import Badge from "./ui/Badge.svelte";
+
+  let { mode, hash = "" }: { mode?: string; hash?: string } = $props();
+
+  const towerCapable = $derived(
+    mode === "multi-turn-ui" ||
+    mode === "orchestration-observe-ui" ||
+    mode === "kv-cache-ui" ||
+    mode === "debate-kv-ui",
+  );
+  const onTower = $derived(hash === "#tower");
 </script>
 
 <header class="sticky top-0 z-40 border-b bg-[rgb(var(--bg))]/80 backdrop-blur">
-  <div class="mx-auto flex max-w-5xl items-center gap-3 px-4 py-2.5">
+  <div class="mx-auto flex max-w-5xl flex-wrap items-center gap-2 px-4 py-2.5 sm:gap-3">
     <div class="flex items-center gap-2">
       <div class="flex h-7 w-7 items-center justify-center rounded-lg bg-[rgb(var(--accent))] text-sm font-bold text-[rgb(var(--accent-fg))]">
         C
       </div>
       <span class="text-sm font-semibold tracking-tight">Combs</span>
     </div>
+
+    {#if towerCapable}
+      <nav class="flex items-center gap-1 text-xs">
+        <a
+          href="#"
+          class="rounded-md px-2 py-1 hover:bg-[rgb(var(--border))]"
+          class:bg-[rgb(var(--border))]={!onTower}
+          class:font-semibold={!onTower}
+        >App</a>
+        <a
+          href="#tower"
+          class="rounded-md px-2 py-1 hover:bg-[rgb(var(--border))]"
+          class:bg-[rgb(var(--border))]={onTower}
+          class:font-semibold={onTower}
+        >Tower</a>
+      </nav>
+    {/if}
 
     <div class="ml-auto flex items-center gap-2 text-xs" class:opacity-40={!monitor.reachable}>
       <!-- realtime network monitor -->

@@ -4,7 +4,6 @@
   import TowerView from "./tower/TowerView.svelte";
   import Button from "./ui/Button.svelte";
   import Badge from "./ui/Badge.svelte";
-  import Card from "./ui/Card.svelte";
 
   let { config }: { config: UiConfig } = $props();
 
@@ -13,6 +12,19 @@
   let scrollEl: HTMLDivElement | undefined = $state();
   let showTower = $state(true);
   let showContext = $state(true);
+  /** Small screens show ONE pane at a time; lg+ shows panes side by side. */
+  let mobileTab = $state<"chat" | "context" | "tower">("chat");
+
+  // All column variants written literally so Tailwind compiles them.
+  const colsClass = $derived(
+    showContext && showTower
+      ? "lg:grid-cols-[minmax(0,1fr)_320px_minmax(0,1.2fr)]"
+      : showContext
+        ? "lg:grid-cols-[minmax(0,1fr)_320px]"
+        : showTower
+          ? "lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]"
+          : "lg:grid-cols-[minmax(0,1fr)]",
+  );
 
   $effect(() => {
     mt.turns.length;
@@ -28,12 +40,23 @@
   }
 </script>
 
-<div class="flex h-[calc(100%-57px)] flex-col">
+<div class="flex h-full flex-col">
   <!-- toolbar -->
-  <div class="flex items-center gap-2 border-b px-4 py-2">
+  <div class="flex flex-wrap items-center gap-2 border-b px-4 py-2">
     <h1 class="text-sm font-semibold">Multi-turn</h1>
     <Badge tone="accent">{config.model}</Badge>
-    <div class="ml-auto flex items-center gap-2">
+    <!-- mobile pane switcher -->
+    <div class="flex items-center gap-1 text-xs lg:hidden">
+      {#each [["chat", "chat"], ["context", "context"], ["tower", "tower"]] as [tab, label]}
+        <button
+          class="rounded-md px-2 py-1 hover:bg-[rgb(var(--border))]"
+          class:bg-[rgb(var(--border))]={mobileTab === tab}
+          class:font-semibold={mobileTab === tab}
+          onclick={() => (mobileTab = tab as typeof mobileTab)}
+        >{label}</button>
+      {/each}
+    </div>
+    <div class="ml-auto hidden items-center gap-2 lg:flex">
       <Button variant="ghost" onclick={() => (showContext = !showContext)}>
         {showContext ? "hide context" : "show context"}
       </Button>
@@ -43,9 +66,9 @@
     </div>
   </div>
 
-  <div class="grid min-h-0 flex-1" style="grid-template-columns: {showTower ? (showContext ? '1fr 320px 1.2fr' : '1fr 1.2fr') : '1fr'};">
+  <div class="grid min-h-0 flex-1 grid-cols-1 {colsClass}">
     <!-- chat -->
-    <div class="flex min-h-0 flex-col border-r">
+    <div class="min-h-0 min-w-0 flex-col border-r {mobileTab === 'chat' ? 'flex' : 'hidden'} lg:flex">
       <div class="min-h-0 flex-1 overflow-y-auto px-4 py-3" bind:this={scrollEl}>
         <div class="flex flex-col gap-3">
           {#each mt.turns as turn}
@@ -87,7 +110,7 @@
 
     <!-- live context -->
     {#if showContext}
-      <div class="min-h-0 overflow-y-auto border-r bg-[rgb(var(--card))] p-3">
+      <div class="min-h-0 min-w-0 overflow-y-auto border-r bg-[rgb(var(--card))] p-3 {mobileTab === 'context' ? 'block' : 'hidden'} lg:block">
         <div class="mb-2 text-xs font-semibold uppercase tracking-wide text-[rgb(var(--muted))]">
           context sent next turn
         </div>
@@ -100,8 +123,8 @@
 
     <!-- control tower -->
     {#if showTower}
-      <div class="min-h-0 overflow-hidden">
-        <TowerView />
+      <div class="min-h-0 min-w-0 overflow-hidden {mobileTab === 'tower' ? 'block' : 'hidden'} lg:block">
+        <TowerView compact />
       </div>
     {/if}
   </div>
