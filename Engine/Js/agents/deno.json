@@ -1,10 +1,10 @@
 {
   "name": "@combs/agents",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "exports": "./mod.ts",
   "imports": {
-    "@combs/core": "jsr:@combs/core@^0.1.0",
-    "@combs/graph": "jsr:@combs/graph@^0.1.0",
-    "@combs/telemetry": "jsr:@combs/telemetry@^0.1.0"
+    "@combs/core": "jsr:@combs/core@^0.2.0",
+    "@combs/graph": "jsr:@combs/graph@^0.2.0",
+    "@combs/telemetry": "jsr:@combs/telemetry@^0.2.0"
   }
 }

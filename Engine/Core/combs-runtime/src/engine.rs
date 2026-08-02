@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 use burn::tensor::{Tensor, TensorData};
 use combs_core::{BufferPool, CombsBackend, CombsDevice};
 use combs_formats::{ModelMetadata, ModelSource, SamplerConfig};
-use combs_models::{CacheConfig, CacheKind, GenerativeModel, KVCache, ModelRegistry};
+use combs_media::PixelBatch;
+use combs_models::{CacheConfig, CacheKind, GenerativeModel, KVCache, ModelRegistry, pixels_to_tensor};
 use tokenizers::Tokenizer;
 
 use crate::detok::IncrementalDetokenizer;
@@ -134,6 +135,8 @@ pub fn check_context_len(
 /// One queued generation request.
 struct GenerateRequest {
     prompt_tokens: Vec<u32>,
+    /// Preprocessed images for multimodal prompts (empty for text-only).
+    images: Vec<PixelBatch>,
     config: GenerationConfig,
     cancel: Arc<AtomicBool>,
     /// Streaming channel: (token id, new text piece) per generated token.
@@ -350,12 +353,44 @@ impl Engine {
         )
     }
 
+    /// [`Engine::generate`] with preprocessed images: the prompt must carry
+    /// the model's image-token spans (one span per image, in order); the
+    /// model splices vision-tower features in at `embed` time. Image turns
+    /// never join the KV session cache (a fresh cache is used and dropped).
+    pub fn generate_with_media(
+        &self,
+        prompt_tokens: &[u32],
+        images: Vec<PixelBatch>,
+        config: &GenerationConfig,
+        on_token: impl FnMut(u32, &str),
+    ) -> Result<GenerationStats> {
+        self.generate_media_cancellable(
+            prompt_tokens,
+            images,
+            config,
+            Arc::new(AtomicBool::new(false)),
+            on_token,
+        )
+    }
+
     /// [`Engine::generate`] with an abort flag: setting `cancel` to `true`
     /// stops the generation between tokens (checked once per decode step)
     /// and returns [`EngineError::Cancelled`].
     pub fn generate_cancellable(
         &self,
         prompt_tokens: &[u32],
+        config: &GenerationConfig,
+        cancel: Arc<AtomicBool>,
+        on_token: impl FnMut(u32, &str),
+    ) -> Result<GenerationStats> {
+        self.generate_media_cancellable(prompt_tokens, Vec::new(), config, cancel, on_token)
+    }
+
+    /// [`Engine::generate_with_media`] with an abort flag.
+    pub fn generate_media_cancellable(
+        &self,
+        prompt_tokens: &[u32],
+        images: Vec<PixelBatch>,
         config: &GenerationConfig,
         cancel: Arc<AtomicBool>,
         mut on_token: impl FnMut(u32, &str),
@@ -365,6 +400,7 @@ impl Engine {
         self.tx
             .send(Command::Generate(Box::new(GenerateRequest {
                 prompt_tokens: prompt_tokens.to_vec(),
+                images,
                 config: config.clone(),
                 cancel,
                 pieces: pieces_tx,
@@ -460,7 +496,11 @@ fn run_generation(
         cache_config.max_seq_len.min(max_position_embeddings),
     )?;
 
-    let reuse = config.session_reuse && cache_config.kind == CacheKind::Paged;
+    // Image turns never join the KV session cache: token prefixes would
+    // collide with different image contents, so media requests run on a
+    // fresh cache and are not saved back.
+    let has_media = !req.images.is_empty();
+    let reuse = config.session_reuse && cache_config.kind == CacheKind::Paged && !has_media;
     let key = config.session_id.clone().unwrap_or_default();
 
     // Longest common prefix with this session's previous request. Capped at
@@ -509,7 +549,16 @@ fn run_generation(
     let suffix = &prompt_tokens[lcp..];
     let data: Vec<i32> = suffix.iter().map(|&t| t as i32).collect();
     let tokens = Tensor::from_data(TensorData::new(data, [1, suffix.len()]), device);
-    let embedded = model.embed(tokens);
+    let embedded = if has_media {
+        let pixels: Vec<Tensor<CombsBackend, 4>> = req
+            .images
+            .iter()
+            .map(|pb| pixels_to_tensor(pb.data.clone(), pb.shape(), device))
+            .collect();
+        model.embed_multimodal(tokens, &pixels)?
+    } else {
+        model.embed(tokens)
+    };
 
     let mut offset = 0;
     let mut logits = None;

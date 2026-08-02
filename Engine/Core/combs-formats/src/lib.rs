@@ -14,7 +14,7 @@ mod source;
 mod tokenizer;
 
 pub use gguf::GgufSource;
-pub use metadata::ModelMetadata;
+pub use metadata::{ModelMetadata, VisionConfig};
 pub use safetensors::SafetensorsSource;
 pub use source::{ModelSource, SamplerConfig, TensorDtype, TensorReader};
 pub use tokenizer::TokenizerSpec;

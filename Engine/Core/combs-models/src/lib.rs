@@ -12,6 +12,7 @@ mod norm;
 mod quant_linear;
 mod registry;
 mod rope;
+mod smolvlm;
 mod traits;
 
 pub use kv::{CacheConfig, CacheKind, ContiguousKVCache, KVCache, PagedKVCache};
@@ -20,6 +21,7 @@ pub use norm::rms_norm;
 pub use quant_linear::QuantizedLinear;
 pub use registry::ModelRegistry;
 pub use rope::RotaryEmbedding;
+pub use smolvlm::{SmolVlmModel, image_prompt_expansion, pixels_to_tensor};
 pub use traits::GenerativeModel;
 
 /// Errors produced while constructing or running models.
@@ -32,6 +34,10 @@ pub enum ModelError {
     /// No registered architecture matches the source metadata.
     #[error("unsupported architecture: {0}")]
     UnsupportedArchitecture(String),
+
+    /// Media input (image/audio) was passed to a model that cannot take it.
+    #[error("unsupported media input: {0}")]
+    UnsupportedMedia(String),
 
     /// A required weight tensor is missing from the source.
     #[error("missing weight tensor: {0}")]

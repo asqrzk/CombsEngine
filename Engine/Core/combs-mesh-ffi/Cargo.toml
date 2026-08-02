@@ -1,0 +1,35 @@
+[package]
+name = "combs-mesh-ffi"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CombsMesh stable C ABI + JSON FFI boundary (combsmesh_*)"
+keywords = ["ffi", "emoji", "c-api"]
+categories = ["api-bindings"]
+publish = true
+
+[lib]
+# Artifact name matches the combsmesh_* symbol prefix (libcombsmesh_ffi.*).
+name = "combsmesh_ffi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+# `engine` enables real inference: RuntimeEngine over combs-runtime
+# (model loaded via the "engine_load" op). The default build is pure
+# data + crypto + CPU render, with `infer` returning Unsupported.
+engine = [
+    "combs-mesh/engine",
+    "dep:combs-core",
+    "dep:combs-formats",
+    "dep:combs-runtime",
+]
+
+[dependencies]
+combs-mesh = { path = "../combs-mesh", version = "0.2.0" }
+combs-core = { workspace = true, optional = true }
+combs-formats = { path = "../combs-formats", version = "0.2.0", optional = true }
+combs-runtime = { path = "../combs-runtime", version = "0.2.0", optional = true }
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true

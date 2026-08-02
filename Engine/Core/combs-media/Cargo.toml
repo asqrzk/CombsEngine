@@ -1,0 +1,15 @@
+[package]
+name = "combs-media"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Host-side media preprocessing (SigLIP image pipeline) for multimodal models in the Combs Engine"
+
+[dependencies]
+image.workspace = true
+thiserror.workspace = true
+combs-core.workspace = true
+
+[dev-dependencies]
+image = { workspace = true, features = ["png"] }

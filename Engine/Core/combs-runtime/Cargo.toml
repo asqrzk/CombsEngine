@@ -1,15 +1,16 @@
 [package]
 name = "combs-runtime"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 description = "Combs Engine generation runtime (engine, sampler, tokenizer)"
 
 [dependencies]
 burn.workspace = true
-combs-core = { path = "../combs-core" }
-combs-formats = { path = "../combs-formats" }
-combs-models = { path = "../combs-models" }
+combs-core.workspace = true
+combs-formats = { path = "../combs-formats", version = "0.2.0" }
+combs-media = { path = "../combs-media", version = "0.2.0" }
+combs-models = { path = "../combs-models", version = "0.2.0" }
 tokenizers.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

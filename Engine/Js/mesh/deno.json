@@ -1,0 +1,5 @@
+{
+  "name": "@combs/mesh",
+  "version": "0.2.0",
+  "exports": "./mod.ts"
+}

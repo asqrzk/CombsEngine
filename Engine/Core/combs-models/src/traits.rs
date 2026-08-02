@@ -28,6 +28,24 @@ pub trait GenerativeModel<B: Backend>: Send {
     /// Embeds token ids: `[batch, seq] -> [batch, seq, hidden]`.
     fn embed(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3>;
 
+    /// Embeds token ids, splicing vision-tower features into the image-token
+    /// spans. `images` are preprocessed pixel batches `[1, channels, H, W]`,
+    /// one per image-token span, in order. Text-only models keep the default
+    /// impl, which rejects non-empty media and otherwise defers to `embed`.
+    fn embed_multimodal(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        images: &[Tensor<B, 4>],
+    ) -> Result<Tensor<B, 3>> {
+        if !images.is_empty() {
+            return Err(crate::ModelError::UnsupportedMedia(format!(
+                "{} image(s) passed to a text-only model",
+                images.len()
+            )));
+        }
+        Ok(self.embed(tokens))
+    }
+
     /// Runs (a chunk of) the prompt through the model, filling the KV cache
     /// for positions `pos`. `pos.end - pos.start` must equal the input
     /// sequence length, and `pos.start` must equal the cache's current

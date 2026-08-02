@@ -39,6 +39,12 @@ impl<B: Backend> ModelRegistry<B> {
         r.register("smollm2", |source, device| {
             Ok(Box::new(crate::llama::LlamaModel::<B>::load(source, device)?))
         });
+        // SmolVLM reports model_type "idefics3" (SigLIP + pixel-shuffle + SmolLM2).
+        r.register("idefics3", |source, device| {
+            Ok(Box::new(crate::smolvlm::SmolVlmModel::<B>::load(
+                source, device,
+            )?))
+        });
         r
     }
 

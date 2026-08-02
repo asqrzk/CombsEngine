@@ -21,6 +21,27 @@ pub fn rms_norm<B: Backend, const D: usize>(
     x * inv_rms * weight.reshape(shape)
 }
 
+/// LayerNorm (SigLIP-style, learnable weight + bias):
+/// `y = (x - μ) / sqrt(σ² + eps) * w + b`, statistics over the last dim.
+pub fn layer_norm<B: Backend, const D: usize>(
+    x: Tensor<B, D>,
+    weight: Tensor<B, 1>,
+    bias: Tensor<B, 1>,
+    eps: f64,
+) -> Tensor<B, D> {
+    let dims = x.dims();
+    let hidden = dims[D - 1];
+
+    let mean = x.clone().mean_dim(D - 1);
+    let centered = x - mean;
+    let var = centered.clone().powf_scalar(2.0).mean_dim(D - 1);
+    let inv_std = var.add_scalar(eps).sqrt().recip();
+
+    let mut shape = [1usize; D];
+    shape[D - 1] = hidden;
+    centered * inv_std * weight.reshape(shape) + bias.reshape(shape)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

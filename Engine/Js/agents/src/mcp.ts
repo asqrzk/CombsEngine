@@ -36,7 +36,7 @@ interface McpTransport {
 }
 
 const PROTOCOL_VERSION = "2024-11-05";
-const CLIENT_INFO = { name: "combs-engine", version: "0.1.0" };
+const CLIENT_INFO = { name: "combs-engine", version: "0.2.0" };
 
 /** Stdio transport: spawns a subprocess and talks JSON-RPC over pipes. */
 export class StdioTransport implements McpTransport {

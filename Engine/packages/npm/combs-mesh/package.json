@@ -1,0 +1,33 @@
+{
+  "name": "@combs-edge/combs-mesh",
+  "version": "0.2.0",
+  "description": "CombsMesh — emoji engine library (Rust core). Installs the prebuilt libcombsmesh_ffi + combsmesh.h for your platform.",
+  "license": "MIT",
+  "homepage": "https://github.com/asqrzk/CombsEngine",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/asqrzk/CombsEngine.git",
+    "directory": "Engine/Packages/npm/combs-mesh"
+  },
+  "main": "index.js",
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "index.js",
+    "install.js",
+    "vendor/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ]
+}

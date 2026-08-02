@@ -10,10 +10,11 @@ first, because the npm/PyPI wrappers download its assets at install time).
 |---|---|
 | `Engine/Core/Cargo.toml` (workspace) | `[workspace.package] version` |
 | `Engine/Packages/npm/combs-engine/package.json` | `version` |
+| `Engine/Packages/npm/combs-mesh/package.json` | `version` |
 | `Engine/Packages/npm/combs-client/package.json` | `version` |
 | `Engine/Packages/npm/combs-zerotrust/package.json` | `version` |
 | `Engine/Packages/pypi/combs-engine/pyproject.toml` | `version` + `src/combs_engine/__init__.py` |
-| `Engine/Js/<pkg>/deno.json` (all seven) | `version` |
+| `Engine/Js/<pkg>/deno.json` (all nine, incl. `mesh`) | `version` |
 
 > `combs-zerotrust` is dual-published: source of truth is
 > `Engine/Js/zerotrust/mod.js` — before publishing, copy it over
@@ -36,7 +37,8 @@ Watch: https://github.com/asqrzk/CombsEngine/actions — the `release`
 workflow attaches `combs-0.2.0-macos-arm64.tar.gz`,
 `combs-0.2.0-macos-x86_64.tar.gz`, `combs-0.2.0-linux-x86_64.tar.gz`,
 `combs-0.2.0-windows-x86_64.zip` (each with the `combs` binary,
-`libcombs_ffi.*` and `combs.h`) to the GitHub Release.
+`libcombs_ffi.*` + `combs.h`, and `libcombsmesh_ffi.*` + `combsmesh.h`)
+to the GitHub Release.
 
 ## 2. npm — `combs-client` + `combs-zerotrust` (the JS libraries)
 
@@ -49,15 +51,18 @@ cd Engine/Packages/npm/combs-zerotrust && npm publish --access public
 cd ../combs-client && npm publish --access public
 ```
 
-## 3. npm — `combs-engine` (the CLI wrapper)
+## 3. npm — `combs-engine` (the CLI wrapper) + `combs-mesh` (the mesh library)
 
 ```bash
 cd Engine/Packages/npm/combs-engine
 npm publish --access public
+cd ../combs-mesh && npm publish --access public
 ```
 
 Users then: `npm install -g combs-engine` → postinstall downloads the
-step-1 release asset for their platform. (One-time setup: `npm login`.)
+step-1 release asset for their platform; `@combs-edge/combs-mesh`
+downloads the same asset and keeps only `libcombsmesh_ffi.*` +
+`combsmesh.h`. (One-time setup: `npm login`.)
 
 ## 4. PyPI — `combs-engine`
 
@@ -74,7 +79,7 @@ account + `twine configure` or API token.)
 
 ## 5. JSR — the TypeScript framework (`@combs/*`)
 
-Publishes all six workspace packages at once:
+Publishes all workspace packages at once (incl. `@combs/mesh`):
 
 ```bash
 cd Engine/Js
@@ -107,6 +112,6 @@ Users then: `cargo install combs-cli`.
 2. ☐ `cargo test --release --workspace` green
 3. ☐ `deno task test` green
 4. ☐ `git tag vX.Y.Z && git push origin vX.Y.Z` → CI release assets
-5. ☐ `npm publish` combs-client, then combs-engine
+5. ☐ `npm publish` combs-client, then combs-engine, then combs-mesh
 6. ☐ `twine upload` combs-engine
 7. ☐ `deno publish` from Engine/Js

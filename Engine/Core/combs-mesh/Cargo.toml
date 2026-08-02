@@ -1,0 +1,42 @@
+[package]
+name = "combs-mesh"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CombsMesh emoji engine core — block format, Unicode codec, crypto, sprites, registry (pure Rust, wasm-friendly)"
+keywords = ["emoji", "sprite", "aead", "unicode", "edge"]
+categories = ["encoding", "multimedia::images", "cryptography"]
+publish = true
+
+[features]
+# `engine` wires real inference (combs-runtime) into the CombsEngineCore
+# trait. Declared but consumed by combs-mesh-ffi; the core crate builds
+# standalone without it.
+engine = ["dep:combs-runtime"]
+# GPU sprite renderer (raw wgpu — see render/gpu.rs docs). OFF by default:
+# the crate stays pure-Rust and wasm32-clean without it.
+gpu = ["dep:wgpu", "dep:pollster"]
+# Browser bindings (wasm-bindgen). The crate stays an rlib; a downstream
+# cdylib (like combs-wasm does for the engine) turns it into a .wasm.
+wasm = ["dep:wasm-bindgen"]
+
+[dependencies]
+combs-runtime = { path = "../combs-runtime", version = "0.2.0", optional = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+aes-gcm.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+crc32fast.workspace = true
+wgpu = { version = "29", optional = true }
+pollster = { version = "0.4", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+combs-core.workspace = true
+
+# getrandom needs the WebCrypto shim on wasm32-unknown-unknown.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }

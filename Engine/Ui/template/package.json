@@ -12,8 +12,8 @@
   "dependencies": {
     "@simplewebauthn/browser": "^13.3.0",
     "@simplewebauthn/server": "^13.3.2",
-    "@combs-edge/combs-client": "^0.1.7",
-    "@combs-edge/combs-zerotrust": "^0.1.7"
+    "@combs-edge/combs-client": "^0.2.0",
+    "@combs-edge/combs-zerotrust": "^0.2.0"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5.0.0",

@@ -1,0 +1,72 @@
+# CI: workspace tests + mesh feature/wasm checks (rust), Deno check + test
+# with real FFI integration (deno). Release packaging lives in release.yml.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: Engine/Core
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Workspace tests
+        run: cargo test --release --workspace
+
+      - name: Mesh wasm32 checks
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo check --release -p combs-mesh --target wasm32-unknown-unknown
+          cargo check --release -p combs-mesh --target wasm32-unknown-unknown --features wasm
+
+      - name: Mesh feature checks (host)
+        run: cargo check --release -p combs-mesh --features gpu,wasm
+
+  deno:
+    # macOS so the FFI integration tests run against real Metal-backed
+    # dylibs (COMBS_SKIP_INTEGRATION stays unset on purpose).
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Build native libraries (engine + mesh)
+        working-directory: Engine/Core
+        run: cargo build --release -p combs-ffi -p combs-mesh-ffi
+
+      - name: Deno check + test
+        working-directory: Engine/Js
+        run: |
+          deno task check
+          deno task test

@@ -1,6 +1,6 @@
 [package]
 name = "combs-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 description = "Combs Engine CLI (`combs` binary)"
@@ -11,10 +11,12 @@ path = "src/main.rs"
 
 [dependencies]
 burn.workspace = true
-combs-core = { path = "../combs-core" }
-combs-formats = { path = "../combs-formats" }
-combs-models = { path = "../combs-models" }
-combs-runtime = { path = "../combs-runtime" }
+combs-core = { path = "../combs-core", version = "0.2.0" }
+combs-formats = { path = "../combs-formats", version = "0.2.0" }
+combs-media = { path = "../combs-media", version = "0.2.0" }
+combs-models = { path = "../combs-models", version = "0.2.0" }
+combs-runtime = { path = "../combs-runtime", version = "0.2.0" }
+base64.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 serde.workspace = true

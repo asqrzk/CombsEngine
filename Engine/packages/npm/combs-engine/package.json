@@ -1,6 +1,6 @@
 {
   "name": "@combs-edge/combs-engine",
-  "version": "0.1.7",
+  "version": "0.2.0",
   "description": "Combs Engine — local-first AI inference CLI (Rust GPU core). Installs the prebuilt `combs` binary for your platform.",
   "license": "MIT",
   "homepage": "https://github.com/asqrzk/CombsEngine",

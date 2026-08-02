@@ -66,6 +66,8 @@ struct Target {
     triple: &'static str,
     /// Library file name inside target/<triple>/release/.
     artifact: &'static str,
+    /// CombsMesh library file name (combs-mesh-ffi, same target dir).
+    mesh_artifact: &'static str,
     /// `false` = cargo check only on this host (no cross linker).
     full_build: fn(&Ctx) -> bool,
     /// Extra env for the cargo invocation.
@@ -110,6 +112,7 @@ const TARGETS: &[Target] = &[
         name: "macos-arm64",
         triple: "aarch64-apple-darwin",
         artifact: "libcombs_ffi.dylib",
+        mesh_artifact: "libcombsmesh_ffi.dylib",
         full_build: |_| true,
         env: |_| vec![],
     },
@@ -117,6 +120,7 @@ const TARGETS: &[Target] = &[
         name: "macos-x86_64",
         triple: "x86_64-apple-darwin",
         artifact: "libcombs_ffi.dylib",
+        mesh_artifact: "libcombsmesh_ffi.dylib",
         full_build: |_| true,
         env: |_| vec![],
     },
@@ -124,6 +128,7 @@ const TARGETS: &[Target] = &[
         name: "ios-arm64",
         triple: "aarch64-apple-ios",
         artifact: "libcombs_ffi.a",
+        mesh_artifact: "libcombsmesh_ffi.a",
         full_build: |_| true,
         env: |_| vec![],
     },
@@ -131,6 +136,7 @@ const TARGETS: &[Target] = &[
         name: "android-arm64",
         triple: "aarch64-linux-android",
         artifact: "libcombs_ffi.so",
+        mesh_artifact: "libcombsmesh_ffi.so",
         full_build: |_| android_linker().is_some(),
         env: |_| {
             android_linker()
@@ -147,6 +153,7 @@ const TARGETS: &[Target] = &[
         name: "windows-x86_64",
         triple: "x86_64-pc-windows-msvc",
         artifact: "combs_ffi.dll",
+        mesh_artifact: "combsmesh_ffi.dll",
         // No MSVC linker on this host: check only.
         full_build: |_| false,
         env: |_| vec![],
@@ -155,6 +162,7 @@ const TARGETS: &[Target] = &[
         name: "linux-x86_64",
         triple: "x86_64-unknown-linux-gnu",
         artifact: "libcombs_ffi.so",
+        mesh_artifact: "libcombsmesh_ffi.so",
         // No cross linker on this host: check only.
         full_build: |_| false,
         env: |_| vec![],
@@ -189,7 +197,10 @@ fn build_target(ctx: &Ctx, target: &Target, force_check: bool) -> Result<PathBuf
     } else {
         cmd.args(["check", "--release"]);
     }
-    cmd.args(["-p", "combs-ffi", "--target", target.triple]);
+    // combs-mesh-ffi ships in the same dist/ dirs. Its `engine` feature is
+    // deliberately OFF here (inference-free artifact by default; enable with
+    // `--features combs-mesh-ffi/engine` for an inference-capable build).
+    cmd.args(["-p", "combs-ffi", "-p", "combs-mesh-ffi", "--target", target.triple]);
     for (k, v) in (target.env)(ctx) {
         cmd.env(k, v);
     }
@@ -240,11 +251,21 @@ fn cmd_bundle(ctx: &Ctx) -> Result<()> {
         if !artifact.exists() {
             bail!("expected artifact missing: {}", artifact.display());
         }
+        let mesh_artifact = artifact.with_file_name(t.mesh_artifact);
+        if !mesh_artifact.exists() {
+            bail!("expected artifact missing: {}", mesh_artifact.display());
+        }
         let out = dist.join(t.name);
         std::fs::create_dir_all(&out)?;
         std::fs::copy(&artifact, out.join(t.artifact))?;
         std::fs::copy(ctx.root.join("include/combs.h"), out.join("combs.h"))?;
+        std::fs::copy(&mesh_artifact, out.join(t.mesh_artifact))?;
+        std::fs::copy(
+            ctx.root.join("combs-mesh-ffi/include/combsmesh.h"),
+            out.join("combsmesh.h"),
+        )?;
         eprintln!("bundled {} -> {}", t.artifact, out.display());
+        eprintln!("bundled {} -> {}", t.mesh_artifact, out.display());
         // Cross-target build trees are several GB each; drop them after the
         // artifact is safely in dist/ (the plain `target/release` host build
         // is unaffected; re-bundling just recompiles).

@@ -346,6 +346,7 @@ fn build_model_metadata(kv: &HashMap<String, MetaValue>) -> Result<ModelMetadata
         attention_bias: false,
         bos_token_id: bos_id,
         eos_token_ids: eos_ids,
+        vision: None,
     })
 }
 

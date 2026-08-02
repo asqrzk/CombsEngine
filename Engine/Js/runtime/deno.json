@@ -1,11 +1,11 @@
 {
   "name": "@combs/runtime",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "exports": "./mod.ts",
   "imports": {
-    "@combs/graph": "jsr:@combs/graph@^0.1.0",
-    "@combs/observe": "jsr:@combs/observe@^0.1.0",
-    "@combs/telemetry": "jsr:@combs/telemetry@^0.1.0",
-    "@combs/zerotrust": "jsr:@combs/zerotrust@^0.1.0"
+    "@combs/graph": "jsr:@combs/graph@^0.2.0",
+    "@combs/observe": "jsr:@combs/observe@^0.2.0",
+    "@combs/telemetry": "jsr:@combs/telemetry@^0.2.0",
+    "@combs/zerotrust": "jsr:@combs/zerotrust@^0.2.0"
   }
 }

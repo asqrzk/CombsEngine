@@ -31,6 +31,7 @@ pub const PRESETS: &[(&str, &str)] = &[
     ("smollm2-135m", "HuggingFaceTB/SmolLM2-135M-Instruct"),
     ("smollm2-360m", "HuggingFaceTB/SmolLM2-360M-Instruct"),
     ("smollm2-1.7b", "HuggingFaceTB/SmolLM2-1.7B-Instruct"),
+    ("smolvlm-256m", "HuggingFaceTB/SmolVLM-256M-Instruct"),
 ];
 
 pub fn resolve_repo(source: &str) -> (String, String) {

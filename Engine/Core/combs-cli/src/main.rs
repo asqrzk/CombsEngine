@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use combs_formats::{ModelSource, open_model_source};
+use combs_media::ImagePreprocessor;
 use combs_runtime::{Engine, GenerationConfig};
 
 mod chew;
@@ -62,6 +63,9 @@ struct RunArgs {
     /// Wrap the prompt in the model's ChatML template and stop at <|im_end|>.
     #[arg(long)]
     chat: bool,
+    /// Attach an image (repeatable; requires a vision model like SmolVLM).
+    #[arg(long = "image")]
+    images: Vec<PathBuf>,
     /// Prompt tokens per prefill call (0 = single-shot; default 512).
     /// Values >= 512 hit a burn/wgpu prefill miscompilation on long prompts.
     #[arg(long)]
@@ -205,7 +209,30 @@ fn cmd_run(args: RunArgs) -> Result<()> {
     );
 
     let device = combs_core::init_device();
-    let prompt = if args.chat {
+    let mut pixel_batches = Vec::new();
+    let prompt = if !args.images.is_empty() {
+        // VLM path: Idefics3/SmolVLM template with one expanded image span
+        // per attached image, then the question.
+        let vision = meta
+            .vision
+            .clone()
+            .context("--image needs a vision model (config.json has no vision_config)")?;
+        let pp = combs_media::SiglipPreprocessor::new(vision.image_size);
+        let mut prompt = String::from("<|im_start|>User:");
+        for path in &args.images {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let batch = pp
+                .preprocess(&bytes)
+                .map_err(|e| anyhow::anyhow!("preprocessing {}: {e}", path.display()))?;
+            eprintln!("image: {} ({}x{})", path.display(), batch.width, batch.height);
+            pixel_batches.push(batch);
+            prompt.push_str(&combs_models::image_prompt_expansion(vision.image_seq_len()));
+        }
+        prompt.push_str(&args.prompt);
+        prompt.push_str("\nAssistant:");
+        prompt
+    } else if args.chat {
         source
             .tokenizer()?
             .chatml_wrap(&args.prompt)
@@ -266,10 +293,15 @@ fn cmd_run(args: RunArgs) -> Result<()> {
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let stats = engine.generate(&tokens, &config, |_id, piece| {
+    let mut emit = |_id: u32, piece: &str| {
         let _ = out.write_all(piece.as_bytes());
         let _ = out.flush();
-    })?;
+    };
+    let stats = if pixel_batches.is_empty() {
+        engine.generate(&tokens, &config, &mut emit)?
+    } else {
+        engine.generate_with_media(&tokens, pixel_batches, &config, &mut emit)?
+    };
 
     println!();
     let cache_note = if stats.cache_pages_used > 0 {

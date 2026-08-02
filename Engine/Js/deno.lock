@@ -54,31 +54,31 @@
     "members": {
       "agents": {
         "dependencies": [
-          "jsr:@combs/core@0.1",
-          "jsr:@combs/graph@0.1",
-          "jsr:@combs/telemetry@0.1"
+          "jsr:@combs/core@0.2",
+          "jsr:@combs/graph@0.2",
+          "jsr:@combs/telemetry@0.2"
         ]
       },
       "flows": {
         "dependencies": [
-          "jsr:@combs/agents@0.1",
-          "jsr:@combs/core@0.1",
-          "jsr:@combs/graph@0.1",
-          "jsr:@combs/runtime@0.1",
-          "jsr:@combs/telemetry@0.1"
+          "jsr:@combs/agents@0.2",
+          "jsr:@combs/core@0.2",
+          "jsr:@combs/graph@0.2",
+          "jsr:@combs/runtime@0.2",
+          "jsr:@combs/telemetry@0.2"
         ]
       },
       "graph": {
         "dependencies": [
-          "jsr:@combs/telemetry@0.1"
+          "jsr:@combs/telemetry@0.2"
         ]
       },
       "runtime": {
         "dependencies": [
-          "jsr:@combs/graph@0.1",
-          "jsr:@combs/observe@0.1",
-          "jsr:@combs/telemetry@0.1",
-          "jsr:@combs/zerotrust@0.1"
+          "jsr:@combs/graph@0.2",
+          "jsr:@combs/observe@0.2",
+          "jsr:@combs/telemetry@0.2",
+          "jsr:@combs/zerotrust@0.2"
         ]
       }
     }

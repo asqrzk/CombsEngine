@@ -55,7 +55,7 @@ pub struct LlamaModel<B: Backend> {
 }
 
 /// `y = x @ W^T (+ b)` for `[batch, seq, in] @ [out, in]`.
-fn linear<B: Backend>(
+pub(crate) fn linear<B: Backend>(
     x: Tensor<B, 3>,
     w: &Tensor<B, 2>,
     bias: Option<&Tensor<B, 1>>,
@@ -90,6 +90,14 @@ fn load_weight<B: Backend, const D: usize>(
         .map_err(ModelError::Format)
 }
 
+pub(crate) fn load_tensor<B: Backend, const D: usize>(
+    source: &dyn ModelSource,
+    device: &Device<B>,
+    name: &str,
+) -> Result<Tensor<B, D>> {
+    load_weight(source, device, name)
+}
+
 fn load_optional_bias<B: Backend>(
     source: &dyn ModelSource,
     device: &Device<B>,
@@ -105,7 +113,7 @@ fn load_optional_bias<B: Backend>(
 }
 
 impl<B: Backend> LlamaModel<B> {
-    fn expect_shape(name: &str, got: &[usize], expected: &[usize]) -> Result<()> {
+    pub(crate) fn expect_shape(name: &str, got: &[usize], expected: &[usize]) -> Result<()> {
         if got == expected {
             Ok(())
         } else {
@@ -120,7 +128,7 @@ impl<B: Backend> LlamaModel<B> {
     /// Shared trunk for prefill and decode: embeddings in, final-normed
     /// hidden states out. `pos` is the absolute position of the first input
     /// token.
-    fn forward_hidden(
+    pub(crate) fn forward_hidden(
         &self,
         mut x: Tensor<B, 3>,
         cache: &mut dyn KVCache<B>,
@@ -169,7 +177,7 @@ impl<B: Backend> LlamaModel<B> {
     }
 
     /// Logits of the last sequence position: `[1, hidden] -> [1, vocab]`.
-    fn last_logits(&self, hidden: Tensor<B, 3>) -> Tensor<B, 2> {
+    pub(crate) fn last_logits(&self, hidden: Tensor<B, 3>) -> Tensor<B, 2> {
         let [_, seq, hidden_size] = hidden.dims();
         let last = hidden.narrow(1, seq - 1, 1).reshape([1, hidden_size]);
         let w = self.lm_head.as_ref().unwrap_or(&self.embed);
@@ -183,11 +191,68 @@ impl<B: Backend> GenerativeModel<B> for LlamaModel<B> {
     }
 
     fn load(source: &dyn ModelSource, device: &Device<B>) -> Result<Self> {
+        Self::load_with_prefix(source, device, "model")
+    }
+
+    fn create_kv_cache(&self, config: &CacheConfig) -> Box<dyn KVCache<B>> {
+        match config.kind {
+            CacheKind::Contiguous => {
+                Box::new(ContiguousKVCache::<B>::new(self.metadata.num_hidden_layers))
+            }
+            CacheKind::Paged => Box::new(PagedKVCache::<B>::new(
+                self.metadata.num_hidden_layers,
+                *config,
+            )),
+        }
+    }
+
+    fn embed(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+        let [batch, seq] = tokens.dims();
+        let flat = tokens.reshape([batch * seq]);
+        self.embed
+            .clone()
+            .select(0, flat)
+            .reshape([batch, seq, self.metadata.hidden_size])
+    }
+
+    fn prefill(
+        &mut self,
+        input: Tensor<B, 3>,
+        cache: &mut dyn KVCache<B>,
+        pos: Range<u32>,
+    ) -> Tensor<B, 2> {
+        let [_, seq, _] = input.dims();
+        assert_eq!(
+            seq,
+            (pos.end - pos.start) as usize,
+            "prefill pos range must match the input sequence length"
+        );
+        let hidden = self.forward_hidden(input, cache, pos.start as usize);
+        self.last_logits(hidden)
+    }
+
+    fn decode(&mut self, input: Tensor<B, 3>, cache: &mut dyn KVCache<B>) -> Tensor<B, 2> {
+        let pos = cache.seq_len();
+        let hidden = self.forward_hidden(input, cache, pos);
+        self.last_logits(hidden)
+    }
+}
+
+impl<B: Backend> LlamaModel<B> {
+    /// Loads the text stack with weight names under `prefix` (e.g. `"model"`
+    /// for plain Llama, `"model.text_model"` for Idefics3/SmolVLM).
+    /// `lm_head.weight` always stays top-level.
+    pub(crate) fn load_with_prefix(
+        source: &dyn ModelSource,
+        device: &Device<B>,
+        prefix: &str,
+    ) -> Result<Self> {
         let m = source.metadata().clone();
 
-        let embed: Tensor<B, 2> = load_weight(source, device, "model.embed_tokens.weight")?;
+        let embed: Tensor<B, 2> =
+            load_weight(source, device, &format!("{prefix}.embed_tokens.weight"))?;
         Self::expect_shape(
-            "model.embed_tokens.weight",
+            "embed_tokens.weight",
             &embed.dims(),
             &[m.vocab_size, m.hidden_size],
         )?;
@@ -200,11 +265,12 @@ impl<B: Backend> GenerativeModel<B> for LlamaModel<B> {
             Some(w)
         };
 
-        let final_norm: Tensor<B, 1> = load_weight(source, device, "model.norm.weight")?;
+        let final_norm: Tensor<B, 1> =
+            load_weight(source, device, &format!("{prefix}.norm.weight"))?;
 
         let mut layers = Vec::with_capacity(m.num_hidden_layers);
         for i in 0..m.num_hidden_layers {
-            let p = format!("model.layers.{i}");
+            let p = format!("{prefix}.layers.{i}");
             let q: Tensor<B, 2> =
                 load_weight(source, device, &format!("{p}.self_attn.q_proj.weight"))?;
             let k: Tensor<B, 2> =
@@ -271,48 +337,5 @@ impl<B: Backend> GenerativeModel<B> for LlamaModel<B> {
             layers,
             rotary,
         })
-    }
-
-    fn create_kv_cache(&self, config: &CacheConfig) -> Box<dyn KVCache<B>> {
-        match config.kind {
-            CacheKind::Contiguous => {
-                Box::new(ContiguousKVCache::<B>::new(self.metadata.num_hidden_layers))
-            }
-            CacheKind::Paged => Box::new(PagedKVCache::<B>::new(
-                self.metadata.num_hidden_layers,
-                *config,
-            )),
-        }
-    }
-
-    fn embed(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        let [batch, seq] = tokens.dims();
-        let flat = tokens.reshape([batch * seq]);
-        self.embed
-            .clone()
-            .select(0, flat)
-            .reshape([batch, seq, self.metadata.hidden_size])
-    }
-
-    fn prefill(
-        &mut self,
-        input: Tensor<B, 3>,
-        cache: &mut dyn KVCache<B>,
-        pos: Range<u32>,
-    ) -> Tensor<B, 2> {
-        let [_, seq, _] = input.dims();
-        assert_eq!(
-            seq,
-            (pos.end - pos.start) as usize,
-            "prefill pos range must match the input sequence length"
-        );
-        let hidden = self.forward_hidden(input, cache, pos.start as usize);
-        self.last_logits(hidden)
-    }
-
-    fn decode(&mut self, input: Tensor<B, 3>, cache: &mut dyn KVCache<B>) -> Tensor<B, 2> {
-        let pos = cache.seq_len();
-        let hidden = self.forward_hidden(input, cache, pos);
-        self.last_logits(hidden)
     }
 }

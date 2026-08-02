@@ -1,6 +1,6 @@
 {
   "name": "@combs-edge/combs-zerotrust",
-  "version": "0.1.7",
+  "version": "0.2.0",
   "description": "Zero-trust crypto core for Combs Engine — identity, sealed envelopes, at-rest keystore, capability tokens. Pure WebCrypto; browser, Node and Deno.",
   "license": "MIT",
   "type": "module",

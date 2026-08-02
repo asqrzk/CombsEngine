@@ -48,3 +48,8 @@ Engine/Packages/npm/**/*.tgz
 /test-results/
 /playwright-report/
 /tmp-*/
+
+# Python build artifacts
+Engine/Packages/pypi/**/dist/
+Engine/Packages/pypi/**/*.egg-info/
+__pycache__/

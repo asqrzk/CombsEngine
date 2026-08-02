@@ -3,26 +3,40 @@ resolver = "2"
 members = [
     "combs-core",
     "combs-formats",
+    "combs-media",
     "combs-models",
     "combs-runtime",
     "combs-ffi",
     "combs-wasm",
     "combs-cli",
+    "combs-mesh",
+    "combs-mesh-ffi",
     "xtask",
 ]
 
 [workspace.package]
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/combs/combs-engine"
+repository = "https://github.com/asqrzk/CombsEngine"
 
 [workspace.dependencies]
-# Burn facade: default features OFF, only the wgpu backend + std.
 burn = { version = "0.21.0", default-features = false, features = ["wgpu", "fusion", "std"] }
-
+combs-core = { version = "0.2.0", path = "combs-core" }
+combs-formats = { version = "0.2.0", path = "combs-formats" }
+combs-media = { version = "0.2.0", path = "combs-media" }
+combs-models = { version = "0.2.0", path = "combs-models" }
+combs-runtime = { version = "0.2.0", path = "combs-runtime" }
+combs-ffi = { version = "0.2.0", path = "combs-ffi" }
+combs-wasm = { version = "0.2.0", path = "combs-wasm" }
+combs-cli = { version = "0.2.0", path = "combs-cli" }
+combs-mesh = { version = "0.2.0", path = "combs-mesh" }
+combs-mesh-ffi = { version = "0.2.0", path = "combs-mesh-ffi" }
 safetensors = "0.6"
 memmap2 = "0.9"
 half = "2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+base64 = "0.22"
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -34,6 +48,12 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+crc32fast = "1"
 
 [profile.release]
 opt-level = 3
