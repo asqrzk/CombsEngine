@@ -6,5 +6,6 @@
     "@combs/core": "jsr:@combs/core@^0.2.0",
     "@combs/graph": "jsr:@combs/graph@^0.2.0",
     "@combs/telemetry": "jsr:@combs/telemetry@^0.2.0"
-  }
+  },
+  "license": "MIT"
 }

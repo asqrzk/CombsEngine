@@ -8,5 +8,6 @@
     "@combs/graph": "jsr:@combs/graph@^0.2.0",
     "@combs/runtime": "jsr:@combs/runtime@^0.2.0",
     "@combs/telemetry": "jsr:@combs/telemetry@^0.2.0"
-  }
+  },
+  "license": "MIT"
 }

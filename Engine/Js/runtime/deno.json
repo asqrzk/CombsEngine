@@ -7,5 +7,6 @@
     "@combs/observe": "jsr:@combs/observe@^0.2.0",
     "@combs/telemetry": "jsr:@combs/telemetry@^0.2.0",
     "@combs/zerotrust": "jsr:@combs/zerotrust@^0.2.0"
-  }
+  },
+  "license": "MIT"
 }
