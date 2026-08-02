@@ -164,9 +164,21 @@ export async function createAgentServer(options: AgentServerOptions): Promise<Ag
                 ? { sealed: await options.keyring.sealFor(peerFp, payload) }
                 : payload as Record<string, unknown>;
 
-            const result = await handler(input, async (event) =>
-              send({ type: "event", id, ...(await sealBack({ event })) }),
-            );
+            // Serialize sealed sends through a per-request chain: emit() is
+            // fire-and-forget for handlers, but sealFor is async — without
+            // chaining, the result's seal can win the race and reach the
+            // wire before an earlier event (observed as flaky ordering on
+            // CI runners). Events must always precede the result.
+            let sendChain: Promise<void> = Promise.resolve();
+            const sendEvent = (event: unknown): Promise<void> => {
+              sendChain = sendChain.then(async () => {
+                send({ type: "event", id, ...(await sealBack({ event })) });
+              }).catch(() => {}); // a failed event send must not break the chain
+              return sendChain;
+            };
+
+            const result = await handler(input, sendEvent);
+            await sendChain; // flush pending event sends before the result
             send({ type: "result", id, ok: true, ...(await sealBack({ data: result })) });
           } catch (err) {
             send({

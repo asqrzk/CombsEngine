@@ -11,9 +11,20 @@ import type { StreamEvent } from "../src/types.ts";
 const MODEL = Deno.env.get("COMBS_TEST_MODEL") ??
   new URL("../../../../models/SmolLM2-135M", import.meta.url).pathname;
 
+// The default model dir is gitignored, so it is absent on CI runners —
+// skip instead of failing when no model is available.
+const MODEL_EXISTS = (() => {
+  try {
+    Deno.statSync(MODEL);
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
 Deno.test({
   name: "ffi engine: metadata + streaming generation",
-  ignore: Deno.env.get("COMBS_SKIP_INTEGRATION") === "1",
+  ignore: Deno.env.get("COMBS_SKIP_INTEGRATION") === "1" || !MODEL_EXISTS,
   async fn() {
     const engine = await Combs.init({ model: MODEL, engine: { max_seq_len: 1024 } });
     try {

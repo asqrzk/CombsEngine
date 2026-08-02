@@ -35,6 +35,8 @@ function tsKey(createdAt: number): string {
 
 /** Deno KV-backed memory. */
 export class KvMemoryStore implements MemoryStore {
+  private lastTs = 0;
+
   private constructor(
     private kv: Deno.Kv,
     private prefix: string[],
@@ -45,11 +47,16 @@ export class KvMemoryStore implements MemoryStore {
   }
 
   async remember(content: string, tags: Record<string, string> = {}): Promise<MemoryEntry> {
+    // Strictly monotonic timestamps: rapid successive writes can land in the
+    // same Date.now() millisecond (CI runners), which would scramble the
+    // "latest first" recall order.
+    const createdAt = Math.max(Date.now(), this.lastTs + 1);
+    this.lastTs = createdAt;
     const entry: MemoryEntry = {
       id: crypto.randomUUID(),
       content,
       tags,
-      createdAt: Date.now(),
+      createdAt,
     };
     // Timestamp-prefixed key so `reverse: true` lists latest first.
     await this.kv.set([...this.prefix, tsKey(entry.createdAt), entry.id], entry);
