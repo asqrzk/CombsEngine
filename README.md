@@ -1,8 +1,31 @@
 # Combs Engine
 
+[![ci](https://github.com/asqrzk/CombsEngine/actions/workflows/ci.yml/badge.svg)](https://github.com/asqrzk/CombsEngine/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/asqrzk/CombsEngine)](https://github.com/asqrzk/CombsEngine/releases)
+[![npm](https://img.shields.io/npm/v/@combs-edge/combs-engine?label=npm)](https://www.npmjs.com/package/@combs-edge/combs-engine)
+[![PyPI](https://img.shields.io/pypi/v/combs-engine?label=pypi)](https://pypi.org/project/combs-engine/)
+[![crates.io](https://img.shields.io/crates/v/combs-mesh?label=crates.io)](https://crates.io/crates/combs-mesh)
+[![JSR](https://img.shields.io/jsr/v/@combs/core?label=jsr)](https://jsr.io/@combs/core)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 > Local-first AI inference engine + agent framework — one Rust GPU core, everywhere.
 
 Combs Engine runs large language models **on-device** with a single Rust core compiled for macOS, iOS, Android, Linux, Windows, and Web (WASM) — and exposes it through a C ABI to a full TypeScript agent framework, an OpenAI-compatible server, native mobile shells, and a one-command UI scaffolder.
+
+## Install
+
+| Channel | Package | Command |
+|---|---|---|
+| **npm** (CLI + engine binary) | `@combs-edge/combs-engine` | `npm i -g @combs-edge/combs-engine` |
+| **npm** (JS client for `combs serve`) | `@combs-edge/combs-client` | `npm i @combs-edge/combs-client` |
+| **npm** (zero-trust crypto) | `@combs-edge/combs-zerotrust` | `npm i @combs-edge/combs-zerotrust` |
+| **npm** (CombsMesh emoji FFI lib) | `@combs-edge/combs-mesh` | `npm i @combs-edge/combs-mesh` |
+| **PyPI** (CLI wrapper) | `combs-engine` | `pip install combs-engine` |
+| **crates.io** (Rust core) | `combs-runtime`, `combs-ffi`, `combs-mesh`, … | `cargo add combs-mesh` |
+| **JSR** (Deno/TS framework) | `@combs/core`, `@combs/graph`, `@combs/agents`, `@combs/mesh`, … | `deno add @combs/core` |
+| **GitHub Releases** | prebuilt binaries per platform | [releases](https://github.com/asqrzk/CombsEngine/releases) |
+
+Or build from source:
 
 ```bash
 # Build the CLI
@@ -36,7 +59,7 @@ Four layers. Compute lives exclusively in **L0** — every layer above is thin o
 │ L2 — Deno / TypeScript Framework   (Engine/Js)              │
 │     @combs/core · @combs/graph · @combs/agents ·            │
 │     @combs/runtime · @combs/flows · @combs/telemetry ·      │
-│     @combs/observe · @combs/zerotrust                       │
+│     @combs/observe · @combs/zerotrust · @combs/mesh         │
 ├─────────────────────────────────────────────────────────────┤
 │ L1 — C ABI / JSON-FFI                (combs-ffi)            │
 │     combs_engine_create · combs_chat_completion_stream ·    │
@@ -50,8 +73,8 @@ Four layers. Compute lives exclusively in **L0** — every layer above is thin o
 
 | Layer | Location | What it is |
 |---|---|---|
-| L0 Core | [`Core/`](Core) | Cargo workspace: `combs-core`, `combs-formats`, `combs-models`, `combs-runtime`, `combs-ffi`, `combs-cli`, `xtask` |
-| L2 Framework | [`Js/`](Js) | Deno workspace of 6 `@combs/*` packages |
+| L0 Core | [`Core/`](Core) | Cargo workspace: `combs-core`, `combs-formats`, `combs-media`, `combs-models`, `combs-runtime`, `combs-ffi`, `combs-mesh`, `combs-mesh-ffi`, `combs-cli`, `xtask` |
+| L2 Framework | [`Js/`](Js) | Deno workspace of 9 `@combs/*` packages |
 | L3 UI | [`Ui/`](Ui) | Svelte 5 + Vite template consumed by `combs chew` |
 | L3 Android | [`Android/`](Android) | JNI glue + Kotlin API over the FFI `.so` |
 | L3 iOS | [`Ios/`](Ios) | Swift wrapper over the FFI static lib |
@@ -67,6 +90,7 @@ Four layers. Compute lives exclusively in **L0** — every layer above is thin o
 - **CLI (`combs`)** — `run` · `serve` · `devices` · `chew` · `pull` · `convert`.
 - **OpenAI-compatible server** — `POST /v1/chat/completions` (SSE streaming + non-streaming), `GET /v1/models`, `GET /health`.
 - **`xtask`** — cross-platform build orchestrator: `cargo xtask matrix` shows live toolchain detection; `cargo xtask bundle` produces `dist/<platform>/{lib, combs.h}` for every target.
+- **CombsMesh emoji engine (`combs-mesh`)** — binary `.cmse` block format (10 block types: text/image/todo/functions/api/lifecycle/character/emotion/encryption/orchestration), Unicode PUA tag-character encoding, AES-256-GCM/ChaCha20 crypto with HKDF subkeys, CPU + wgpu sprite renderers, content-addressed registry, wasm32-clean with wasm-bindgen bindings; C ABI via `combs-mesh-ffi` (`combsmesh_*` + `combsmesh_op_json`).
 
 ### L2 — TypeScript Framework (`Engine/Js`)
 
@@ -79,6 +103,7 @@ Four layers. Compute lives exclusively in **L0** — every layer above is thin o
 | `@combs/flows` | `createWorkflow` (steps/loops/checks), `createRoleplayChat`, `addMemory` |
 | `@combs/telemetry` | Scoped logging, OpenTelemetry-shaped spans, metrics |
 | `@combs/observe` | Realtime observability bus (isomorphic core) — EventBus, instrument middleware (`wrapEngine`/`instrumentFetch`/`span`), sinks (memory/NDJSON/WebSocket), redaction; powers the Control Tower |
+| `@combs/mesh` | CombsMesh emoji client — FFI `Mesh` wrapper, pure-TS Unicode PUA codec (byte-parity with Rust), MCP server mode, `MeshPeer` WS connector with sha256-verified fetch |
 
 ### L3 — UI & Shells
 
