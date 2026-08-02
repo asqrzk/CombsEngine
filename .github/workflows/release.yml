@@ -30,7 +30,7 @@ jobs:
       matrix:
         include:
           - { os: macos-14, platform: macos, arch: arm64 }   # Apple Silicon
-          - { os: macos-13, platform: macos, arch: x86_64 }  # Intel Mac
+          - { os: macos-15-intel, platform: macos, arch: x86_64 }  # Intel Mac (macos-13 retired)
           - { os: ubuntu-latest, platform: linux, arch: x86_64 }
           - { os: windows-latest, platform: windows, arch: x86_64 }
     runs-on: ${{ matrix.os }}
