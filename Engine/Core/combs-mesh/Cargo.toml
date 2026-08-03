@@ -35,7 +35,8 @@ crc32fast.workspace = true
 wgpu = { version = "29", optional = true }
 pollster = { version = "0.4", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
-combs-core.workspace = true
+# NOTE: no combs-core dep — this crate is pure data (no burn/wgpu in the
+# default graph); that keeps it wasm32-clean and light for crates.io users.
 
 # getrandom needs the WebCrypto shim on wasm32-unknown-unknown.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
