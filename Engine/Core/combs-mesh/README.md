@@ -16,8 +16,21 @@ adapts `combs-runtime` behind the `CombsEngineCore` trait.
 ```
 combs-mesh        pure Rust: format, unicode codec, crypto, render, registry
 combs-mesh-ffi    cdylib: combsmesh_* C ABI + combsmesh_op_json (JSON-FFI)
-@combs/mesh (L2, later)  Deno client + MCP server connectors
+@combs/mesh (L2)  Deno client + MCP server + MeshPeer connector
 ```
+
+## Protocol family
+
+| Surface | Owner | Spec |
+|---|---|---|
+| `.cmse` binary + PUA envelope | this crate | this README (frozen wire format) |
+| `/mesh/v1` peer federation | `@combs/mesh` `peer.ts` | `documentations/mesh-protocol.md` |
+| MCP connector | `@combs/mesh` `mcp.ts` | mesh-protocol.md §related surfaces |
+| Sealed envelopes | `@combs/zerotrust` | Engine/Js/zerotrust |
+
+Product repos (e.g. the CombsMesh repo: SHARD runtime + M2 fabric crate)
+consume all of the above via published packages — they never reimplement
+the wire format, codec, or crypto.
 
 ## Binary format v1 (`.cmse`)
 
