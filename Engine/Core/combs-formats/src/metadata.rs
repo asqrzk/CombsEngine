@@ -42,6 +42,9 @@ pub struct ModelMetadata {
     /// Vision-tower hyperparameters for multimodal models (Idefics3/SmolVLM
     /// today); `None` for text-only models.
     pub vision: Option<VisionConfig>,
+    /// Layer-type attention pattern (Gemma sliding-window interleave);
+    /// defaults to all-global (Llama-family behavior).
+    pub attention_pattern: AttentionPattern,
 }
 
 /// Vision-encoder hyperparameters parsed from `config.json::vision_config`
@@ -67,6 +70,40 @@ pub struct VisionConfig {
     pub scale_factor: usize,
     /// Token id whose span in the prompt is replaced by visual embeddings.
     pub image_token_id: u32,
+}
+
+/// Attention RoPE/scale settings that vary by layer type (Gemma2/3):
+/// `pattern`-th layers are "global" (full attention, `rope_theta`); the
+/// rest are "local" (sliding-window attention, `rope_local_theta`).
+#[derive(Debug, Clone)]
+pub struct AttentionPattern {
+    /// Sliding-window span for local layers; `None` = all layers global.
+    pub sliding_window: Option<usize>,
+    /// Every Nth layer is global (HF `sliding_window_pattern`, default 6).
+    pub pattern: usize,
+    /// RoPE base frequency for local layers (`rope_local_base_freq`).
+    pub rope_local_theta: f64,
+    /// Attention logit scale divisor (`query_pre_attn_scalar`); when
+    /// `None`, the scale is `1/sqrt(head_dim)`.
+    pub query_pre_attn_scalar: Option<f64>,
+}
+
+impl Default for AttentionPattern {
+    fn default() -> Self {
+        AttentionPattern {
+            sliding_window: None,
+            pattern: 6,
+            rope_local_theta: 10000.0,
+            query_pre_attn_scalar: None,
+        }
+    }
+}
+
+impl AttentionPattern {
+    /// Whether layer `i` uses global attention (vs sliding-window local).
+    pub fn is_global_layer(&self, i: usize) -> bool {
+        self.sliding_window.is_none() || (i + 1) % self.pattern == 0
+    }
 }
 
 impl VisionConfig {
@@ -142,6 +179,30 @@ fn token_ids(v: Option<&serde_json::Value>) -> Vec<u32> {
 }
 
 impl ModelMetadata {
+    /// Minimal placeholder metadata for diffusion components that do not
+    /// carry a language-model `config.json` (UNet, VAE, etc.).
+    pub fn diffusion_placeholder(architecture: &str) -> Self {
+        Self {
+            architecture: architecture.to_string(),
+            hidden_size: 0,
+            intermediate_size: 0,
+            num_hidden_layers: 0,
+            num_attention_heads: 0,
+            num_key_value_heads: 0,
+            vocab_size: 0,
+            max_position_embeddings: 0,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+            tie_word_embeddings: false,
+            head_dim: 0,
+            attention_bias: false,
+            bos_token_id: None,
+            eos_token_ids: Vec::new(),
+            vision: None,
+            attention_pattern: AttentionPattern::default(),
+        }
+    }
+
     /// Parses metadata from a HuggingFace `config.json` value, optionally
     /// merged with a `generation_config.json` value (which can override/add
     /// bos/eos ids).
@@ -210,7 +271,11 @@ impl ModelMetadata {
                 .or_else(|| text.get("tie_word_embeddings"))
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false),
-            head_dim: hidden_size / num_attention_heads,
+            head_dim: text
+                .get("head_dim")
+                .and_then(|x| x.as_u64())
+                .map(|x| x as usize)
+                .unwrap_or(hidden_size / num_attention_heads),
             attention_bias: text
                 .get("attention_bias")
                 .and_then(|x| x.as_bool())
@@ -218,6 +283,17 @@ impl ModelMetadata {
             bos_token_id,
             eos_token_ids,
             vision: VisionConfig::from_hf_config(config)?,
+            attention_pattern: AttentionPattern {
+                sliding_window: text
+                    .get("sliding_window")
+                    .and_then(|x| x.as_u64())
+                    .map(|x| x as usize),
+                pattern: get_u64(text, "sliding_window_pattern").unwrap_or(6) as usize,
+                rope_local_theta: get_f64(text, "rope_local_base_freq", 10000.0),
+                query_pre_attn_scalar: text
+                    .get("query_pre_attn_scalar")
+                    .and_then(|x| x.as_f64()),
+            },
         })
     }
 }

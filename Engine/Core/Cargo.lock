@@ -1178,12 +1178,14 @@ dependencies = [
  "burn",
  "clap",
  "combs-core",
+ "combs-diffusion",
  "combs-formats",
  "combs-media",
  "combs-models",
  "combs-runtime",
  "console",
  "dialoguer",
+ "image",
  "serde",
  "serde_json",
  "tiny_http",
@@ -1197,6 +1199,20 @@ dependencies = [
  "burn",
  "serde",
  "wgpu",
+]
+
+[[package]]
+name = "combs-diffusion"
+version = "0.2.0"
+dependencies = [
+ "burn",
+ "combs-core",
+ "combs-formats",
+ "combs-models",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokenizers",
 ]
 
 [[package]]
@@ -1224,6 +1240,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",
+ "tokenizers",
 ]
 
 [[package]]

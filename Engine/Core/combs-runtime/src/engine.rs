@@ -220,7 +220,7 @@ pub struct Engine {
     device: CombsDevice,
     tokenizer: Tokenizer,
     metadata: ModelMetadata,
-    im_end_id: Option<u32>,
+    spec: combs_formats::TokenizerSpec,
     default_config: GenerationConfig,
     cache_config: CacheConfig,
     tx: mpsc::Sender<Command>,
@@ -260,7 +260,6 @@ impl Engine {
         let spec = source.tokenizer()?;
         let tokenizer = Tokenizer::from_file(&spec.tokenizer_json)
             .map_err(|e| EngineError::Tokenizer(e.to_string()))?;
-        let im_end_id = spec.special_token_id("<|im_end|>");
 
         let (tx, rx) = mpsc::channel();
         let worker = {
@@ -286,7 +285,7 @@ impl Engine {
             device,
             tokenizer,
             metadata: source.metadata().clone(),
-            im_end_id,
+            spec,
             default_config: default_config_from(source.sampler_defaults().as_ref()),
             cache_config,
             tx,
@@ -312,7 +311,19 @@ impl Engine {
 
     /// The `<|im_end|>` token id, if the tokenizer defines one (chat models).
     pub fn im_end_id(&self) -> Option<u32> {
-        self.im_end_id
+        self.spec.special_token_id("<|im_end|>")
+    }
+
+    /// Gemma-style end-of-turn id (`<end_of_turn>`), when defined.
+    pub fn end_turn_id(&self) -> Option<u32> {
+        self.spec.special_token_id("<end_of_turn>")
+    }
+
+    /// Wraps (role, content) message pairs into the model's chat template
+    /// (ChatML or Gemma turns, detected from the tokenizer's special
+    /// tokens), ending with the assistant turn open.
+    pub fn wrap_chat(&self, messages: &[(String, String)]) -> String {
+        self.spec.wrap_messages(messages)
     }
 
     /// Default generation config: [`GenerationConfig::default`] merged with
@@ -395,11 +406,20 @@ impl Engine {
         cancel: Arc<AtomicBool>,
         mut on_token: impl FnMut(u32, &str),
     ) -> Result<GenerationStats> {
+        // HF `add_special_tokens` semantics: prompts start with BOS when the
+        // model declares one. Gemma collapses without it; templates that
+        // already open with `<bos>` are detected and left alone.
+        let mut prompt_tokens = prompt_tokens.to_vec();
+        if let Some(bos) = self.metadata.bos_token_id {
+            if prompt_tokens.first() != Some(&bos) {
+                prompt_tokens.insert(0, bos);
+            }
+        }
         let (pieces_tx, pieces_rx) = mpsc::channel();
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx
             .send(Command::Generate(Box::new(GenerateRequest {
-                prompt_tokens: prompt_tokens.to_vec(),
+                prompt_tokens,
                 images,
                 config: config.clone(),
                 cancel,

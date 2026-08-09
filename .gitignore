@@ -25,6 +25,8 @@ Engine/Js/**/node_modules/
 
 # Logs & temp
 *.log
+.env
+kimi-export-*.md
 
 # UI build artifacts
 Engine/Ui/**/node_modules/

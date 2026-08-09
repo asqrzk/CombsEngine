@@ -15,6 +15,7 @@ mod stop;
 
 pub use combs_models::{CacheConfig, CacheKind};
 pub use engine::{Engine, GenerationConfig, GenerationStats, check_context_len};
+
 pub use logits::{
     FrequencyPenalty, LogitsProcessor, LogitsProcessorChain, PresencePenalty,
     RepetitionPenalty, TemperatureScaler, TopK, TopP,

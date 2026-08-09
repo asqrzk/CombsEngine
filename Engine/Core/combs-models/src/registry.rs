@@ -45,6 +45,14 @@ impl<B: Backend> ModelRegistry<B> {
                 source, device,
             )?))
         });
+        // Gemma 3 text ("gemma3_text") and the text trunk of multimodal
+        // Gemma 3 ("gemma3") share this block.
+        r.register("gemma3_text", |source, device| {
+            Ok(Box::new(crate::gemma::GemmaModel::<B>::load(source, device)?))
+        });
+        r.register("gemma3", |source, device| {
+            Ok(Box::new(crate::gemma::GemmaModel::<B>::load(source, device)?))
+        });
         r
     }
 

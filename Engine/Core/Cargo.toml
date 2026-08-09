@@ -11,6 +11,7 @@ members = [
     "combs-cli",
     "combs-mesh",
     "combs-mesh-ffi",
+    "combs-diffusion",
     "xtask",
 ]
 

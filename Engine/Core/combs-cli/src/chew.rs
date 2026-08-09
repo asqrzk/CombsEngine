@@ -287,7 +287,7 @@ fn maybe_start_serve(args: &ChewArgs, dir: &Path, model: &str) -> Option<std::pr
                 .interact()
                 .unwrap_or(false);
         if get {
-            match crate::pull::pull(model) {
+            match crate::pull::pull(model, false) {
                 Ok(dir) => resolved = Some(dir),
                 Err(e) => eprintln!("{} {e:#}", style("model download failed:").red()),
             }

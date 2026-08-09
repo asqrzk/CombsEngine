@@ -96,6 +96,23 @@ pub trait KVCache<B: Backend>: Send {
         v: Tensor<B, 4>,
         pos: usize,
         scale: f64,
+    ) -> Tensor<B, 4> {
+        self.attention_opts(layer, q, k, v, pos, scale, None)
+    }
+
+    /// [`KVCache::attention`] with an optional sliding-window span (Gemma
+    /// local layers): when `Some(w)`, query at absolute position p attends
+    /// only keys in `(p - w, p]` — older keys stay cached but are masked
+    /// out. `None` = full causal attention (Llama-family behavior).
+    fn attention_opts(
+        &mut self,
+        layer: usize,
+        q: Tensor<B, 4>,
+        k: Tensor<B, 4>,
+        v: Tensor<B, 4>,
+        pos: usize,
+        scale: f64,
+        window: Option<usize>,
     ) -> Tensor<B, 4>;
 
     /// Total cached sequence length.
@@ -148,6 +165,7 @@ fn attend<B: Backend>(
     v: Tensor<B, 4>,
     pos: usize,
     scale: f64,
+    window: Option<usize>,
 ) -> Tensor<B, 4> {
     let device = q.device();
     let [_, n_q, seq, d] = q.dims();
@@ -157,7 +175,7 @@ fn attend<B: Backend>(
     let v = repeat_kv(v, n_rep);
 
     let default_scale = 1.0 / (d as f64).sqrt();
-    if flash_enabled() && (scale - default_scale).abs() < 1e-12 {
+    if flash_enabled() && window.is_none() && (scale - default_scale).abs() < 1e-12 {
         return burn::tensor::module::attention(
             q,
             k,
@@ -174,15 +192,23 @@ fn attend<B: Backend>(
         );
     }
 
-    // Reference path: explicit scores, causal mask, softmax, P@V.
+    // Reference path: explicit scores, causal (+ optional sliding-window)
+    // mask, softmax, P@V.
     let scores = q.matmul(k.transpose()).mul_scalar(scale);
-    let scores = if seq > 1 {
-        // Causal mask: query at global position p attends keys <= p.
+    let scores = if seq > 1 || window.is_some() {
+        // Causal mask: query at global position p attends keys <= p; a
+        // sliding window w further forbids keys <= p - w.
         let q_pos =
             Tensor::<B, 1, Int>::arange((pos as i64)..((pos + seq) as i64), &device)
                 .reshape([seq, 1]);
         let k_pos = Tensor::<B, 1, Int>::arange(0..(total as i64), &device).reshape([1, total]);
-        let forbidden: Tensor<B, 2, Bool> = k_pos.greater(q_pos);
+        let mut forbidden: Tensor<B, 2, Bool> = k_pos.clone().greater(q_pos.clone());
+        if let Some(w) = window {
+            let too_old = k_pos
+                .add_scalar(w as i64 - 1)
+                .lower(q_pos);
+            forbidden = forbidden.bool_or(too_old);
+        }
         let mask = forbidden
             .unsqueeze_dims::<4>(&[0, 1])
             .expand([1, n_q, seq, total]);
@@ -217,7 +243,7 @@ impl<B: Backend> ContiguousKVCache<B> {
 }
 
 impl<B: Backend> KVCache<B> for ContiguousKVCache<B> {
-    fn attention(
+    fn attention_opts(
         &mut self,
         layer: usize,
         q: Tensor<B, 4>,
@@ -225,6 +251,7 @@ impl<B: Backend> KVCache<B> for ContiguousKVCache<B> {
         v: Tensor<B, 4>,
         pos: usize,
         scale: f64,
+        window: Option<usize>,
     ) -> Tensor<B, 4> {
         let slot = &mut self.layers[layer];
         let (k_full, v_full) = match slot.take() {
@@ -235,7 +262,7 @@ impl<B: Backend> KVCache<B> for ContiguousKVCache<B> {
             None => (k, v),
         };
         self.seq_len = k_full.dims()[2];
-        let out = attend(q, k_full.clone(), v_full.clone(), pos, scale);
+        let out = attend(q, k_full.clone(), v_full.clone(), pos, scale, window);
         *slot = Some((k_full, v_full));
         out
     }
@@ -364,7 +391,7 @@ impl<B: Backend> PagedKVCache<B> {
 }
 
 impl<B: Backend> KVCache<B> for PagedKVCache<B> {
-    fn attention(
+    fn attention_opts(
         &mut self,
         layer: usize,
         q: Tensor<B, 4>,
@@ -372,6 +399,7 @@ impl<B: Backend> KVCache<B> for PagedKVCache<B> {
         v: Tensor<B, 4>,
         pos: usize,
         scale: f64,
+        window: Option<usize>,
     ) -> Tensor<B, 4> {
         let [_, n_kv, seq, head_dim] = k.dims();
         let total = pos + seq;
@@ -427,7 +455,7 @@ impl<B: Backend> KVCache<B> for PagedKVCache<B> {
         let v_full = self.gather_window(arena_v.clone(), pages, total);
         self.arenas[layer] = Some((arena_k, arena_v));
 
-        attend(q, k_full, v_full, pos, scale)
+        attend(q, k_full, v_full, pos, scale, window)
     }
 
     fn seq_len(&self) -> usize {

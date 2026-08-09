@@ -7,10 +7,12 @@
 //! layout (`[in, out]` → `[out, in]`, which for row-major data is just a
 //! shape reversal — no data movement).
 //!
-//! Supported tensor types: F32, F16, BF16, Q4_0, Q8_0. Quantized tensors
-//! are dequantized on load (CPU scalar path) — wiring `QuantizedLinear` to
-//! keep them packed in VRAM is a follow-up. Q4_K/Q5_K/Q6_K superblock
-//! formats are not yet supported (clear error).
+//! Supported tensor types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0,
+//! Q4_K, Q5_K, Q6_K.
+//! Quantized tensors are dequantized on load (CPU scalar path) — wiring
+//! `QuantizedLinear` to keep them packed in VRAM is a follow-up. K-quant
+//! superblock layouts follow ggml exactly (256-value blocks, 6-bit packed
+//! scales/mins for 4/5_K, per-16 i8 scales for 6_K).
 //!
 //! Tokenizer: a sibling `tokenizer.json` is used when present; otherwise a
 //! BPE `tokenizer.json` is synthesized from the GGUF tokenizer metadata
@@ -197,7 +199,13 @@ fn read_meta_value(c: &mut Cursor, ty: u32) -> Result<MetaValue> {
 const GGML_F32: u32 = 0;
 const GGML_F16: u32 = 1;
 const GGML_Q4_0: u32 = 2;
+const GGML_Q4_1: u32 = 3;
+const GGML_Q5_0: u32 = 6;
+const GGML_Q5_1: u32 = 7;
 const GGML_Q8_0: u32 = 8;
+const GGML_Q4_K: u32 = 12;
+const GGML_Q5_K: u32 = 13;
+const GGML_Q6_K: u32 = 14;
 const GGML_BF16: u32 = 30;
 
 impl GgufSource {
@@ -347,6 +355,10 @@ fn build_model_metadata(kv: &HashMap<String, MetaValue>) -> Result<ModelMetadata
         bos_token_id: bos_id,
         eos_token_ids: eos_ids,
         vision: None,
+        // GGUF: llama-family defaults (all-global). Gemma GGUF keys
+        // (attention.sliding_window etc.) are a follow-up — the
+        // safetensors path is the Gemma reference for U1.
+        attention_pattern: crate::metadata::AttentionPattern::default(),
     })
 }
 
@@ -373,8 +385,23 @@ fn tokenizer_ids(kv: &HashMap<String, MetaValue>) -> (Vec<u32>, Option<u32>, Has
     (eos, bos, added)
 }
 
+/// Counts GGUF special tokens (token_type 3 = control, 4 = user-defined).
+fn special_token_count(kv: &HashMap<String, MetaValue>) -> usize {
+    match kv.get("tokenizer.ggml.token_type") {
+        Some(MetaValue::I32s(types)) => types.iter().filter(|t| **t == 3 || **t == 4).count(),
+        _ => 0,
+    }
+}
+
 /// Builds a minimal HF BPE tokenizer.json from GGUF tokenizer metadata when
 /// no sibling tokenizer.json exists (cached alongside the model file).
+///
+/// Staleness: v1 syntheses wrote `"added_tokens": []`, which BPE-shredded
+/// ChatML control tokens (`<|im_start|>`/`<|im_end|>`) — the "garbled GGUF"
+/// bug — and the poisoned cache was sticky. The cached file is regenerated
+/// whenever its added_tokens count disagrees with the GGUF metadata. (No
+/// in-file version marker: the tokenizers crate rejects unknown top-level
+/// keys.)
 fn ensure_tokenizer_json(path: &Path, kv: &HashMap<String, MetaValue>) -> Result<PathBuf> {
     let sibling = path.with_file_name("tokenizer.json");
     if sibling.exists() {
@@ -382,7 +409,14 @@ fn ensure_tokenizer_json(path: &Path, kv: &HashMap<String, MetaValue>) -> Result
     }
     let cached = path.with_extension("tokenizer.json");
     if cached.exists() {
-        return Ok(cached);
+        let have = std::fs::read_to_string(&cached)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("added_tokens")?.as_array().map(Vec::len));
+        if have == Some(special_token_count(kv)) {
+            return Ok(cached);
+        }
+        // Stale synthesis — regenerate below.
     }
 
     let tokens = match kv.get("tokenizer.ggml.tokens") {
@@ -415,11 +449,31 @@ fn ensure_tokenizer_json(path: &Path, kv: &HashMap<String, MetaValue>) -> Result
         ranks.insert(id.to_string(), serde_json::Value::from(rank));
     }
 
+    // Special tokens (GGUF token_type 3 = control, 4 = user-defined) must
+    // be registered as added_tokens so the tokenizer keeps them atomic
+    // instead of BPE-shredding them (e.g. <|im_start|>/<|im_end|>).
+    let mut added_tokens = Vec::new();
+    if let Some(MetaValue::I32s(types)) = kv.get("tokenizer.ggml.token_type") {
+        for (i, (tok, ty)) in tokens.iter().zip(types.iter()).enumerate() {
+            if *ty == 3 || *ty == 4 {
+                added_tokens.push(serde_json::json!({
+                    "id": i,
+                    "content": tok,
+                    "single_word": false,
+                    "lstrip": false,
+                    "rstrip": false,
+                    "normalized": false,
+                    "special": true,
+                }));
+            }
+        }
+    }
+
     let json = serde_json::json!({
         "version": "1.0",
         "truncation": null,
         "padding": null,
-        "added_tokens": [],
+        "added_tokens": added_tokens,
         "normalizer": null,
         "pre_tokenizer": {
             "type": "Sequence",
@@ -496,15 +550,31 @@ fn tensor_byte_size(info: &TensorInfo) -> Result<usize> {
         }
         Ok(n / 32 * bs)
     };
+    let superblock = |bs: usize| -> Result<usize> {
+        if n % 256 != 0 {
+            return Err(FormatError::Safetensors(format!(
+                "gguf tensor {}: {n} elements not divisible by K-quant superblock 256",
+                info.name
+            )));
+        }
+        Ok(n / 256 * bs)
+    };
     Ok(match info.ggml_type {
         GGML_F32 => n * 4,
         GGML_F16 | GGML_BF16 => n * 2,
         GGML_Q4_0 => block(18)?, // 2-byte scale + 16 bytes per 32 values
+        GGML_Q4_1 => block(20)?, // f16 scale + f16 min + 16 bytes
+        GGML_Q5_0 => block(22)?, // f16 scale + u32 high bits + 16 bytes
+        GGML_Q5_1 => block(24)?, // f16 scale + f16 min + u32 high bits + 16 bytes
         GGML_Q8_0 => block(34)?, // 2-byte scale + 32 int8 per 32 values
+        // K-quants: 256-value superblocks.
+        GGML_Q4_K => superblock(144)?, // 2×f16 + 12B packed scales/mins + 128B quants
+        GGML_Q5_K => superblock(176)?, // + 32B high bits
+        GGML_Q6_K => superblock(210)?, // 128B ql + 64B qh + 16×i8 scales + f16
         other => {
             return Err(FormatError::UnsupportedDtype {
                 tensor: info.name.clone(),
-                dtype: format!("ggml_type {other} (Q4_K/Q5_K/Q6_K not yet supported)"),
+                dtype: format!("ggml_type {other}"),
             });
         }
     })
@@ -545,6 +615,205 @@ fn dequantize_q8_0(data: &[u8], n: usize) -> Result<Vec<f32>> {
     if out.len() != n {
         return Err(FormatError::Safetensors(format!(
             "q8_0 dequant size mismatch: {} != {n}",
+            out.len()
+        )));
+    }
+    Ok(out)
+}
+
+/// Dequantizes a Q4_1 tensor to f32. Like Q4_0 but asymmetric:
+/// value = q·d + m (f16 scale + f16 min per 32-value block).
+fn dequantize_q4_1(data: &[u8], n: usize) -> Result<Vec<f32>> {
+    let mut out = Vec::with_capacity(n);
+    for block in data.chunks_exact(20) {
+        let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let m = half::f16::from_le_bytes([block[2], block[3]]).to_f32();
+        let mut vals = [0f32; 32];
+        for j in 0..16 {
+            let byte = block[4 + j];
+            vals[j] = (byte & 0x0F) as f32 * d + m;
+            vals[j + 16] = (byte >> 4) as f32 * d + m;
+        }
+        out.extend_from_slice(&vals);
+    }
+    if out.len() != n {
+        return Err(FormatError::Safetensors(format!(
+            "q4_1 dequant size mismatch: {} != {n}",
+            out.len()
+        )));
+    }
+    Ok(out)
+}
+
+/// Dequantizes a Q5_0 tensor to f32. 32-value blocks (22 bytes): f16
+/// scale, u32 high bits (bit j → value j, bit j+16 → value j+16), 16
+/// packed nibble bytes; values biased by -16.
+fn dequantize_q5_0(data: &[u8], n: usize) -> Result<Vec<f32>> {
+    let mut out = Vec::with_capacity(n);
+    for block in data.chunks_exact(22) {
+        let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+        let mut vals = [0f32; 32];
+        for j in 0..16 {
+            let byte = block[6 + j];
+            let lo = ((byte & 0x0F) as u32 | (((qh >> j) & 1) << 4)) as i32 - 16;
+            let hi = ((byte >> 4) as u32 | (((qh >> (j + 16)) & 1) << 4)) as i32 - 16;
+            vals[j] = lo as f32 * d;
+            vals[j + 16] = hi as f32 * d;
+        }
+        out.extend_from_slice(&vals);
+    }
+    if out.len() != n {
+        return Err(FormatError::Safetensors(format!(
+            "q5_0 dequant size mismatch: {} != {n}",
+            out.len()
+        )));
+    }
+    Ok(out)
+}
+
+/// Dequantizes a Q5_1 tensor to f32. Like Q5_0 but asymmetric (scale +
+/// min, no bias): value = q·d + m. 24-byte blocks.
+fn dequantize_q5_1(data: &[u8], n: usize) -> Result<Vec<f32>> {
+    let mut out = Vec::with_capacity(n);
+    for block in data.chunks_exact(24) {
+        let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let m = half::f16::from_le_bytes([block[2], block[3]]).to_f32();
+        let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+        let mut vals = [0f32; 32];
+        for j in 0..16 {
+            let byte = block[8 + j];
+            let lo = (byte & 0x0F) as u32 | (((qh >> j) & 1) << 4);
+            let hi = (byte >> 4) as u32 | (((qh >> (j + 16)) & 1) << 4);
+            vals[j] = lo as f32 * d + m;
+            vals[j + 16] = hi as f32 * d + m;
+        }
+        out.extend_from_slice(&vals);
+    }
+    if out.len() != n {
+        return Err(FormatError::Safetensors(format!(
+            "q5_1 dequant size mismatch: {} != {n}",
+            out.len()
+        )));
+    }
+    Ok(out)
+}
+
+/// K-quant 6-bit scale/min unpacking (ggml `get_scale_min_k4`): the 12
+/// scale bytes pack eight 6-bit scales and eight 6-bit mins, with the top
+/// 2 bits of bytes 0..8 carrying the high bits of sub-blocks 4..8.
+fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        (
+            (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4),
+            (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+        )
+    }
+}
+
+/// Dequantizes a Q4_K tensor to f32. 256-value superblocks (144 bytes):
+/// f16 d, f16 dmin, 12B packed scales/mins, 128B 4-bit quants.
+fn dequantize_q4_k(data: &[u8], n: usize) -> Result<Vec<f32>> {
+    let mut out = Vec::with_capacity(n);
+    for sb in data.chunks_exact(144) {
+        let d = half::f16::from_le_bytes([sb[0], sb[1]]).to_f32();
+        let dmin = half::f16::from_le_bytes([sb[2], sb[3]]).to_f32();
+        let scales = &sb[4..16];
+        let qs = &sb[16..144];
+        for j in 0..4 {
+            // Each 64-value group uses 32 qs bytes; low nibbles → first
+            // sub-block, high nibbles → second.
+            let (sc1, m1) = scale_min_k4(2 * j, scales);
+            let (sc2, m2) = scale_min_k4(2 * j + 1, scales);
+            let (d1, fmin1) = (d * sc1 as f32, dmin * m1 as f32);
+            let (d2, fmin2) = (d * sc2 as f32, dmin * m2 as f32);
+            for l in 0..32 {
+                let byte = qs[32 * j + l];
+                out.push(d1 * (byte & 0x0F) as f32 - fmin1);
+            }
+            for l in 0..32 {
+                let byte = qs[32 * j + l];
+                out.push(d2 * (byte >> 4) as f32 - fmin2);
+            }
+        }
+    }
+    if out.len() != n {
+        return Err(FormatError::Safetensors(format!(
+            "q4_k dequant size mismatch: {} != {n}",
+            out.len()
+        )));
+    }
+    Ok(out)
+}
+
+/// Dequantizes a Q5_K tensor to f32. Like Q4_K plus 32 high-bit bytes:
+/// group j reads bit 2j (low sub-block) / 2j+1 (high sub-block) of qh.
+fn dequantize_q5_k(data: &[u8], n: usize) -> Result<Vec<f32>> {
+    let mut out = Vec::with_capacity(n);
+    for sb in data.chunks_exact(176) {
+        let d = half::f16::from_le_bytes([sb[0], sb[1]]).to_f32();
+        let dmin = half::f16::from_le_bytes([sb[2], sb[3]]).to_f32();
+        let scales = &sb[4..16];
+        let qh = &sb[16..48];
+        let qs = &sb[48..176];
+        for j in 0..4 {
+            let (sc1, m1) = scale_min_k4(2 * j, scales);
+            let (sc2, m2) = scale_min_k4(2 * j + 1, scales);
+            let (d1, fmin1) = (d * sc1 as f32, dmin * m1 as f32);
+            let (d2, fmin2) = (d * sc2 as f32, dmin * m2 as f32);
+            for l in 0..32 {
+                let lo = (qs[32 * j + l] & 0x0F) as u32;
+                let hi = ((qh[l] >> (2 * j)) & 1) as u32;
+                out.push(d1 * ((lo | (hi << 4)) as f32) - fmin1);
+            }
+            for l in 0..32 {
+                let lo = (qs[32 * j + l] >> 4) as u32;
+                let hi = ((qh[l] >> (2 * j + 1)) & 1) as u32;
+                out.push(d2 * ((lo | (hi << 4)) as f32) - fmin2);
+            }
+        }
+    }
+    if out.len() != n {
+        return Err(FormatError::Safetensors(format!(
+            "q5_k dequant size mismatch: {} != {n}",
+            out.len()
+        )));
+    }
+    Ok(out)
+}
+
+/// Dequantizes a Q6_K tensor to f32. 256-value superblocks (210 bytes):
+/// 128B low nibbles, 64B high 2-bit fields, 16 i8 scales (one per 16
+/// values), f16 super-scale. Values are biased by -32.
+fn dequantize_q6_k(data: &[u8], n: usize) -> Result<Vec<f32>> {
+    let mut out = Vec::with_capacity(n);
+    for sb in data.chunks_exact(210) {
+        let d = half::f16::from_le_bytes([sb[208], sb[209]]).to_f32();
+        // Process the superblock as two 128-value halves.
+        for half_idx in 0..2 {
+            let ql = &sb[64 * half_idx..64 * half_idx + 64];
+            let qh = &sb[128 + 32 * half_idx..128 + 32 * half_idx + 32];
+            let scales = &sb[192 + 8 * half_idx..192 + 8 * half_idx + 8];
+            let mut vals = [0f32; 128];
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = ((ql[l] & 0x0F) | ((qh[l] & 0x03) << 4)) as i8 as i32 - 32;
+                let q2 = ((ql[l + 32] & 0x0F) | ((qh[l] & 0x0C) >> 2 << 4)) as i8 as i32 - 32;
+                let q3 = ((ql[l] >> 4) | ((qh[l] & 0x30) >> 4 << 4)) as i8 as i32 - 32;
+                let q4 = ((ql[l + 32] >> 4) | ((qh[l] & 0xC0) >> 6 << 4)) as i8 as i32 - 32;
+                vals[l] = d * (scales[is] as i8) as f32 * q1 as f32;
+                vals[l + 32] = d * (scales[is + 2] as i8) as f32 * q2 as f32;
+                vals[l + 64] = d * (scales[is + 4] as i8) as f32 * q3 as f32;
+                vals[l + 96] = d * (scales[is + 6] as i8) as f32 * q4 as f32;
+            }
+            out.extend_from_slice(&vals);
+        }
+    }
+    if out.len() != n {
+        return Err(FormatError::Safetensors(format!(
+            "q6_k dequant size mismatch: {} != {n}",
             out.len()
         )));
     }
@@ -597,8 +866,38 @@ impl ModelSource for GgufSource {
                 let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
                 Ok(TensorReader::owned(name.to_string(), shape, bytes))
             }
+            GGML_Q4_1 => {
+                let values = dequantize_q4_1(data, n)?;
+                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+                Ok(TensorReader::owned(name.to_string(), shape, bytes))
+            }
+            GGML_Q5_0 => {
+                let values = dequantize_q5_0(data, n)?;
+                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+                Ok(TensorReader::owned(name.to_string(), shape, bytes))
+            }
+            GGML_Q5_1 => {
+                let values = dequantize_q5_1(data, n)?;
+                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+                Ok(TensorReader::owned(name.to_string(), shape, bytes))
+            }
             GGML_Q8_0 => {
                 let values = dequantize_q8_0(data, n)?;
+                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+                Ok(TensorReader::owned(name.to_string(), shape, bytes))
+            }
+            GGML_Q4_K => {
+                let values = dequantize_q4_k(data, n)?;
+                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+                Ok(TensorReader::owned(name.to_string(), shape, bytes))
+            }
+            GGML_Q5_K => {
+                let values = dequantize_q5_k(data, n)?;
+                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+                Ok(TensorReader::owned(name.to_string(), shape, bytes))
+            }
+            GGML_Q6_K => {
+                let values = dequantize_q6_k(data, n)?;
                 let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
                 Ok(TensorReader::owned(name.to_string(), shape, bytes))
             }

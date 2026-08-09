@@ -24,7 +24,9 @@ struct TensorEntry {
     shape: Vec<usize>,
 }
 
-/// [`ModelSource`] over a HuggingFace-format directory:
+/// [`ModelSource`] over a HuggingFace-format directory.
+///
+/// Standard layout:
 ///
 /// ```text
 /// <dir>/config.json                   (required)
@@ -34,6 +36,11 @@ struct TensorEntry {
 /// <dir>/model.safetensors             (single-file), or
 /// <dir>/model.safetensors.index.json  (sharded)
 /// ```
+///
+/// For diffusion sub-dirs (`unet/`, `vae/`, `text_encoder/`) use
+/// [`SafetensorsSource::load_weights_only`], which tolerates
+/// `diffusion_pytorch_model.safetensors` (or `model.safetensors`) and no
+/// tokenizer/config.
 ///
 /// Files are memory-mapped; [`ModelSource::open_tensor`] returns zero-copy
 /// views into the mapping.
@@ -142,30 +149,74 @@ impl SafetensorsSource {
         });
 
         // --- weight shards ---------------------------------------------------------
-        let index_json = dir.join("model.safetensors.index.json");
-        let single = dir.join("model.safetensors");
-        let shard_files: Vec<PathBuf> = if index_json.exists() {
-            let idx = read_json(&index_json, true)?.expect("required");
-            let weight_map = idx
-                .get("weight_map")
-                .and_then(|v| v.as_object())
-                .ok_or_else(|| FormatError::MissingField("weight_map".to_string()))?;
-            let mut files: Vec<PathBuf> = weight_map
-                .values()
-                .filter_map(|v| v.as_str())
-                .map(|f| dir.join(f))
-                .collect();
-            files.sort();
-            files.dedup();
-            files
-        } else if single.exists() {
-            vec![single]
-        } else {
-            return Err(FormatError::MissingFile(format!(
-                "{single:?} (or model.safetensors.index.json)"
-            )));
-        };
+        let shard_files = Self::collect_shard_files(dir, &["model.safetensors"])?;
+        let (shards, index) = Self::mmap_shards(&shard_files)?;
 
+        Ok(SafetensorsSource {
+            metadata,
+            tokenizer,
+            sampler,
+            shards,
+            index,
+        })
+    }
+
+    /// Opens a directory purely for weight loading. No `config.json` or
+    /// `tokenizer.json` is required; `metadata()` returns a placeholder and
+    /// `tokenizer()` errors. Accepts diffusion-style
+    /// `diffusion_pytorch_model.safetensors` as well as `model.safetensors`.
+    pub fn load_weights_only(dir: impl AsRef<Path>, architecture: &str) -> Result<Self> {
+        let dir = dir.as_ref();
+        let shard_files = Self::collect_shard_files(
+            dir,
+            &[
+                "diffusion_pytorch_model.safetensors",
+                "model.safetensors",
+            ],
+        )?;
+        let (shards, index) = Self::mmap_shards(&shard_files)?;
+        Ok(SafetensorsSource {
+            metadata: ModelMetadata::diffusion_placeholder(architecture),
+            tokenizer: TokenizerSpec::placeholder(),
+            sampler: None,
+            shards,
+            index,
+        })
+    }
+
+    fn collect_shard_files(dir: &Path, base_names: &[&str]) -> Result<Vec<PathBuf>> {
+        for base in base_names {
+            let index_json = dir.join(format!("{base}.index.json"));
+            if index_json.exists() {
+                let idx = read_json(&index_json, true)?.expect("required");
+                let weight_map = idx
+                    .get("weight_map")
+                    .and_then(|v| v.as_object())
+                    .ok_or_else(|| FormatError::MissingField("weight_map".to_string()))?;
+                let mut files: Vec<PathBuf> = weight_map
+                    .values()
+                    .filter_map(|v| v.as_str())
+                    .map(|f| dir.join(f))
+                    .collect();
+                files.sort();
+                files.dedup();
+                return Ok(files);
+            }
+            let single = dir.join(base);
+            if single.exists() {
+                return Ok(vec![single]);
+            }
+        }
+        Err(FormatError::MissingFile(format!(
+            "{:?} (or .index.json)",
+            base_names
+                .iter()
+                .map(|b| dir.join(b))
+                .collect::<Vec<_>>()
+        )))
+    }
+
+    fn mmap_shards(shard_files: &[PathBuf]) -> Result<(Vec<Shard>, HashMap<String, TensorEntry>)> {
         let mut shards = Vec::with_capacity(shard_files.len());
         let mut index = HashMap::new();
         for (shard_idx, file) in shard_files.iter().enumerate() {
@@ -188,14 +239,7 @@ impl SafetensorsSource {
             }
             shards.push(Shard { mmap });
         }
-
-        Ok(SafetensorsSource {
-            metadata,
-            tokenizer,
-            sampler,
-            shards,
-            index,
-        })
+        Ok((shards, index))
     }
 }
 
@@ -230,6 +274,11 @@ impl ModelSource for SafetensorsSource {
     }
 
     fn tokenizer(&self) -> Result<TokenizerSpec> {
+        if self.tokenizer.tokenizer_json.as_os_str().is_empty() {
+            return Err(FormatError::MissingFile(
+                "tokenizer.json (weights-only source has no tokenizer)".to_string(),
+            ));
+        }
         Ok(self.tokenizer.clone())
     }
 
@@ -328,5 +377,35 @@ mod tests {
         assert_eq!(tok.special_token_id("<|im_end|>"), Some(2));
 
         assert!(src.open_tensor("missing").is_err());
+    }
+
+    /// `load_weights_only` accepts diffusion-style filenames and no config.
+    #[test]
+    fn loads_weights_only_without_config_or_tokenizer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let bytes: Vec<u8> = (0..16)
+            .flat_map(|i| (i as f32).to_le_bytes())
+            .collect();
+        let t = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::F32,
+            vec![4, 4],
+            &bytes,
+        )
+        .unwrap();
+        safetensors::serialize_to_file(
+            vec![("conv_in.weight", t)],
+            None,
+            root.join("diffusion_pytorch_model.safetensors")
+                .as_path(),
+        )
+        .unwrap();
+
+        let src =
+            SafetensorsSource::load_weights_only(root, "stable-diffusion-unet").unwrap();
+        assert_eq!(src.metadata().architecture, "stable-diffusion-unet");
+        assert_eq!(src.tensor_names(), vec!["conv_in.weight"]);
+        assert!(src.tokenizer().is_err());
     }
 }

@@ -21,6 +21,16 @@ pub fn rms_norm<B: Backend, const D: usize>(
     x * inv_rms * weight.reshape(shape)
 }
 
+/// Gemma-style RMSNorm: `y = x / rms(x) * (1 + w)` — the learnable weight
+/// is zero-centered (HF `Gemma3RMSNorm`).
+pub fn gemma_rms_norm<B: Backend, const D: usize>(
+    x: Tensor<B, D>,
+    weight: Tensor<B, 1>,
+    eps: f64,
+) -> Tensor<B, D> {
+    rms_norm(x, weight.add_scalar(1.0), eps)
+}
+
 /// LayerNorm (SigLIP-style, learnable weight + bias):
 /// `y = (x - μ) / sqrt(σ² + eps) * w + b`, statistics over the last dim.
 pub fn layer_norm<B: Backend, const D: usize>(

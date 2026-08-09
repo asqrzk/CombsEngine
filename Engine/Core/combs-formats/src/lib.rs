@@ -7,16 +7,24 @@
 //! mmap-backed, zero-copy views). GGUF / ONNX / litertlm adapters plug in
 //! here later by implementing the same trait.
 
+mod flatbuf;
 mod gguf;
+mod litertlm;
 mod metadata;
+mod protomin;
 mod safetensors;
 mod source;
+mod spm;
+mod tflite;
 mod tokenizer;
 
 pub use gguf::GgufSource;
-pub use metadata::{ModelMetadata, VisionConfig};
+pub use metadata::{AttentionPattern, ModelMetadata, VisionConfig};
 pub use safetensors::SafetensorsSource;
+pub use litertlm::{SectionInfo, read_sections as litertlm_read_sections};
 pub use source::{ModelSource, SamplerConfig, TensorDtype, TensorReader};
+pub use spm::{ensure_tokenizer_json_from_spm, spm_added_tokens};
+pub use tflite::TfliteSource;
 pub use tokenizer::TokenizerSpec;
 
 use std::path::Path;
@@ -28,6 +36,12 @@ pub fn open_model_source(path: impl AsRef<Path>) -> Result<Box<dyn ModelSource>>
     let path = path.as_ref();
     if path.is_file() && path.extension().is_some_and(|e| e == "gguf") {
         return Ok(Box::new(GgufSource::load(path)?));
+    }
+    if path.is_file() && path.extension().is_some_and(|e| e == "task" || e == "tflite") {
+        return Ok(Box::new(TfliteSource::load(path)?));
+    }
+    if path.is_file() && path.extension().is_some_and(|e| e == "litertlm") {
+        return litertlm::open_litertlm(path);
     }
     if path.is_dir() {
         return Ok(Box::new(SafetensorsSource::load(path)?));

@@ -4,7 +4,13 @@
 //! - `GET  /health` → `{"status":"ok"}`
 //! - `GET  /v1/models` → the loaded model id
 //! - `POST /v1/chat/completions` → OpenAI chat completion, `stream: true`
-//!   for SSE chunks terminated by `data: [DONE]`.
+//!   for SSE chunks terminated by `data: [DONE]`. Vision models accept
+//!   OpenAI array content parts (`image_url` with base64 data: URLs);
+//!   images are preprocessed via combs-media and spliced into the
+//!   model's `<image>` token spans.
+//!
+//! CORS: `Access-Control-Allow-Origin: *` on every response + OPTIONS
+//! preflight, so browsers can call the engine directly (static hosting).
 //!
 //! tiny_http is synchronous and lightweight (no async runtime); the
 //! engine's single-flight queue serializes concurrent requests. SSE
@@ -16,9 +22,12 @@ use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde_json::{Value, json};
 
-use combs_runtime::{Engine, GenerationConfig};
+use combs_media::{ImagePreprocessor, PixelBatch, SiglipPreprocessor};
+use combs_models::image_prompt_expansion;
+use combs_runtime::{Engine, GenerationConfig, GenerationStats};
 
 /// Response type used everywhere: a boxed reader so streaming and buffered
 /// responses share one concrete type.
@@ -35,6 +44,28 @@ pub fn serve(engine: Arc<Engine>, model_id: String, addr: &str) -> Result<()> {
         std::thread::spawn(move || {
             let url = request.url().to_string();
             let method = request.method().as_str().to_string();
+            // CORS preflight — browsers probe before cross-origin POSTs.
+            if method == "OPTIONS" {
+                let _ = request.respond(
+                    tiny_http::Response::empty(204)
+                        .with_header(cors_header())
+                        .with_header(
+                            tiny_http::Header::from_bytes(
+                                "Access-Control-Allow-Methods",
+                                "GET, POST, OPTIONS",
+                            )
+                            .unwrap(),
+                        )
+                        .with_header(
+                            tiny_http::Header::from_bytes(
+                                "Access-Control-Allow-Headers",
+                                "content-type, authorization",
+                            )
+                            .unwrap(),
+                        ),
+                );
+                return;
+            }
             let response = match (method.as_str(), url.as_str()) {
                 ("GET", "/health") => json_response(200, json!({"status": "ok"})),
                 ("GET", "/v1/models") => json_response(
@@ -77,6 +108,10 @@ fn error_json(kind: &str, message: &str) -> Value {
     json!({"error": {"type": kind, "message": message}})
 }
 
+fn cors_header() -> tiny_http::Header {
+    tiny_http::Header::from_bytes("Access-Control-Allow-Origin", "*").unwrap()
+}
+
 fn json_response(status: u16, body: Value) -> HttpResponse {
     let data = body.to_string().into_bytes();
     let len = data.len();
@@ -86,6 +121,7 @@ fn json_response(status: u16, body: Value) -> HttpResponse {
             Some(len),
         )
         .with_header(tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap())
+        .with_header(cors_header())
 }
 
 fn handle_chat(engine: &Arc<Engine>, model_id: &str, body: &str) -> HttpResponse {
@@ -110,7 +146,12 @@ fn handle_chat(engine: &Arc<Engine>, model_id: &str, body: &str) -> HttpResponse
             error_json("invalid_request", "`messages` must be a non-empty array"),
         );
     }
-    let prompt = apply_chatml(&messages);
+    let (prompt, images) = match build_prompt(engine, &messages) {
+        Ok(v) => v,
+        Err(msg) => {
+            return json_response(400, error_json("invalid_request", &msg));
+        }
+    };
 
     let tokens = match engine.encode(&prompt) {
         Ok(t) => t,
@@ -156,6 +197,9 @@ fn handle_chat(engine: &Arc<Engine>, model_id: &str, body: &str) -> HttpResponse
     if let Some(id) = engine.im_end_id() {
         config.stop_token_ids.push(id);
     }
+    if let Some(id) = engine.end_turn_id() {
+        config.stop_token_ids.push(id);
+    }
     // Optional named KV session (e.g. one per debate agent) — requests with
     // the same id share a rolling prefix-reuse session.
     if let Some(sid) = req.get("session_id").and_then(Value::as_str) {
@@ -170,7 +214,9 @@ fn handle_chat(engine: &Arc<Engine>, model_id: &str, body: &str) -> HttpResponse
 
     if !stream {
         let mut text = String::new();
-        let result = engine.generate(&tokens, &config, |_id, piece| text.push_str(piece));
+        let result = generate_maybe_media(engine, &tokens, images, &config, |_id, piece| {
+            text.push_str(piece)
+        });
         return match result {
             Ok(stats) => json_response(
                 200,
@@ -216,7 +262,7 @@ fn handle_chat(engine: &Arc<Engine>, model_id: &str, body: &str) -> HttpResponse
             tx.send(format!("data: {chunk}\n\n")).is_ok()
         };
         let _ = send_chunk(json!({"role": "assistant"}), None, None);
-        let result = engine.generate(&tokens, &config, |_id, piece| {
+        let result = generate_maybe_media(&engine, &tokens, images, &config, |_id, piece| {
             let _ = send_chunk(json!({"content": piece}), None, None);
         });
         match result {
@@ -248,22 +294,116 @@ fn handle_chat(engine: &Arc<Engine>, model_id: &str, body: &str) -> HttpResponse
         .with_data(Box::new(ChannelReader::new(rx)) as Box<dyn Read + Send>, None)
         .with_header(tiny_http::Header::from_bytes("Content-Type", "text/event-stream").unwrap())
         .with_header(tiny_http::Header::from_bytes("Cache-Control", "no-cache").unwrap())
+        .with_header(cors_header())
 }
 
-/// Applies the ChatML template (same convention as the FFI boundary).
-fn apply_chatml(messages: &[Value]) -> String {
-    let mut out = String::new();
+/// Route to the media-aware engine path when the request carries images
+/// (image turns bypass the KV session cache engine-side by design).
+fn generate_maybe_media(
+    engine: &Arc<Engine>,
+    tokens: &[u32],
+    images: Vec<PixelBatch>,
+    config: &GenerationConfig,
+    on_token: impl FnMut(u32, &str),
+) -> combs_runtime::Result<GenerationStats> {
+    if images.is_empty() {
+        engine.generate(tokens, config, on_token)
+    } else {
+        engine.generate_with_media(tokens, images, config, on_token)
+    }
+}
+
+/// Builds the chat prompt in the model's own template (ChatML or Gemma
+/// turns, via [`Engine::wrap_chat`]), extracting OpenAI array content
+/// parts. `image_url` parts (base64 data: URLs) are decoded and
+/// preprocessed in order; each image's `<image>`-token span is spliced
+/// into the message text where the part appears (spans before the
+/// question, matching the `combs run --image` convention). Returns
+/// (prompt, pixel_batches).
+fn build_prompt(engine: &Arc<Engine>, messages: &[Value]) -> Result<(String, Vec<PixelBatch>), String> {
+    let vision = engine.metadata().vision.clone();
+    let mut images: Vec<PixelBatch> = Vec::new();
+    let mut pairs: Vec<(String, String)> = Vec::with_capacity(messages.len());
     for m in messages {
         let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
         let role = match role {
             "system" | "user" | "assistant" => role,
             _ => "user",
         };
-        let content = m.get("content").and_then(Value::as_str).unwrap_or("");
-        out.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
+        let mut content = String::new();
+        match m.get("content") {
+            Some(Value::String(s)) => content = s.clone(),
+            Some(Value::Array(parts)) => {
+                for part in parts {
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            if let Some(t) = part.get("text").and_then(Value::as_str) {
+                                content.push_str(t);
+                            }
+                        }
+                        Some("image_url") => {
+                            let url = part
+                                .get("image_url")
+                                .and_then(|u| u.get("url"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            let v = vision.as_ref().ok_or(
+                                "this model has no vision tower — use a vision model (e.g. smolvlm) for image input",
+                            )?;
+                            let bytes = decode_data_image(url)?;
+                            let batch = SiglipPreprocessor::new(v.image_size)
+                                .preprocess(&bytes)
+                                .map_err(|e| format!("image preprocessing failed: {e}"))?;
+                            images.push(batch);
+                            content.push_str(&image_prompt_expansion(v.image_seq_len()));
+                        }
+                        _ => {} // unknown parts ignored (forward-compat)
+                    }
+                }
+            }
+            _ => {}
+        }
+        pairs.push((role.to_string(), content));
     }
-    out.push_str("<|im_start|>assistant\n");
-    out
+    // Vision models (Idefics3/SmolVLM) were trained on a specific
+    // `<|im_start|>User:<image-tokens>prompt\nAssistant:` format with no
+    // `<|im_end|>` separators. The generic `wrap_chat` ChatML path works
+    // for text-only models but degrades vision output, so we build the
+    // vision prompt explicitly when images are present.
+    let prompt = if images.is_empty() {
+        engine.wrap_chat(&pairs)
+    } else {
+        let mut prompt = String::from("<|im_start|>User:");
+        for (role, content) in &pairs {
+            match role.as_str() {
+                "system" => {
+                    prompt.push_str(content);
+                    prompt.push('\n');
+                }
+                "user" => prompt.push_str(content),
+                "assistant" => {
+                    prompt.push_str("\n<|im_start|>Assistant: ");
+                    prompt.push_str(content);
+                    prompt.push('\n');
+                }
+                _ => {}
+            }
+        }
+        prompt.push_str("\nAssistant:");
+        prompt
+    };
+    Ok((prompt, images))
+}
+
+/// Decodes a `data:<mime>;base64,<payload>` image URL. Remote http(s)
+/// URLs are rejected — fetch client-side and inline as a data URL.
+fn decode_data_image(url: &str) -> Result<Vec<u8>, String> {
+    let payload = url
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(',').map(|(_, data)| data))
+        .ok_or("image_url must be a base64 data: URL (fetch remote URLs client-side)")?;
+    B64.decode(payload.trim())
+        .map_err(|e| format!("bad image base64: {e}"))
 }
 
 /// `Read` over an mpsc channel of SSE strings: blocks until the next chunk

@@ -6,6 +6,7 @@
 //! [`ModelRegistry`]. Phase 1 ships the Llama family (incl. SmolLM2).
 
 mod kv;
+mod gemma;
 mod llama;
 mod matmul;
 mod norm;
@@ -15,6 +16,7 @@ mod rope;
 mod smolvlm;
 mod traits;
 
+pub use gemma::GemmaModel;
 pub use kv::{CacheConfig, CacheKind, ContiguousKVCache, KVCache, PagedKVCache};
 pub use llama::LlamaModel;
 pub use norm::rms_norm;

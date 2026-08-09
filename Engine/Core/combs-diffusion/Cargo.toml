@@ -1,0 +1,19 @@
+[package]
+name = "combs-diffusion"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+description = "Diffusion model runtime for Combs Engine (Burn-native)"
+
+[dependencies]
+burn.workspace = true
+combs-core.workspace = true
+combs-formats = { path = "../combs-formats", version = "0.2.0" }
+combs-models = { path = "../combs-models", version = "0.2.0" }
+serde_json.workspace = true
+thiserror.workspace = true
+tokenizers.workspace = true
+
+[dev-dependencies]
+burn = { version = "0.21.0", default-features = false, features = ["ndarray", "std"] }
+tempfile = "3"

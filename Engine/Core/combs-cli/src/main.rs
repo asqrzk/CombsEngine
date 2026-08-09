@@ -14,6 +14,7 @@ use combs_media::ImagePreprocessor;
 use combs_runtime::{Engine, GenerationConfig};
 
 mod chew;
+mod generate_image;
 mod pull;
 mod serve;
 
@@ -82,12 +83,17 @@ enum Command {
     Pull {
         /// Preset id (smollm2-135m) or HuggingFace repo (org/name).
         source: String,
+        /// Download a Stable Diffusion checkpoint (unet/vae/text_encoder subdirs).
+        #[arg(long)]
+        diffusion: bool,
     },
     /// Convert/repackage a model (Phase 5).
     Convert {
         /// Input model path.
         input: PathBuf,
     },
+    /// Generate an image with a local Stable Diffusion checkpoint.
+    GenerateImage(generate_image::GenerateImageArgs),
     /// Start an OpenAI-compatible HTTP server.
     Serve {
         /// Path to the model directory (HF safetensors layout) or .gguf file.
@@ -130,12 +136,13 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Run(args) => cmd_run(args),
         Command::Devices => cmd_devices(),
-        Command::Pull { source } => {
-            let dir = pull::pull(&source)?;
+        Command::Pull { source, diffusion } => {
+            let dir = pull::pull(&source, diffusion)?;
             println!("cached at: {}", dir.display());
             Ok(())
         }
         Command::Convert { .. } => not_yet("convert", "Phase 5 (GGUF/burnpack adapters)"),
+        Command::GenerateImage(args) => generate_image::cmd_generate_image(args),
         Command::Serve { model, port } => cmd_serve(model, port),
         Command::Chew(cmd) => match cmd.mode {
             ChewMode::ChatUi(args) => chew::chew("chat-ui", args),
@@ -162,6 +169,9 @@ fn resolve_model_arg(model: &PathBuf) -> Result<PathBuf> {
     }
     let name = model.to_string_lossy();
     if let Some(dir) = pull::cached_dir(&name) {
+        return Ok(dir);
+    }
+    if let Some(dir) = pull::cached_diffusion_dir(&name) {
         return Ok(dir);
     }
     anyhow::bail!("model '{name}' not found — download it first: combs pull {name}")
