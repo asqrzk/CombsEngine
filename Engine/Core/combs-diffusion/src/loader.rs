@@ -117,13 +117,17 @@ fn load_stable_diffusion_1_5<B: Backend>(
 }
 
 /// Read `tokenizer.json` / `tokenizer_config.json` from a Diffusers root.
+/// Accepts either a root `tokenizer.json` or `tokenizer/tokenizer.json`.
 fn load_tokenizer_spec(model_dir: &Path) -> Result<TokenizerSpec> {
-    let tokenizer_json = model_dir.join("tokenizer.json");
-    if !tokenizer_json.exists() {
+    let tokenizer_json = if model_dir.join("tokenizer.json").is_file() {
+        model_dir.join("tokenizer.json")
+    } else if model_dir.join("tokenizer/tokenizer.json").is_file() {
+        model_dir.join("tokenizer/tokenizer.json")
+    } else {
         return Err(FormatError::MissingFile(
-            tokenizer_json.display().to_string(),
+            "tokenizer.json or tokenizer/tokenizer.json".to_string(),
         ));
-    }
+    };
 
     let mut added_tokens = std::collections::HashMap::new();
     let mut chat_template = None;

@@ -225,6 +225,7 @@ impl<B: Backend> VAEDecoder<B> {
             "decoder.conv_in",
             [LATENT_CHANNELS, BLOCK_OUT_CHANNELS[3]],
             [3, 3],
+            [1, 1],
             device,
         )?;
 
@@ -270,6 +271,7 @@ impl<B: Backend> VAEDecoder<B> {
             "decoder.conv_out",
             [BLOCK_OUT_CHANNELS[0], OUT_CHANNELS],
             [3, 3],
+            [1, 1],
             device,
         )?;
 

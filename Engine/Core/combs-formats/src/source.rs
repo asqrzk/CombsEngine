@@ -31,23 +31,42 @@ pub trait ModelSource: Send + Sync {
 /// Element dtypes supported by the loaders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TensorDtype {
+    /// IEEE 64-bit float.
+    F64,
     /// IEEE 32-bit float.
     F32,
     /// IEEE 16-bit half float.
     F16,
     /// bfloat16.
     BF16,
+    /// Signed 64-bit integer.
+    I64,
+    /// Signed 32-bit integer.
+    I32,
+    /// Signed 16-bit integer.
+    I16,
+    /// Signed 8-bit integer.
+    I8,
+    /// Unsigned 64-bit integer.
+    U64,
+    /// Unsigned 32-bit integer.
+    U32,
+    /// Unsigned 16-bit integer.
+    U16,
     /// Unsigned 8-bit integer (raw packed data, e.g. quantized weights).
     U8,
+    /// Boolean (stored as one byte).
+    Bool,
 }
 
 impl TensorDtype {
     /// Byte size of one element.
     pub fn size(&self) -> usize {
         match self {
-            TensorDtype::F32 => 4,
-            TensorDtype::F16 | TensorDtype::BF16 => 2,
-            TensorDtype::U8 => 1,
+            TensorDtype::F64 | TensorDtype::I64 | TensorDtype::U64 => 8,
+            TensorDtype::F32 | TensorDtype::I32 | TensorDtype::U32 => 4,
+            TensorDtype::F16 | TensorDtype::BF16 | TensorDtype::I16 | TensorDtype::U16 => 2,
+            TensorDtype::I8 | TensorDtype::U8 | TensorDtype::Bool => 1,
         }
     }
 }
@@ -55,10 +74,19 @@ impl TensorDtype {
 impl std::fmt::Display for TensorDtype {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            TensorDtype::F64 => write!(f, "F64"),
             TensorDtype::F32 => write!(f, "F32"),
             TensorDtype::F16 => write!(f, "F16"),
             TensorDtype::BF16 => write!(f, "BF16"),
+            TensorDtype::I64 => write!(f, "I64"),
+            TensorDtype::I32 => write!(f, "I32"),
+            TensorDtype::I16 => write!(f, "I16"),
+            TensorDtype::I8 => write!(f, "I8"),
+            TensorDtype::U64 => write!(f, "U64"),
+            TensorDtype::U32 => write!(f, "U32"),
+            TensorDtype::U16 => write!(f, "U16"),
             TensorDtype::U8 => write!(f, "U8"),
+            TensorDtype::Bool => write!(f, "Bool"),
         }
     }
 }
@@ -112,10 +140,16 @@ impl<'a> TensorReader<'a> {
         self.shape.iter().product()
     }
 
-    /// Converts the raw bytes to f32 `TensorData` (F16/BF16 are widened, F32
-    /// is a straight reinterpretation of the little-endian bytes).
+    /// Converts the raw bytes to f32 `TensorData`. Integer and boolean tensors
+    /// are cast to f32 so weight loaders never abort on buffer dtypes such as
+    /// I64 `position_ids`.
     pub fn load_data(&self) -> Result<TensorData> {
         let values: Vec<f32> = match self.dtype {
+            TensorDtype::F64 => self
+                .data
+                .chunks_exact(8)
+                .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32)
+                .collect(),
             TensorDtype::F32 => self
                 .data
                 .chunks_exact(4)
@@ -131,14 +165,51 @@ impl<'a> TensorReader<'a> {
                 .chunks_exact(2)
                 .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect(),
+            TensorDtype::I64 => self
+                .data
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32)
+                .collect(),
+            TensorDtype::I32 => self
+                .data
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
+                .collect(),
+            TensorDtype::I16 => self
+                .data
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32)
+                .collect(),
+            TensorDtype::I8 => self
+                .data
+                .iter()
+                .map(|&b| b as i8 as f32)
+                .collect(),
+            TensorDtype::U64 => self
+                .data
+                .chunks_exact(8)
+                .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32)
+                .collect(),
+            TensorDtype::U32 => self
+                .data
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
+                .collect(),
+            TensorDtype::U16 => self
+                .data
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]) as f32)
+                .collect(),
             TensorDtype::U8 => self.data.iter().map(|&b| b as f32).collect(),
+            TensorDtype::Bool => self.data.iter().map(|&b| (b != 0) as i32 as f32).collect(),
         };
         if values.len() != self.num_elements() {
             return Err(FormatError::Safetensors(format!(
-                "tensor {}: expected {} elements, got {}",
+                "tensor {}: expected {} elements, got {} (dtype {})",
                 self.name,
                 self.num_elements(),
-                values.len()
+                values.len(),
+                self.dtype
             )));
         }
         Ok(TensorData::new(values, self.shape.clone()))

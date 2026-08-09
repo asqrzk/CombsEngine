@@ -62,25 +62,33 @@ pub fn expect_shape(name: &str, actual: &[usize], expected: &[usize]) -> Result<
 }
 
 /// Load a `Conv2d` module from HF-style `weight` and optional `bias`.
+/// Falls back to `{prefix}.conv.weight` for Diffusers `Downsample2D` /
+/// `Upsample2D` wrappers.
 pub(crate) fn load_conv2d<B: Backend>(
     source: &dyn ModelSource,
     prefix: &str,
     channels: [usize; 2],
     kernel_size: [usize; 2],
+    stride: [usize; 2],
     device: &burn::tensor::Device<B>,
 ) -> Result<Conv2d<B>> {
-    let weight = load_param::<B, 4>(source, &format!("{prefix}.weight"), device)?;
-    let bias = load_optional_param::<B, 1>(source, &format!("{prefix}.bias"), device)?;
+    let (weight_key, bias_key) = if source.tensor_names().contains(&format!("{prefix}.weight")) {
+        (format!("{prefix}.weight"), format!("{prefix}.bias"))
+    } else {
+        (format!("{prefix}.conv.weight"), format!("{prefix}.conv.bias"))
+    };
+    let weight = load_param::<B, 4>(source, &weight_key, device)?;
+    let bias = load_optional_param::<B, 1>(source, &bias_key, device)?;
     let [out_ch, in_ch, kh, kw] = weight.dims();
     expect_shape(
-        &format!("{prefix}.weight"),
+        &weight_key,
         &[out_ch, in_ch, kh, kw],
         &[channels[1], channels[0], kernel_size[0], kernel_size[1]],
     )?;
     Ok(Conv2d {
         weight,
         bias,
-        stride: [1, 1],
+        stride,
         kernel_size,
         dilation: [1, 1],
         groups: 1,

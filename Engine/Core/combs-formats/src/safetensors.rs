@@ -69,16 +69,25 @@ fn read_json(path: &Path, required: bool) -> Result<Option<serde_json::Value>> {
 }
 
 fn convert_dtype(
-    name: &str,
+    _name: &str,
     dtype: safetensors::Dtype,
 ) -> Result<TensorDtype> {
     match dtype {
+        safetensors::Dtype::F64 => Ok(TensorDtype::F64),
         safetensors::Dtype::F32 => Ok(TensorDtype::F32),
         safetensors::Dtype::F16 => Ok(TensorDtype::F16),
         safetensors::Dtype::BF16 => Ok(TensorDtype::BF16),
+        safetensors::Dtype::I64 => Ok(TensorDtype::I64),
+        safetensors::Dtype::I32 => Ok(TensorDtype::I32),
+        safetensors::Dtype::I16 => Ok(TensorDtype::I16),
+        safetensors::Dtype::I8 => Ok(TensorDtype::I8),
+        safetensors::Dtype::U64 => Ok(TensorDtype::U64),
+        safetensors::Dtype::U32 => Ok(TensorDtype::U32),
+        safetensors::Dtype::U16 => Ok(TensorDtype::U16),
         safetensors::Dtype::U8 => Ok(TensorDtype::U8),
+        safetensors::Dtype::BOOL => Ok(TensorDtype::Bool),
         other => Err(FormatError::UnsupportedDtype {
-            tensor: name.to_string(),
+            tensor: _name.to_string(),
             dtype: format!("{other:?}"),
         }),
     }
@@ -349,8 +358,20 @@ mod tests {
             &w2_bytes,
         )
         .unwrap();
+
+        // Add an I64 position_ids buffer like some CLIP text encoders ship.
+        let pos_ids_bytes: Vec<u8> = (0..8i64)
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
+        let v_pos = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::I64,
+            vec![8],
+            &pos_ids_bytes,
+        )
+        .unwrap();
+
         safetensors::serialize_to_file(
-            vec![("a.weight", v1), ("b.weight", v2)],
+            vec![("a.weight", v1), ("b.weight", v2), ("text_model.embeddings.position_ids", v_pos)],
             None,
             root.join("model.safetensors").as_path(),
         )
@@ -359,7 +380,15 @@ mod tests {
         let src = SafetensorsSource::load(root).unwrap();
         assert_eq!(src.metadata().architecture, "llama");
         assert_eq!(src.metadata().head_dim, 4);
-        assert_eq!(src.tensor_names(), vec!["a.weight", "b.weight"]);
+        assert_eq!(
+            src.tensor_names(),
+            vec!["a.weight", "b.weight", "text_model.embeddings.position_ids"]
+        );
+
+        let pos = src.open_tensor("text_model.embeddings.position_ids").unwrap();
+        assert_eq!(pos.dtype(), TensorDtype::I64);
+        let pos_vals: Vec<f32> = pos.load_data().unwrap().to_vec().unwrap();
+        assert_eq!(pos_vals[7], 7.0);
 
         let a = src.open_tensor("a.weight").unwrap();
         assert_eq!(a.shape(), &[4, 4]);

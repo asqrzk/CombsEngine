@@ -201,7 +201,7 @@ impl<B: Backend> UNet2DConditionModel<B> {
         let layers_per_block = 2;
         let n_blocks = block_out_channels.len();
 
-        let conv_in = load_conv2d(source, "conv_in", [4, block_out_channels[0]], [3, 3], device)?;
+        let conv_in = load_conv2d(source, "conv_in", [4, block_out_channels[0]], [3, 3], [1, 1], device)?;
         let time_emb = TimeEmbedding::load_from(
             source,
             "time_embedding",
@@ -333,6 +333,7 @@ impl<B: Backend> UNet2DConditionModel<B> {
             "conv_out",
             [block_out_channels[0], 4],
             [3, 3],
+            [1, 1],
             device,
         )?;
 

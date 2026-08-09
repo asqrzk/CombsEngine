@@ -83,9 +83,6 @@ enum Command {
     Pull {
         /// Preset id (smollm2-135m) or HuggingFace repo (org/name).
         source: String,
-        /// Download a Stable Diffusion checkpoint (unet/vae/text_encoder subdirs).
-        #[arg(long)]
-        diffusion: bool,
     },
     /// Convert/repackage a model (Phase 5).
     Convert {
@@ -136,8 +133,8 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Run(args) => cmd_run(args),
         Command::Devices => cmd_devices(),
-        Command::Pull { source, diffusion } => {
-            let dir = pull::pull(&source, diffusion)?;
+        Command::Pull { source } => {
+            let dir = pull::pull(&source)?;
             println!("cached at: {}", dir.display());
             Ok(())
         }

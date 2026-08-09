@@ -80,16 +80,16 @@ impl<B: Backend> ResnetBlock2D<B> {
         let groups2 = norm_groups(out_channels);
 
         let norm1 = load_group_norm(source, &format!("{prefix}.norm1"), groups1, in_channels, eps, device)?;
-        let conv1 = load_conv2d(source, &format!("{prefix}.conv1"), [in_channels, out_channels], [3, 3], device)?;
+        let conv1 = load_conv2d(source, &format!("{prefix}.conv1"), [in_channels, out_channels], [3, 3], [1, 1], device)?;
         let time_emb_proj = if let Some(d) = time_emb_dim {
             Some(load_linear(source, &format!("{prefix}.time_emb_proj"), d, out_channels, true, device)?)
         } else {
             None
         };
         let norm2 = load_group_norm(source, &format!("{prefix}.norm2"), groups2, out_channels, eps, device)?;
-        let conv2 = load_conv2d(source, &format!("{prefix}.conv2"), [out_channels, out_channels], [3, 3], device)?;
+        let conv2 = load_conv2d(source, &format!("{prefix}.conv2"), [out_channels, out_channels], [3, 3], [1, 1], device)?;
         let conv_shortcut = if in_channels != out_channels {
-            Some(load_conv2d(source, &format!("{prefix}.conv_shortcut"), [in_channels, out_channels], [1, 1], device)?)
+            Some(load_conv2d(source, &format!("{prefix}.conv_shortcut"), [in_channels, out_channels], [1, 1], [1, 1], device)?)
         } else {
             None
         };
@@ -412,7 +412,7 @@ impl<B: Backend> SpatialTransformer<B> {
         device: &burn::tensor::Device<B>,
     ) -> Result<Self> {
         let norm = load_group_norm(source, &format!("{prefix}.norm"), norm_groups(channels), channels, 1e-6, device)?;
-        let proj_in = load_conv2d(source, &format!("{prefix}.proj_in"), [channels, channels], [1, 1], device)?;
+        let proj_in = load_conv2d(source, &format!("{prefix}.proj_in"), [channels, channels], [1, 1], [1, 1], device)?;
         let transformer = BasicTransformerBlock::load_from(
             source,
             &format!("{prefix}.transformer_blocks.0"),
@@ -423,7 +423,7 @@ impl<B: Backend> SpatialTransformer<B> {
             false,
             device,
         )?;
-        let proj_out = load_conv2d(source, &format!("{prefix}.proj_out"), [channels, channels], [1, 1], device)?;
+        let proj_out = load_conv2d(source, &format!("{prefix}.proj_out"), [channels, channels], [1, 1], [1, 1], device)?;
         Ok(Self {
             norm,
             proj_in,
@@ -473,7 +473,7 @@ impl<B: Backend> Downsample2D<B> {
         channels: usize,
         device: &burn::tensor::Device<B>,
     ) -> Result<Self> {
-        let conv = load_conv2d(source, prefix, [channels, channels], [3, 3], device)?;
+        let conv = load_conv2d(source, prefix, [channels, channels], [3, 3], [2, 2], device)?;
         Ok(Self { conv })
     }
 
@@ -501,7 +501,7 @@ impl<B: Backend> Upsample2D<B> {
         channels: usize,
         device: &burn::tensor::Device<B>,
     ) -> Result<Self> {
-        let conv = load_conv2d(source, prefix, [channels, channels], [3, 3], device)?;
+        let conv = load_conv2d(source, prefix, [channels, channels], [3, 3], [1, 1], device)?;
         Ok(Self { conv })
     }
 

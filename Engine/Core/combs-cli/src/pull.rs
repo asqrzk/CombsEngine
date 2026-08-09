@@ -8,8 +8,11 @@
 //! boundary (chats, downloads, agent data), not the engine's model store.
 //!
 //! Accepts a preset id (`smollm2-135m`) or a full HF repo
-//! (`HuggingFaceTB/SmolLM2-135M-Instruct`).
+//! (`HuggingFaceTB/SmolLM2-135M-Instruct`). Models are detected from the
+//! remote file tree: text/vision (config.json), diffusion (model_index.json),
+//! or GGUF (single `.gguf` file).
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -17,28 +20,33 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use console::style;
 
-/// Files every preset needs (tokenizer.json covers vocab/merges).
-const FILES: &[&str] = &[
-    "config.json",
-    "generation_config.json",
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "model.safetensors",
+/// Preset id, HF repo, cache slug.
+pub const PRESETS: &[(&str, &str, &str)] = &[
+    ("smollm2-135m", "HuggingFaceTB/SmolLM2-135M-Instruct", "smollm2-135m"),
+    ("smollm2-360m", "HuggingFaceTB/SmolLM2-360M-Instruct", "smollm2-360m"),
+    ("smollm2-1.7b", "HuggingFaceTB/SmolLM2-1.7B-Instruct", "smollm2-1.7b"),
+    ("smolvlm-256m", "HuggingFaceTB/SmolVLM-256M-Instruct", "smolvlm-256m"),
+    ("sd-1.5", "runwayml/stable-diffusion-v1-5", "stable-diffusion-v1-5"),
 ];
 
-/// Preset id → Hugging Face repo (must match @combs/core presets).
-pub const PRESETS: &[(&str, &str)] = &[
-    ("smollm2-135m", "HuggingFaceTB/SmolLM2-135M-Instruct"),
-    ("smollm2-360m", "HuggingFaceTB/SmolLM2-360M-Instruct"),
-    ("smollm2-1.7b", "HuggingFaceTB/SmolLM2-1.7B-Instruct"),
-    ("smolvlm-256m", "HuggingFaceTB/SmolVLM-256M-Instruct"),
-    ("sd-1.5", "runwayml/stable-diffusion-v1-5"),
-];
+#[derive(Debug, Clone, serde::Deserialize)]
+struct TreeEntry {
+    path: String,
+    #[serde(rename = "type")]
+    r#type: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    TextVision,
+    Diffusion,
+    Gguf,
+}
 
 pub fn resolve_repo(source: &str) -> (String, String) {
-    for (id, repo) in PRESETS {
+    for (id, repo, slug) in PRESETS {
         if source.eq_ignore_ascii_case(id) || source.eq_ignore_ascii_case(repo) {
-            return ((*id).to_string(), (*repo).to_string());
+            return ((*slug).to_string(), (*repo).to_string());
         }
     }
     // Full repo id: cache under the model slug.
@@ -58,14 +66,25 @@ pub fn cache_root() -> Result<PathBuf> {
     Ok(home.join("models"))
 }
 
-/// True when `source` resolves to a preset/repo already in the cache.
+/// Returns the cached path for a text/vision or GGUF model, if present.
 pub fn cached_dir(source: &str) -> Option<PathBuf> {
     let (id, _) = resolve_repo(source);
     let dir = cache_root().ok()?.join(id);
-    dir.join("model.safetensors").is_file().then_some(dir)
+    if dir.join("model.safetensors").is_file() {
+        return Some(dir);
+    }
+    // GGUF is cached as a single file inside the slug dir.
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if entry.path().extension().is_some_and(|e| e == "gguf") {
+                return Some(entry.path());
+            }
+        }
+    }
+    None
 }
 
-/// True when `source` resolves to a diffusion checkpoint in the cache.
+/// Returns the cached path for a diffusion checkpoint, if present.
 pub fn cached_diffusion_dir(source: &str) -> Option<PathBuf> {
     let (id, _) = resolve_repo(source);
     let dir = cache_root().ok()?.join(id);
@@ -80,83 +99,298 @@ pub fn cached_diffusion_dir(source: &str) -> Option<PathBuf> {
 }
 
 /// Downloads `source` (preset id or HF repo) into the cache; returns the
-/// cache directory. Existing files are skipped (resume-friendly).
-pub fn pull(source: &str, diffusion: bool) -> Result<PathBuf> {
-    if diffusion {
-        return pull_diffusion(source);
-    }
-
-    let (id, repo) = resolve_repo(source);
-    let dir = cache_root()?.join(&id);
+/// cache directory (or file, for GGUF). Existing files are skipped.
+pub fn pull(source: &str) -> Result<PathBuf> {
+    let (slug, repo) = resolve_repo(source);
+    let dir = cache_root()?.join(&slug);
     fs::create_dir_all(&dir)?;
+
+    let tree = fetch_tree(&repo)?;
+    let kind = detect_kind(&tree)?;
 
     println!(
         "{}",
         style(format!("pulling {repo} → {}", dir.display())).bold().cyan()
     );
-    for file in FILES {
-        let target = dir.join(file);
-        if target.is_file() {
-            println!("  {} {file}", style("✓ cached").dim());
-            continue;
-        }
-        let url = format!("https://huggingface.co/{repo}/resolve/main/{file}");
-        download(&url, &target).with_context(|| format!("downloading {file}"))?;
-    }
+
+    match kind {
+        Kind::Diffusion => pull_diffusion(&repo, &dir, &tree),
+        Kind::TextVision => pull_text(&repo, &dir, &tree),
+        Kind::Gguf => pull_gguf(&repo, &dir, &tree),
+    }?;
+
     println!("{}", style("model ready").bold().green());
     Ok(dir)
 }
 
-/// Stable Diffusion checkpoint layout used by `combs-diffusion`:
-///   unet/diffusion_pytorch_model.safetensors
-///   vae/diffusion_pytorch_model.safetensors
-///   text_encoder/model.safetensors
-///   tokenizer.json   (from openai/clip-vit-large-patch14)
-fn pull_diffusion(source: &str) -> Result<PathBuf> {
-    let repo = source.to_string();
-    let slug = source.rsplit('/').next().unwrap_or(source).to_lowercase();
-    let dir = cache_root()?.join(slug);
-
-    println!(
-        "{}",
-        style(format!("pulling diffusion checkpoint {repo} → {}", dir.display())).bold().cyan()
+fn fetch_tree(repo: &str) -> Result<Vec<TreeEntry>> {
+    let url = format!(
+        "https://huggingface.co/api/models/{repo}/tree/main?recursive=true"
     );
-
-    // UNet: prefer fp16, fall back to full precision.
-    download_subdir_file(&repo, &dir, "unet", "diffusion_pytorch_model", &[".fp16.safetensors", ".safetensors"])?;
-    // VAE
-    download_subdir_file(&repo, &dir, "vae", "diffusion_pytorch_model", &[".fp16.safetensors", ".safetensors"])?;
-    // Text encoder (CLIP)
-    download_subdir_file(&repo, &dir, "text_encoder", "model", &[".fp16.safetensors", ".safetensors"])?;
-
-    // CLIP tokenizer — SD 1.5 uses openai/clip-vit-large-patch14's tokenizer.json.
-    let tok_target = dir.join("tokenizer.json");
-    if !tok_target.is_file() {
-        let tok_url = "https://huggingface.co/openai/clip-vit-large-patch14/resolve/main/tokenizer.json";
-        download(tok_url, &tok_target).context("downloading CLIP tokenizer.json")?;
-    } else {
-        println!("  {} tokenizer.json", style("✓ cached").dim());
+    let mut req = ureq::get(&url);
+    if let Some(token) = hf_token() {
+        req = req.header("Authorization", &format!("Bearer {token}"));
     }
-
-    println!("{}", style("diffusion checkpoint ready").bold().green());
-    Ok(dir)
+    let resp = req
+        .call()
+        .with_context(|| format!("fetching file tree for {repo}"))?;
+    let text = resp
+        .into_body()
+        .read_to_string()
+        .context("reading tree response")?;
+    let mut entries: Vec<TreeEntry> =
+        serde_json::from_str(&text).context("parsing HF tree JSON")?;
+    entries.retain(|e| e.r#type == "file");
+    Ok(entries)
 }
 
-/// Try a list of suffixes in order and save the first hit as `{name}.safetensors`.
-fn download_subdir_file(repo: &str, dir: &PathBuf, subdir: &str, name: &str, suffixes: &[&str]) -> Result<()> {
-    let target = dir.join(subdir).join(format!("{name}.safetensors"));
+fn detect_kind(tree: &[TreeEntry]) -> Result<Kind> {
+    let paths: HashSet<&str> = tree.iter().map(|e| e.path.as_str()).collect();
+    if paths.contains("model_index.json") {
+        return Ok(Kind::Diffusion);
+    }
+    if paths.contains("config.json") {
+        return Ok(Kind::TextVision);
+    }
+    if paths.iter().any(|p| p.ends_with(".gguf")) {
+        return Ok(Kind::Gguf);
+    }
+    bail!(
+        "cannot detect model kind: no config.json, model_index.json, or .gguf found in the repo"
+    )
+}
+
+fn pull_text(repo: &str, dir: &PathBuf, tree: &[TreeEntry]) -> Result<()> {
+    let paths: HashSet<&str> = tree.iter().map(|e| e.path.as_str()).collect();
+
+    // Required/optional config files.
+    let required = ["config.json", "tokenizer.json"];
+    for file in required {
+        if paths.contains(file) {
+            download_required(repo, dir, file)?;
+        } else {
+            bail!("text model missing required file: {file}");
+        }
+    }
+    download_optional(repo, dir, "generation_config.json")?;
+    download_optional(repo, dir, "tokenizer_config.json")?;
+
+    // Weight files: single → sharded → GGUF.
+    if paths.contains("model.safetensors") {
+        download_required(repo, dir, "model.safetensors")?;
+    } else if paths.contains("model.safetensors.index.json") {
+        download_required(repo, dir, "model.safetensors.index.json")?;
+        let index_text = fs::read_to_string(dir.join("model.safetensors.index.json"))?;
+        let index: serde_json::Value =
+            serde_json::from_str(&index_text).context("parsing safetensors index")?;
+        let weight_map = index
+            .get("weight_map")
+            .and_then(|v| v.as_object())
+            .context("model.safetensors.index.json missing weight_map")?;
+        let mut shard_files: Vec<&str> = weight_map
+            .values()
+            .filter_map(|v| v.as_str())
+            .collect();
+        shard_files.sort();
+        shard_files.dedup();
+        for file in shard_files {
+            download_required(repo, dir, file)?;
+        }
+    } else if let Some(file) = pick_safetensors_file(tree) {
+        download_required(repo, dir, &file)?;
+    } else if let Some(file) = pick_gguf_file(tree) {
+        // Save GGUF as model.gguf inside the slug dir so serve can find it.
+        let target = dir.join("model.gguf");
+        download_required_as(repo, &target, &format!("{repo}/resolve/main/{file}"))?;
+    } else {
+        bail!("no safetensors or GGUF weight files found");
+    }
+
+    Ok(())
+}
+
+fn pull_gguf(repo: &str, dir: &PathBuf, tree: &[TreeEntry]) -> Result<()> {
+    let file = pick_gguf_file(tree).context("no .gguf file found")?;
+    let target = dir.join("model.gguf");
+    download_required_as(repo, &target, &format!("{repo}/resolve/main/{file}"))?;
+    Ok(())
+}
+
+fn pick_safetensors_file(tree: &[TreeEntry]) -> Option<String> {
+    // Prefer the canonical single file, then any sharded-style file.
+    for file in tree.iter().map(|e| &e.path) {
+        if file == "model.safetensors" {
+            return Some(file.clone());
+        }
+    }
+    for file in tree.iter().map(|e| &e.path) {
+        if file.ends_with(".safetensors") && !file.contains(".") {
+            return Some(file.clone());
+        }
+    }
+    tree.iter()
+        .map(|e| &e.path)
+        .find(|p| p.ends_with(".safetensors"))
+        .cloned()
+}
+
+fn pick_gguf_file(tree: &[TreeEntry]) -> Option<String> {
+    let mut files: Vec<String> = tree
+        .iter()
+        .filter(|e| e.path.ends_with(".gguf"))
+        .map(|e| e.path.clone())
+        .collect();
+    if files.is_empty() {
+        return None;
+    }
+    // Prefer sensible quant ordering; Q4_K_M is a good default.
+    let prefs = ["Q4_K_M", "Q4_K_S", "Q4_0", "Q5_K_M", "Q5_K_S", "Q8_0"];
+    for pref in prefs {
+        if let Some(f) = files.iter().find(|f| f.contains(pref)) {
+            return Some(f.clone());
+        }
+    }
+    files.sort();
+    files.into_iter().next()
+}
+
+fn pull_diffusion(repo: &str, dir: &PathBuf, tree: &[TreeEntry]) -> Result<()> {
+    let paths: HashSet<&str> = tree.iter().map(|e| e.path.as_str()).collect();
+
+    // Model metadata used for architecture detection.
+    download_required(repo, dir, "model_index.json")?;
+
+    // Component dirs we currently support.
+    let components = ["unet", "vae", "text_encoder"];
+    for comp in components {
+        if !paths.iter().any(|p| p.starts_with(&format!("{comp}/"))) {
+            bail!("diffusion checkpoint missing required component: {comp}/");
+        }
+        download_required(repo, dir, &format!("{comp}/config.json"))?;
+
+        let (candidates, canonical) = match comp {
+            "unet" | "vae" => (
+                vec![
+                    format!("{comp}/diffusion_pytorch_model.fp16.safetensors"),
+                    format!("{comp}/diffusion_pytorch_model.safetensors"),
+                ],
+                format!("{comp}/diffusion_pytorch_model.safetensors"),
+            ),
+            "text_encoder" => (
+                vec![
+                    format!("{comp}/model.fp16.safetensors"),
+                    format!("{comp}/model.safetensors"),
+                    format!("{comp}/diffusion_pytorch_model.fp16.safetensors"),
+                    format!("{comp}/diffusion_pytorch_model.safetensors"),
+                ],
+                format!("{comp}/model.safetensors"),
+            ),
+            _ => unreachable!(),
+        };
+        download_first_as(repo, dir, &candidates, &canonical)?;
+    }
+
+    // Tokenizer: prefer in-repo fast tokenizer, then root tokenizer.json,
+    // then the CLIP repo fallback, then BPE vocab+merges.
+    if paths.contains("tokenizer/tokenizer.json") {
+        // Download all small tokenizer files we might need.
+        for file in ["tokenizer/tokenizer.json", "tokenizer/tokenizer_config.json"] {
+            download_optional(repo, dir, file)?;
+        }
+    } else if paths.contains("tokenizer.json") {
+        download_required(repo, dir, "tokenizer.json")?;
+    } else {
+        let tok_target = dir.join("tokenizer.json");
+        if !tok_target.is_file() {
+            let tok_url = "https://huggingface.co/openai/clip-vit-large-patch14/resolve/main/tokenizer.json";
+            if !try_download(tok_url, &tok_target)? {
+                // Fall back to old-style BPE files.
+                if paths.contains("tokenizer/vocab.json") && paths.contains("tokenizer/merges.txt") {
+                    download_required(repo, dir, "tokenizer/vocab.json")?;
+                    download_required(repo, dir, "tokenizer/merges.txt")?;
+                    download_optional(repo, dir, "tokenizer/tokenizer_config.json")?;
+                } else {
+                    bail!("diffusion checkpoint has no recognizable tokenizer");
+                }
+            }
+        } else {
+            println!("  {} tokenizer.json", style("✓ cached").dim());
+        }
+    }
+
+    // Scheduler config is optional but useful.
+    download_optional(repo, dir, "scheduler/scheduler_config.json")?;
+
+    Ok(())
+}
+
+/// Download `source_path` from the repo, erroring if it is missing.
+fn download_required(repo: &str, dir: &PathBuf, source_path: &str) -> Result<()> {
+    let target = dir.join(source_path);
     if target.is_file() {
-        println!("  {} {subdir}/{name}.safetensors", style("✓ cached").dim());
+        println!("  {} {source_path}", style("✓ cached").dim());
         return Ok(());
     }
-    fs::create_dir_all(target.parent().unwrap())?;
-    for suffix in suffixes {
-        let url = format!("https://huggingface.co/{repo}/resolve/main/{subdir}/{name}{suffix}");
-        match download(&url, &target) {
-            Ok(_) => return Ok(()),
-            Err(_) if suffix != suffixes.last().unwrap() => continue,
-            Err(e) => return Err(e).with_context(|| format!("downloading {subdir}/{name}.safetensors")),
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let url = format!("https://huggingface.co/{repo}/resolve/main/{source_path}");
+    download(&url, &target).with_context(|| format!("downloading {source_path}"))
+}
+
+/// Download from an arbitrary URL and save as `target`.
+fn download_required_as(_repo: &str, target: &PathBuf, url_relative: &str) -> Result<()> {
+    if target.is_file() {
+        println!("  {} {}", style("✓ cached").dim(), target.file_name().unwrap().to_string_lossy());
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let url = format!("https://huggingface.co/{url_relative}");
+    download(&url, target).with_context(|| format!("downloading {}", target.display()))
+}
+
+/// Try each source path in order; save the first hit as `target_relative`.
+fn download_first_as(
+    repo: &str,
+    dir: &PathBuf,
+    source_paths: &[String],
+    target_relative: &str,
+) -> Result<()> {
+    let target = dir.join(target_relative);
+    if target.is_file() {
+        println!("  {} {target_relative}", style("✓ cached").dim());
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    for (i, source) in source_paths.iter().enumerate() {
+        let url = format!("https://huggingface.co/{repo}/resolve/main/{source}");
+        match try_download(&url, &target) {
+            Ok(true) => return Ok(()),
+            Ok(false) if i + 1 < source_paths.len() => continue,
+            Ok(false) => bail!("none of the candidate weight files found: {source_paths:?}"),
+            Err(e) => return Err(e).with_context(|| format!("downloading {target_relative}")),
         }
+    }
+    Ok(())
+}
+
+/// Download an optional file; silently skip 404.
+fn download_optional(repo: &str, dir: &PathBuf, source_path: &str) -> Result<()> {
+    let target = dir.join(source_path);
+    if target.is_file() {
+        println!("  {} {source_path}", style("✓ cached").dim());
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let url = format!("https://huggingface.co/{repo}/resolve/main/{source_path}");
+    if try_download(&url, &target)? {
+        println!("  {} {source_path} ({:.1} MB)", style("✓").green(), file_mb(&target));
     }
     Ok(())
 }
@@ -167,50 +401,68 @@ fn hf_token() -> Option<String> {
         .ok()
 }
 
-fn download(url: &str, target: &PathBuf) -> Result<()> {
-    let part = target.with_extension("part");
+/// Download `url` to `target`, returning true on success. 404 returns false;
+/// other HTTP errors return Err.
+fn try_download(url: &str, target: &PathBuf) -> Result<bool> {
     let mut req = ureq::get(url);
     if let Some(token) = hf_token() {
         req = req.header("Authorization", &format!("Bearer {token}"));
     }
-    let resp = req.call().context("request failed")?;
-    let total: u64 = resp
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    match req.call() {
+        Ok(resp) => {
+            let part = target.with_extension("part");
+            let total: u64 = resp
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
 
-    let mut reader = resp.into_body().into_reader();
-    let mut out = fs::File::create(&part)?;
-    let mut buf = vec![0u8; 512 * 1024];
-    let mut done: u64 = 0;
-    let mut last_mb = 0u64;
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
+            let mut reader = resp.into_body().into_reader();
+            let mut out = fs::File::create(&part)?;
+            let mut buf = vec![0u8; 512 * 1024];
+            let mut done: u64 = 0;
+            let mut last_mb = 0u64;
+            loop {
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                out.write_all(&buf[..n])?;
+                done += n as u64;
+                let mb = done / (10 * 1024 * 1024);
+                if mb != last_mb {
+                    last_mb = mb;
+                    eprint!(
+                        "\r  {} {:.0}/{:.0} MB",
+                        style(target.file_name().unwrap().to_string_lossy().to_string()).bold(),
+                        done as f64 / 1e6,
+                        total as f64 / 1e6
+                    );
+                }
+            }
+            eprintln!();
+            out.flush()?;
+            if total > 0 && done != total {
+                fs::remove_file(&part).ok();
+                bail!("short download: {done}/{total} bytes");
+            }
+            fs::rename(&part, target)?;
+            Ok(true)
         }
-        out.write_all(&buf[..n])?;
-        done += n as u64;
-        let mb = done / (10 * 1024 * 1024);
-        if mb != last_mb {
-            last_mb = mb;
-            eprint!(
-                "\r  {} {:.0}/{:.0} MB",
-                style(target.file_name().unwrap().to_string_lossy().to_string()).bold(),
-                done as f64 / 1e6,
-                total as f64 / 1e6
-            );
-        }
+        Err(ureq::Error::StatusCode(404)) => Ok(false),
+        Err(e) => Err(e).context("request failed"),
     }
-    eprintln!();
-    out.flush()?;
-    if total > 0 && done != total {
-        fs::remove_file(&part).ok();
-        bail!("short download: {done}/{total} bytes");
+}
+
+/// Download `url` to `target`, erroring on any failure.
+fn download(url: &str, target: &PathBuf) -> Result<()> {
+    if !try_download(url, target)? {
+        bail!("HTTP 404: {url}");
     }
-    fs::rename(&part, target)?;
-    println!("  {} {} ({:.1} MB)", style("✓").green(), target.file_name().unwrap().to_string_lossy(), done as f64 / 1e6);
     Ok(())
+}
+
+fn file_mb(path: &PathBuf) -> f64 {
+    fs::metadata(path).map(|m| m.len() as f64 / 1e6).unwrap_or(0.0)
 }
