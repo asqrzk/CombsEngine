@@ -1199,6 +1199,7 @@ name = "combs-core"
 version = "0.2.0"
 dependencies = [
  "burn",
+ "cubecl",
  "serde",
  "wgpu",
 ]

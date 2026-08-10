@@ -134,6 +134,27 @@ pub trait KVCache<B: Backend>: Send {
     fn pages_used(&self) -> Option<usize> {
         None
     }
+
+    /// Page-table snapshot for observability (paged cache only). Cheap:
+    /// reads counters, never touches device memory.
+    fn page_stats(&self) -> Option<PageStats> {
+        None
+    }
+}
+
+/// A paged cache's page-table state at a point in time (for monitoring).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageStats {
+    /// Pages holding live KV entries for this sequence.
+    pub pages_used: usize,
+    /// Pages still available in this cache's arena.
+    pub pages_free: usize,
+    /// Total pages in the arena (`pages_used + pages_free` when healthy).
+    pub num_pages: usize,
+    /// Tokens per page.
+    pub page_size: usize,
+    /// Cached sequence length in tokens.
+    pub seq_len: usize,
 }
 
 /// Repeats each KV head `n_rep` times consecutively (GQA → MHA expansion):
@@ -361,6 +382,17 @@ impl<B: Backend> PagedKVCache<B> {
         self.allocator.num_free()
     }
 
+    /// Page-table snapshot (see [`KVCache::page_stats`]).
+    pub fn page_stats_inner(&self) -> PageStats {
+        PageStats {
+            pages_used: self.table.len(),
+            pages_free: self.allocator.num_free(),
+            num_pages: self.config.num_pages(),
+            page_size: self.config.page_size,
+            seq_len: self.seq_len,
+        }
+    }
+
     /// Ensures the page table covers `total` positions.
     fn ensure_pages(&mut self, total: usize) -> usize {
         let pages_needed = total.div_ceil(self.config.page_size);
@@ -494,6 +526,10 @@ impl<B: Backend> KVCache<B> for PagedKVCache<B> {
 
     fn pages_used(&self) -> Option<usize> {
         Some(self.table.len())
+    }
+
+    fn page_stats(&self) -> Option<PageStats> {
+        Some(self.page_stats_inner())
     }
 }
 

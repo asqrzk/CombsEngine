@@ -106,6 +106,34 @@ pub fn device_caps(device: &CombsDevice) -> DeviceCaps {
     }
 }
 
+/// GPU allocator state from cubecl's memory manager (authoritative — process
+/// RSS is meaningless for unified-memory GPU accounting).
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct GpuMemory {
+    /// Bytes referenced by live handles.
+    pub bytes_in_use: u64,
+    /// Bytes reserved by the pool (in-use + cached slabs).
+    pub bytes_reserved: u64,
+    /// Bytes lost to alignment padding.
+    pub bytes_padding: u64,
+    /// Live allocation count.
+    pub number_allocs: u64,
+}
+
+/// Samples the GPU allocator. `memory_usage()` is `submit_blocking` on the
+/// compute stream — call from the engine worker between generations (or
+/// rate-limited), not from request threads during a long prefill.
+pub fn gpu_memory(device: &CombsDevice) -> Option<GpuMemory> {
+    let client =
+        <burn::backend::wgpu::WgpuRuntime as cubecl::prelude::Runtime>::client(device);
+    client.memory_usage().ok().map(|m| GpuMemory {
+        bytes_in_use: m.bytes_in_use,
+        bytes_reserved: m.bytes_reserved,
+        bytes_padding: m.bytes_padding,
+        number_allocs: m.number_allocs,
+    })
+}
+
 /// Initializes the wgpu runtime for `device` and returns adapter information.
 ///
 /// Note: this performs the cubecl runtime setup for the device (the same setup

@@ -14,7 +14,10 @@ mod sampler;
 mod stop;
 
 pub use combs_models::{CacheConfig, CacheKind};
-pub use engine::{Engine, GenerationConfig, GenerationStats, check_context_len};
+pub use engine::{
+    Engine, EngineStatsSnapshot, GenerationConfig, GenerationStats, LastGeneration, SessionInfo,
+    check_context_len,
+};
 
 pub use logits::{
     FrequencyPenalty, LogitsProcessor, LogitsProcessorChain, PresencePenalty,

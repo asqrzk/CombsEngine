@@ -21,7 +21,7 @@ mod smolvlm;
 mod traits;
 
 pub use gemma::GemmaModel;
-pub use kv::{CacheConfig, CacheKind, ContiguousKVCache, KVCache, PagedKVCache};
+pub use kv::{CacheConfig, CacheKind, ContiguousKVCache, KVCache, PageStats, PagedKVCache};
 pub use llama::LlamaModel;
 pub use norm::rms_norm;
 pub use qlinear::{Linear, QuantLinearOp, try_quant_linear};

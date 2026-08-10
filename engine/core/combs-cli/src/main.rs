@@ -218,6 +218,12 @@ fn cmd_serve(
         .unwrap_or_else(|| "combs-model".to_string());
     eprintln!("loading weights...");
     let device = combs_core::init_device();
+    // Adapter caps are captured once, BEFORE the engine primes the cubecl
+    // runtime: `device_caps` performs the runtime setup itself, and calling
+    // it again after the engine has registered the service panics in
+    // cubecl 0.10 ("Service already initialized").
+    let device_caps =
+        serde_json::to_value(combs_core::device_caps(&device)).unwrap_or(serde_json::Value::Null);
     let engine = if let Some(size) = context_size {
         let mut cc = combs_runtime::CacheConfig::paged(size);
         if matches!(std::env::var("COMBS_KV").as_deref(), Ok("contiguous")) {
@@ -227,7 +233,55 @@ fn cmd_serve(
     } else {
         std::sync::Arc::new(Engine::load(&source, device)?)
     };
-    serve::serve(engine, model_id, &format!("0.0.0.0:{port}"), prefill_chunk_size)
+    let static_info = serde_json::json!({
+        "weights": weights_report(source.as_ref()),
+        "device": device_caps,
+    });
+    serve::serve(
+        engine,
+        model_id,
+        &format!("0.0.0.0:{port}"),
+        prefill_chunk_size,
+        static_info,
+    )
+}
+
+/// Load-time weight identity for `/v1/stats`: per-format tensor counts and
+/// packed byte totals, from the source's raw quant view. Reports what the
+/// *file* stores; kernel-incompatible tensors still run dense (that per-
+/// tensor decision is logged by `COMBS_DEBUG_QUANT`). The dense arm skips
+/// byte accounting for quantized-but-unsupported formats rather than
+/// paying a second CPU dequantization at startup.
+fn weights_report(source: &dyn combs_formats::ModelSource) -> serde_json::Value {
+    use std::collections::BTreeMap;
+    let mut by_format: BTreeMap<&'static str, (u64, u64)> = BTreeMap::new();
+    let mut other_count = 0u64;
+    for name in source.tensor_names() {
+        match source.open_tensor_quant(&name) {
+            Ok(Some(qt)) => {
+                let key = match qt.format {
+                    combs_formats::QuantFormat::Q4_0 => "q4_0",
+                    combs_formats::QuantFormat::Q5_0 => "q5_0",
+                    combs_formats::QuantFormat::Q8_0 => "q8_0",
+                    combs_formats::QuantFormat::Q4K => "q4_k",
+                    combs_formats::QuantFormat::Q6K => "q6_k",
+                };
+                let e = by_format.entry(key).or_default();
+                e.0 += 1;
+                e.1 += qt.data.len() as u64;
+            }
+            _ => other_count += 1,
+        }
+    }
+    let packed_total: u64 = by_format.values().map(|(_, b)| b).sum();
+    serde_json::json!({
+        "formats": by_format
+            .iter()
+            .map(|(k, (count, bytes))| (k.to_string(), serde_json::json!({"tensors": count, "bytes": bytes})))
+            .collect::<serde_json::Map<String, serde_json::Value>>(),
+        "packed_bytes_total": packed_total,
+        "dense_tensors": other_count,
+    })
 }
 
 fn cmd_devices() -> Result<()> {

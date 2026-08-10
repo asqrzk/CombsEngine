@@ -18,8 +18,9 @@
 
 use std::io::Read;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
@@ -31,21 +32,39 @@ use combs_runtime::{Engine, GenerationConfig, GenerationStats};
 
 use crate::http::{HttpResponse, cors_header, error_json, json_response, respond_preflight};
 
+/// Server-process counters for `/v1/stats` (the engine snapshot carries the
+/// per-generation numbers; these cover the HTTP surface).
+struct ServeCounters {
+    started: Instant,
+    in_flight: AtomicU64,
+}
+
 /// Serves `engine` on `addr` (`host:port`) forever.
 /// `default_prefill_chunk` overrides the engine's chunked-prefill size for
 /// every request (from `combs serve --prefill-chunk-size`).
+/// `static_info` is load-time identity for `/v1/stats` — `{weights, device}`,
+/// built once in `cmd_serve` (device caps must be captured before the engine
+/// initializes the cubecl runtime; see `cmd_serve`).
 pub fn serve(
     engine: Arc<Engine>,
     model_id: String,
     addr: &str,
     default_prefill_chunk: Option<usize>,
+    static_info: Value,
 ) -> Result<()> {
     let server = tiny_http::Server::http(addr).map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
+    let counters = Arc::new(ServeCounters {
+        started: Instant::now(),
+        in_flight: AtomicU64::new(0),
+    });
+    let static_info = Arc::new(static_info);
     eprintln!("combs serve: listening on http://{addr} (model: {model_id})");
 
     for mut request in server.incoming_requests() {
         let engine = engine.clone();
         let model_id = model_id.clone();
+        let counters = counters.clone();
+        let static_info = static_info.clone();
         std::thread::spawn(move || {
             let url = request.url().to_string();
             let method = request.method().as_str().to_string();
@@ -61,12 +80,15 @@ pub fn serve(
                     json!({"object": "list", "data": [model_card(&engine, &model_id)]}),
                 ),
                 ("GET", "/v1/model/info") => model_info(&engine, &model_id),
+                ("GET", "/v1/stats") => {
+                    stats_response(&engine, &model_id, &counters, &static_info)
+                }
                 ("POST", "/v1/chat/completions") => {
                     let mut body = String::new();
                     if request.as_reader().read_to_string(&mut body).is_err() {
                         json_response(400, error_json("invalid_request", "unreadable body"))
                     } else {
-                        handle_chat(&engine, &model_id, &body, default_prefill_chunk)
+                        handle_chat(&engine, &model_id, &body, default_prefill_chunk, &counters)
                     }
                 }
                 _ => json_response(404, error_json("not_found", "unknown endpoint")),
@@ -75,6 +97,98 @@ pub fn serve(
         });
     }
     Ok(())
+}
+
+/// `GET /v1/stats` — the engine's observability snapshot: rolling totals,
+/// last-generation timings, GPU allocator state, live KV sessions, weight
+/// identity, and build flags. Reads the worker-maintained snapshot; never
+/// waits on generation.
+fn stats_response(
+    engine: &Arc<Engine>,
+    model_id: &str,
+    counters: &ServeCounters,
+    static_info: &Value,
+) -> HttpResponse {
+    let snap = engine.stats_snapshot();
+    let cc = engine.cache_config();
+    let meta = engine.metadata();
+    let hit_rate = if snap.prompt_tokens_total > 0 {
+        snap.cached_tokens_total as f64 / snap.prompt_tokens_total as f64
+    } else {
+        0.0
+    };
+    let sessions: Vec<Value> = snap
+        .sessions
+        .iter()
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "history_tokens": s.history_len,
+                "pages": s.pages.map(|p| json!({
+                    "used": p.pages_used,
+                    "free": p.pages_free,
+                    "total": p.num_pages,
+                    "page_size": p.page_size,
+                    "seq_len": p.seq_len,
+                    "kv_bytes": p.pages_used as u64 * snap.kv_page_bytes,
+                })),
+            })
+        })
+        .collect();
+    json_response(
+        200,
+        json!({
+            "object": "engine.stats",
+            "model": model_id,
+            "architecture": &meta.architecture,
+            "uptime_s": counters.started.elapsed().as_secs(),
+            "in_flight": counters.in_flight.load(Ordering::Relaxed),
+            "totals": {
+                "requests": snap.requests_total,
+                "errors": snap.errors_total,
+                "prompt_tokens": snap.prompt_tokens_total,
+                "generated_tokens": snap.generated_tokens_total,
+                "cached_tokens": snap.cached_tokens_total,
+                "cache_hit_rate": hit_rate,
+            },
+            "throughput": {
+                "decode_tok_s_ewma": snap.decode_tok_s_ewma,
+                "last": snap.last.as_ref().map(|l| json!({
+                    "prompt_tokens": l.prompt_tokens,
+                    "generated_tokens": l.generated_tokens,
+                    "cached_tokens": l.cached_tokens,
+                    "ttft_ms": l.ttft_ms,
+                    "prefill_tok_s": l.prefill_tok_s,
+                    "decode_tok_s": l.decode_tok_s,
+                    "total_ms": l.total_ms,
+                    "cache_pages_used": l.cache_pages_used,
+                })),
+            },
+            "gpu": snap.gpu.map(|g| json!({
+                "bytes_in_use": g.bytes_in_use,
+                "bytes_reserved": g.bytes_reserved,
+                "bytes_padding": g.bytes_padding,
+                "number_allocs": g.number_allocs,
+            })),
+            "kv": {
+                "kind": format!("{:?}", cc.kind).to_lowercase(),
+                "max_seq_len": cc.max_seq_len,
+                "page_size": cc.page_size,
+                "page_bytes": snap.kv_page_bytes,
+                "max_sessions": snap.max_sessions,
+                "evictions": snap.session_evictions,
+                "sessions": sessions,
+            },
+            "weights": static_info.get("weights").cloned().unwrap_or(Value::Null),
+            "device": static_info.get("device").cloned().unwrap_or(Value::Null),
+            "build": {
+                "dtype": if cfg!(feature = "f16") { "f16" } else { "f32" },
+                "kv_env": std::env::var("COMBS_KV").ok(),
+                "attn_env": std::env::var("COMBS_ATTN").ok(),
+                "quant_kernels": std::env::var_os("COMBS_NO_QUANT_KERNELS").is_none(),
+            },
+        }),
+    )
 }
 
 fn model_card(engine: &Arc<Engine>, model_id: &str) -> Value {
@@ -117,6 +231,31 @@ fn model_info(engine: &Arc<Engine>, model_id: &str) -> HttpResponse {
     )
 }
 
+/// The OpenAI-compatible `usage` object, extended with the timing and
+/// cache stats the engine computes anyway (additive fields — existing
+/// consumers that read only the token counts are unaffected). This is the
+/// per-request half of the observability surface; `/v1/stats` is the
+/// rolling half.
+fn usage_json(stats: &GenerationStats, session_id: Option<&str>) -> Value {
+    json!({
+        "prompt_tokens": stats.prompt_tokens,
+        "completion_tokens": stats.generated_tokens,
+        "total_tokens": stats.prompt_tokens + stats.generated_tokens,
+        "prompt_tokens_details": {"cached_tokens": stats.cached_tokens},
+        "timing": {
+            "ttft_ms": stats.ttft.as_secs_f64() * 1000.0,
+            "prefill_tok_s": stats.prefill_tokens_per_second(),
+            "decode_tok_s": stats.decode_tokens_per_second(),
+            "total_ms": stats.total_time.as_secs_f64() * 1000.0,
+        },
+        "cache": {
+            "pages_used": stats.cache_pages_used,
+            "cached_tokens": stats.cached_tokens,
+        },
+        "session_id": session_id,
+    })
+}
+
 /// Maps engine errors to (HTTP status, error type): context overflow is a
 /// client-fixable 400, everything else stays a 500.
 fn engine_error_parts(e: &combs_runtime::EngineError) -> (u16, &'static str) {
@@ -140,6 +279,7 @@ fn handle_chat(
     model_id: &str,
     body: &str,
     default_prefill_chunk: Option<usize>,
+    counters: &Arc<ServeCounters>,
 ) -> HttpResponse {
     let req: Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -239,9 +379,11 @@ fn handle_chat(
 
     if !stream {
         let mut text = String::new();
+        counters.in_flight.fetch_add(1, Ordering::Relaxed);
         let result = generate_maybe_media(engine, &tokens, images, &config, |_id, piece| {
             text.push_str(piece)
         });
+        counters.in_flight.fetch_sub(1, Ordering::Relaxed);
         return match result {
             Ok(stats) => json_response(
                 200,
@@ -255,12 +397,7 @@ fn handle_chat(
                         "message": {"role": "assistant", "content": text},
                         "finish_reason": if stats.generated_tokens >= config.max_tokens { "length" } else { "stop" },
                     }],
-                    "usage": {
-                        "prompt_tokens": stats.prompt_tokens,
-                        "completion_tokens": stats.generated_tokens,
-                        "total_tokens": stats.prompt_tokens + stats.generated_tokens,
-                        "prompt_tokens_details": {"cached_tokens": stats.cached_tokens},
-                    },
+                    "usage": usage_json(&stats, config.session_id.as_deref()),
                 }),
             ),
             Err(e) => {
@@ -275,7 +412,9 @@ fn handle_chat(
     let engine = engine.clone();
     let model_id = model_id.to_string();
     let chunk_id = completion_id.clone();
+    let counters = counters.clone();
     std::thread::spawn(move || {
+        counters.in_flight.fetch_add(1, Ordering::Relaxed);
         let send_chunk = |delta: Value, finish: Option<&str>, usage: Option<Value>| -> bool {
             let mut chunk = json!({
                 "id": chunk_id,
@@ -300,12 +439,7 @@ fn handle_chat(
                 } else {
                     "stop"
                 };
-                let usage = json!({
-                    "prompt_tokens": stats.prompt_tokens,
-                    "completion_tokens": stats.generated_tokens,
-                    "total_tokens": stats.prompt_tokens + stats.generated_tokens,
-                    "prompt_tokens_details": {"cached_tokens": stats.cached_tokens},
-                });
+                let usage = usage_json(&stats, config.session_id.as_deref());
                 let _ = send_chunk(json!({}), Some(finish), Some(usage));
             }
             Err(e) => {
@@ -316,6 +450,7 @@ fn handle_chat(
                 ));
             }
         }
+        counters.in_flight.fetch_sub(1, Ordering::Relaxed);
         let _ = tx.send("data: [DONE]\n\n".to_string());
     });
 

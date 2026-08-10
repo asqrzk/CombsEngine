@@ -10,6 +10,9 @@ f16 = []
 
 [dependencies]
 burn.workspace = true
+# For the GPU allocator sample in `gpu_memory()` (Runtime::client +
+# memory_usage) — same pinned version as the rest of the workspace.
+cubecl = { version = "0.10.0", default-features = false, features = ["wgpu", "std"] }
 serde.workspace = true
 wgpu = "29"
 

@@ -183,6 +183,7 @@ const DEFAULT_KV_ARENA_CAP: usize = 65536;
 struct SessionSet {
     map: std::collections::HashMap<String, SessionState>,
     tick: u64,
+    evictions: u64,
 }
 
 impl SessionSet {
@@ -190,6 +191,7 @@ impl SessionSet {
         SessionSet {
             map: std::collections::HashMap::new(),
             tick: 0,
+            evictions: 0,
         }
     }
 
@@ -213,9 +215,75 @@ impl SessionSet {
                 .map(|(k, _)| k.clone())
             {
                 self.map.remove(&oldest);
+                self.evictions += 1;
             }
         }
     }
+}
+
+/// Point-in-time engine statistics, written by the worker thread after
+/// every generation and read (lock held for microseconds) by observers —
+/// never through the single-flight command queue, which would block a
+/// `/v1/stats` poll behind an in-flight generation.
+#[derive(Debug, Clone, Default)]
+pub struct EngineStatsSnapshot {
+    /// Completed generation requests (including failed ones).
+    pub requests_total: u64,
+    /// Requests that ended in an engine error.
+    pub errors_total: u64,
+    /// Sum of prompt tokens across requests.
+    pub prompt_tokens_total: u64,
+    /// Sum of generated tokens across requests.
+    pub generated_tokens_total: u64,
+    /// Sum of prefix-reuse (KV cache hit) tokens across requests.
+    pub cached_tokens_total: u64,
+    /// Exponentially-weighted decode throughput (tok/s), α = 0.3.
+    pub decode_tok_s_ewma: f64,
+    /// The most recent completed generation.
+    pub last: Option<LastGeneration>,
+    /// Live rolling sessions and their KV footprint.
+    pub sessions: Vec<SessionInfo>,
+    /// Sessions LRU-evicted since load.
+    pub session_evictions: u64,
+    /// Session-table capacity ([`MAX_SESSIONS`]).
+    pub max_sessions: usize,
+    /// GPU allocator state, sampled on the worker after each generation.
+    pub gpu: Option<combs_core::GpuMemory>,
+    /// Bytes one KV page costs across all layers (both K and V), so
+    /// consumers can turn page counts into memory: `pages × kv_page_bytes`.
+    pub kv_page_bytes: u64,
+}
+
+/// Timing/count summary of one completed generation.
+#[derive(Debug, Clone)]
+pub struct LastGeneration {
+    /// Prompt length in tokens.
+    pub prompt_tokens: usize,
+    /// Generated length in tokens.
+    pub generated_tokens: usize,
+    /// Prefix-reuse hit length in tokens.
+    pub cached_tokens: usize,
+    /// Time to first token, milliseconds.
+    pub ttft_ms: f64,
+    /// Prefill throughput, tokens/second.
+    pub prefill_tok_s: f64,
+    /// Decode throughput, tokens/second.
+    pub decode_tok_s: f64,
+    /// Wall time of the whole request, milliseconds.
+    pub total_ms: f64,
+    /// KV pages held by the request's cache at completion.
+    pub cache_pages_used: usize,
+}
+
+/// One live rolling session's KV state.
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    /// Session id (`"(anonymous)"` for the empty key).
+    pub id: String,
+    /// Tokens in the session history (== KV cache contents).
+    pub history_len: usize,
+    /// Page-table state of the session's cache, when paged.
+    pub pages: Option<combs_models::PageStats>,
 }
 
 /// Length of the longest common prefix of two token slices.
@@ -238,6 +306,7 @@ pub struct Engine {
     cache_config: CacheConfig,
     tx: mpsc::Sender<Command>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    stats: Arc<Mutex<EngineStatsSnapshot>>,
     #[allow(dead_code)] // facade used by later phases for arena management
     pool: BufferPool,
 }
@@ -285,11 +354,28 @@ impl Engine {
         let tokenizer = Tokenizer::from_file(&spec.tokenizer_json)
             .map_err(|e| EngineError::Tokenizer(e.to_string()))?;
 
+        // Observability snapshot: seeded with the static KV geometry so
+        // consumers can turn page counts into bytes; the worker refreshes
+        // the dynamic parts after every generation.
+        let meta = source.metadata();
+        let elem_bytes: u64 = if cfg!(feature = "f16") { 2 } else { 4 };
+        let stats = Arc::new(Mutex::new(EngineStatsSnapshot {
+            max_sessions: MAX_SESSIONS,
+            kv_page_bytes: cache_config.page_size as u64
+                * meta.num_key_value_heads as u64
+                * meta.head_dim as u64
+                * elem_bytes
+                * 2 // K and V
+                * meta.num_hidden_layers as u64,
+            ..EngineStatsSnapshot::default()
+        }));
+
         let (tx, rx) = mpsc::channel();
         let worker = {
             let tokenizer = tokenizer.clone();
             let device = device.clone();
             let max_position_embeddings = source.metadata().max_position_embeddings;
+            let stats = stats.clone();
             std::thread::Builder::new()
                 .name("combs-engine".to_string())
                 .spawn(move || {
@@ -300,6 +386,7 @@ impl Engine {
                         cache_config,
                         max_position_embeddings,
                         rx,
+                        stats,
                     );
                 })
                 .map_err(|e| EngineError::WorkerGone(format!("spawning worker: {e}")))?
@@ -314,8 +401,15 @@ impl Engine {
             cache_config,
             tx,
             worker: Mutex::new(Some(worker)),
+            stats,
             pool: BufferPool::new(),
         })
+    }
+
+    /// Clones the current statistics snapshot (worker-maintained; safe to
+    /// call at any time — never blocks on generation).
+    pub fn stats_snapshot(&self) -> EngineStatsSnapshot {
+        self.stats.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
     /// Model metadata.
@@ -485,6 +579,7 @@ fn worker_loop(
     cache_config: CacheConfig,
     max_position_embeddings: usize,
     rx: mpsc::Receiver<Command>,
+    stats: Arc<Mutex<EngineStatsSnapshot>>,
 ) {
     // Rolling KV sessions — survive across requests so multi-turn callers
     // (and named per-agent sessions) only prefill the new prompt suffix.
@@ -502,6 +597,7 @@ fn worker_loop(
                     &req,
                     &mut sessions,
                 );
+                update_stats(&stats, &result, &sessions, &device);
                 // `req.pieces` closes when `req` drops at the end of this
                 // iteration; the reply is queued first, so the caller always
                 // sees all pieces followed by the result.
@@ -509,6 +605,63 @@ fn worker_loop(
             }
         }
     }
+}
+
+/// Refreshes the shared snapshot after a generation. Runs on the worker so
+/// the GPU allocator sample (`submit_blocking`) never contends with an
+/// in-flight generation; observers only ever pay a mutex clone.
+fn update_stats(
+    stats: &Mutex<EngineStatsSnapshot>,
+    result: &Result<GenerationStats>,
+    sessions: &SessionSet,
+    device: &CombsDevice,
+) {
+    let gpu = combs_core::gpu_memory(device);
+    let session_infos: Vec<SessionInfo> = sessions
+        .map
+        .iter()
+        .map(|(k, s)| SessionInfo {
+            id: if k.is_empty() {
+                "(anonymous)".to_string()
+            } else {
+                k.clone()
+            },
+            history_len: s.history.len(),
+            pages: s.cache.page_stats(),
+        })
+        .collect();
+
+    let Ok(mut snap) = stats.lock() else { return };
+    snap.requests_total += 1;
+    match result {
+        Ok(st) => {
+            snap.prompt_tokens_total += st.prompt_tokens as u64;
+            snap.generated_tokens_total += st.generated_tokens as u64;
+            snap.cached_tokens_total += st.cached_tokens as u64;
+            let decode = st.decode_tokens_per_second();
+            if decode > 0.0 {
+                snap.decode_tok_s_ewma = if snap.decode_tok_s_ewma == 0.0 {
+                    decode
+                } else {
+                    0.7 * snap.decode_tok_s_ewma + 0.3 * decode
+                };
+            }
+            snap.last = Some(LastGeneration {
+                prompt_tokens: st.prompt_tokens,
+                generated_tokens: st.generated_tokens,
+                cached_tokens: st.cached_tokens,
+                ttft_ms: st.ttft.as_secs_f64() * 1000.0,
+                prefill_tok_s: st.prefill_tokens_per_second(),
+                decode_tok_s: decode,
+                total_ms: st.total_time.as_secs_f64() * 1000.0,
+                cache_pages_used: st.cache_pages_used,
+            });
+        }
+        Err(_) => snap.errors_total += 1,
+    }
+    snap.sessions = session_infos;
+    snap.session_evictions = sessions.evictions;
+    snap.gpu = gpu;
 }
 
 /// Executes one generation request on the worker thread.

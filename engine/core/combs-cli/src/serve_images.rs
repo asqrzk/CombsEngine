@@ -27,6 +27,16 @@ use crate::http::{HttpResponse, error_json, json_response, respond_preflight};
 
 type SharedPipeline = Arc<Mutex<Box<dyn DiffusionModel<combs_core::CombsBackend>>>>;
 
+/// Worker observability for `/v1/stats`: rolling counters written after
+/// each generation (u64 atomics; durations stored as milliseconds).
+#[derive(Default)]
+struct ImageStats {
+    requests_total: std::sync::atomic::AtomicU64,
+    errors_total: std::sync::atomic::AtomicU64,
+    last_duration_ms: std::sync::atomic::AtomicU64,
+    last_bytes: std::sync::atomic::AtomicU64,
+}
+
 pub fn cmd_serve_images(model: PathBuf, port: u16) -> Result<()> {
     let model_dir = super::resolve_model_arg(&model)?;
     let architecture =
@@ -51,8 +61,11 @@ pub fn cmd_serve_images(model: PathBuf, port: u16) -> Result<()> {
         .unwrap_or_else(|| "combs-diffusion".to_string());
     eprintln!("[serve-images] listening on http://{addr} (model: {model_id})");
 
+    let stats = Arc::new(ImageStats::default());
     for mut request in server.incoming_requests() {
         let pipeline = pipeline.clone();
+        let stats = stats.clone();
+        let model_id = model_id.clone();
         std::thread::spawn(move || {
             let url = request.url().to_string();
             let method = request.method().as_str().to_string();
@@ -62,12 +75,28 @@ pub fn cmd_serve_images(model: PathBuf, port: u16) -> Result<()> {
             }
             let response = match (method.as_str(), url.as_str()) {
                 ("GET", "/health") => json_response(200, json!({"status": "ok"})),
+                ("GET", "/v1/stats") => {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    json_response(
+                        200,
+                        json!({
+                            "object": "image_worker.stats",
+                            "model": model_id,
+                            // try_lock fails iff a generation holds the pipeline.
+                            "busy": pipeline.try_lock().is_err(),
+                            "requests_total": stats.requests_total.load(Relaxed),
+                            "errors_total": stats.errors_total.load(Relaxed),
+                            "last_duration_ms": stats.last_duration_ms.load(Relaxed),
+                            "last_bytes": stats.last_bytes.load(Relaxed),
+                        }),
+                    )
+                }
                 ("POST", "/v1/images/generations") => {
                     let mut body = String::new();
                     if request.as_reader().read_to_string(&mut body).is_err() {
                         json_response(400, error_json("invalid_request", "unreadable body"))
                     } else {
-                        handle_generate(&pipeline, &body)
+                        handle_generate(&pipeline, &body, &stats)
                     }
                 }
                 _ => json_response(404, error_json("not_found", "unknown endpoint")),
@@ -78,7 +107,7 @@ pub fn cmd_serve_images(model: PathBuf, port: u16) -> Result<()> {
     Ok(())
 }
 
-fn handle_generate(pipeline: &SharedPipeline, body: &str) -> HttpResponse {
+fn handle_generate(pipeline: &SharedPipeline, body: &str, stats: &ImageStats) -> HttpResponse {
     let req: Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(e) => {
@@ -127,6 +156,19 @@ fn handle_generate(pipeline: &SharedPipeline, body: &str) -> HttpResponse {
         img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)?;
         Ok(buf)
     })();
+
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        stats.requests_total.fetch_add(1, Relaxed);
+        stats
+            .last_duration_ms
+            .store(started.elapsed().as_millis() as u64, Relaxed);
+        if let Ok(png) = &result {
+            stats.last_bytes.store(png.len() as u64, Relaxed);
+        } else {
+            stats.errors_total.fetch_add(1, Relaxed);
+        }
+    }
 
     match result {
         Ok(png) => {
