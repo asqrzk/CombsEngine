@@ -360,19 +360,47 @@ pub struct PagedKVCache<B: Backend> {
     table: Vec<usize>,
     seq_len: usize,
     arenas: Vec<Option<(Tensor<B, 4>, Tensor<B, 4>)>>,
+    /// Per-layer sliding-window override (transformers' layer-typed cache):
+    /// `Some(w)` layers keep only the most recent `w-1` tokens in a rolling
+    /// tensor and never touch the paged arena — for gemma's 5 local : 1
+    /// global pattern this skips the arena allocation for ~5/6 of layers.
+    /// Empty ⇒ every layer is global (the llama case).
+    layer_windows: Vec<Option<usize>>,
+    /// Rolling K/V for sliding layers, `[1, n_kv, ≤w-1, head_dim]`. Keys
+    /// are stored post-RoPE with their absolute positions baked in; only
+    /// the attention mask is re-based when old tokens are evicted.
+    sliding: Vec<Option<(Tensor<B, 4>, Tensor<B, 4>)>>,
     device: Option<Device<B>>,
 }
 
 impl<B: Backend> PagedKVCache<B> {
-    /// Creates an empty paged cache for `num_layers` layers. Arena tensors
-    /// are allocated lazily on first use of each layer.
+    /// Creates an empty paged cache for `num_layers` layers (all global).
+    /// Arena tensors are allocated lazily on first use of each layer.
     pub fn new(num_layers: usize, config: CacheConfig) -> Self {
+        Self::new_with_windows(num_layers, config, vec![None; num_layers])
+    }
+
+    /// Creates a paged cache with a per-layer sliding-window assignment
+    /// (`windows[i] = Some(w)` ⇒ layer `i` stores at most `w-1` past
+    /// tokens). `w >= 2` — a window of 1 would leave decode steps with no
+    /// past context at all.
+    pub fn new_with_windows(
+        num_layers: usize,
+        config: CacheConfig,
+        windows: Vec<Option<usize>>,
+    ) -> Self {
+        assert_eq!(windows.len(), num_layers, "one window entry per layer");
+        for w in windows.iter().flatten() {
+            assert!(*w >= 2, "sliding window must be >= 2, got {w}");
+        }
         PagedKVCache {
             allocator: PageAllocator::new(config.num_pages()),
             config,
             table: Vec::new(),
             seq_len: 0,
             arenas: (0..num_layers).map(|_| None).collect(),
+            layer_windows: windows,
+            sliding: (0..num_layers).map(|_| None).collect(),
             device: None,
         }
     }
@@ -404,6 +432,56 @@ impl<B: Backend> PagedKVCache<B> {
             self.table.push(page);
         }
         pages_needed
+    }
+
+    /// Sliding-layer attention (transformers `DynamicSlidingWindowLayer`):
+    /// concat the rolling store with the new K/V, attend over the full
+    /// concat, persist only the trailing `w-1` tokens.
+    ///
+    /// The stored keys carry their original RoPE (absolute positions);
+    /// after eviction the first stored key is at absolute position
+    /// `kv_offset = pos + seq - full_len`, so the causal/window mask is
+    /// evaluated with the queries re-based by that offset — RoPE is never
+    /// re-applied or re-indexed.
+    fn sliding_attention(
+        &mut self,
+        layer: usize,
+        q: Tensor<B, 4>,
+        k: Tensor<B, 4>,
+        v: Tensor<B, 4>,
+        pos: usize,
+        scale: f64,
+        w: usize,
+    ) -> Tensor<B, 4> {
+        let seq = k.dims()[2];
+        let slot = &mut self.sliding[layer];
+        let (k_full, v_full) = match slot.take() {
+            Some((k_old, v_old)) => (
+                Tensor::cat(vec![k_old, k], 2),
+                Tensor::cat(vec![v_old, v], 2),
+            ),
+            None => (k, v),
+        };
+        let full_len = k_full.dims()[2];
+        let kv_offset = pos + seq - full_len;
+        let out = attend(
+            q,
+            k_full.clone(),
+            v_full.clone(),
+            pos - kv_offset,
+            scale,
+            Some(w),
+        );
+        // Keep `w-1` past tokens: the next decode step appends one, giving
+        // exactly `w` visible keys (transformers' `-window + 1` rule). A
+        // prefill chunk longer than the window attends over its full concat
+        // first (context within the chunk is never lost), then truncates.
+        let keep = full_len.min(w - 1);
+        *slot = Some((
+            k_full.narrow(2, full_len - keep, keep),
+            v_full.narrow(2, full_len - keep, keep),
+        ));
+        out
     }
 
     /// Gathers the first `pages` page-table entries of `arena`
@@ -464,6 +542,12 @@ impl<B: Backend> KVCache<B> for PagedKVCache<B> {
         if self.device.is_none() {
             self.device = Some(k.device());
         }
+        // Sliding layers bypass the paged arena entirely (the caller's
+        // `window` argument and this cache's per-layer assignment come from
+        // the same AttentionPattern, so the cache's own value is used).
+        if let Some(w) = self.layer_windows.get(layer).copied().flatten() {
+            return self.sliding_attention(layer, q, k, v, pos, scale, w);
+        }
         if self.arenas[layer].is_none() {
             let device = k.device();
             let shape = [self.config.num_pages(), n_kv, self.config.page_size, head_dim];
@@ -505,8 +589,34 @@ impl<B: Backend> KVCache<B> for PagedKVCache<B> {
     /// Rolls back the last `n` cached tokens, freeing trailing pages that
     /// become fully unused. K/V content of popped positions is left in the
     /// arena but is never read (writes always cover `seq_len..` densely).
+    ///
+    /// Sliding layers can only roll back while nothing has been evicted
+    /// from their window: once eviction starts, the tokens a rollback
+    /// would re-expose are gone, so the whole cache refuses (`0`) and the
+    /// caller rebuilds from scratch — the same "prefix caching disables
+    /// under sliding windows" rule HF applies. All-or-nothing: state is
+    /// only mutated when the full rollback is possible.
     fn popn(&mut self, n: usize) -> usize {
         let n = n.min(self.seq_len);
+        if n == 0 {
+            return 0;
+        }
+        for w in self.layer_windows.iter().flatten() {
+            if self.seq_len > w - 1 {
+                return 0; // eviction already happened in this layer
+            }
+        }
+        for slot in self.sliding.iter_mut() {
+            if let Some((k, v)) = slot.take() {
+                // Un-evicted invariant: stored length == seq_len, so the
+                // rollback is a plain tail truncation.
+                let len = k.dims()[2];
+                let keep = len.saturating_sub(n);
+                if keep > 0 {
+                    *slot = Some((k.narrow(2, 0, keep), v.narrow(2, 0, keep)));
+                }
+            }
+        }
         self.seq_len -= n;
         let keep = self.seq_len.div_ceil(self.config.page_size);
         while self.table.len() > keep {
@@ -520,6 +630,9 @@ impl<B: Backend> KVCache<B> for PagedKVCache<B> {
         self.table.clear();
         self.allocator.reset(self.config.num_pages());
         self.seq_len = 0;
+        for slot in &mut self.sliding {
+            *slot = None;
+        }
         // Arena tensors are kept (capacity reuse); stale content is never
         // read because writes always cover seq_len.. densely.
     }
@@ -536,6 +649,117 @@ impl<B: Backend> KVCache<B> for PagedKVCache<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type TB = burn::backend::NdArray<f32>;
+
+    /// Deterministic non-degenerate K/V for token `i`: `[1, n_kv, 1, d]`.
+    fn kv_tok(i: usize, n_kv: usize, d: usize) -> (Tensor<TB, 4>, Tensor<TB, 4>) {
+        let dev = Default::default();
+        let mk = |salt: usize| {
+            let data: Vec<f32> = (0..n_kv * d)
+                .map(|j| ((i * 7 + j * 3 + salt) % 13) as f32 / 13.0 - 0.5)
+                .collect();
+            Tensor::<TB, 4>::from_data(TensorData::new(data, [1, n_kv, 1, d]), &dev)
+        };
+        (mk(0), mk(5))
+    }
+
+    /// Deterministic query for token `i`: `[1, n_q, 1, d]`.
+    fn q_tok(i: usize, n_q: usize, d: usize) -> Tensor<TB, 4> {
+        let dev = Default::default();
+        let data: Vec<f32> = (0..n_q * d)
+            .map(|j| ((i * 11 + j * 5) % 17) as f32 / 17.0 - 0.5)
+            .collect();
+        Tensor::<TB, 4>::from_data(TensorData::new(data, [1, n_q, 1, d]), &dev)
+    }
+
+    fn assert_close4(a: Tensor<TB, 4>, b: Tensor<TB, 4>, what: &str) {
+        let av: Vec<f32> = a.into_data().to_vec().unwrap();
+        let bv: Vec<f32> = b.into_data().to_vec().unwrap();
+        assert_eq!(av.len(), bv.len(), "{what}: shape");
+        for (i, (x, y)) in av.iter().zip(bv.iter()).enumerate() {
+            assert!((x - y).abs() < 1e-5, "{what}[{i}]: {x} vs {y}");
+        }
+    }
+
+    /// The divine invariant: a sliding layer (evict + offset-rebased mask)
+    /// must produce the same attention output as a global layer that keeps
+    /// everything and enforces the window purely via masking. Exercises
+    /// pre-eviction, eviction, GQA expansion, and a prefill chunk longer
+    /// than the window.
+    #[test]
+    fn sliding_layer_matches_masked_global() {
+        let (n_kv, n_q, d, w) = (2usize, 4usize, 4usize, 5usize);
+        let cfg = CacheConfig::paged(64);
+        let scale = 1.0 / (d as f64).sqrt() * 0.9; // off-default: force mask path
+        let mut global = PagedKVCache::<TB>::new(1, cfg);
+        let mut sliding = PagedKVCache::<TB>::new_with_windows(1, cfg, vec![Some(w)]);
+
+        // Prefill chunk of 7 (> window) at pos 0.
+        let ks: Vec<_> = (0..7).map(|i| kv_tok(i, n_kv, d)).collect();
+        let k7 = Tensor::cat(ks.iter().map(|(k, _)| k.clone()).collect(), 2);
+        let v7 = Tensor::cat(ks.iter().map(|(_, v)| v.clone()).collect(), 2);
+        let q7 = Tensor::cat((0..7).map(|i| q_tok(i, n_q, d)).collect(), 2);
+        let a = global.attention_opts(0, q7.clone(), k7.clone(), v7.clone(), 0, scale, Some(w));
+        let b = sliding.attention_opts(0, q7, k7, v7, 0, scale, Some(w));
+        assert_close4(a, b, "prefill chunk");
+
+        // Decode steps 7..14 — eviction active well past the window.
+        for i in 7..14 {
+            let (k, v) = kv_tok(i, n_kv, d);
+            let q = q_tok(i, n_q, d);
+            let a = global.attention_opts(0, q.clone(), k.clone(), v.clone(), i, scale, Some(w));
+            let b = sliding.attention_opts(0, q, k, v, i, scale, Some(w));
+            assert_close4(a, b, &format!("decode step {i}"));
+        }
+
+        // The sliding cache never touched the paged arena.
+        assert_eq!(sliding.pages_used(), Some(0), "sliding layers use no pages");
+        assert!(global.pages_used().unwrap() > 0);
+    }
+
+    /// Rollback before any eviction behaves exactly like a fresh cache
+    /// replaying the truncated stream.
+    #[test]
+    fn sliding_popn_before_eviction_matches_replay() {
+        let (n_kv, n_q, d, w) = (2usize, 2usize, 4usize, 8usize);
+        let cfg = CacheConfig::paged(64);
+        let scale = 0.4;
+        let mut cache = PagedKVCache::<TB>::new_with_windows(1, cfg, vec![Some(w)]);
+        for i in 0..4 {
+            let (k, v) = kv_tok(i, n_kv, d);
+            cache.attention_opts(0, q_tok(i, n_q, d), k, v, i, scale, Some(w));
+        }
+        assert_eq!(cache.popn(2), 2, "un-evicted rollback succeeds");
+        assert_eq!(cache.seq_len(), 2);
+
+        let mut fresh = PagedKVCache::<TB>::new_with_windows(1, cfg, vec![Some(w)]);
+        for i in 0..2 {
+            let (k, v) = kv_tok(i, n_kv, d);
+            fresh.attention_opts(0, q_tok(i, n_q, d), k, v, i, scale, Some(w));
+        }
+        // Same next token after rollback vs replay must agree.
+        let (k, v) = kv_tok(9, n_kv, d);
+        let a = cache.attention_opts(0, q_tok(9, n_q, d), k.clone(), v.clone(), 2, scale, Some(w));
+        let b = fresh.attention_opts(0, q_tok(9, n_q, d), k, v, 2, scale, Some(w));
+        assert_close4(a, b, "post-rollback step");
+    }
+
+    /// Once a sliding layer has evicted, rollback must refuse entirely
+    /// (all-or-nothing) and leave state untouched.
+    #[test]
+    fn sliding_popn_after_eviction_refuses() {
+        let (n_kv, n_q, d, w) = (1usize, 1usize, 4usize, 4usize);
+        let cfg = CacheConfig::paged(64);
+        let mut cache = PagedKVCache::<TB>::new_with_windows(1, cfg, vec![Some(w)]);
+        for i in 0..6 {
+            let (k, v) = kv_tok(i, n_kv, d);
+            cache.attention_opts(0, q_tok(i, n_q, d), k, v, i, 0.5, Some(w));
+        }
+        assert_eq!(cache.popn(1), 0, "evicted sliding layer refuses rollback");
+        assert_eq!(cache.seq_len(), 6, "refused rollback leaves state intact");
+        assert_eq!(cache.popn(0), 0);
+    }
 
     #[test]
     fn allocator_alloc_in_order_and_exhaust() {

@@ -282,14 +282,26 @@ impl<B: Backend> GenerativeModel<B> for GemmaModel<B> {
     }
 
     fn create_kv_cache(&self, config: &CacheConfig) -> Box<dyn KVCache<B>> {
+        let layers = self.metadata.num_hidden_layers;
         match config.kind {
-            CacheKind::Contiguous => {
-                Box::new(ContiguousKVCache::<B>::new(self.metadata.num_hidden_layers))
+            CacheKind::Contiguous => Box::new(ContiguousKVCache::<B>::new(layers)),
+            CacheKind::Paged => {
+                // Layer-typed cache: local layers store only their window
+                // (gemma's 5 local : 1 global pattern ⇒ ~5/6 of the KV
+                // arena memory is never allocated). Same AttentionPattern
+                // the forward pass masks with.
+                let pattern = &self.metadata.attention_pattern;
+                let windows: Vec<Option<usize>> = (0..layers)
+                    .map(|i| {
+                        if pattern.is_global_layer(i) {
+                            None
+                        } else {
+                            pattern.sliding_window
+                        }
+                    })
+                    .collect();
+                Box::new(PagedKVCache::<B>::new_with_windows(layers, *config, windows))
             }
-            CacheKind::Paged => Box::new(PagedKVCache::<B>::new(
-                self.metadata.num_hidden_layers,
-                *config,
-            )),
         }
     }
 

@@ -316,11 +316,38 @@ models surface with them.
   flags. `usage` carries timing/cache per request. The CombsLLM Monitor
   tab consumes this via the platform's /api/events SSE stream.
 
-Next engine phase (planned, not started): layer-typed KV cache with the
-(kv_length, kv_offset) mask contract + sliding-window layers for gemma's
-5:1 local:global pattern (~5/6 KV memory at long context); then KIVI-style
-KV cache quantization (fp16 residual window + group-64 int4 bulk,
-full-attention layers only) behind COMBS_KV_QUANT=1.
+**Layer-typed sliding-window KV — LANDED (2026-08-10).** The transformers
+DynamicSlidingWindowLayer design mapped onto `PagedKVCache`:
+- `new_with_windows(layers, config, windows)`: `Some(w)` layers keep a
+  rolling `[1, n_kv, ≤w-1, d]` tensor (the `-w+1` rule: next decode step
+  appends 1 ⇒ exactly `w` visible keys) and **never allocate a paged
+  arena**; `None` layers unchanged. Keys stored post-RoPE with absolute
+  positions; on eviction only the mask is re-based
+  (`kv_offset = pos + seq - full_len`, queries shifted by it into
+  `attend`) — RoPE is never re-applied.
+- Rollback: all-or-nothing. Un-evicted sliding layers truncate exactly;
+  once evicted, `popn` refuses (returns 0) and the engine's reuse gate
+  (now `popped == need`, else fresh cache) rebuilds — HF's "prefix caching
+  disables under sliding windows" rule. Pure history extensions still
+  reuse (need == 0).
+- Gemma wires its `AttentionPattern` into `create_kv_cache`; llama stays
+  all-global and byte-identical.
+- Proof: unit parity tests (sliding vs mask-only global — prefill chunk >
+  window, eviction, GQA, rollback/replay) all exact; E2E gemma-3-1b on a
+  900+-token prompt is **token-identical** between the sliding paged cache
+  and the contiguous mask-only reference; post-generation worker-stream
+  GPU sample shows 0.25 GB = exactly the 4 global-layer arenas (4×67 MB) —
+  the 22 sliding layers allocate nothing (was 26×67 MB = 1.74 GB).
+- Caveat noted: cubecl `memory_usage()` is per-stream — the serve stats
+  GPU number covers the worker stream (KV + activations), not the
+  load-stream weights; the `combs run` post-load print is the converse.
+
+Next engine phase (planned, not started): KIVI-style KV cache quantization
+(fp16 residual window + group-64 quantized bulk, full-attention layers
+only) behind COMBS_KV_QUANT=1. Note for the implementer: burn Int tensors
+are i32 (no memory win) — true int8/int4 KV packing goes through our
+CubeCL machinery (pack 4×i8 per u32 like qmatmul's layouts), so this is a
+kernel task, not a tensor-op task.
 
 ---
 

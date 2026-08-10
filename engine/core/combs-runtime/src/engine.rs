@@ -359,6 +359,13 @@ impl Engine {
         // the dynamic parts after every generation.
         let meta = source.metadata();
         let elem_bytes: u64 = if cfg!(feature = "f16") { 2 } else { 4 };
+        // Only global-attention layers hold paged arenas; sliding layers
+        // (gemma's 5:1 pattern) keep a small rolling tensor instead.
+        let pattern = &meta.attention_pattern;
+        let global_layers = (0..meta.num_hidden_layers)
+            .filter(|&i| pattern.is_global_layer(i))
+            .count()
+            .max(1);
         let stats = Arc::new(Mutex::new(EngineStatsSnapshot {
             max_sessions: MAX_SESSIONS,
             kv_page_bytes: cache_config.page_size as u64
@@ -366,7 +373,7 @@ impl Engine {
                 * meta.head_dim as u64
                 * elem_bytes
                 * 2 // K and V
-                * meta.num_hidden_layers as u64,
+                * global_layers as u64,
             ..EngineStatsSnapshot::default()
         }));
 
@@ -711,12 +718,21 @@ fn run_generation(
                 let shared = common_prefix(&s.history, prompt_tokens)
                     .min(prompt_tokens.len().saturating_sub(1));
                 if shared > 0 {
-                    let popped = s.cache.popn(s.history.len() - shared);
-                    s.history.truncate(s.history.len() - popped);
-                    // Invariant: lcp == cache seq_len == history len (paged
-                    // cache always pops the full requested amount).
-                    lcp = s.history.len();
-                    s.cache
+                    let need = s.history.len() - shared;
+                    let popped = s.cache.popn(need);
+                    if popped == need {
+                        // Invariant: lcp == cache seq_len == history len.
+                        s.history.truncate(shared);
+                        lcp = shared;
+                        s.cache
+                    } else {
+                        // The cache cannot roll back to the shared prefix
+                        // (sliding-window layers past eviction): a partial
+                        // rollback would leave divergent tokens cached, so
+                        // rebuild fresh. Pure extensions (need == 0) never
+                        // hit this arm.
+                        model.create_kv_cache(cache_config)
+                    }
                 } else {
                     model.create_kv_cache(cache_config)
                 }
