@@ -22,6 +22,7 @@ use crate::kv::{CacheConfig, KVCache};
 use crate::llama::{LlamaModel, linear, load_tensor};
 use crate::matmul::safe_matmul;
 use crate::norm::layer_norm;
+use crate::precision::{to_f32, to_float};
 use crate::traits::GenerativeModel;
 use crate::{ModelError, Result};
 
@@ -140,8 +141,11 @@ impl<B: Backend> SiglipEncoder<B> {
             .swap_dims(1, 2);
 
         // K dims hit the broken wgpu/Metal matmul region (>=512) — safe_matmul.
+        // Scores + softmax in f32 for f16 stability (no-op in f32 builds).
+        let out_dtype = q.dtype();
+        let (q, k, v) = (to_f32(q), to_f32(k), to_f32(v));
         let scores = safe_matmul(q, k.transpose()).mul_scalar(self.scale);
-        let ctx = safe_matmul(softmax(scores, 3), v);
+        let ctx = to_float(safe_matmul(softmax(scores, 3), v), out_dtype);
         let ctx = ctx.swap_dims(1, 2).reshape([batch, seq, heads * head_dim]);
         linear(ctx, &layer.o_w, Some(&layer.o_b))
     }

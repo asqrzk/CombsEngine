@@ -10,7 +10,7 @@ name = "combs"
 path = "src/main.rs"
 
 [features]
-f16 = ["combs-core/f16"]
+f16 = ["combs-core/f16", "combs-runtime/f16"]
 
 [dependencies]
 burn.workspace = true

@@ -169,7 +169,14 @@ const MAX_SESSIONS: usize = 4;
 /// positional maximum. 32k tokens covers long coding sessions while keeping
 /// the arena allocation bounded on 16–18 GB machines; `--context-size`
 /// (CLI) / `load_with_cache_config` (API) override.
+///
+/// Under `--features f16` each cached token costs half the memory, so the
+/// default cap doubles to 64k — the "spend the freed VRAM on longer context"
+/// win. An explicit `--context-size` still overrides either default.
+#[cfg(not(feature = "f16"))]
 const DEFAULT_KV_ARENA_CAP: usize = 32768;
+#[cfg(feature = "f16")]
+const DEFAULT_KV_ARENA_CAP: usize = 65536;
 
 /// The worker's session table: named rolling sessions with LRU eviction.
 /// The anonymous session (empty key) serves requests without a session id.

@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Combs Engine generation runtime (engine, sampler, tokenizer)"
 
+[features]
+f16 = []
+
 [dependencies]
 burn.workspace = true
 combs-core.workspace = true

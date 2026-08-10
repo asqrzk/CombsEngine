@@ -68,17 +68,16 @@ validated for the Llama/SmolLM2 family.
   default path is byte-for-byte identical.
 - Two binaries now exist: `combs` (f32, default) and `combs-f16` (f16).
 
-### Remaining f16 follow-ups (not blocking)
-- **Gemma-3 f16** still emits empty output — needs 1–2 more f32 guards
-  (embedding √hidden scale and/or a BOS/template check; gelu is already guarded).
-  Llama-family + SmolLM2 are fully working.
-- **SmolVLM vision encoder** (`smolvlm.rs` softmax) not yet f16-guarded — text
-  path works; guard the vision attention with the same `to_f32`/`to_float`
-  pattern before using f16 with images.
-- **Reclaim the freed VRAM:** in f16, KV per token is half, so the
-  `DEFAULT_KV_ARENA_CAP` (32k) could double to 64k for the same memory — a
-  dtype-aware cap is an easy follow-up (this is the "use the other half for more
-  KV / longer context" idea).
+### Status of the follow-ups
+- **Gemma-3**: emits empty output in **both f32 and f16** for a raw
+  (no-BOS) prompt — so this is a pre-existing Gemma prompt/template issue
+  (needs a leading `<bos>`), **not an f16 regression**. f16 is at parity with
+  f32 here. Tracked separately from precision work.
+- **SmolVLM vision encoder** — ✅ f16-guarded (`smolvlm.rs` scores+softmax now
+  run in f32 via `to_f32`/`to_float`).
+- **Reclaim freed VRAM** — ✅ `DEFAULT_KV_ARENA_CAP` is now dtype-aware: 32k in
+  f32, **64k in f16** (KV per token is half, so the same memory buys 2× the
+  context). `--context-size` still overrides.
 
 ### (original notes retained below)
 
