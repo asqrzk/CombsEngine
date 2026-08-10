@@ -19,6 +19,7 @@ mod generate_image;
 mod http;
 mod pull;
 mod serve;
+mod serve_audio;
 mod serve_images;
 
 #[derive(Parser)]
@@ -106,6 +107,16 @@ enum Command {
         #[arg(long, default_value_t = 8082)]
         port: u16,
     },
+    /// Start a persistent speech worker (loads the TTS engine once,
+    /// serves /v1/audio/speech and /v1/audio/voices).
+    ServeAudio {
+        /// Kokoro checkpoint directory (or a preset id like `kokoro-82m`).
+        #[arg(long)]
+        model: PathBuf,
+        /// Port to listen on.
+        #[arg(long, default_value_t = 8083)]
+        port: u16,
+    },
     /// Start an OpenAI-compatible HTTP server.
     Serve {
         /// Path to the model directory (HF safetensors layout) or .gguf file.
@@ -165,6 +176,7 @@ fn main() -> Result<()> {
         Command::GenerateImage(args) => generate_image::cmd_generate_image(args),
         Command::GenerateAudio(args) => generate_audio::cmd_generate_audio(args),
         Command::ServeImages { model, port } => serve_images::cmd_serve_images(model, port),
+        Command::ServeAudio { model, port } => serve_audio::cmd_serve_audio(model, port),
         Command::Serve { model, port, context_size, prefill_chunk_size } => {
             cmd_serve(model, port, context_size, prefill_chunk_size)
         }

@@ -543,3 +543,31 @@ byte-identical PNG (sha-equal), different seed differs, cfg 7.5 vs 1.0
 differs (red channel +9 toward the prompt), negative-prompt path active.
 The 4×3 visual QA grid (seeds × scales × schedulers) remains a documented
 manual pass via the Create flow's new picker.
+
+---
+
+## 2026-08-11 — Wave 1.4: `combs serve-audio` persistent speech worker (LANDED)
+
+TTS leaves subprocess-per-request land. `generate_audio.rs` refactored
+around a load-once `TtsEngine` (ONNX session + phoneme vocab resident,
+per-voice style tables cached on first use; `encode_wav` split out for
+in-memory serving); `combs generate-audio` is now a thin caller. New
+`combs serve-audio --model <dir|kokoro-82m> --port 8083` mirrors the
+serve-images pattern: `/health`, `/v1/stats` (busy/totals/durations/voices),
+`GET /v1/audio/voices`, `POST /v1/audio/speech` (`{input|text, voice?,
+speed?, lang?}` → binary `audio/wav`, OpenAI-shaped), mutex single-flight.
+STT (`/v1/audio/transcriptions`) joins this worker in wave 4.
+
+Platform: `ensureAudioWorker()` lazy-start (image-worker clone),
+worker-first `generateAudio` with subprocess fallback, worker-first voice
+listing, `audio` surface in `surfaces()` (Monitor + `ps` sampling pick it
+up automatically), `audioPort`/`COMBS_AUDIO_PORT` config persisted, audio
+worker stopped on shutdown and on TTS model change.
+
+**Proof**: first-ever HTTP-surface test in combs-cli
+(`tests/serve_audio.rs`, env-gated on the kokoro cache): spawns the worker,
+asserts health, 55-voice listing incl. af_heart, real synthesis returning
+RIFF/WAVE @ 24 kHz > 10 KB, and 400 on empty input. Live E2E: two speech
+requests at 1.6 s / 1.4 s against the resident engine (the subprocess path
+re-paid session build + espeak per call); `/v1/stats` live. Deno checks
+green.

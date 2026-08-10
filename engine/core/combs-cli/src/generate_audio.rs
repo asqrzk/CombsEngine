@@ -61,19 +61,6 @@ pub fn cmd_generate_audio(args: GenerateAudioArgs) -> Result<()> {
         }
         return Ok(());
     }
-    if args.text.trim().is_empty() {
-        bail!("--text is empty");
-    }
-    if args.speed <= 0.0 {
-        bail!("--speed must be positive");
-    }
-
-    let onnx = find_onnx(&model_dir)?;
-    let vocab = load_vocab(&model_dir)?;
-    let style = load_style(&model_dir, &args.voice)?;
-    let lang = args.lang.clone().unwrap_or_else(|| {
-        if args.voice.starts_with('b') { "en-gb".into() } else { "en-us".into() }
-    });
 
     eprintln!(
         "generating speech (voice: {}, speed: {}): {}",
@@ -82,38 +69,95 @@ pub fn cmd_generate_audio(args: GenerateAudioArgs) -> Result<()> {
         truncate(&args.text, 80),
     );
 
-    // ort's error type carries non-Send state, so it can't ride `?` into
-    // anyhow — flatten every ort error to a string via `ort_err`.
-    let mut session = ort::session::Session::builder()
-        .map_err(ort_err)?
-        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
-        .map_err(ort_err)?
-        .commit_from_file(&onnx)
-        .map_err(ort_err)
-        .with_context(|| format!("loading ONNX model {}", onnx.display()))?;
-
-    let mut waveform: Vec<f32> = Vec::new();
-    for sentence in split_sentences(&args.text) {
-        let phonemes = phonemize(&sentence, &lang)?;
-        if phonemes.is_empty() {
-            continue;
-        }
-        let ids = tokenize(&phonemes, &vocab);
-        if ids.len() <= 2 {
-            continue;
-        }
-        let chunk = run_inference(&mut session, &ids, &style, args.speed)
-            .with_context(|| format!("synthesizing: {}", truncate(&sentence, 60)))?;
-        waveform.extend_from_slice(&chunk);
-    }
-    if waveform.is_empty() {
-        bail!("no audio produced (text phonemized to nothing)");
-    }
-
+    let mut engine = TtsEngine::load(&model_dir)?;
+    let waveform =
+        engine.synthesize(&args.text, &args.voice, args.speed, args.lang.as_deref())?;
     write_wav(&args.output, &waveform)?;
     let secs = waveform.len() as f32 / SAMPLE_RATE as f32;
     eprintln!("wrote {} ({secs:.1}s)", args.output.display());
     Ok(())
+}
+
+/// The load-once TTS engine: ONNX session, phoneme vocab, and per-voice
+/// style tables (cached on first use). `combs serve-audio` keeps one of
+/// these resident — the per-request cold start (session build + style
+/// load) only ever happens once per process.
+pub struct TtsEngine {
+    session: ort::session::Session,
+    vocab: HashMap<char, i64>,
+    model_dir: PathBuf,
+    styles: HashMap<String, Vec<f32>>,
+}
+
+impl TtsEngine {
+    pub fn load(model_dir: &Path) -> Result<Self> {
+        let onnx = find_onnx(model_dir)?;
+        let vocab = load_vocab(model_dir)?;
+        // ort's error type carries non-Send state, so it can't ride `?`
+        // into anyhow — flatten every ort error to a string via `ort_err`.
+        let session = ort::session::Session::builder()
+            .map_err(ort_err)?
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+            .map_err(ort_err)?
+            .commit_from_file(&onnx)
+            .map_err(ort_err)
+            .with_context(|| format!("loading ONNX model {}", onnx.display()))?;
+        Ok(Self {
+            session,
+            vocab,
+            model_dir: model_dir.to_path_buf(),
+            styles: HashMap::new(),
+        })
+    }
+
+    /// Available voice names (`voices/*.bin` stems).
+    pub fn voices(&self) -> Result<Vec<String>> {
+        list_voices(&self.model_dir)
+    }
+
+    /// Synthesizes 24 kHz mono f32 samples. `lang: None` derives the
+    /// espeak language from the voice prefix (`b?_*` → en-gb).
+    pub fn synthesize(
+        &mut self,
+        text: &str,
+        voice: &str,
+        speed: f32,
+        lang: Option<&str>,
+    ) -> Result<Vec<f32>> {
+        if text.trim().is_empty() {
+            bail!("text is empty");
+        }
+        if speed <= 0.0 {
+            bail!("speed must be positive");
+        }
+        if !self.styles.contains_key(voice) {
+            let style = load_style(&self.model_dir, voice)?;
+            self.styles.insert(voice.to_string(), style);
+        }
+        let style = self.styles.get(voice).expect("just inserted").clone();
+        let lang = lang.map(str::to_string).unwrap_or_else(|| {
+            if voice.starts_with('b') { "en-gb".into() } else { "en-us".into() }
+        });
+
+        let mut waveform: Vec<f32> = Vec::new();
+        for sentence in split_sentences(text) {
+            let phonemes = phonemize(&sentence, &lang)?;
+            if phonemes.is_empty() {
+                continue;
+            }
+            let ids = tokenize(&phonemes, &self.vocab);
+            if ids.len() <= 2 {
+                continue;
+            }
+            let chunk = run_inference(&mut self.session, &ids, &style, speed)
+                .with_context(|| format!("synthesizing: {}", truncate(&sentence, 60)))?;
+            waveform.extend_from_slice(&chunk);
+        }
+        if waveform.is_empty() {
+            bail!("no audio produced (text phonemized to nothing)");
+        }
+        Ok(waveform)
+    }
 }
 
 // ── Model discovery ─────────────────────────────────────────────────
@@ -344,6 +388,13 @@ fn run_inference(
 
 /// Minimal 16-bit PCM mono WAV writer (24 kHz).
 fn write_wav(path: &Path, samples: &[f32]) -> Result<()> {
+    std::fs::write(path, encode_wav(samples))
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// 16-bit PCM mono WAV bytes (24 kHz) — the in-memory form the audio
+/// worker serves directly.
+pub fn encode_wav(samples: &[f32]) -> Vec<u8> {
     let mut pcm = Vec::with_capacity(samples.len() * 2);
     for &s in samples {
         let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
@@ -367,8 +418,7 @@ fn write_wav(path: &Path, samples: &[f32]) -> Result<()> {
     wav.extend_from_slice(b"data");
     wav.extend_from_slice(&data_len.to_le_bytes());
     wav.extend_from_slice(&pcm);
-
-    std::fs::write(path, wav).with_context(|| format!("writing {}", path.display()))
+    wav
 }
 
 /// `ort::Error` carries non-Send state and can't convert through `?` into
