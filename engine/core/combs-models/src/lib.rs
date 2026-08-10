@@ -5,6 +5,7 @@
 //! create_kv_cache` function set); architectures register themselves in the
 //! [`ModelRegistry`]. Phase 1 ships the Llama family (incl. SmolLM2).
 
+mod archspec;
 mod kv;
 mod gemma;
 mod llama;
@@ -20,6 +21,7 @@ mod rope;
 mod smolvlm;
 mod traits;
 
+pub use archspec::{ArchSpec, LayerKind, NormFlavor};
 pub use gemma::GemmaModel;
 pub use kv::{CacheConfig, CacheKind, ContiguousKVCache, KVCache, PageStats, PagedKVCache};
 pub use llama::LlamaModel;

@@ -379,7 +379,48 @@ fn build_model_metadata(kv: &HashMap<String, MetaValue>) -> Result<ModelMetadata
         // (attention.sliding_window etc.) are a follow-up — the
         // safetensors path is the Gemma reference for U1.
         attention_pattern: crate::metadata::AttentionPattern::default(),
+        // GGUF stores no activation key; the per-arch resolver supplies it.
+        activation: crate::metadata::Activation::default(),
+        rope_scaling: gguf_rope_scaling(kv, &prefix)?,
     })
+}
+
+/// GGUF `rope.scaling.*` keys (llama.cpp writes `linear`/`yarn`; llama3
+/// scaling is baked as a `rope_freqs.weight` tensor instead — that tensor
+/// is a separate follow-up and absent from our cached files).
+fn gguf_rope_scaling(
+    kv: &HashMap<String, MetaValue>,
+    prefix: &str,
+) -> Result<crate::metadata::RopeScaling> {
+    use crate::metadata::RopeScaling;
+    let get_f32 = |key: String| match kv.get(&key) {
+        Some(MetaValue::F32(v)) => Some(*v as f64),
+        _ => None,
+    };
+    let kind = match kv.get(&format!("{prefix}.rope.scaling.type")) {
+        Some(MetaValue::String(s)) => s.clone(),
+        _ => return Ok(RopeScaling::None),
+    };
+    let factor = get_f32(format!("{prefix}.rope.scaling.factor")).unwrap_or(1.0);
+    let orig = match kv.get(&format!("{prefix}.rope.scaling.original_context_length")) {
+        Some(MetaValue::U32(v)) => *v as usize,
+        Some(MetaValue::U64(v)) => *v as usize,
+        _ => 32768,
+    };
+    match kind.as_str() {
+        "none" => Ok(RopeScaling::None),
+        "linear" => Ok(RopeScaling::Linear { factor }),
+        "yarn" => Ok(RopeScaling::Yarn {
+            factor,
+            original_max_position_embeddings: orig,
+            beta_fast: get_f32(format!("{prefix}.rope.scaling.yarn_beta_fast")).unwrap_or(32.0),
+            beta_slow: get_f32(format!("{prefix}.rope.scaling.yarn_beta_slow")).unwrap_or(1.0),
+            attention_factor: None,
+        }),
+        other => Err(FormatError::MissingField(format!(
+            "unsupported GGUF rope scaling type {other:?}"
+        ))),
+    }
 }
 
 fn tokenizer_ids(kv: &HashMap<String, MetaValue>) -> (Vec<u32>, Option<u32>, HashMap<u32, String>) {

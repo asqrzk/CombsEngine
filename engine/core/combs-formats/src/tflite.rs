@@ -315,6 +315,9 @@ fn metadata_from_params(p: &LlmParameters) -> Result<ModelMetadata> {
             query_pre_attn_scalar: p.query_pre_attn_scalar,
             max_window_layers: None,
         },
+        // ODML text exports are gemma-family (gelu-tanh MLPs).
+        activation: crate::metadata::Activation::GeluTanh,
+        rope_scaling: crate::metadata::RopeScaling::None,
     })
 }
 

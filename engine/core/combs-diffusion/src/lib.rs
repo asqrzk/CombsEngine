@@ -83,6 +83,8 @@ fn diffusion_metadata(architecture: &str) -> ModelMetadata {
         eos_token_ids: Vec::new(),
         vision: None,
         attention_pattern: AttentionPattern::default(),
+        activation: combs_formats::Activation::default(),
+        rope_scaling: combs_formats::RopeScaling::default(),
     }
 }
 

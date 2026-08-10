@@ -45,6 +45,102 @@ pub struct ModelMetadata {
     /// Layer-type attention pattern (Gemma sliding-window interleave);
     /// defaults to all-global (Llama-family behavior).
     pub attention_pattern: AttentionPattern,
+    /// MLP activation (`hidden_act` / `hidden_activation`).
+    pub activation: Activation,
+    /// RoPE frequency scaling (`rope_scaling`); `None` variant when absent.
+    pub rope_scaling: RopeScaling,
+}
+
+/// MLP activation function, parsed from `hidden_act`/`hidden_activation`.
+/// The tanh-approximation family (`gelu_pytorch_tanh`, `gelu_new`,
+/// `gelu_fast`) all map to [`Activation::GeluTanh`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Activation {
+    #[default]
+    Silu,
+    GeluTanh,
+    Gelu,
+}
+
+impl Activation {
+    fn parse(name: Option<&str>) -> Self {
+        match name {
+            Some("gelu_pytorch_tanh" | "gelu_new" | "gelu_fast") => Activation::GeluTanh,
+            Some("gelu") => Activation::Gelu,
+            // silu/swish and anything unknown: the llama-family default.
+            _ => Activation::Silu,
+        }
+    }
+}
+
+/// RoPE frequency scaling, parsed from HF `rope_scaling` (accepts both the
+/// modern `rope_type` and the legacy `type` key). Table math lives in
+/// `combs-models::rope`; this is parse-only.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum RopeScaling {
+    #[default]
+    None,
+    Linear {
+        factor: f64,
+    },
+    /// Llama-3.1+ piecewise frequency scaling.
+    Llama3 {
+        factor: f64,
+        low_freq_factor: f64,
+        high_freq_factor: f64,
+        original_max_position_embeddings: usize,
+    },
+    /// YaRN NTK-by-parts interpolation (+ attention temperature).
+    Yarn {
+        factor: f64,
+        original_max_position_embeddings: usize,
+        beta_fast: f64,
+        beta_slow: f64,
+        /// Explicit attention scaling; `None` = the YaRN default
+        /// `0.1·ln(factor) + 1`.
+        attention_factor: Option<f64>,
+    },
+}
+
+impl RopeScaling {
+    fn parse(config: &serde_json::Value) -> Result<Self> {
+        let Some(rs) = config.get("rope_scaling").filter(|v| !v.is_null()) else {
+            return Ok(RopeScaling::None);
+        };
+        let kind = rs
+            .get("rope_type")
+            .or_else(|| rs.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("default");
+        let f = |key: &str, default: f64| rs.get(key).and_then(|v| v.as_f64()).unwrap_or(default);
+        let factor = f("factor", 1.0);
+        match kind {
+            "default" => Ok(RopeScaling::None),
+            "linear" => Ok(RopeScaling::Linear { factor }),
+            "llama3" => Ok(RopeScaling::Llama3 {
+                factor,
+                low_freq_factor: f("low_freq_factor", 1.0),
+                high_freq_factor: f("high_freq_factor", 4.0),
+                original_max_position_embeddings: rs
+                    .get("original_max_position_embeddings")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(8192) as usize,
+            }),
+            "yarn" => Ok(RopeScaling::Yarn {
+                factor,
+                original_max_position_embeddings: rs
+                    .get("original_max_position_embeddings")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(32768) as usize,
+                beta_fast: f("beta_fast", 32.0),
+                beta_slow: f("beta_slow", 1.0),
+                attention_factor: rs.get("attention_factor").and_then(|v| v.as_f64()),
+            }),
+            other => Err(FormatError::MissingField(format!(
+                "unsupported rope_scaling type {other:?} (supported: linear, llama3, yarn)"
+            ))),
+        }
+    }
 }
 
 /// Vision-encoder hyperparameters parsed from `config.json::vision_config`
@@ -207,6 +303,8 @@ impl ModelMetadata {
             eos_token_ids: Vec::new(),
             vision: None,
             attention_pattern: AttentionPattern::default(),
+            activation: Activation::default(),
+            rope_scaling: RopeScaling::default(),
         }
     }
 
@@ -313,6 +411,12 @@ impl ModelMetadata {
                     .and_then(|x| x.as_u64())
                     .map(|x| x as usize),
             },
+            activation: Activation::parse(
+                text.get("hidden_act")
+                    .or_else(|| text.get("hidden_activation"))
+                    .and_then(|x| x.as_str()),
+            ),
+            rope_scaling: RopeScaling::parse(text)?,
         })
     }
 }

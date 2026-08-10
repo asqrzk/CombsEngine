@@ -29,7 +29,7 @@ pub mod quants {
         dequantize_q4_0, dequantize_q4_k, dequantize_q5_0, dequantize_q6_k, dequantize_q8_0,
     };
 }
-pub use metadata::{AttentionPattern, ModelMetadata, VisionConfig};
+pub use metadata::{Activation, AttentionPattern, ModelMetadata, RopeScaling, VisionConfig};
 pub use safetensors::SafetensorsSource;
 pub use litertlm::{SectionInfo, read_sections as litertlm_read_sections};
 pub use source::{ModelSource, QuantFormat, QuantTensor, SamplerConfig, TensorDtype, TensorReader};
