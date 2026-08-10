@@ -36,7 +36,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     defaults:
       run:
-        working-directory: Engine/Core
+        working-directory: engine/core
     steps:
       - uses: actions/checkout@v4
 
@@ -49,8 +49,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            Engine/Core/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Engine/Core/Cargo.lock') }}
+            engine/core/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('engine/core/Cargo.lock') }}
 
       - name: Build CLI + FFI libraries
         run: cargo build --release -p combs-cli -p combs-ffi -p combs-mesh-ffi
@@ -103,7 +103,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: combs-${{ matrix.platform }}-${{ matrix.arch }}
-          path: Engine/artifacts/
+          path: engine/artifacts/
 
   release:
     needs: build

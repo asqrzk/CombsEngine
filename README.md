@@ -56,7 +56,7 @@ Four layers. Compute lives exclusively in **L0** — every layer above is thin o
 │     Svelte 5 UI template · Android (JNI/Kotlin) ·           │
 │     iOS (Swift) · Web Worker transport                      │
 ├─────────────────────────────────────────────────────────────┤
-│ L2 — Deno / TypeScript Framework   (Engine/Js)              │
+│ L2 — Deno / TypeScript Framework   (engine/js)              │
 │     @combs/core · @combs/graph · @combs/agents ·            │
 │     @combs/runtime · @combs/flows · @combs/telemetry ·      │
 │     @combs/observe · @combs/zerotrust · @combs/mesh         │
@@ -65,7 +65,7 @@ Four layers. Compute lives exclusively in **L0** — every layer above is thin o
 │     combs_engine_create · combs_chat_completion_stream ·    │
 │     OpenAI-compatible server (`combs serve`)                │
 ├─────────────────────────────────────────────────────────────┤
-│ L0 — Rust GPU Core                   (Engine/Core)          │
+│ L0 — Rust GPU Core                   (engine/core)          │
 │     Burn 0.21 · CubeCL · wgpu (Metal/Vulkan/DX12/WebGPU)    │
 │     Paged KV cache · full sampler · GGUF/SafeTensors        │
 └─────────────────────────────────────────────────────────────┘
@@ -81,7 +81,7 @@ Four layers. Compute lives exclusively in **L0** — every layer above is thin o
 
 ## What's Available
 
-### L0 — Rust Core (`Engine/Core`)
+### L0 — Rust Core (`engine/core`)
 
 - **Inference engine** — Llama-family architectures on Burn 0.21 + CubeCL/wgpu; validated with SmolLM2 on Apple Silicon (Metal). New architectures = one line in the `ModelRegistry`.
 - **Model formats** — SafeTensors (Hugging Face layout) and **GGUF v3** (Q8_0 / Q4_0 / F16 / F32) through a single `ModelSource` adapter trait. `combs run --model anything.gguf` just works.
@@ -92,7 +92,7 @@ Four layers. Compute lives exclusively in **L0** — every layer above is thin o
 - **`xtask`** — cross-platform build orchestrator: `cargo xtask matrix` shows live toolchain detection; `cargo xtask bundle` produces `dist/<platform>/{lib, combs.h}` for every target.
 - **CombsMesh emoji engine (`combs-mesh`)** — binary `.cmse` block format (10 block types: text/image/todo/functions/api/lifecycle/character/emotion/encryption/orchestration), Unicode PUA tag-character encoding, AES-256-GCM/ChaCha20 crypto with HKDF subkeys, CPU + wgpu sprite renderers, content-addressed registry, wasm32-clean with wasm-bindgen bindings; C ABI via `combs-mesh-ffi` (`combsmesh_*` + `combsmesh_op_json`).
 
-### L2 — TypeScript Framework (`Engine/Js`)
+### L2 — TypeScript Framework (`engine/js`)
 
 | Package | Purpose |
 |---|---|

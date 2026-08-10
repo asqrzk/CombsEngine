@@ -21,7 +21,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     defaults:
       run:
-        working-directory: Engine/Core
+        working-directory: engine/core
     steps:
       - uses: actions/checkout@v4
 
@@ -62,11 +62,11 @@ jobs:
           deno-version: v2.x
 
       - name: Build native libraries (engine + mesh)
-        working-directory: Engine/Core
+        working-directory: engine/core
         run: cargo build --release -p combs-ffi -p combs-mesh-ffi
 
       - name: Deno check + test
-        working-directory: Engine/Js
+        working-directory: engine/js
         run: |
           deno task check
           deno task test
