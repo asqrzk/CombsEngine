@@ -295,6 +295,33 @@ prefill-shape tiling for the fused kernels (per-element kernel is
 decode-optimal; prefill is correct but untiled); Q4_1/Q5_1/Q5_K kernels if
 models surface with them.
 
+## Observability + theory follow-ups (2026-08-10)
+
+- **Gemma f16 FIXED**: the sqrt(hidden) embedding scale was the last
+  unguarded half-precision op (HF documents the same corruption in bf16);
+  now computed in f32 (gemma.rs embed). f16 gemma output is identical to
+  f32 — and decodes at 17.2 tok/s vs f32's 1.8 (unfused backend avoids
+  whatever stalls fused f32 gemma; that slowness is still open).
+- **GGUF Q/K RoPE permutation — audit inconclusive but empirically OK**:
+  llama.cpp's convert permutes Q/K rows for the llama arch, our rope is HF
+  rotate_half with no de-permutation in gguf.rs, yet GGUF vs safetensors
+  quality is at parity (same first tokens, coherent text, dense-vs-quant
+  token-identical). Either the pairing coincidentally composes or the
+  files we use aren't permuted as assumed. Proper resolution: a
+  perplexity comparison (HF perplexity.md methodology) safetensors vs
+  GGUF on ~1k tokens — do before trusting GGUF for anything sensitive.
+- **/v1/stats** (serve.rs) now reports: totals + cache hit rate, EWMA
+  decode tok/s, last-generation timings, GPU allocator sample, per-session
+  KV page tables + kv_bytes, weight/quant identity, device caps, build
+  flags. `usage` carries timing/cache per request. The CombsLLM Monitor
+  tab consumes this via the platform's /api/events SSE stream.
+
+Next engine phase (planned, not started): layer-typed KV cache with the
+(kv_length, kv_offset) mask contract + sliding-window layers for gemma's
+5:1 local:global pattern (~5/6 KV memory at long context); then KIVI-style
+KV cache quantization (fp16 residual window + group-64 int4 bulk,
+full-attention layers only) behind COMBS_KV_QUANT=1.
+
 ---
 
 ## Phase 3 — Validation, targets, benchmarks

@@ -301,8 +301,15 @@ impl<B: Backend> GenerativeModel<B> for GemmaModel<B> {
             .clone()
             .select(0, flat)
             .reshape([batch, seq, self.metadata.hidden_size]);
-        // Gemma scales embeddings by sqrt(hidden_size).
-        x.mul_scalar((self.metadata.hidden_size as f64).sqrt())
+        // Gemma scales embeddings by sqrt(hidden_size). Computed in f32:
+        // HF documents that doing this multiply in half precision corrupts
+        // the values (their example: 55.4256 → 55.5 in bf16), and on the
+        // f16 build this was the last unguarded op in the gemma path.
+        let out_dtype = x.dtype();
+        to_float(
+            to_f32(x).mul_scalar((self.metadata.hidden_size as f64).sqrt()),
+            out_dtype,
+        )
     }
 
     fn prefill(
