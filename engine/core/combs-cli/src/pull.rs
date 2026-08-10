@@ -277,7 +277,16 @@ fn pull_tts(repo: &str, dir: &PathBuf, tree: &[TreeEntry]) -> Result<()> {
 }
 
 fn pull_gguf(repo: &str, dir: &PathBuf, tree: &[TreeEntry]) -> Result<()> {
-    let file = pick_gguf_file(tree).context("no .gguf file found")?;
+    let Some(file) = pick_gguf_file(tree) else {
+        if tree.iter().any(|e| is_split_shard(&e.path)) {
+            bail!(
+                "this repo only publishes split GGUFs (…-00001-of-0000N shards); \
+                 multi-file GGUF loading is not supported yet — pick a repo with \
+                 single-file quants (e.g. bartowski/lmstudio-community mirrors)"
+            );
+        }
+        bail!("no .gguf file found");
+    };
     let target = dir.join("model.gguf");
     download_required_as(repo, &target, &format!("{repo}/resolve/main/{file}"))?;
     Ok(())
@@ -301,10 +310,28 @@ fn pick_safetensors_file(tree: &[TreeEntry]) -> Option<String> {
         .cloned()
 }
 
+/// llama.cpp shard naming: `<name>-00001-of-00002.gguf`. Downloading one
+/// shard yields a model missing most of its layers, so shards are excluded
+/// from single-file selection.
+fn is_split_shard(path: &str) -> bool {
+    let Some(stem) = path.strip_suffix(".gguf") else {
+        return false;
+    };
+    let mut parts = stem.rsplitn(3, '-');
+    let (Some(count), Some(of), Some(rest)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let is_index = |s: &str| s.len() == 5 && s.bytes().all(|b| b.is_ascii_digit());
+    of == "of"
+        && is_index(count)
+        && rest.rsplit('-').next().is_some_and(is_index)
+}
+
 fn pick_gguf_file(tree: &[TreeEntry]) -> Option<String> {
     let mut files: Vec<String> = tree
         .iter()
-        .filter(|e| e.path.ends_with(".gguf"))
+        .filter(|e| e.path.ends_with(".gguf") && !is_split_shard(&e.path))
         .map(|e| e.path.clone())
         .collect();
     if files.is_empty() {
@@ -536,4 +563,41 @@ fn download(url: &str, target: &PathBuf) -> Result<()> {
 
 fn file_mb(path: &PathBuf) -> f64 {
     fs::metadata(path).map(|m| m.len() as f64 / 1e6).unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tree(paths: &[&str]) -> Vec<TreeEntry> {
+        paths
+            .iter()
+            .map(|p| TreeEntry { path: p.to_string(), r#type: "file".to_string() })
+            .collect()
+    }
+
+    #[test]
+    fn split_shards_are_recognized() {
+        assert!(is_split_shard("qwen2.5-coder-7b-instruct-q4_k_m-00001-of-00002.gguf"));
+        assert!(is_split_shard("Model-Q4_K_M-00002-of-00003.gguf"));
+        assert!(!is_split_shard("model.gguf"));
+        assert!(!is_split_shard("Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"));
+        assert!(!is_split_shard("best-of-model.gguf"));
+        assert!(!is_split_shard("model-00001-of-00002.safetensors"));
+    }
+
+    #[test]
+    fn gguf_pick_skips_shards() {
+        // Single-file quant preferred even when shards list first.
+        let t = tree(&[
+            "m-q4_k_m-00001-of-00002.gguf",
+            "m-q4_k_m-00002-of-00002.gguf",
+            "m-Q8_0.gguf",
+        ]);
+        assert_eq!(pick_gguf_file(&t), Some("m-Q8_0.gguf".to_string()));
+
+        // Only shards available -> no pick (pull_gguf reports why).
+        let t = tree(&["m-q4_k_m-00001-of-00002.gguf", "m-q4_k_m-00002-of-00002.gguf"]);
+        assert_eq!(pick_gguf_file(&t), None);
+    }
 }

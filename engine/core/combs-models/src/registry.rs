@@ -39,6 +39,21 @@ impl<B: Backend> ModelRegistry<B> {
         r.register("smollm2", |source, device| {
             Ok(Box::new(crate::llama::LlamaModel::<B>::load(source, device)?))
         });
+        // Qwen2/2.5 is llama-structured plus q/k/v projection biases (loaded
+        // by presence) — but its optional upper-layer sliding partition
+        // (`use_sliding_window: true`) is not expressible yet; all shipped
+        // qwen2.5 checkpoints have it off, which the metadata parse maps to
+        // `sliding_window: None`.
+        r.register("qwen2", |source, device| {
+            reject_active_sliding(source, "qwen2")?;
+            Ok(Box::new(crate::llama::LlamaModel::<B>::load(source, device)?))
+        });
+        // Mistral v0.3+/Nemo report `sliding_window: null` and are plain
+        // llama; v0.1's all-layer sliding window is not supported yet.
+        r.register("mistral", |source, device| {
+            reject_active_sliding(source, "mistral")?;
+            Ok(Box::new(crate::llama::LlamaModel::<B>::load(source, device)?))
+        });
         // SmolVLM reports model_type "idefics3" (SigLIP + pixel-shuffle + SmolLM2).
         r.register("idefics3", |source, device| {
             Ok(Box::new(crate::smolvlm::SmolVlmModel::<B>::load(
@@ -88,6 +103,19 @@ impl<B: Backend> ModelRegistry<B> {
     }
 }
 
+/// Rejects checkpoints whose sliding window is actually active — the llama
+/// block runs all layers global and unmasked, which would be silently wrong.
+/// Landing in roadmap wave 2 (per-layer `AttentionLayout`).
+fn reject_active_sliding(source: &dyn ModelSource, arch: &str) -> Result<()> {
+    if let Some(w) = source.metadata().attention_pattern.sliding_window {
+        return Err(ModelError::UnsupportedArchitecture(format!(
+            "{arch} with an active sliding window (w={w}) — supported once the \
+             per-layer attention layout lands (roadmap wave 2)"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +125,8 @@ mod tests {
         let r = ModelRegistry::<burn::backend::NdArray<f32>>::new();
         assert!(r.supports("llama"));
         assert!(r.supports("smollm2"));
+        assert!(r.supports("qwen2"));
+        assert!(r.supports("mistral"));
         assert!(!r.supports("qwen3"));
     }
 }

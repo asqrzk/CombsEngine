@@ -14,6 +14,12 @@ pub struct TokenizerSpec {
     /// Raw chat template string (Jinja) if present in `tokenizer_config.json`.
     /// Phase 1 uses a built-in ChatML wrap instead of evaluating Jinja.
     pub chat_template: Option<String>,
+    /// Whether prompts should be prefixed with BOS (HF `add_bos_token` /
+    /// GGUF `tokenizer.ggml.add_bos_token`). `None` = unspecified, which the
+    /// engine treats as "prepend when the model declares a BOS id". Qwen2
+    /// declares a BOS id but sets this to `false`; ignoring it prepends
+    /// `<|endoftext|>` to every prompt.
+    pub add_bos: Option<bool>,
 }
 
 impl TokenizerSpec {
@@ -24,6 +30,7 @@ impl TokenizerSpec {
             tokenizer_json: PathBuf::new(),
             added_tokens: HashMap::new(),
             chat_template: None,
+            add_bos: None,
         }
     }
 

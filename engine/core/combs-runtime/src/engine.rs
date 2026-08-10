@@ -547,11 +547,15 @@ impl Engine {
     ) -> Result<GenerationStats> {
         // HF `add_special_tokens` semantics: prompts start with BOS when the
         // model declares one. Gemma collapses without it; templates that
-        // already open with `<bos>` are detected and left alone.
+        // already open with `<bos>` are detected and left alone. Qwen2
+        // declares a BOS id but sets `add_bos_token: false` — honoring it
+        // avoids prepending `<|endoftext|>` to every prompt.
         let mut prompt_tokens = prompt_tokens.to_vec();
-        if let Some(bos) = self.metadata.bos_token_id {
-            if prompt_tokens.first() != Some(&bos) {
-                prompt_tokens.insert(0, bos);
+        if self.spec.add_bos != Some(false) {
+            if let Some(bos) = self.metadata.bos_token_id {
+                if prompt_tokens.first() != Some(&bos) {
+                    prompt_tokens.insert(0, bos);
+                }
             }
         }
         let (pieces_tx, pieces_rx) = mpsc::channel();

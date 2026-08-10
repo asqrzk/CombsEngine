@@ -86,6 +86,12 @@ pub struct AttentionPattern {
     /// Attention logit scale divisor (`query_pre_attn_scalar`); when
     /// `None`, the scale is `1/sqrt(head_dim)`.
     pub query_pre_attn_scalar: Option<f64>,
+    /// Qwen2-style partition, stored raw: the first N layers are global and
+    /// layers >= N slide — the inverse of `pattern`'s every-Nth-global.
+    /// Not consumed yet; the per-layer `AttentionLayout` (roadmap wave 2)
+    /// resolves it. All shipped qwen2.5 checkpoints disable sliding anyway
+    /// (`use_sliding_window: false` nulls `sliding_window` at parse).
+    pub max_window_layers: Option<usize>,
 }
 
 impl Default for AttentionPattern {
@@ -95,6 +101,7 @@ impl Default for AttentionPattern {
             pattern: 6,
             rope_local_theta: 10000.0,
             query_pre_attn_scalar: None,
+            max_window_layers: None,
         }
     }
 }
@@ -284,15 +291,27 @@ impl ModelMetadata {
             eos_token_ids,
             vision: VisionConfig::from_hf_config(config)?,
             attention_pattern: AttentionPattern {
+                // Qwen2-family configs carry `sliding_window` even when
+                // sliding is off (`use_sliding_window: false`); an explicit
+                // false must null the window or the layer-pattern math would
+                // invent gemma-style local layers.
                 sliding_window: text
                     .get("sliding_window")
                     .and_then(|x| x.as_u64())
-                    .map(|x| x as usize),
+                    .map(|x| x as usize)
+                    .filter(|_| {
+                        text.get("use_sliding_window").and_then(|x| x.as_bool())
+                            != Some(false)
+                    }),
                 pattern: get_u64(text, "sliding_window_pattern").unwrap_or(6) as usize,
                 rope_local_theta: get_f64(text, "rope_local_base_freq", 10000.0),
                 query_pre_attn_scalar: text
                     .get("query_pre_attn_scalar")
                     .and_then(|x| x.as_f64()),
+                max_window_layers: text
+                    .get("max_window_layers")
+                    .and_then(|x| x.as_u64())
+                    .map(|x| x as usize),
             },
         })
     }
@@ -340,6 +359,32 @@ mod tests {
         assert_eq!(meta.eos_token_ids, vec![1, 2]);
         // GQA default: kv heads == q heads.
         assert_eq!(meta.num_key_value_heads, 2);
+    }
+
+    #[test]
+    fn qwen2_use_sliding_window_false_nulls_the_window() {
+        let base = serde_json::json!({
+            "model_type": "qwen2", "hidden_size": 8, "intermediate_size": 16,
+            "num_hidden_layers": 2, "num_attention_heads": 2, "vocab_size": 10,
+            "sliding_window": 131072, "use_sliding_window": false,
+            "max_window_layers": 28
+        });
+        let meta = ModelMetadata::from_hf_config(&base, None).unwrap();
+        assert_eq!(meta.attention_pattern.sliding_window, None);
+        assert_eq!(meta.attention_pattern.max_window_layers, Some(28));
+
+        // Explicitly enabled (rare long-context qwen) keeps the window, so
+        // the registry guard can reject it loudly instead of running wrong.
+        let mut on = base.clone();
+        on["use_sliding_window"] = serde_json::json!(true);
+        let meta = ModelMetadata::from_hf_config(&on, None).unwrap();
+        assert_eq!(meta.attention_pattern.sliding_window, Some(131072));
+
+        // Absent key (gemma/mistral style) keeps the window too.
+        let mut absent = base.clone();
+        absent.as_object_mut().unwrap().remove("use_sliding_window");
+        let meta = ModelMetadata::from_hf_config(&absent, None).unwrap();
+        assert_eq!(meta.attention_pattern.sliding_window, Some(131072));
     }
 
     #[test]

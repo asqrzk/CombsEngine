@@ -313,18 +313,12 @@ impl<B: Backend> LlamaModel<B> {
                 &[m.num_key_value_heads * m.head_dim, m.hidden_size],
             )?;
 
-            // Biases are absent in this model family but tolerated for
-            // related checkpoints (e.g. some Qwen releases).
+            // Bias loading is presence-driven: HF Qwen2 configs never emit
+            // `attention_bias` (the bias is implicit in the modeling code),
+            // so gating on metadata would silently skip real bias tensors.
+            // Plain llama/smollm checkpoints have none and probe to `None`.
             let bias = |proj: &str| -> Result<Option<Tensor<B, 1>>> {
-                if m.attention_bias || proj.starts_with("mlp") {
-                    load_optional_bias(
-                        source,
-                        device,
-                        &format!("{p}.{proj}.bias"),
-                    )
-                } else {
-                    Ok(None)
-                }
+                load_optional_bias(source, device, &format!("{p}.{proj}.bias"))
             };
 
             layers.push(LlamaLayer {

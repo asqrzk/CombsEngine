@@ -256,6 +256,24 @@ impl GgufSource {
         };
         let data_start = c.pos.div_ceil(alignment) * alignment;
 
+        // Split GGUFs (llama.cpp `gguf-split` shards, `…-00001-of-0000N`)
+        // carry only a slice of the tensors; loading one would fail later
+        // with a baffling missing-tensor error and a wrong tied-head guess.
+        if let Some(MetaValue::U32(count)) = kv.get("split.count") {
+            if *count > 1 {
+                let no = match kv.get("split.no") {
+                    Some(MetaValue::U32(n)) => *n + 1,
+                    _ => 1,
+                };
+                return Err(FormatError::Safetensors(format!(
+                    "split GGUF: this file is shard {no} of {count} — \
+                     multi-file GGUF loading is not supported yet; pull a \
+                     single-file quant or merge the shards with llama.cpp's \
+                     `llama-gguf-split --merge`"
+                )));
+            }
+        }
+
         let metadata = build_model_metadata(&kv)?;
         let (eos_ids, bos_id, added_tokens) = tokenizer_ids(&kv);
         let tokenizer_json = ensure_tokenizer_json(&path, &kv)?;
@@ -351,6 +369,8 @@ fn build_model_metadata(kv: &HashMap<String, MetaValue>) -> Result<ModelMetadata
         // GGUF files usually include output.weight; if absent, the head is tied.
         tie_word_embeddings: false, // refined in load() via tensor presence
         head_dim: hidden / heads,
+        // Bias loading is presence-driven (the loader probes bias tensors),
+        // so this flag is informational only for GGUF.
         attention_bias: false,
         bos_token_id: bos_id,
         eos_token_ids: eos_ids,
@@ -393,6 +413,19 @@ fn special_token_count(kv: &HashMap<String, MetaValue>) -> usize {
     }
 }
 
+/// BPE split regex for the synthesized tokenizer, selected by the GGUF
+/// `tokenizer.ggml.pre` family. Qwen2 splits digit runs into single digits
+/// (`\p{N}`) where the GPT-2/llama-bpe families group up to three
+/// (`\p{N}{1,3}`) — digit tokenization drift is user-visible on coder models.
+fn pretokenizer_regex(kv: &HashMap<String, MetaValue>) -> &'static str {
+    const DEFAULT: &str = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+    const QWEN2: &str = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+    match kv.get("tokenizer.ggml.pre") {
+        Some(MetaValue::String(pre)) if pre == "qwen2" => QWEN2,
+        _ => DEFAULT,
+    }
+}
+
 /// Builds a minimal HF BPE tokenizer.json from GGUF tokenizer metadata when
 /// no sibling tokenizer.json exists (cached alongside the model file).
 ///
@@ -409,11 +442,26 @@ fn ensure_tokenizer_json(path: &Path, kv: &HashMap<String, MetaValue>) -> Result
     }
     let cached = path.with_extension("tokenizer.json");
     if cached.exists() {
-        let have = std::fs::read_to_string(&cached)
+        let parsed = std::fs::read_to_string(&cached)
             .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+        let have_added = parsed
+            .as_ref()
             .and_then(|v| v.get("added_tokens")?.as_array().map(Vec::len));
-        if have == Some(special_token_count(kv)) {
+        // Older syntheses hardcoded the GPT-2 split regex for every family;
+        // regenerate when the cached regex disagrees with the `pre` family.
+        let have_regex = parsed.as_ref().and_then(|v| {
+            v.get("pre_tokenizer")?
+                .get("pretokenizers")?
+                .get(0)?
+                .get("pattern")?
+                .get("Regex")?
+                .as_str()
+                .map(str::to_string)
+        });
+        if have_added == Some(special_token_count(kv))
+            && have_regex.as_deref() == Some(pretokenizer_regex(kv))
+        {
             return Ok(cached);
         }
         // Stale synthesis — regenerate below.
@@ -478,7 +526,7 @@ fn ensure_tokenizer_json(path: &Path, kv: &HashMap<String, MetaValue>) -> Result
         "pre_tokenizer": {
             "type": "Sequence",
             "pretokenizers": [
-                {"type": "Split", "pattern": {"Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}, "behavior": "Isolated", "invert": false},
+                {"type": "Split", "pattern": {"Regex": pretokenizer_regex(kv)}, "behavior": "Isolated", "invert": false},
                 {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false}
             ]
         },
@@ -920,10 +968,15 @@ impl ModelSource for GgufSource {
     }
 
     fn tokenizer(&self) -> Result<TokenizerSpec> {
+        let add_bos = match self.kv.get("tokenizer.ggml.add_bos_token") {
+            Some(MetaValue::Bool(b)) => Some(*b),
+            _ => None,
+        };
         Ok(TokenizerSpec {
             tokenizer_json: self.tokenizer_json.clone(),
             added_tokens: self.added_tokens.clone(),
             chat_template: None,
+            add_bos,
         })
     }
 

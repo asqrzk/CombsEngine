@@ -409,3 +409,48 @@ Log the chosen precision/kernel per tensor at load for transparency.
 
 Phases 0→2 give a usable, memory-efficient engine in ~2 weeks; Phase 1B is the
 "native quantized" finish that makes 7B run in ~4 GB.
+
+---
+
+## 2026-08-11 — Universal-engine wave 1.1: Qwen2/2.5 + Mistral (LANDED)
+
+Per `CombsLLM/docs/ROADMAP.md` v2 wave 1.1. What shipped:
+
+- **Registry**: `qwen2` + `mistral` → llama loader, both guarded by
+  `reject_active_sliding` (an *active* window would run unmasked and silently
+  wrong on the llama block — refused loudly until the wave-2 AttentionLayout).
+  Metadata parse nulls `sliding_window` when `use_sliding_window: false`
+  (qwen configs carry the key even when sliding is off); `max_window_layers`
+  stored raw for wave 2.
+- **Presence-driven bias loading** (llama.rs): q/k/v/o bias tensors are probed
+  by existence, not gated on `metadata.attention_bias` — HF Qwen2 configs
+  never emit the flag, and GGUF hardcoded it false. Proven behaviorally:
+  synthetic checkpoints with real vs zero vs absent biases (zero == absent
+  bit-for-bit, real diverges).
+- **`add_bos` honored end-to-end**: `TokenizerSpec.add_bos` from
+  `tokenizer.ggml.add_bos_token` / `tokenizer_config.json::add_bos_token`;
+  the engine's BOS prepend skips when `Some(false)`. Qwen GGUF declares a BOS
+  id (`<|endoftext|>`) but `add_bos_token=false` — previously every prompt
+  would have been silently prefixed with it.
+- **Per-family GGUF pretokenizer** (`tokenizer.ggml.pre`): qwen2 splits digit
+  runs into single digits (`\p{N}` vs the GPT-2/llama `\p{N}{1,3}`); the
+  synthesized-tokenizer cache regenerates when its regex disagrees (the old
+  cache poisoning class, now covered for regex drift too).
+- **Split-GGUF guards**: `GgufSource::load` rejects llama.cpp `gguf-split`
+  shards with "shard N of M" instead of a baffling missing-tensor error +
+  wrong tied-head inference; `combs pull` skips `-NNNNN-of-NNNNN` shard files
+  and explains when a repo has nothing else. (The cached qwen "model.gguf"
+  turned out to be shard 1 of 2 — 81 of 339 tensors — which is why the model
+  never worked. Multi-file GGUF loading + pull resume/retry are wave-2
+  backlog.)
+
+**Proof**: new tests — qwen GGUF fixture (add_bos + digit split + poisoned
+cache regen), bias presence proof, sliding guards, split-shard rejection,
+metadata gate; full formats/models/runtime suites green. **Token-identity
+regression**: llama-3.2-1b GGUF, smollm2-360m safetensors + GGUF byte-identical
+greedy output vs the pre-change binary (only timing footers differ). **E2E**:
+qwen2.5-coder-7b-instruct Q4_K_M (bartowski single-file, 339 tensors) loads as
+`qwen2 (28 layers, hidden 3584, separate lm_head)`, 6.68 GB in use after load,
+and greedily generates a correct Python IPv4 validator through the ChatML wrap.
+Decode 1.1 tok/s on fused-f32 per-element kernels — slow as expected at 7B;
+prefill tiling + the f16-default gate (wave 4) are the scheduled fixes.

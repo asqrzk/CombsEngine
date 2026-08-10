@@ -313,6 +313,7 @@ fn metadata_from_params(p: &LlmParameters) -> Result<ModelMetadata> {
             pattern: if p.sliding_window_pattern > 0 { p.sliding_window_pattern } else { 6 },
             rope_local_theta: if p.rope_local_theta > 0.0 { p.rope_local_theta } else { 10_000.0 },
             query_pre_attn_scalar: p.query_pre_attn_scalar,
+            max_window_layers: None,
         },
     })
 }
@@ -381,6 +382,7 @@ impl ModelSource for TfliteSource {
             tokenizer_json: self.tokenizer_json.clone(),
             added_tokens: self.added_tokens.clone(),
             chat_template: None,
+            add_bos: None,
         })
     }
 

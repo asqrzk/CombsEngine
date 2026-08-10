@@ -113,6 +113,7 @@ impl SafetensorsSource {
         }
         let mut added_tokens = HashMap::new();
         let mut chat_template = None;
+        let mut add_bos = None;
         if let Some(tc) = read_json(&dir.join("tokenizer_config.json"), false)? {
             if let Some(map) = tc.get("added_tokens_decoder").and_then(|v| v.as_object()) {
                 for (id, entry) in map {
@@ -128,11 +129,13 @@ impl SafetensorsSource {
                 .get("chat_template")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            add_bos = tc.get("add_bos_token").and_then(|v| v.as_bool());
         }
         let tokenizer = TokenizerSpec {
             tokenizer_json,
             added_tokens,
             chat_template,
+            add_bos,
         };
 
         // --- sampler defaults ----------------------------------------------------

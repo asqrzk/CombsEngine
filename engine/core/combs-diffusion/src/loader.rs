@@ -161,6 +161,7 @@ fn load_tokenizer_spec(model_dir: &Path) -> Result<TokenizerSpec> {
         tokenizer_json,
         added_tokens,
         chat_template,
+        add_bos: None,
     })
 }
 
