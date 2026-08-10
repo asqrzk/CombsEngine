@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Args;
 
-use combs_diffusion::{DiffusionArchitecture, DiffusionModel, load_diffusion_model};
+use combs_diffusion::{
+    DiffusionArchitecture, DiffusionModel, SchedulerKind, load_diffusion_model,
+};
 
 #[derive(Args, Clone)]
 pub struct GenerateImageArgs {
@@ -34,6 +36,9 @@ pub struct GenerateImageArgs {
     /// RNG seed.
     #[arg(long)]
     pub seed: Option<u64>,
+    /// Denoising scheduler: ddpm | ddim | dpm++2m.
+    #[arg(long, default_value = "dpm++2m")]
+    pub scheduler: String,
     /// Output PNG path.
     #[arg(long, default_value = "output.png")]
     pub output: PathBuf,
@@ -54,11 +59,14 @@ pub fn cmd_generate_image(args: GenerateImageArgs) -> Result<()> {
         load_diffusion_model::<combs_core::CombsBackend>(architecture, &model_dir, &device)
             .context("loading diffusion pipeline")?;
 
+    let scheduler = SchedulerKind::parse(&args.scheduler)
+        .with_context(|| format!("unknown scheduler {:?} (ddpm | ddim | dpm++2m)", args.scheduler))?;
+
     let embed = pipeline
         .encode_prompt(&args.prompt, args.negative_prompt.as_deref())
         .context("encoding prompt")?;
 
-    let image = pipeline
+    let (image, effective_seed) = pipeline
         .generate(
             embed,
             args.width,
@@ -66,11 +74,16 @@ pub fn cmd_generate_image(args: GenerateImageArgs) -> Result<()> {
             args.steps,
             args.guidance_scale,
             args.seed,
+            scheduler,
         )
         .context("generating image")?;
 
     save_tensor_as_png(&image, &args.output).context("saving output image")?;
-    println!("saved {}", args.output.display());
+    println!(
+        "saved {} ({}, seed {effective_seed})",
+        args.output.display(),
+        scheduler.name()
+    );
     Ok(())
 }
 

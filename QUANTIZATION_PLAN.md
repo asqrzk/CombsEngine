@@ -508,3 +508,38 @@ audit**: the mismatch was real, the earlier "empirical parity" was a
 shallow-prompt illusion, and parity is now proven at the strongest level
 (quant-vs-dense token identity). The wave-4 perplexity harness remains
 scheduled as ongoing QA, no longer as the audit's resolution.
+
+---
+
+## 2026-08-11 — Wave 1.3: diffusion correctness — CFG, seeds, schedulers (LANDED)
+
+The three dead knobs are real now. `guidance_scale` and `seed` were parsed
+end-to-end and silently dropped; the negative embedding was computed then
+discarded; DDPM@20 under-denoised.
+
+- **Classifier-free guidance**: one batched UNet pass over [uncond; cond]
+  (batch 2), split, `uncond + scale·(cond − uncond)`; `scale ≤ 1` skips the
+  uncond half. Fix surfaced: the resnet time projection reshapes to
+  [batch, C, 1, 1], so the timestep embedding is now built batch-sized.
+- **Seeded host-side noise** (`noise.rs`): xorshift64* + Box–Muller (same
+  no-dep RNG family as the sampler), uploaded via `from_data` — backend
+  RNGs are global and non-reproducible; host noise gives byte-identical
+  images per seed on any backend. Entropy-drawn seeds are echoed in the
+  serve-images response (`"seed"`), the CLI print, and the Create flow
+  (which auto-fills the empty seed field for replay).
+- **Scheduler trait** + three implementations sharing the SD 1.5
+  scaled-linear schedule and diffusers "leading" spacing (offset 1), all
+  computed in f64: spaced-posterior DDPM (fixed_small), DDIM
+  (set_alpha_to_one=false), and **DPM++ 2M** (multistep midpoint, epsilon,
+  final sigma zero, first-order final step) — **the new default @ 20
+  steps**, fixing the under-denoise. `scheduler` field on the HTTP API,
+  `--scheduler` CLI flag, picker in the Create flow.
+
+**Proof**: golden tests against Python-computed diffusers-formula references
+(alphas_cumprod to 1e-9, DDPM posterior coefficients to 1e-9, DDIM and
+DPM++ 2M 20-step scalar chains to f32 tolerance); seeded-noise stream
+reproducibility + Gaussian moments; E2E on SD 1.5 @ 512×512×20: same seed →
+byte-identical PNG (sha-equal), different seed differs, cfg 7.5 vs 1.0
+differs (red channel +9 toward the prompt), negative-prompt path active.
+The 4×3 visual QA grid (seeds × scales × schedulers) remains a documented
+manual pass via the Create flow's new picker.

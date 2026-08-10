@@ -13,6 +13,7 @@ use combs_formats::{AttentionPattern, ModelMetadata, ModelSource, TokenizerSpec}
 pub mod blocks;
 pub mod clip;
 pub mod loader;
+pub mod noise;
 pub mod scheduler;
 pub mod time;
 pub mod unet;
@@ -21,7 +22,8 @@ pub mod weights;
 
 pub use clip::{input_ids_to_tensor, ClipTextModel};
 pub use loader::{load_diffusion_model, DiffusionArchitecture};
-pub use scheduler::DdpmScheduler;
+pub use noise::NoiseSource;
+pub use scheduler::{Scheduler, SchedulerKind};
 pub use unet::UNet2DConditionModel;
 pub use vae::VAEDecoder;
 
@@ -47,8 +49,9 @@ pub trait DiffusionModel<B: Backend>: Send {
     /// Encode prompt strings into conditioning embeddings.
     fn encode_prompt(&self, prompt: &str, negative_prompt: Option<&str>) -> Result<PromptEmbed<B>>;
 
-    /// Run the full denoising loop and return an image tensor
-    /// `[batch, channels, height, width]` in RGB order.
+    /// Run the full denoising loop and return the image tensor
+    /// `[batch, channels, height, width]` in RGB order plus the effective
+    /// seed (caller-provided, or entropy-drawn and echoed for reproduction).
     fn generate(
         &mut self,
         prompt: PromptEmbed<B>,
@@ -57,7 +60,8 @@ pub trait DiffusionModel<B: Backend>: Send {
         num_inference_steps: usize,
         guidance_scale: f32,
         seed: Option<u64>,
-    ) -> Result<Tensor<B, 4>>;
+        scheduler: SchedulerKind,
+    ) -> Result<(Tensor<B, 4>, u64)>;
 }
 
 fn diffusion_metadata(architecture: &str) -> ModelMetadata {
@@ -87,7 +91,6 @@ fn diffusion_metadata(architecture: &str) -> ModelMetadata {
 pub struct StableDiffusionPipeline<B: Backend> {
     metadata: ModelMetadata,
     device: burn::tensor::Device<B>,
-    scheduler: DdpmScheduler,
     unet: UNet2DConditionModel<B>,
     vae_decoder: VAEDecoder<B>,
     text_encoder: Option<ClipTextModel<B>>,
@@ -102,7 +105,6 @@ impl<B: Backend> DiffusionModel<B> for StableDiffusionPipeline<B> {
     fn load(source: &dyn ModelSource, device: &burn::tensor::Device<B>) -> Result<Self> {
         // TODO: read config.json, load UNet/VAE/text-encoder weights from safetensors.
         let metadata = diffusion_metadata("stable-diffusion");
-        let scheduler = DdpmScheduler::new(1000);
         let unet = UNet2DConditionModel::new(device);
         let mut vae_decoder = VAEDecoder::new(device);
 
@@ -128,7 +130,6 @@ impl<B: Backend> DiffusionModel<B> for StableDiffusionPipeline<B> {
         Ok(Self {
             metadata,
             device: device.clone(),
-            scheduler,
             unet,
             vae_decoder,
             text_encoder,
@@ -171,29 +172,53 @@ impl<B: Backend> DiffusionModel<B> for StableDiffusionPipeline<B> {
         width: u32,
         height: u32,
         num_inference_steps: usize,
-        _guidance_scale: f32,
-        _seed: Option<u64>,
-    ) -> Result<Tensor<B, 4>> {
+        guidance_scale: f32,
+        seed: Option<u64>,
+        scheduler: SchedulerKind,
+    ) -> Result<(Tensor<B, 4>, u64)> {
         let [b, _seq, _hidden] = prompt.positive.dims();
         let latent_h = (height / 8).max(1) as usize;
         let latent_w = (width / 8).max(1) as usize;
         let latent_channels = 4;
 
-        // 1. random latent noise
-        let mut latent = Tensor::random(
-            [b, latent_channels, latent_h, latent_w],
-            burn::tensor::Distribution::Normal(0.0, 1.0),
-            &self.device,
-        );
+        // Classifier-free guidance: one batched UNet pass over
+        // [uncond; cond], split, then `uncond + scale * (cond - uncond)`.
+        // `scale <= 1` skips the uncond half entirely (single-batch pass).
+        let do_cfg = guidance_scale > 1.0 && prompt.negative.is_some();
+        let context = if do_cfg {
+            Tensor::cat(
+                vec![prompt.negative.clone().unwrap(), prompt.positive.clone()],
+                0,
+            )
+        } else {
+            prompt.positive.clone()
+        };
+
+        // 1. seeded latent noise (host-generated: reproducible everywhere)
+        let mut noise = NoiseSource::new(seed);
+        let mut sched = scheduler.build::<B>(num_inference_steps);
+        let mut latent = noise
+            .normal_tensor::<B>([b, latent_channels, latent_h, latent_w], &self.device)
+            .mul_scalar(sched.init_noise_sigma());
 
         // 2. denoising loop
-        let mut schedule = self.scheduler.inference_steps(num_inference_steps);
-        while schedule.has_next() {
-            let timestep = schedule.timestep() as f32;
-            let noise_pred = self
-                .unet
-                .forward(latent.clone(), timestep, prompt.positive.clone());
-            latent = schedule.step(&latent, &noise_pred);
+        let steps = sched.timesteps().to_vec();
+        for (i, &t) in steps.iter().enumerate() {
+            let input = sched.scale_model_input(latent.clone(), i);
+            let input = if do_cfg {
+                Tensor::cat(vec![input.clone(), input], 0)
+            } else {
+                input
+            };
+            let pred = self.unet.forward(input, t as f32, context.clone());
+            let noise_pred = if do_cfg {
+                let uncond = pred.clone().narrow(0, 0, b);
+                let cond = pred.narrow(0, b, b);
+                uncond.clone() + (cond - uncond).mul_scalar(guidance_scale)
+            } else {
+                pred
+            };
+            latent = sched.step(noise_pred, i, latent, &mut noise);
         }
 
         // 3. VAE decode latent -> image
@@ -201,7 +226,7 @@ impl<B: Backend> DiffusionModel<B> for StableDiffusionPipeline<B> {
         let latent = latent.div_scalar(0.18215f32);
         let image = self.vae_decoder.forward(latent);
         let image = image.clamp(-1.0, 1.0).mul_scalar(0.5).add_scalar(0.5);
-        Ok(image)
+        Ok((image, noise.effective_seed()))
     }
 }
 
@@ -217,7 +242,6 @@ impl<B: Backend> StableDiffusionPipeline<B> {
         device: &burn::tensor::Device<B>,
     ) -> Result<Self> {
         let metadata = diffusion_metadata("stable-diffusion");
-        let scheduler = DdpmScheduler::new(1000);
         let unet = UNet2DConditionModel::load_from(unet_source, device)?;
         let vae_decoder = VAEDecoder::load_from(vae_source, device)?;
         let text_encoder = ClipTextModel::load_from(text_source, device)?;
@@ -225,7 +249,6 @@ impl<B: Backend> StableDiffusionPipeline<B> {
         Ok(Self {
             metadata,
             device: device.clone(),
-            scheduler,
             unet,
             vae_decoder,
             text_encoder: Some(text_encoder),

@@ -64,7 +64,10 @@ fn diffusion_pipeline_runs() {
         negative: None,
     };
 
-    let image = pipeline.generate(embed, 64, 64, 5, 7.5, Some(42)).unwrap();
+    let (image, seed) = pipeline
+        .generate(embed, 64, 64, 5, 7.5, Some(42), combs_diffusion::SchedulerKind::default())
+        .unwrap();
+    assert_eq!(seed, 42);
 
     let [batch, channels, height, width] = image.dims();
     assert_eq!(batch, 1);

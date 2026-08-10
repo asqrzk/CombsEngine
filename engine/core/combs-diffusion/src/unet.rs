@@ -354,9 +354,12 @@ impl<B: Backend> UNet2DConditionModel<B> {
         timestep: f32,
         context: Tensor<B, 3>,
     ) -> Tensor<B, 4> {
-        let [_b, _c, _h, _w] = latent.dims();
+        let [b, _c, _h, _w] = latent.dims();
+        // One timestep entry per batch row: the resnet time projection is
+        // reshaped to [batch, C, 1, 1], so CFG's batched [uncond; cond]
+        // pass needs a batch-sized embedding.
         let t = Tensor::from_data(
-            burn::tensor::TensorData::from([timestep as i64].as_slice()),
+            burn::tensor::TensorData::from(vec![timestep as i64; b].as_slice()),
             &latent.device(),
         );
         let t_emb = timestep_embedding(&t, 320, &latent.device());

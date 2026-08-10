@@ -20,7 +20,9 @@ use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde_json::{Value, json};
 
-use combs_diffusion::{DiffusionArchitecture, DiffusionModel, load_diffusion_model};
+use combs_diffusion::{
+    DiffusionArchitecture, DiffusionModel, SchedulerKind, load_diffusion_model,
+};
 
 use crate::generate_image::tensor_to_rgb_image;
 use crate::http::{HttpResponse, error_json, json_response, respond_preflight};
@@ -141,20 +143,38 @@ fn handle_generate(pipeline: &SharedPipeline, body: &str, stats: &ImageStats) ->
     let guidance =
         req.get("guidance_scale").and_then(Value::as_f64).unwrap_or(7.5) as f32;
     let seed = req.get("seed").and_then(Value::as_u64);
+    let scheduler = match req.get("scheduler").and_then(Value::as_str) {
+        None => SchedulerKind::default(),
+        Some(s) => match SchedulerKind::parse(s) {
+            Some(kind) => kind,
+            None => {
+                return json_response(
+                    400,
+                    error_json(
+                        "invalid_request",
+                        &format!("unknown scheduler {s:?} (ddpm | ddim | dpm++2m)"),
+                    ),
+                );
+            }
+        },
+    };
 
-    eprintln!("[serve-images] generate: {prompt} ({width}x{height}, {steps} steps)");
+    eprintln!(
+        "[serve-images] generate: {prompt} ({width}x{height}, {steps} steps, {}, cfg {guidance})",
+        scheduler.name()
+    );
 
     // Single in-flight generation: the pipeline holds VRAM-resident state.
     let mut pipeline = pipeline.lock().unwrap();
     let started = std::time::Instant::now();
-    let result = (|| -> Result<Vec<u8>> {
+    let result = (|| -> Result<(Vec<u8>, u64)> {
         let embed = pipeline.encode_prompt(prompt, negative)?;
-        let image =
-            pipeline.generate(embed, width, height, steps, guidance, seed)?;
+        let (image, effective_seed) =
+            pipeline.generate(embed, width, height, steps, guidance, seed, scheduler)?;
         let img = tensor_to_rgb_image(&image)?;
         let mut buf: Vec<u8> = Vec::new();
         img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)?;
-        Ok(buf)
+        Ok((buf, effective_seed))
     })();
 
     {
@@ -163,7 +183,7 @@ fn handle_generate(pipeline: &SharedPipeline, body: &str, stats: &ImageStats) ->
         stats
             .last_duration_ms
             .store(started.elapsed().as_millis() as u64, Relaxed);
-        if let Ok(png) = &result {
+        if let Ok((png, _)) = &result {
             stats.last_bytes.store(png.len() as u64, Relaxed);
         } else {
             stats.errors_total.fetch_add(1, Relaxed);
@@ -171,9 +191,9 @@ fn handle_generate(pipeline: &SharedPipeline, body: &str, stats: &ImageStats) ->
     }
 
     match result {
-        Ok(png) => {
+        Ok((png, effective_seed)) => {
             eprintln!(
-                "[serve-images] done in {:.1}s ({} bytes)",
+                "[serve-images] done in {:.1}s ({} bytes, seed {effective_seed})",
                 started.elapsed().as_secs_f64(),
                 png.len()
             );
@@ -184,6 +204,10 @@ fn handle_generate(pipeline: &SharedPipeline, body: &str, stats: &ImageStats) ->
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0),
+                    // Echoed so the UI can display and replay the seed even
+                    // when the request left it unset.
+                    "seed": effective_seed,
+                    "scheduler": scheduler.name(),
                     "data": [{ "b64_json": B64.encode(png) }],
                 }),
             )
