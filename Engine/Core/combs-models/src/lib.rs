@@ -11,6 +11,7 @@ mod llama;
 mod matmul;
 mod norm;
 mod precision;
+mod qkernel;
 mod quant_linear;
 mod registry;
 mod rope;

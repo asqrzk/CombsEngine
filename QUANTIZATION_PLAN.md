@@ -130,6 +130,57 @@ runs coherently with no NaNs and ~half the memory. **Effort: days.**
 
 ---
 
+## Kernel architecture — best-practices from HuggingFace `kernels`
+
+HF's `kernels` library (drop-in optimized kernels distributed per op+device) is a
+proven design template. Principles we adopt for our CubeCL kernels:
+
+1. **Swap behind a stable op interface.** Model code keeps calling `linear()`,
+   `rms_norm()`, `attend()`. The kernel is chosen underneath — model code never
+   changes. (We already have these seams.)
+2. **Always fall back to a portable path.** HF: "falls back to standard PyTorch
+   when no kernel is available." Ours: the portable burn-tensor path (and the
+   `gguf.rs` CPU dequant) is the reference/fallback; the CubeCL kernel is the
+   opt-in fast path. **This is what de-risks the burn dependency** — kernels are
+   optional accelerators, never load-bearing for correctness.
+3. **Device-aware dispatch.** HF maps each op to a different kernel per
+   cuda/rocm/metal/xpu. Ours: a small registry picks the kernel by
+   `(op, device, dtype, weight-format)`; unknown combos → fallback.
+4. **Own your fusion (don't depend on an auto-fuser).** HF ships explicit fused
+   modules (e.g. `RMSNorm+MLP`) with a companion layout class. This is the direct
+   answer to "why depend on burn-fusion?": we write the specific fused kernels
+   that matter (dequant+matmul first), which we control and can debug — instead
+   of an opaque global fuser that panics on f16.
+5. **Two-layer kernel = Layout + Compute.** HF splits `KernelNameLayout` (weight
+   packing / checkpoint remap) from `KernelName` (the `forward` compute). Ours:
+   a **WeightStore** packs GGUF quant blocks into the device buffer layout the
+   kernel expects, separate from the **kernel** that consumes them. Testable
+   independently.
+6. **Validate against a reference with tolerance.** HF notes kernels differ from
+   the reference by reordering/accumulation ("matches ~97%"). Ours: each CubeCL
+   kernel is unit-tested against the `gguf.rs` CPU dequant + an f32 reference
+   matmul, within tolerance.
+7. **Priority ops = the same ones HF kernelizes:** Linear (quantized
+   dequant-matmul first), Attention, RMSNorm, Rotary, activations.
+
+### The abstraction (what we build)
+
+```
+trait LinearKernel {                     // the swappable op
+    fn forward(&self, x: Tensor) -> Tensor;
+}
+// impls, chosen by the registry:
+//   PortableLinear      — f32/f16 burn matmul            (fallback, exists)
+//   PortableQuantLinear — dequant (CPU/burn) + matmul    (fallback, exists)
+//   CubeQ4Linear        — fused Q4 dequant-matmul kernel (fast path, NEW)
+struct WeightStore { /* packed bytes + scales on device, per format */ }
+fn pick_linear(device, dtype, fmt) -> Box<dyn LinearKernel>  // registry + fallback
+```
+
+Model loaders build the op via `pick_linear(...)`; on an unsupported
+device/format it returns the portable impl. New kernels register without
+touching model code — exactly HF's model.
+
 ## Phase 1 — Quantized weights (the big weight-memory win)
 
 Weights dominate memory, so keep them quantized in VRAM and dequantize on demand.

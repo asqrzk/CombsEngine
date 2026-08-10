@@ -1294,6 +1294,7 @@ dependencies = [
  "burn",
  "combs-core",
  "combs-formats",
+ "cubecl",
  "thiserror 2.0.19",
  "tokenizers",
 ]
