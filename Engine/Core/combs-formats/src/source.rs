@@ -42,6 +42,10 @@ pub trait ModelSource: Send + Sync {
 pub enum QuantFormat {
     /// 32-value blocks, f16 scale + 16 nibble bytes (18 B).
     Q4_0,
+    /// 32-value blocks, f16 scale + u32 high bits + 16 nibble bytes (22 B).
+    Q5_0,
+    /// 32-value blocks, f16 scale + 32 i8 values (34 B).
+    Q8_0,
     /// 256-value superblocks, 6-bit sub-scales + 4-bit quants (144 B).
     Q4K,
     /// 256-value superblocks, i8 sub-scales + 6-bit quants (210 B).

@@ -607,7 +607,9 @@ pub fn dequantize_q4_0(data: &[u8], n: usize) -> Result<Vec<f32>> {
 }
 
 /// Dequantizes a Q8_0 tensor to f32.
-fn dequantize_q8_0(data: &[u8], n: usize) -> Result<Vec<f32>> {
+///
+/// Public via [`crate::quants`] as the golden reference for the GPU kernel.
+pub fn dequantize_q8_0(data: &[u8], n: usize) -> Result<Vec<f32>> {
     let mut out = Vec::with_capacity(n);
     for block in data.chunks_exact(34) {
         let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
@@ -651,7 +653,9 @@ fn dequantize_q4_1(data: &[u8], n: usize) -> Result<Vec<f32>> {
 /// Dequantizes a Q5_0 tensor to f32. 32-value blocks (22 bytes): f16
 /// scale, u32 high bits (bit j → value j, bit j+16 → value j+16), 16
 /// packed nibble bytes; values biased by -16.
-fn dequantize_q5_0(data: &[u8], n: usize) -> Result<Vec<f32>> {
+///
+/// Public via [`crate::quants`] as the golden reference for the GPU kernel.
+pub fn dequantize_q5_0(data: &[u8], n: usize) -> Result<Vec<f32>> {
     let mut out = Vec::with_capacity(n);
     for block in data.chunks_exact(22) {
         let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
@@ -933,6 +937,8 @@ impl ModelSource for GgufSource {
         };
         let format = match info.ggml_type {
             GGML_Q4_0 => crate::QuantFormat::Q4_0,
+            GGML_Q5_0 => crate::QuantFormat::Q5_0,
+            GGML_Q8_0 => crate::QuantFormat::Q8_0,
             GGML_Q4_K => crate::QuantFormat::Q4K,
             GGML_Q6_K => crate::QuantFormat::Q6K,
             _ => return Ok(None),

@@ -106,7 +106,7 @@ pub(crate) fn load_tensor<B: Backend, const D: usize>(
 /// Loads a projection weight as a [`Linear`]: the packed-quant fast path
 /// when the source stores it in a kernel-supported GGUF format *and* the
 /// backend runs on wgpu, else the dense tensor (portable fallback).
-fn load_linear<B: Backend>(
+pub(crate) fn load_linear<B: Backend>(
     source: &dyn ModelSource,
     device: &Device<B>,
     name: &str,

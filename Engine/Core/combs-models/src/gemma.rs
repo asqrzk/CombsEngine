@@ -28,7 +28,8 @@ use burn::tensor::{Device, Int, Tensor, backend::Backend};
 use combs_formats::{ModelMetadata, ModelSource};
 
 use crate::kv::{CacheConfig, CacheKind, ContiguousKVCache, KVCache, PagedKVCache};
-use crate::llama::{linear, load_tensor};
+use crate::llama::{load_linear, load_tensor};
+use crate::qlinear::Linear;
 use crate::matmul::safe_matmul;
 use crate::norm::gemma_rms_norm;
 use crate::precision::{to_f32, to_float};
@@ -48,17 +49,18 @@ fn expect_shape(name: &str, got: &[usize], expected: &[usize]) -> Result<()> {
     }
 }
 
-/// One decoder layer's weights (all projections `[out, in]`, HF layout).
+/// One decoder layer's weights (all projections `[out, in]`, HF layout);
+/// projections are [`Linear`] — dense or packed-quant per stored format.
 struct GemmaLayer<B: Backend> {
-    q: Tensor<B, 2>,
-    k: Tensor<B, 2>,
-    v: Tensor<B, 2>,
-    o: Tensor<B, 2>,
+    q: Linear<B>,
+    k: Linear<B>,
+    v: Linear<B>,
+    o: Linear<B>,
     q_norm: Tensor<B, 1>, // [head_dim]
     k_norm: Tensor<B, 1>, // [head_dim]
-    gate: Tensor<B, 2>,
-    up: Tensor<B, 2>,
-    down: Tensor<B, 2>,
+    gate: Linear<B>,
+    up: Linear<B>,
+    down: Linear<B>,
     input_norm: Tensor<B, 1>,
     post_attn_norm: Tensor<B, 1>,
     pre_ff_norm: Tensor<B, 1>,
@@ -68,8 +70,8 @@ struct GemmaLayer<B: Backend> {
 /// Gemma 3 causal LM.
 pub struct GemmaModel<B: Backend> {
     metadata: ModelMetadata,
-    embed: Tensor<B, 2>, // [vocab, hidden]
-    lm_head: Option<Tensor<B, 2>>,
+    embed: Tensor<B, 2>, // [vocab, hidden]; dense for `select` + tied head
+    lm_head: Option<Linear<B>>,
     final_norm: Tensor<B, 1>,
     layers: Vec<GemmaLayer<B>>,
     rope_global: RotaryEmbedding<B>,
@@ -123,13 +125,19 @@ impl<B: Backend> GemmaModel<B> {
 
             // --- attention block --------------------------------------
             let h = gemma_rms_norm(x.clone(), layer.input_norm.clone(), m.rms_norm_eps);
-            let q = linear(h.clone(), &layer.q, None)
+            let q = layer
+                .q
+                .forward(h.clone(), None)
                 .reshape([1, seq, m.num_attention_heads, m.head_dim])
                 .swap_dims(1, 2);
-            let k = linear(h.clone(), &layer.k, None)
+            let k = layer
+                .k
+                .forward(h.clone(), None)
                 .reshape([1, seq, m.num_key_value_heads, m.head_dim])
                 .swap_dims(1, 2);
-            let v = linear(h, &layer.v, None)
+            let v = layer
+                .v
+                .forward(h, None)
                 .reshape([1, seq, m.num_key_value_heads, m.head_dim])
                 .swap_dims(1, 2);
 
@@ -145,14 +153,15 @@ impl<B: Backend> GemmaModel<B> {
             let ctx = ctx
                 .swap_dims(1, 2)
                 .reshape([1, seq, m.num_attention_heads * m.head_dim]);
-            let attn_out = linear(ctx, &layer.o, None);
+            let attn_out = layer.o.forward(ctx, None);
             // Sandwich: post-norm on the sublayer output before residual.
             x = x + gemma_rms_norm(attn_out, layer.post_attn_norm.clone(), m.rms_norm_eps);
 
             // --- MLP block (gelu-tanh gated) ---------------------------
             let h = gemma_rms_norm(x.clone(), layer.pre_ff_norm.clone(), m.rms_norm_eps);
-            let gated = gelu_tanh(linear(h.clone(), &layer.gate, None)) * linear(h, &layer.up, None);
-            let mlp_out = linear(gated, &layer.down, None);
+            let gated =
+                gelu_tanh(layer.gate.forward(h.clone(), None)) * layer.up.forward(h, None);
+            let mlp_out = layer.down.forward(gated, None);
             x = x + gemma_rms_norm(mlp_out, layer.post_ff_norm.clone(), m.rms_norm_eps);
         }
 
@@ -161,9 +170,16 @@ impl<B: Backend> GemmaModel<B> {
 
     fn last_logits(&self, hidden: Tensor<B, 3>) -> Tensor<B, 2> {
         let [_, seq, hidden_size] = hidden.dims();
-        let last = hidden.narrow(1, seq - 1, 1).reshape([1, hidden_size]);
-        let w = self.lm_head.as_ref().unwrap_or(&self.embed);
-        safe_matmul(last, w.clone().transpose())
+        let last = hidden.narrow(1, seq - 1, 1); // [1, 1, hidden]
+        let logits = match &self.lm_head {
+            Some(head) => head.forward(last, None),
+            None => {
+                let last = last.reshape([1, hidden_size]);
+                return safe_matmul(last, self.embed.clone().transpose());
+            }
+        };
+        let [_, _, vocab] = logits.dims();
+        logits.reshape([1, vocab])
     }
 }
 
@@ -188,16 +204,13 @@ impl<B: Backend> GenerativeModel<B> for GemmaModel<B> {
             // Some checkpoints (e.g. unsloth's gemma-3-1b) tie embeddings
             // without saying so in config.json — fall back to tied when
             // the tensor simply isn't there.
-            match source.open_tensor("lm_head.weight") {
-                Ok(reader) => {
-                    let w: Tensor<B, 2> = reader
-                        .load_to_tensor::<B, 2>(device)
-                        .map_err(ModelError::Format)?;
+            match load_linear(source, device, "lm_head.weight") {
+                Ok(w) => {
                     expect_shape("lm_head.weight", &w.dims(), &[m.vocab_size, m.hidden_size])?;
                     Some(w)
                 }
-                Err(combs_formats::FormatError::TensorNotFound(_)) => None,
-                Err(e) => return Err(ModelError::Format(e)),
+                Err(ModelError::MissingTensor(_)) => None,
+                Err(e) => return Err(e),
             }
         };
 
@@ -206,8 +219,8 @@ impl<B: Backend> GenerativeModel<B> for GemmaModel<B> {
         let mut layers = Vec::with_capacity(m.num_hidden_layers);
         for i in 0..m.num_hidden_layers {
             let p = format!("model.layers.{i}");
-            let q: Tensor<B, 2> = load_tensor(source, device, &format!("{p}.self_attn.q_proj.weight"))?;
-            let k: Tensor<B, 2> = load_tensor(source, device, &format!("{p}.self_attn.k_proj.weight"))?;
+            let q = load_linear(source, device, &format!("{p}.self_attn.q_proj.weight"))?;
+            let k = load_linear(source, device, &format!("{p}.self_attn.k_proj.weight"))?;
             expect_shape(
                 &format!("{p}.self_attn.q_proj.weight"),
                 &q.dims(),
@@ -221,13 +234,13 @@ impl<B: Backend> GenerativeModel<B> for GemmaModel<B> {
             layers.push(GemmaLayer {
                 q,
                 k,
-                v: load_tensor(source, device, &format!("{p}.self_attn.v_proj.weight"))?,
-                o: load_tensor(source, device, &format!("{p}.self_attn.o_proj.weight"))?,
+                v: load_linear(source, device, &format!("{p}.self_attn.v_proj.weight"))?,
+                o: load_linear(source, device, &format!("{p}.self_attn.o_proj.weight"))?,
                 q_norm: load_tensor(source, device, &format!("{p}.self_attn.q_norm.weight"))?,
                 k_norm: load_tensor(source, device, &format!("{p}.self_attn.k_norm.weight"))?,
-                gate: load_tensor(source, device, &format!("{p}.mlp.gate_proj.weight"))?,
-                up: load_tensor(source, device, &format!("{p}.mlp.up_proj.weight"))?,
-                down: load_tensor(source, device, &format!("{p}.mlp.down_proj.weight"))?,
+                gate: load_linear(source, device, &format!("{p}.mlp.gate_proj.weight"))?,
+                up: load_linear(source, device, &format!("{p}.mlp.up_proj.weight"))?,
+                down: load_linear(source, device, &format!("{p}.mlp.down_proj.weight"))?,
                 input_norm: load_tensor(source, device, &format!("{p}.input_layernorm.weight"))?,
                 post_attn_norm: load_tensor(
                     source,

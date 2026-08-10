@@ -268,6 +268,397 @@ impl<R: Runtime> Q40Weight<R> {
 }
 
 // ---------------------------------------------------------------------------
+// Q5_0 / Q8_0 (32-value blocks) — the formats ggml falls back to for
+// tensors whose row size is not a 256 multiple (e.g. SmolLM2's hidden 960),
+// so a "Q4_K_M" file of such a model is mostly Q5_0 with Q8_0 embeddings.
+// ---------------------------------------------------------------------------
+
+/// Bytes per GGUF Q5_0 block: f16 scale + u32 high bits + 16 nibble bytes.
+pub const Q5_0_BLOCK_BYTES: usize = 22;
+/// Bytes per GGUF Q8_0 block: f16 scale + 32 i8 values.
+pub const Q8_0_BLOCK_BYTES: usize = 34;
+
+/// Layout step for Q5_0: SoA of `(nibble words [4/blk], high-bit words
+/// [1/blk], f32 scales)` — 24 B / 32 weights = 6.0 bits/weight.
+pub fn repack_q5_0(data: &[u8]) -> Result<(Vec<u32>, Vec<u32>, Vec<f32>)> {
+    if data.is_empty() || data.len() % Q5_0_BLOCK_BYTES != 0 {
+        return Err(ModelError::BadShape {
+            tensor: "q5_0 block stream".into(),
+            expected: vec![Q5_0_BLOCK_BYTES],
+            got: vec![data.len()],
+        });
+    }
+    let n_blocks = data.len() / Q5_0_BLOCK_BYTES;
+    let mut qs = Vec::with_capacity(n_blocks * 4);
+    let mut qh = Vec::with_capacity(n_blocks);
+    let mut d = Vec::with_capacity(n_blocks);
+    for block in data.chunks_exact(Q5_0_BLOCK_BYTES) {
+        d.push(burn::tensor::f16::from_le_bytes([block[0], block[1]]).to_f32());
+        qh.push(u32::from_le_bytes([block[2], block[3], block[4], block[5]]));
+        for w in 0..4 {
+            let o = 6 + 4 * w;
+            qs.push(u32::from_le_bytes([
+                block[o],
+                block[o + 1],
+                block[o + 2],
+                block[o + 3],
+            ]));
+        }
+    }
+    Ok((qs, qh, d))
+}
+
+/// Layout step for Q8_0: SoA of `(i8 words [8/blk], f32 scales)` —
+/// 36 B / 32 weights = 9.0 bits/weight.
+pub fn repack_q8_0(data: &[u8]) -> Result<(Vec<u32>, Vec<f32>)> {
+    if data.is_empty() || data.len() % Q8_0_BLOCK_BYTES != 0 {
+        return Err(ModelError::BadShape {
+            tensor: "q8_0 block stream".into(),
+            expected: vec![Q8_0_BLOCK_BYTES],
+            got: vec![data.len()],
+        });
+    }
+    let n_blocks = data.len() / Q8_0_BLOCK_BYTES;
+    let mut qs = Vec::with_capacity(n_blocks * 8);
+    let mut d = Vec::with_capacity(n_blocks);
+    for block in data.chunks_exact(Q8_0_BLOCK_BYTES) {
+        d.push(burn::tensor::f16::from_le_bytes([block[0], block[1]]).to_f32());
+        for w in 0..8 {
+            let o = 2 + 4 * w;
+            qs.push(u32::from_le_bytes([
+                block[o],
+                block[o + 1],
+                block[o + 2],
+                block[o + 3],
+            ]));
+        }
+    }
+    Ok((qs, d))
+}
+
+/// Q5_0 dequant-only kernel, bit-exact mirror of the CPU reference:
+/// `((nibble | high_bit«4) − 16) · d`, high bit `j` of the block's u32 for
+/// value `j` (low nibbles), `j+16` for the highs.
+#[cube(launch_unchecked)]
+fn q5_0_dequant_kernel(
+    qs: &Array<u32>,
+    qh: &Array<u32>,
+    d: &Array<f32>,
+    out: &mut Array<f32>,
+    n: usize,
+) {
+    if ABSOLUTE_POS < n {
+        let block = ABSOLUTE_POS / 32;
+        let j = ABSOLUTE_POS % 32;
+        let byte_idx = j % 16;
+        let word = qs[block * 4 + byte_idx / 4];
+        let byte = (word >> (u32::cast_from(byte_idx % 4) * 8)) & 0xFF;
+        let mut nib = byte & 0xF;
+        if j >= 16 {
+            nib = byte >> 4;
+        }
+        let hi_bit = (qh[block] >> u32::cast_from(j)) & 1;
+        let q = i32::cast_from(nib | (hi_bit << 4)) - 16;
+        out[ABSOLUTE_POS] = f32::cast_from(q) * d[block];
+    }
+}
+
+/// Fused Q5_0 dequant-matmul (see `q4_0_matmul_kernel` for the scheme).
+#[cube(launch_unchecked)]
+fn q5_0_matmul_kernel(
+    x: &Array<f32>,
+    qs: &Array<u32>,
+    qh: &Array<u32>,
+    d: &Array<f32>,
+    out: &mut Array<f32>,
+    m: usize,
+    k: usize,
+    n_out: usize,
+) {
+    if ABSOLUTE_POS < m * n_out {
+        let row = ABSOLUTE_POS / n_out;
+        let col = ABSOLUTE_POS % n_out;
+        let blocks_per_row = k / 32;
+        let mut acc = 0.0f32;
+        for kb in 0..blocks_per_row {
+            let block = col * blocks_per_row + kb;
+            let x_base = row * k + kb * 32;
+            let bits = qh[block];
+            let mut block_acc = 0.0f32;
+            for w in 0..4usize {
+                let word = qs[block * 4 + w];
+                for b in 0..4usize {
+                    let byte = (word >> (u32::cast_from(b) * 8)) & 0xFF;
+                    let jj = w * 4 + b;
+                    let lo_bit = (bits >> u32::cast_from(jj)) & 1;
+                    let hi_bit = (bits >> u32::cast_from(jj + 16)) & 1;
+                    let lo = f32::cast_from(i32::cast_from((byte & 0xF) | (lo_bit << 4)) - 16);
+                    let hi = f32::cast_from(i32::cast_from((byte >> 4) | (hi_bit << 4)) - 16);
+                    block_acc += lo * x[x_base + jj];
+                    block_acc += hi * x[x_base + 16 + jj];
+                }
+            }
+            acc += d[block] * block_acc;
+        }
+        out[row * n_out + col] = acc;
+    }
+}
+
+/// Q8_0 dequant-only kernel: sign-extended i8 times the block scale.
+#[cube(launch_unchecked)]
+fn q8_0_dequant_kernel(qs: &Array<u32>, d: &Array<f32>, out: &mut Array<f32>, n: usize) {
+    if ABSOLUTE_POS < n {
+        let block = ABSOLUTE_POS / 32;
+        let j = ABSOLUTE_POS % 32;
+        let word = qs[block * 8 + j / 4];
+        let byte = (word >> (u32::cast_from(j % 4) * 8)) & 0xFF;
+        let q = (i32::cast_from(byte) << 24) >> 24;
+        out[ABSOLUTE_POS] = f32::cast_from(q) * d[block];
+    }
+}
+
+/// Fused Q8_0 dequant-matmul.
+#[cube(launch_unchecked)]
+fn q8_0_matmul_kernel(
+    x: &Array<f32>,
+    qs: &Array<u32>,
+    d: &Array<f32>,
+    out: &mut Array<f32>,
+    m: usize,
+    k: usize,
+    n_out: usize,
+) {
+    if ABSOLUTE_POS < m * n_out {
+        let row = ABSOLUTE_POS / n_out;
+        let col = ABSOLUTE_POS % n_out;
+        let blocks_per_row = k / 32;
+        let mut acc = 0.0f32;
+        for kb in 0..blocks_per_row {
+            let block = col * blocks_per_row + kb;
+            let x_base = row * k + kb * 32;
+            let mut block_acc = 0.0f32;
+            for w in 0..8usize {
+                let word = qs[block * 8 + w];
+                for b in 0..4usize {
+                    let byte = (word >> (u32::cast_from(b) * 8)) & 0xFF;
+                    let q = (i32::cast_from(byte) << 24) >> 24;
+                    block_acc += f32::cast_from(q) * x[x_base + w * 4 + b];
+                }
+            }
+            acc += d[block] * block_acc;
+        }
+        out[row * n_out + col] = acc;
+    }
+}
+
+/// Runs the Q5_0 dequant-only kernel (validation/debugging path).
+pub fn dequantize_q5_0_gpu<R: Runtime>(client: &ComputeClient<R>, data: &[u8]) -> Result<Vec<f32>> {
+    let (qs, qh, d) = repack_q5_0(data)?;
+    let n = d.len() * Q4_0_BLOCK;
+    let qs_h = client.create_from_slice(u32::as_bytes(&qs));
+    let qh_h = client.create_from_slice(u32::as_bytes(&qh));
+    let d_h = client.create_from_slice(f32::as_bytes(&d));
+    let out_h = client.empty(n * core::mem::size_of::<f32>());
+    unsafe {
+        q5_0_dequant_kernel::launch_unchecked::<R>(
+            client,
+            cube_count_1d(n as u32),
+            CubeDim::new_1d(CUBE_DIM),
+            ArrayArg::from_raw_parts(qs_h, qs.len()),
+            ArrayArg::from_raw_parts(qh_h, qh.len()),
+            ArrayArg::from_raw_parts(d_h, d.len()),
+            ArrayArg::from_raw_parts(out_h.clone(), n),
+            n,
+        );
+    }
+    let bytes = client.read_one_unchecked(out_h);
+    Ok(f32::from_bytes(&bytes).to_vec())
+}
+
+/// Runs the Q8_0 dequant-only kernel (validation/debugging path).
+pub fn dequantize_q8_0_gpu<R: Runtime>(client: &ComputeClient<R>, data: &[u8]) -> Result<Vec<f32>> {
+    let (qs, d) = repack_q8_0(data)?;
+    let n = d.len() * Q4_0_BLOCK;
+    let qs_h = client.create_from_slice(u32::as_bytes(&qs));
+    let d_h = client.create_from_slice(f32::as_bytes(&d));
+    let out_h = client.empty(n * core::mem::size_of::<f32>());
+    unsafe {
+        q8_0_dequant_kernel::launch_unchecked::<R>(
+            client,
+            cube_count_1d(n as u32),
+            CubeDim::new_1d(CUBE_DIM),
+            ArrayArg::from_raw_parts(qs_h, qs.len()),
+            ArrayArg::from_raw_parts(d_h, d.len()),
+            ArrayArg::from_raw_parts(out_h.clone(), n),
+            n,
+        );
+    }
+    let bytes = client.read_one_unchecked(out_h);
+    Ok(f32::from_bytes(&bytes).to_vec())
+}
+
+/// A weight matrix resident in VRAM in packed Q5_0 form (`[n_out, k]`,
+/// `k % 32 == 0`, blocks along `k`).
+pub struct Q50Weight<R: Runtime> {
+    qs: Handle,
+    qh: Handle,
+    d: Handle,
+    n_out: usize,
+    k: usize,
+    _runtime: PhantomData<R>,
+}
+
+impl<R: Runtime> Q50Weight<R> {
+    /// Repacks a GGUF Q5_0 tensor onto the device.
+    pub fn from_gguf_bytes(
+        client: &ComputeClient<R>,
+        data: &[u8],
+        n_out: usize,
+        k: usize,
+    ) -> Result<Self> {
+        if k == 0 || k % Q4_0_BLOCK != 0 || data.len() != n_out * k / Q4_0_BLOCK * Q5_0_BLOCK_BYTES
+        {
+            return Err(ModelError::BadShape {
+                tensor: "q5_0 weight".into(),
+                expected: vec![n_out, k],
+                got: vec![data.len()],
+            });
+        }
+        let (qs, qh, d) = repack_q5_0(data)?;
+        Ok(Q50Weight {
+            qs: client.create_from_slice(u32::as_bytes(&qs)),
+            qh: client.create_from_slice(u32::as_bytes(&qh)),
+            d: client.create_from_slice(f32::as_bytes(&d)),
+            n_out,
+            k,
+            _runtime: PhantomData,
+        })
+    }
+
+    /// Bytes in VRAM: 24 per 32 weights (6.0 bits/weight).
+    pub fn vram_bytes(&self) -> usize {
+        (self.n_out * self.k / Q4_0_BLOCK) * 24
+    }
+
+    /// Device path: launch only, output handle returned.
+    pub fn matmul_device(&self, client: &ComputeClient<R>, x: Handle, m: usize) -> Handle {
+        let out_len = m * self.n_out;
+        let out_h = client.empty(out_len * core::mem::size_of::<f32>());
+        let n_blocks = self.n_out * self.k / Q4_0_BLOCK;
+        unsafe {
+            q5_0_matmul_kernel::launch_unchecked::<R>(
+                client,
+                cube_count_capped(out_len as u32),
+                CubeDim::new_1d(CUBE_DIM),
+                ArrayArg::from_raw_parts(x, m * self.k),
+                ArrayArg::from_raw_parts(self.qs.clone(), n_blocks * 4),
+                ArrayArg::from_raw_parts(self.qh.clone(), n_blocks),
+                ArrayArg::from_raw_parts(self.d.clone(), n_blocks),
+                ArrayArg::from_raw_parts(out_h.clone(), out_len),
+                m,
+                self.k,
+                self.n_out,
+            );
+        }
+        out_h
+    }
+
+    /// Host-slice convenience for tests.
+    pub fn matmul_host(&self, client: &ComputeClient<R>, x: &[f32], m: usize) -> Result<Vec<f32>> {
+        if m == 0 || x.len() != m * self.k {
+            return Err(ModelError::BadShape {
+                tensor: "q5_0 matmul input".into(),
+                expected: vec![m, self.k],
+                got: vec![x.len()],
+            });
+        }
+        let x_h = client.create_from_slice(f32::as_bytes(x));
+        let out_h = self.matmul_device(client, x_h, m);
+        let bytes = client.read_one_unchecked(out_h);
+        Ok(f32::from_bytes(&bytes).to_vec())
+    }
+}
+
+/// A weight matrix resident in VRAM in packed Q8_0 form (`[n_out, k]`,
+/// `k % 32 == 0`, blocks along `k`).
+pub struct Q80Weight<R: Runtime> {
+    qs: Handle,
+    d: Handle,
+    n_out: usize,
+    k: usize,
+    _runtime: PhantomData<R>,
+}
+
+impl<R: Runtime> Q80Weight<R> {
+    /// Repacks a GGUF Q8_0 tensor onto the device.
+    pub fn from_gguf_bytes(
+        client: &ComputeClient<R>,
+        data: &[u8],
+        n_out: usize,
+        k: usize,
+    ) -> Result<Self> {
+        if k == 0 || k % Q4_0_BLOCK != 0 || data.len() != n_out * k / Q4_0_BLOCK * Q8_0_BLOCK_BYTES
+        {
+            return Err(ModelError::BadShape {
+                tensor: "q8_0 weight".into(),
+                expected: vec![n_out, k],
+                got: vec![data.len()],
+            });
+        }
+        let (qs, d) = repack_q8_0(data)?;
+        Ok(Q80Weight {
+            qs: client.create_from_slice(u32::as_bytes(&qs)),
+            d: client.create_from_slice(f32::as_bytes(&d)),
+            n_out,
+            k,
+            _runtime: PhantomData,
+        })
+    }
+
+    /// Bytes in VRAM: 36 per 32 weights (9.0 bits/weight).
+    pub fn vram_bytes(&self) -> usize {
+        (self.n_out * self.k / Q4_0_BLOCK) * 36
+    }
+
+    /// Device path: launch only, output handle returned.
+    pub fn matmul_device(&self, client: &ComputeClient<R>, x: Handle, m: usize) -> Handle {
+        let out_len = m * self.n_out;
+        let out_h = client.empty(out_len * core::mem::size_of::<f32>());
+        let n_blocks = self.n_out * self.k / Q4_0_BLOCK;
+        unsafe {
+            q8_0_matmul_kernel::launch_unchecked::<R>(
+                client,
+                cube_count_capped(out_len as u32),
+                CubeDim::new_1d(CUBE_DIM),
+                ArrayArg::from_raw_parts(x, m * self.k),
+                ArrayArg::from_raw_parts(self.qs.clone(), n_blocks * 8),
+                ArrayArg::from_raw_parts(self.d.clone(), n_blocks),
+                ArrayArg::from_raw_parts(out_h.clone(), out_len),
+                m,
+                self.k,
+                self.n_out,
+            );
+        }
+        out_h
+    }
+
+    /// Host-slice convenience for tests.
+    pub fn matmul_host(&self, client: &ComputeClient<R>, x: &[f32], m: usize) -> Result<Vec<f32>> {
+        if m == 0 || x.len() != m * self.k {
+            return Err(ModelError::BadShape {
+                tensor: "q8_0 matmul input".into(),
+                expected: vec![m, self.k],
+                got: vec![x.len()],
+            });
+        }
+        let x_h = client.create_from_slice(f32::as_bytes(x));
+        let out_h = self.matmul_device(client, x_h, m);
+        let bytes = client.read_one_unchecked(out_h);
+        Ok(f32::from_bytes(&bytes).to_vec())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // K-quants (256-value superblocks). Shared in-kernel byte helpers first.
 // ---------------------------------------------------------------------------
 
@@ -772,6 +1163,10 @@ impl<R: Runtime> Q6KWeight<R> {
 pub enum QuantWeight {
     /// GGUF Q4_0.
     Q40(Q40Weight<cubecl::wgpu::WgpuRuntime>),
+    /// GGUF Q5_0.
+    Q50(Q50Weight<cubecl::wgpu::WgpuRuntime>),
+    /// GGUF Q8_0.
+    Q80(Q80Weight<cubecl::wgpu::WgpuRuntime>),
     /// GGUF Q4_K.
     Q4K(Q4KWeight<cubecl::wgpu::WgpuRuntime>),
     /// GGUF Q6_K.
@@ -791,6 +1186,8 @@ impl QuantWeight {
         use combs_formats::QuantFormat;
         Ok(match format {
             QuantFormat::Q4_0 => QuantWeight::Q40(Q40Weight::from_gguf_bytes(client, data, n_out, k)?),
+            QuantFormat::Q5_0 => QuantWeight::Q50(Q50Weight::from_gguf_bytes(client, data, n_out, k)?),
+            QuantFormat::Q8_0 => QuantWeight::Q80(Q80Weight::from_gguf_bytes(client, data, n_out, k)?),
             QuantFormat::Q4K => QuantWeight::Q4K(Q4KWeight::from_gguf_bytes(client, data, n_out, k)?),
             QuantFormat::Q6K => QuantWeight::Q6K(Q6KWeight::from_gguf_bytes(client, data, n_out, k)?),
         })
@@ -800,6 +1197,8 @@ impl QuantWeight {
     pub fn n_out(&self) -> usize {
         match self {
             QuantWeight::Q40(w) => w.n_out,
+            QuantWeight::Q50(w) => w.n_out,
+            QuantWeight::Q80(w) => w.n_out,
             QuantWeight::Q4K(w) => w.n_out,
             QuantWeight::Q6K(w) => w.n_out,
         }
@@ -809,6 +1208,8 @@ impl QuantWeight {
     pub fn k(&self) -> usize {
         match self {
             QuantWeight::Q40(w) => w.k,
+            QuantWeight::Q50(w) => w.k,
+            QuantWeight::Q80(w) => w.k,
             QuantWeight::Q4K(w) => w.k,
             QuantWeight::Q6K(w) => w.k,
         }
@@ -818,6 +1219,8 @@ impl QuantWeight {
     pub fn vram_bytes(&self) -> usize {
         match self {
             QuantWeight::Q40(w) => w.vram_bytes(),
+            QuantWeight::Q50(w) => w.vram_bytes(),
+            QuantWeight::Q80(w) => w.vram_bytes(),
             QuantWeight::Q4K(w) => w.vram_bytes(),
             QuantWeight::Q6K(w) => w.vram_bytes(),
         }
@@ -832,6 +1235,8 @@ impl QuantWeight {
     ) -> Handle {
         match self {
             QuantWeight::Q40(w) => w.matmul_device(client, x, m),
+            QuantWeight::Q50(w) => w.matmul_device(client, x, m),
+            QuantWeight::Q80(w) => w.matmul_device(client, x, m),
             QuantWeight::Q4K(w) => w.matmul_device(client, x, m),
             QuantWeight::Q6K(w) => w.matmul_device(client, x, m),
         }
@@ -1043,6 +1448,88 @@ mod tests {
             let got = weight.matmul_host(&client, &x, m).unwrap();
             assert_close(&got, &expect, 1e-3, &format!("q6_k matmul m={m}"));
         }
+    }
+
+    /// Q5_0 stream: valid f16 scales, LCG high bits + nibbles.
+    fn synth_q5_0(n_blocks: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n_blocks * Q5_0_BLOCK_BYTES);
+        for b in 0..n_blocks {
+            let scale = burn::tensor::f16::from_f32(0.003 * ((b % 11) as f32 + 1.0));
+            out.extend_from_slice(&scale.to_le_bytes());
+            out.extend_from_slice(&lcg_bytes(20, 0x51D0 ^ b as u32));
+        }
+        out
+    }
+
+    /// Q8_0 stream: valid f16 scales, LCG i8 payload (full range).
+    fn synth_q8_0(n_blocks: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n_blocks * Q8_0_BLOCK_BYTES);
+        for b in 0..n_blocks {
+            let scale = burn::tensor::f16::from_f32(0.003 * ((b % 11) as f32 + 1.0));
+            out.extend_from_slice(&scale.to_le_bytes());
+            out.extend_from_slice(&lcg_bytes(32, 0x80C0 ^ b as u32));
+        }
+        out
+    }
+
+    /// Q5_0/Q8_0 GPU dequant must be **bit-exact** vs the CPU references —
+    /// both are a single f32 multiply per value, same as Q4_0.
+    #[test]
+    fn q5_0_and_q8_0_dequant_are_bit_exact() {
+        let device = Default::default();
+        let client = WgpuRuntime::client(&device);
+
+        let data = synth_q5_0(33);
+        let n = 33 * Q4_0_BLOCK;
+        let expect = combs_formats::quants::dequantize_q5_0(&data, n).unwrap();
+        let got = dequantize_q5_0_gpu::<WgpuRuntime>(&client, &data).unwrap();
+        assert_eq!(got, expect, "q5_0 GPU dequant must be bit-exact");
+
+        let data = synth_q8_0(33);
+        let expect = combs_formats::quants::dequantize_q8_0(&data, n).unwrap();
+        let got = dequantize_q8_0_gpu::<WgpuRuntime>(&client, &data).unwrap();
+        assert_eq!(got, expect, "q8_0 GPU dequant must be bit-exact");
+    }
+
+    /// Fused Q5_0/Q8_0 matmuls vs reference matmuls over the reference
+    /// dequants, decode and prefill shapes.
+    #[test]
+    fn q5_0_and_q8_0_fused_matmul_match_reference() {
+        let device = Default::default();
+        let client = WgpuRuntime::client(&device);
+        let (n_out, k) = (67, 128);
+        let n_blocks = n_out * k / Q4_0_BLOCK;
+
+        let data5 = synth_q5_0(n_blocks);
+        let w5 = combs_formats::quants::dequantize_q5_0(&data5, n_out * k).unwrap();
+        let q5 = Q50Weight::<WgpuRuntime>::from_gguf_bytes(&client, &data5, n_out, k).unwrap();
+        assert_eq!(q5.vram_bytes(), n_blocks * 24);
+
+        let data8 = synth_q8_0(n_blocks);
+        let w8 = combs_formats::quants::dequantize_q8_0(&data8, n_out * k).unwrap();
+        let q8 = Q80Weight::<WgpuRuntime>::from_gguf_bytes(&client, &data8, n_out, k).unwrap();
+        assert_eq!(q8.vram_bytes(), n_blocks * 36);
+
+        for m in [1usize, 3] {
+            let x: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 7 % 13) as f32 - 6.0) / 8.0)
+                .collect();
+            let got5 = q5.matmul_host(&client, &x, m).unwrap();
+            assert_close(&got5, &ref_matmul(&x, &w5, m, k, n_out), 1e-3, &format!("q5_0 m={m}"));
+            let got8 = q8.matmul_host(&client, &x, m).unwrap();
+            assert_close(&got8, &ref_matmul(&x, &w8, m, k, n_out), 1e-3, &format!("q8_0 m={m}"));
+        }
+    }
+
+    /// Q5_0/Q8_0 malformed input rejection.
+    #[test]
+    fn q5_q8_shape_validation() {
+        let device = Default::default();
+        let client = WgpuRuntime::client(&device);
+        assert!(repack_q5_0(&[0u8; 21]).is_err());
+        assert!(repack_q8_0(&[0u8; 33]).is_err());
+        assert!(Q50Weight::<WgpuRuntime>::from_gguf_bytes(&client, &synth_q5_0(2), 2, 31).is_err());
+        assert!(Q80Weight::<WgpuRuntime>::from_gguf_bytes(&client, &synth_q8_0(2), 2, 64).is_err());
     }
 
     /// K-quant shape validation mirrors the Q4_0 rules.

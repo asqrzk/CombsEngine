@@ -272,9 +272,28 @@ How it's wired:
   stores those in 32-block formats — e.g. SmolLM2's hidden 960) fall back
   to dense per tensor, never error.
 
-Still open in Phase 2: gemma.rs/smolvlm vision linears through the factory;
-Q8_0/Q5_0 kernels for models with non-256-divisible rows; prefill-shape
-tiling for the fused kernels (per-element kernel is decode-optimal).
+Follow-up round (landed): **Q5_0 + Q8_0 kernels** — the formats ggml falls
+back to for rows not divisible by 256, so "Q4_K_M" files of models like
+SmolLM2 (hidden 960: 176 Q5_0 + 17 Q8_0 tensors) now pack fully. Both GPU
+dequants are bit-exact vs the CPU references. **Gemma** now loads its seven
+projections + lm_head through the same `load_linear` factory.
+
+Validated matrix (Metal, `combs run`, greedy — quant output token-identical
+to the dense fallback in every case):
+| Model | Path | GPU in use |
+|---|---|---|
+| Llama-3.2-1B Q4_K_M | packed, f32 fused | 1.72 GB |
+| Llama-3.2-1B Q4_K_M | dense fallback | 5.01 GB |
+| Llama-3.2-1B Q4_K_M | packed, f16 build | **1.16 GB** |
+| SmolLM2-360M Q4_K_M (Q5_0/Q8_0 mix) | packed (all 224 tensors) | 427 MB |
+| SmolLM2-360M Q4_K_M | dense fallback | 1.45 GB |
+| Gemma-3-1B / SmolVLM safetensors | dense (regression-checked) | unchanged |
+
+Still open: SmolVLM vision-tower linears through the factory (GGUF VLM
+files are rare; text stack already covered via the shared Llama loader);
+prefill-shape tiling for the fused kernels (per-element kernel is
+decode-optimal; prefill is correct but untiled); Q4_1/Q5_1/Q5_K kernels if
+models surface with them.
 
 ---
 
