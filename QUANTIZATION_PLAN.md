@@ -203,22 +203,29 @@ fused win + ggml fidelity.
 
 ### 1B — Custom CubeCL fused dequant-matmul kernels (native, best)
 
-**STATUS: Q4_0 landed and validated on Metal** (`combs-models/src/qmatmul.rs`):
-- Layout layer: `repack_q4_0` turns GGUF 18-byte blocks into a GPU
-  structure-of-arrays (nibble bytes as `u32` words + f32 scale per block —
-  5.0 bits/weight in VRAM; f32 scales keep bit-exactness, f16-pair packing is
-  a later 0.5-bit saving). `Q40Weight` holds the packed handles device-side.
-- Compute layer: `q4_0_dequant_kernel` (validation) + `q4_0_matmul_kernel`
-  (fused production path, per-block f32 accumulation, scale applied once).
-- Validation per principle #6: dequant kernel is **bit-exact** vs
-  `combs_formats::quants::dequantize_q4_0` (the gguf.rs scalar path, now
-  public as the golden reference); fused matmul matches a reference matmul
-  within 1e-4 for decode (m=1) and prefill (m>1) shapes.
+**STATUS: Q4_0, Q4_K and Q6_K landed and validated on Metal**
+(`combs-models/src/qmatmul.rs`) — everything a Q4_K_M model file needs:
+- Layout layer: `repack_q4_0` / `repack_q4_k` / `repack_q6_k` turn GGUF
+  block streams (18/144/210 B — none word-aligned) into GPU
+  structure-of-arrays: packed quant bytes as `u32` words + f32 super-scales
+  (5.0 / 4.63 / 6.63 bits per weight in VRAM; exact f16→f32 scale
+  conversion preserves reference numerics). `Q40Weight`/`Q4KWeight`/
+  `Q6KWeight` hold the packed handles device-side.
+- Compute layer per format: a `*_dequant_kernel` (validation) + a
+  `*_matmul_kernel` (fused production path, f32 accumulation). K-quants
+  unpack the 6-bit scale/min pairs (`get_scale_min_k4`) and Q6_K's split
+  4+2-bit values in-kernel, and use the ggml sum-split
+  (`Σ(d·sc·q − dmin·m)x = d·sc·Σqx − dmin·m·Σx`) so scales apply once per
+  sub-block.
+- Validation per principle #6: dequant kernels match
+  `combs_formats::quants::{dequantize_q4_0, dequantize_q4_k,
+  dequantize_q6_k}` (the gguf.rs scalar paths, now public as the golden
+  reference) — Q4_0 **bit-exact**, K-quants within 1e-6 relative (FMA
+  contraction only); fused matmuls match a reference matmul within 1e-3
+  for decode (m=1) and prefill (m>1) shapes.
 
 Remaining in 1B:
-- Author `#[cube]` kernels that read **ggml-packed blocks directly**
-  (Q8_0/Q4_K/Q5_K/Q6_K) the same way — next: **Q4_K + Q6_K** (Q4_K_M files,
-  the most common), reusing the same layout/kernel/golden-test pattern.
+- Q8_0/Q5_K kernels if models need them (same pattern, mechanical now).
 - Store weights as raw packed bytes end-to-end (stop the CPU→f32 expansion in
   gguf.rs; upload the quant blocks as-is) — needs a raw-tensor accessor on
   `GgufSource` + Phase 2's per-tensor dispatch.

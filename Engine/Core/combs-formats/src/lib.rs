@@ -25,7 +25,7 @@ pub use gguf::GgufSource;
 /// `combs-models` validate against (QUANTIZATION_PLAN.md, principle #6:
 /// every kernel is tested against a portable reference).
 pub mod quants {
-    pub use crate::gguf::dequantize_q4_0;
+    pub use crate::gguf::{dequantize_q4_0, dequantize_q4_k, dequantize_q6_k};
 }
 pub use metadata::{AttentionPattern, ModelMetadata, VisionConfig};
 pub use safetensors::SafetensorsSource;

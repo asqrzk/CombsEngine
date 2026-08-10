@@ -718,7 +718,9 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
 
 /// Dequantizes a Q4_K tensor to f32. 256-value superblocks (144 bytes):
 /// f16 d, f16 dmin, 12B packed scales/mins, 128B 4-bit quants.
-fn dequantize_q4_k(data: &[u8], n: usize) -> Result<Vec<f32>> {
+///
+/// Public via [`crate::quants`] as the golden reference for the GPU kernel.
+pub fn dequantize_q4_k(data: &[u8], n: usize) -> Result<Vec<f32>> {
     let mut out = Vec::with_capacity(n);
     for sb in data.chunks_exact(144) {
         let d = half::f16::from_le_bytes([sb[0], sb[1]]).to_f32();
@@ -790,7 +792,9 @@ fn dequantize_q5_k(data: &[u8], n: usize) -> Result<Vec<f32>> {
 /// Dequantizes a Q6_K tensor to f32. 256-value superblocks (210 bytes):
 /// 128B low nibbles, 64B high 2-bit fields, 16 i8 scales (one per 16
 /// values), f16 super-scale. Values are biased by -32.
-fn dequantize_q6_k(data: &[u8], n: usize) -> Result<Vec<f32>> {
+///
+/// Public via [`crate::quants`] as the golden reference for the GPU kernel.
+pub fn dequantize_q6_k(data: &[u8], n: usize) -> Result<Vec<f32>> {
     let mut out = Vec::with_capacity(n);
     for sb in data.chunks_exact(210) {
         let d = half::f16::from_le_bytes([sb[208], sb[209]]).to_f32();
