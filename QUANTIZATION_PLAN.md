@@ -454,3 +454,57 @@ qwen2.5-coder-7b-instruct Q4_K_M (bartowski single-file, 339 tensors) loads as
 and greedily generates a correct Python IPv4 validator through the ChatML wrap.
 Decode 1.1 tok/s on fused-f32 per-element kernels — slow as expected at 7B;
 prefill tiling + the f16-default gate (wave 4) are the scheduled fixes.
+
+---
+
+## 2026-08-11 — Wave 1.2: checkpoint chat templates + GGUF RoPE de-permutation (LANDED)
+
+Two fixes that turned out to be one story: llama-family quality over chat.
+
+**Chat templates (minijinja).** The checkpoint's own Jinja template
+(tokenizer_config.json AND GGUF `tokenizer.chat_template`, now read) is
+evaluated under the transformers contract ({messages, add_generation_prompt,
+bos_token, eos_token} + raise_exception + strftime_now, trim_blocks +
+lstrip_blocks) in `combs-runtime/src/template.rs`; `Engine::wrap_chat`
+prefers it and falls back to the token-sniffed ChatML/Gemma wraps on any
+render failure (log-once, never a 500). ONE template path now serves
+`combs serve`, `combs run --chat` (wrap moved after Engine::load — llama
+`--chat` used to be a hard error), and the FFI (drifted `apply_chatml`
+deleted). `render_str` per call: parsing 4 KB of Jinja is microseconds
+against a generation and keeps renders thread-safe with zero 'static
+gymnastics. `COMBS_CHAT_DATE` pins `strftime_now` for reproducibility.
+Proof: 12 golden fixtures (llama-3.2/qwen2.5/gemma-3/smollm2 real templates
+× 3 message sets) byte-equal vs a Python-jinja2 reference generated under
+transformers' environment settings; the gemma template render proved
+byte-identical to the old hardcoded wrap before switching. smollm2 prompts
+now include its template's default system prompt (transformers-faithful
+change, documented).
+
+**GGUF RoPE de-permutation — the real root cause.** With correct llama3
+formatting in place, llama-3.2-1b GGUF still produced garbage; probes showed
+ANY structured prompt degraded while trivial continuations survived.
+Diagnosis: llama.cpp's convert permutes each head's attn_q/attn_k rows into
+interleaved-pairs RoPE layout for llama-family archs; this engine applies HF
+rotate-half and never de-interleaved. qwen2 GGUF (unpermuted arch) working
+perfectly while llama GGUF garbled was the tell. Fix in gguf.rs:
+`rope_depermute_src_rows` (transformers' `_reverse_permute_weights` map,
+hf[j] = ggml[2j] | ggml[2(j-d/2)+1] per head) applied in BOTH open paths —
+dense dequant reorders rows post-dequant; `open_tensor_quant` reorders the
+packed stream row-chunk-wise (every supported block format stores whole
+blocks per row, so the reorder is exact; `QuantTensor.data` became
+`Cow<[u8]>`). Gated on arch ∈ {llama, mistral}, tensors attn_q/attn_k
+(weight + bias).
+
+**Proof.** Unit: forward-permute/inverse round-trip. E2E: llama-3.2-1b
+`--chat` went from token salad to "Mmap is a system call in Unix-like
+operating systems that allows a program to map a file or a block of memory
+into a virtual address space…"; **smollm2-360m Q4_K_M GGUF now generates
+token-identical text to its f32 safetensors twin** (48-token greedy — the
+old lazy 4-token bailout was permutation damage in miniature); serve HTTP
+multi-turn with a context-dependent follow-up answers correctly (the
+recorded "fluent but off" failure class). gemma chat unchanged through the
+template path. **This closes the long-standing GGUF Q/K RoPE permutation
+audit**: the mismatch was real, the earlier "empirical parity" was a
+shallow-prompt illusion, and parity is now proven at the strongest level
+(quant-vs-dense token identity). The wave-4 perplexity harness remains
+scheduled as ongoing QA, no longer as the audit's resolution.

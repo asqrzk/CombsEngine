@@ -302,6 +302,10 @@ pub struct Engine {
     tokenizer: Tokenizer,
     metadata: ModelMetadata,
     spec: combs_formats::TokenizerSpec,
+    /// The checkpoint's own Jinja chat template, when it ships one;
+    /// `wrap_chat` falls back to the token-sniffed builtin wraps otherwise.
+    template: Option<crate::template::ChatTemplate>,
+    template_warned: std::sync::Once,
     default_config: GenerationConfig,
     cache_config: CacheConfig,
     tx: mpsc::Sender<Command>,
@@ -413,11 +417,28 @@ impl Engine {
                 .map_err(|e| EngineError::WorkerGone(format!("spawning worker: {e}")))?
         };
 
+        // Checkpoint chat template (tokenizer_config.json / GGUF
+        // `tokenizer.chat_template`): resolve the bos/eos token STRINGS the
+        // template context exposes from the special-token table.
+        let token_string = |id: Option<u32>| {
+            id.and_then(|id| spec.added_tokens.get(&id).cloned())
+                .unwrap_or_default()
+        };
+        let template = spec.chat_template.clone().map(|src| {
+            crate::template::ChatTemplate::new(
+                src,
+                token_string(meta.bos_token_id),
+                token_string(meta.eos_token_ids.first().copied()),
+            )
+        });
+
         Ok(Engine {
             device,
             tokenizer,
             metadata: source.metadata().clone(),
             spec,
+            template,
+            template_warned: std::sync::Once::new(),
             default_config: default_config_from(source.sampler_defaults().as_ref()),
             cache_config,
             tx,
@@ -458,10 +479,24 @@ impl Engine {
         self.spec.special_token_id("<end_of_turn>")
     }
 
-    /// Wraps (role, content) message pairs into the model's chat template
-    /// (ChatML or Gemma turns, detected from the tokenizer's special
-    /// tokens), ending with the assistant turn open.
+    /// Wraps (role, content) message pairs into the model's chat format,
+    /// ending with the assistant turn open. Prefers the checkpoint's own
+    /// Jinja chat template; falls back to the token-sniffed builtin wraps
+    /// (ChatML / Gemma) when no template ships or rendering fails — a bad
+    /// template logs once and degrades, it never breaks chat.
     pub fn wrap_chat(&self, messages: &[(String, String)]) -> String {
+        if let Some(template) = &self.template {
+            match template.render(messages) {
+                Ok(prompt) => return prompt,
+                Err(e) => self.template_warned.call_once(|| {
+                    tracing::warn!(
+                        "chat template failed to render ({e}); falling back \
+                         to the builtin {:?} wrap for this session",
+                        self.spec.chat_template_kind()
+                    );
+                }),
+            }
+        }
         self.spec.wrap_messages(messages)
     }
 

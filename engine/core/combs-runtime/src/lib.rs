@@ -12,6 +12,7 @@ mod engine;
 mod logits;
 mod sampler;
 mod stop;
+mod template;
 
 pub use combs_models::{CacheConfig, CacheKind};
 pub use engine::{
@@ -25,6 +26,7 @@ pub use logits::{
 };
 pub use sampler::{GreedySampler, MultinomialSampler, Sampler, SamplingParams, sampler_from_params};
 pub use stop::{StopDetector, StopStringMatcher};
+pub use template::ChatTemplate;
 
 /// Errors produced by the runtime.
 #[derive(Debug, thiserror::Error)]

@@ -318,7 +318,7 @@ pub fn try_quant_linear<B: Backend>(
     // itself falls back to 32-block formats for such shapes) is not an
     // error: the dense path handles it. Kernels are accelerators, never
     // load-bearing.
-    let Ok(w) = QuantWeight::from_quant_tensor(&client, qt.format, qt.data, n_out, k) else {
+    let Ok(w) = QuantWeight::from_quant_tensor(&client, qt.format, &qt.data, n_out, k) else {
         debug_quant(name, "kernel-incompatible shape — dense fallback");
         return Ok(None);
     };

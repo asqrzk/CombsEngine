@@ -234,20 +234,9 @@ fn emit(cb: Option<CombsStreamCallback>, user_data: *mut c_void, event: &StreamE
     }
 }
 
-/// Applies the ChatML template to `messages` (fallback for models without a
-/// Jinja-aware renderer; a full `minijinja` renderer is a later phase).
-fn apply_chatml(messages: &[ChatMessageJson]) -> String {
-    let mut out = String::new();
-    for m in messages {
-        let role = match m.role.as_str() {
-            "system" | "user" | "assistant" => m.role.as_str(),
-            _ => "user",
-        };
-        out.push_str(&format!("<|im_start|>{role}\n{}<|im_end|>\n", m.content));
-    }
-    out.push_str("<|im_start|>assistant\n");
-    out
-}
+// Chat wrapping goes through `Engine::wrap_chat` — the same checkpoint
+// template (or token-sniffed fallback) path as `combs serve` and
+// `combs run --chat`, so all three surfaces produce identical prompts.
 
 /// Runs a chat completion. Blocks until done; streams events to `cb`.
 /// Returns 0 on success, -1 on error (also emitted as an `error` event).
@@ -274,7 +263,13 @@ pub unsafe extern "C" fn combs_chat_completion(
         let req_id = unsafe { read_str(request_id, "request_id") }?.to_string();
 
         let prompt = match (&request.messages, &request.prompt) {
-            (Some(messages), _) => apply_chatml(messages),
+            (Some(messages), _) => {
+                let pairs: Vec<(String, String)> = messages
+                    .iter()
+                    .map(|m| (m.role.clone(), m.content.clone()))
+                    .collect();
+                engine.engine.wrap_chat(&pairs)
+            }
             (None, Some(p)) => p.clone(),
             (None, None) => return Err("request needs `prompt` or `messages`".into()),
         };

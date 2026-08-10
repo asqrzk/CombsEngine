@@ -1315,6 +1315,9 @@ dependencies = [
  "combs-formats",
  "combs-media",
  "combs-models",
+ "minijinja",
+ "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "tokenizers",
  "tracing",
@@ -3668,6 +3671,22 @@ checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
 dependencies = [
  "libc",
  "stable_deref_trait",
+]
+
+[[package]]
+name = "memo-map"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38d1115007560874e373613744c6fba374c17688327a71c1476d1a5954cc857b"
+
+[[package]]
+name = "minijinja"
+version = "2.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42d74234349a775546a83af0f0c0c0e3a73227dee4950a542cda81a47240b3e6"
+dependencies = [
+ "memo-map",
+ "serde",
 ]
 
 [[package]]

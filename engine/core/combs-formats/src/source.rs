@@ -58,8 +58,9 @@ pub struct QuantTensor<'a> {
     pub format: QuantFormat,
     /// Logical shape, HF layout (`[out_features, in_features]` for weights).
     pub shape: Vec<usize>,
-    /// The raw block stream (mmap-backed).
-    pub data: &'a [u8],
+    /// The raw block stream — mmap-backed when served verbatim, owned when
+    /// the source had to reorder rows (GGUF RoPE de-permutation).
+    pub data: std::borrow::Cow<'a, [u8]>,
 }
 
 /// Element dtypes supported by the loaders.
@@ -155,6 +156,22 @@ impl<'a> TensorReader<'a> {
             name,
             shape,
             dtype: TensorDtype::F32,
+            data: std::borrow::Cow::Owned(data),
+        }
+    }
+
+    /// Creates a reader over owned bytes of an explicit dtype (used when a
+    /// passthrough tensor had to be row-reordered on load).
+    pub fn owned_with_dtype(
+        name: String,
+        shape: Vec<usize>,
+        dtype: TensorDtype,
+        data: Vec<u8>,
+    ) -> Self {
+        TensorReader {
+            name,
+            shape,
+            dtype,
             data: std::borrow::Cow::Owned(data),
         }
     }

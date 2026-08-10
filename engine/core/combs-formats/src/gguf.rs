@@ -879,6 +879,57 @@ pub fn dequantize_q6_k(data: &[u8], n: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+/// llama.cpp's `convert_hf_to_gguf` permutes each attention head's
+/// `attn_q`/`attn_k` rows for llama-family architectures — HF rotate-half
+/// halves `[0..d/2 | d/2..d]` become ggml interleaved pairs
+/// `[0, d/2, 1, d/2+1, …]`. This engine applies HF rotate-half RoPE, so the
+/// rows must be de-interleaved back on load (transformers'
+/// `_reverse_permute_weights`). Returns, for each HF row, the source ggml
+/// row: `hf[j] = ggml[2j]` for `j < d/2`, else `ggml[2(j − d/2) + 1]`,
+/// per head.
+fn rope_depermute_src_rows(rows: usize, n_head: usize) -> Vec<usize> {
+    let d = rows / n_head;
+    let half = d / 2;
+    let mut map = Vec::with_capacity(rows);
+    for h in 0..n_head {
+        let base = h * d;
+        for j in 0..d {
+            let src = if j < half { 2 * j } else { 2 * (j - half) + 1 };
+            map.push(base + src);
+        }
+    }
+    map
+}
+
+/// Reorders `values` (f32, `rows` equal-length rows) by the de-permute map.
+fn depermute_rows_f32(values: Vec<f32>, rows: usize, n_head: usize) -> Vec<f32> {
+    let row_len = values.len() / rows;
+    let map = rope_depermute_src_rows(rows, n_head);
+    let mut out = Vec::with_capacity(values.len());
+    for src in map {
+        out.extend_from_slice(&values[src * row_len..(src + 1) * row_len]);
+    }
+    out
+}
+
+impl GgufSource {
+    /// Head count to de-permute `ggml_name` with, when this file's arch
+    /// stores Q/K in llama.cpp's interleaved-pairs layout. `None` = serve
+    /// the tensor verbatim.
+    fn depermute_heads(&self, ggml_name: &str) -> Option<usize> {
+        if !matches!(self.metadata.architecture.as_str(), "llama" | "mistral") {
+            return None;
+        }
+        let rest = ggml_name.strip_prefix("blk.")?;
+        let (_, rest) = rest.split_once('.')?;
+        match rest {
+            "attn_q.weight" | "attn_q.bias" => Some(self.metadata.num_attention_heads),
+            "attn_k.weight" | "attn_k.bias" => Some(self.metadata.num_key_value_heads),
+            _ => None,
+        }
+    }
+}
+
 impl ModelSource for GgufSource {
     fn metadata(&self) -> &ModelMetadata {
         &self.metadata
@@ -898,7 +949,6 @@ impl ModelSource for GgufSource {
             .iter()
             .find(|(k, _)| map_tensor_name(k).as_deref() == Some(name))
             .ok_or_else(|| FormatError::TensorNotFound(name.to_string()))?;
-        let _ = ggml_name;
 
         let size = tensor_byte_size(info)?;
         let start = self.data_start + info.offset;
@@ -910,61 +960,53 @@ impl ModelSource for GgufSource {
         // HF layout = ggml dims reversed (row-major data needs no movement).
         let shape: Vec<usize> = info.dims.iter().rev().copied().collect();
         let n = num_elements(&info.dims);
+        let rows = shape.first().copied().unwrap_or(1).max(1);
+        let permute = self.depermute_heads(ggml_name);
 
-        match info.ggml_type {
-            GGML_F32 | GGML_F16 | GGML_BF16 => {
-                let dtype = match info.ggml_type {
-                    GGML_F32 => TensorDtype::F32,
-                    GGML_F16 => TensorDtype::F16,
-                    _ => TensorDtype::BF16,
-                };
-                Ok(TensorReader::new(name.to_string(), shape, dtype, data))
-            }
-            GGML_Q4_0 => {
-                let values = dequantize_q4_0(data, n)?;
-                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-                Ok(TensorReader::owned(name.to_string(), shape, bytes))
-            }
-            GGML_Q4_1 => {
-                let values = dequantize_q4_1(data, n)?;
-                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-                Ok(TensorReader::owned(name.to_string(), shape, bytes))
-            }
-            GGML_Q5_0 => {
-                let values = dequantize_q5_0(data, n)?;
-                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-                Ok(TensorReader::owned(name.to_string(), shape, bytes))
-            }
-            GGML_Q5_1 => {
-                let values = dequantize_q5_1(data, n)?;
-                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-                Ok(TensorReader::owned(name.to_string(), shape, bytes))
-            }
-            GGML_Q8_0 => {
-                let values = dequantize_q8_0(data, n)?;
-                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-                Ok(TensorReader::owned(name.to_string(), shape, bytes))
-            }
-            GGML_Q4_K => {
-                let values = dequantize_q4_k(data, n)?;
-                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-                Ok(TensorReader::owned(name.to_string(), shape, bytes))
-            }
-            GGML_Q5_K => {
-                let values = dequantize_q5_k(data, n)?;
-                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-                Ok(TensorReader::owned(name.to_string(), shape, bytes))
-            }
-            GGML_Q6_K => {
-                let values = dequantize_q6_k(data, n)?;
-                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-                Ok(TensorReader::owned(name.to_string(), shape, bytes))
-            }
-            other => Err(FormatError::UnsupportedDtype {
-                tensor: info.name.clone(),
-                dtype: format!("ggml_type {other}"),
-            }),
+        // Passthrough dtypes: serve the mmap slice, unless the rows must be
+        // de-interleaved (RoPE de-permutation) — then copy row-reordered.
+        if let GGML_F32 | GGML_F16 | GGML_BF16 = info.ggml_type {
+            let dtype = match info.ggml_type {
+                GGML_F32 => TensorDtype::F32,
+                GGML_F16 => TensorDtype::F16,
+                _ => TensorDtype::BF16,
+            };
+            return Ok(match permute {
+                None => TensorReader::new(name.to_string(), shape, dtype, data),
+                Some(n_head) => {
+                    let row_bytes = size / rows;
+                    let map = rope_depermute_src_rows(rows, n_head);
+                    let mut out = Vec::with_capacity(size);
+                    for src in map {
+                        out.extend_from_slice(&data[src * row_bytes..(src + 1) * row_bytes]);
+                    }
+                    TensorReader::owned_with_dtype(name.to_string(), shape, dtype, out)
+                }
+            });
         }
+
+        let values = match info.ggml_type {
+            GGML_Q4_0 => dequantize_q4_0(data, n)?,
+            GGML_Q4_1 => dequantize_q4_1(data, n)?,
+            GGML_Q5_0 => dequantize_q5_0(data, n)?,
+            GGML_Q5_1 => dequantize_q5_1(data, n)?,
+            GGML_Q8_0 => dequantize_q8_0(data, n)?,
+            GGML_Q4_K => dequantize_q4_k(data, n)?,
+            GGML_Q5_K => dequantize_q5_k(data, n)?,
+            GGML_Q6_K => dequantize_q6_k(data, n)?,
+            other => {
+                return Err(FormatError::UnsupportedDtype {
+                    tensor: info.name.clone(),
+                    dtype: format!("ggml_type {other}"),
+                });
+            }
+        };
+        let values = match permute {
+            Some(n_head) => depermute_rows_f32(values, rows, n_head),
+            None => values,
+        };
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        Ok(TensorReader::owned(name.to_string(), shape, bytes))
     }
 
     fn tokenizer(&self) -> Result<TokenizerSpec> {
@@ -972,16 +1014,20 @@ impl ModelSource for GgufSource {
             Some(MetaValue::Bool(b)) => Some(*b),
             _ => None,
         };
+        let chat_template = match self.kv.get("tokenizer.chat_template") {
+            Some(MetaValue::String(t)) => Some(t.clone()),
+            _ => None,
+        };
         Ok(TokenizerSpec {
             tokenizer_json: self.tokenizer_json.clone(),
             added_tokens: self.added_tokens.clone(),
-            chat_template: None,
+            chat_template,
             add_bos,
         })
     }
 
     fn open_tensor_quant(&self, name: &str) -> Result<Option<crate::QuantTensor<'_>>> {
-        let Some((_, info)) = self
+        let Some((ggml_name, info)) = self
             .tensors
             .iter()
             .find(|(k, _)| map_tensor_name(k).as_deref() == Some(name))
@@ -1001,11 +1047,30 @@ impl ModelSource for GgufSource {
         let data = self.mmap.get(start..start + size).ok_or_else(|| {
             FormatError::Safetensors(format!("gguf tensor {} out of bounds", info.name))
         })?;
-        Ok(Some(crate::QuantTensor {
-            format,
-            shape: info.dims.iter().rev().copied().collect(),
-            data,
-        }))
+        let shape: Vec<usize> = info.dims.iter().rev().copied().collect();
+
+        // RoPE de-permutation for packed weights: every supported block
+        // format stores whole blocks per row, so reordering the packed
+        // stream row-chunk-wise is exact. If the packed rows aren't
+        // cleanly addressable, fall back to the dense path (which
+        // de-permutes after dequantization).
+        let data = match self.depermute_heads(ggml_name) {
+            None => std::borrow::Cow::Borrowed(data),
+            Some(n_head) => {
+                let rows = shape.first().copied().unwrap_or(1).max(1);
+                if size % rows != 0 {
+                    return Ok(None);
+                }
+                let row_bytes = size / rows;
+                let map = rope_depermute_src_rows(rows, n_head);
+                let mut out = Vec::with_capacity(size);
+                for src in map {
+                    out.extend_from_slice(&data[src * row_bytes..(src + 1) * row_bytes]);
+                }
+                std::borrow::Cow::Owned(out)
+            }
+        };
+        Ok(Some(crate::QuantTensor { format, shape, data }))
     }
 
     fn sampler_defaults(&self) -> Option<SamplerConfig> {
@@ -1022,6 +1087,37 @@ impl GgufSource {
     /// Model file path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+#[cfg(test)]
+mod depermute_tests {
+    use super::rope_depermute_src_rows;
+
+    /// llama.cpp's forward permute: per head, rows [2, d/2] -> swap -> flat,
+    /// i.e. ggml[2i] = hf[i], ggml[2i+1] = hf[d/2 + i].
+    fn forward_permute(rows: &[Vec<u32>], n_head: usize) -> Vec<Vec<u32>> {
+        let d = rows.len() / n_head;
+        let mut out = Vec::with_capacity(rows.len());
+        for h in 0..n_head {
+            let head = &rows[h * d..(h + 1) * d];
+            for i in 0..d / 2 {
+                out.push(head[i].clone());
+                out.push(head[d / 2 + i].clone());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn depermute_inverts_llama_cpp_permute() {
+        // 2 heads x head_dim 8 = 16 rows, each row tagged by its HF index.
+        let hf: Vec<Vec<u32>> = (0..16).map(|i| vec![i, 100 + i]).collect();
+        let ggml = forward_permute(&hf, 2);
+        assert_ne!(hf, ggml, "permute must actually move rows");
+        let map = rope_depermute_src_rows(16, 2);
+        let recovered: Vec<Vec<u32>> = map.iter().map(|&src| ggml[src].clone()).collect();
+        assert_eq!(recovered, hf, "de-permute must invert llama.cpp's layout");
     }
 }
 

@@ -336,18 +336,21 @@ fn cmd_run(args: RunArgs) -> Result<()> {
         }
         prompt.push_str(&args.prompt);
         prompt.push_str("\nAssistant:");
-        prompt
+        Some(prompt)
     } else if args.chat {
-        source
-            .tokenizer()?
-            .chatml_wrap(&args.prompt)
-            .context("tokenizer has no <|im_start|>/<|im_end|> tokens; cannot use --chat")?
+        // Chat wrapping needs the loaded engine (checkpoint template or
+        // token-sniffed fallback) — resolved after `Engine::load` below.
+        None
     } else {
-        args.prompt
+        Some(args.prompt.clone())
     };
 
     eprintln!("loading weights...");
     let engine = Engine::load(&source, device)?;
+    let prompt = match prompt {
+        Some(p) => p,
+        None => engine.wrap_chat(&[("user".to_string(), args.prompt.clone())]),
+    };
     // Real GPU-allocator numbers (weights resident after load) — this is
     // where packed-quant weights show their VRAM win; process RSS/footprint
     // is dominated by pool reservations and unified-memory accounting.
@@ -365,6 +368,13 @@ fn cmd_run(args: RunArgs) -> Result<()> {
 
     let tokens = engine.encode(&prompt)?;
     eprintln!("prompt: {} tokens", tokens.len());
+    // COMBS_DEBUG_PROMPT=1: dump the wrapped prompt and its token ids —
+    // the fastest way to spot template/tokenizer mismatches (shredded
+    // special tokens, double BOS) without attaching a debugger.
+    if std::env::var("COMBS_DEBUG_PROMPT").is_ok() {
+        eprintln!("prompt text: {prompt:?}");
+        eprintln!("prompt ids: {tokens:?}");
+    }
 
     // Start from the engine defaults (model generation_config merged in);
     // explicit CLI flags always win.

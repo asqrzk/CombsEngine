@@ -17,7 +17,10 @@ combs-models = { path = "../combs-models", version = "0.2.0" }
 tokenizers.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+minijinja.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+serde.workspace = true
 burn = { version = "0.21.0", default-features = false, features = ["ndarray", "std"] }
