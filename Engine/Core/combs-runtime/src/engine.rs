@@ -165,6 +165,12 @@ struct SessionState {
 /// Each session owns its KV arena, so this also bounds cache VRAM.
 const MAX_SESSIONS: usize = 4;
 
+/// Default cap for the KV arena when the model advertises a larger
+/// positional maximum. 32k tokens covers long coding sessions while keeping
+/// the arena allocation bounded on 16–18 GB machines; `--context-size`
+/// (CLI) / `load_with_cache_config` (API) override.
+const DEFAULT_KV_ARENA_CAP: usize = 32768;
+
 /// The worker's session table: named rolling sessions with LRU eviction.
 /// The anonymous session (empty key) serves requests without a session id.
 struct SessionSet {
@@ -233,7 +239,10 @@ impl Engine {
     /// Loads a model from any [`ModelSource`] via the default registry.
     ///
     /// The KV cache kind is selected by `COMBS_KV=paged|contiguous`
-    /// (default: paged) with capacity `max_position_embeddings`.
+    /// (default: paged) with capacity `max_position_embeddings`, capped at
+    /// [`DEFAULT_KV_ARENA_CAP`] so models advertising huge positional maxes
+    /// (e.g. 128k) don't allocate enormous arenas by default. Use
+    /// [`Engine::load_with_cache_config`] (CLI: `--context-size`) to raise.
     pub fn load(source: &dyn ModelSource, device: CombsDevice) -> Result<Self> {
         let kind = match std::env::var("COMBS_KV").as_deref() {
             Ok("contiguous") => CacheKind::Contiguous,
@@ -243,7 +252,15 @@ impl Engine {
                 CacheKind::Paged
             }
         };
-        let mut config = CacheConfig::paged(source.metadata().max_position_embeddings);
+        let positional = source.metadata().max_position_embeddings;
+        let arena = positional.min(DEFAULT_KV_ARENA_CAP);
+        if arena < positional {
+            tracing::info!(
+                "KV arena capped at {arena} tokens (model max {positional}); \
+                 raise with --context-size"
+            );
+        }
+        let mut config = CacheConfig::paged(arena);
         config.kind = kind;
         Self::load_with_cache_config(source, device, config)
     }

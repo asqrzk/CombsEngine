@@ -29,12 +29,17 @@ use combs_media::{ImagePreprocessor, PixelBatch, SiglipPreprocessor};
 use combs_models::image_prompt_expansion;
 use combs_runtime::{Engine, GenerationConfig, GenerationStats};
 
-/// Response type used everywhere: a boxed reader so streaming and buffered
-/// responses share one concrete type.
-type HttpResponse = tiny_http::Response<Box<dyn Read + Send>>;
+use crate::http::{HttpResponse, cors_header, error_json, json_response, respond_preflight};
 
 /// Serves `engine` on `addr` (`host:port`) forever.
-pub fn serve(engine: Arc<Engine>, model_id: String, addr: &str) -> Result<()> {
+/// `default_prefill_chunk` overrides the engine's chunked-prefill size for
+/// every request (from `combs serve --prefill-chunk-size`).
+pub fn serve(
+    engine: Arc<Engine>,
+    model_id: String,
+    addr: &str,
+    default_prefill_chunk: Option<usize>,
+) -> Result<()> {
     let server = tiny_http::Server::http(addr).map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
     eprintln!("combs serve: listening on http://{addr} (model: {model_id})");
 
@@ -46,38 +51,22 @@ pub fn serve(engine: Arc<Engine>, model_id: String, addr: &str) -> Result<()> {
             let method = request.method().as_str().to_string();
             // CORS preflight — browsers probe before cross-origin POSTs.
             if method == "OPTIONS" {
-                let _ = request.respond(
-                    tiny_http::Response::empty(204)
-                        .with_header(cors_header())
-                        .with_header(
-                            tiny_http::Header::from_bytes(
-                                "Access-Control-Allow-Methods",
-                                "GET, POST, OPTIONS",
-                            )
-                            .unwrap(),
-                        )
-                        .with_header(
-                            tiny_http::Header::from_bytes(
-                                "Access-Control-Allow-Headers",
-                                "content-type, authorization",
-                            )
-                            .unwrap(),
-                        ),
-                );
+                respond_preflight(request);
                 return;
             }
             let response = match (method.as_str(), url.as_str()) {
                 ("GET", "/health") => json_response(200, json!({"status": "ok"})),
                 ("GET", "/v1/models") => json_response(
                     200,
-                    json!({"object": "list", "data": [model_card(&model_id)]}),
+                    json!({"object": "list", "data": [model_card(&engine, &model_id)]}),
                 ),
+                ("GET", "/v1/model/info") => model_info(&engine, &model_id),
                 ("POST", "/v1/chat/completions") => {
                     let mut body = String::new();
                     if request.as_reader().read_to_string(&mut body).is_err() {
                         json_response(400, error_json("invalid_request", "unreadable body"))
                     } else {
-                        handle_chat(&engine, &model_id, &body)
+                        handle_chat(&engine, &model_id, &body, default_prefill_chunk)
                     }
                 }
                 _ => json_response(404, error_json("not_found", "unknown endpoint")),
@@ -88,13 +77,55 @@ pub fn serve(engine: Arc<Engine>, model_id: String, addr: &str) -> Result<()> {
     Ok(())
 }
 
-fn model_card(model_id: &str) -> Value {
+fn model_card(engine: &Arc<Engine>, model_id: &str) -> Value {
     json!({
         "id": model_id,
         "object": "model",
         "created": now_unix(),
         "owned_by": "combs",
+        "context_length": engine.metadata().max_position_embeddings,
     })
+}
+
+/// Rich model descriptor: real context budget (KV arena), architecture,
+/// and generation defaults — everything a client needs to size requests.
+fn model_info(engine: &Arc<Engine>, model_id: &str) -> HttpResponse {
+    let meta = engine.metadata();
+    let cc = engine.cache_config();
+    let dc = engine.default_config();
+    json_response(
+        200,
+        json!({
+            "id": model_id,
+            "object": "model.info",
+            "architecture": &meta.architecture,
+            "context_length": meta.max_position_embeddings,
+            "kv_cache": {
+                "kind": format!("{:?}", cc.kind).to_lowercase(),
+                "max_seq_len": cc.max_seq_len,
+                "page_size": cc.page_size,
+            },
+            "vocab_size": meta.vocab_size,
+            "vision": meta.vision.is_some(),
+            "defaults": {
+                "max_tokens": dc.max_tokens,
+                "temperature": dc.sampling.temperature,
+                "top_p": dc.sampling.top_p,
+                "top_k": dc.sampling.top_k,
+            },
+        }),
+    )
+}
+
+/// Maps engine errors to (HTTP status, error type): context overflow is a
+/// client-fixable 400, everything else stays a 500.
+fn engine_error_parts(e: &combs_runtime::EngineError) -> (u16, &'static str) {
+    match e {
+        combs_runtime::EngineError::ContextTooLong { .. } => {
+            (400, "context_length_exceeded")
+        }
+        _ => (500, "engine_error"),
+    }
 }
 
 fn now_unix() -> u64 {
@@ -104,27 +135,12 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-fn error_json(kind: &str, message: &str) -> Value {
-    json!({"error": {"type": kind, "message": message}})
-}
-
-fn cors_header() -> tiny_http::Header {
-    tiny_http::Header::from_bytes("Access-Control-Allow-Origin", "*").unwrap()
-}
-
-fn json_response(status: u16, body: Value) -> HttpResponse {
-    let data = body.to_string().into_bytes();
-    let len = data.len();
-    tiny_http::Response::empty(status)
-        .with_data(
-            Box::new(std::io::Cursor::new(data)) as Box<dyn Read + Send>,
-            Some(len),
-        )
-        .with_header(tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap())
-        .with_header(cors_header())
-}
-
-fn handle_chat(engine: &Arc<Engine>, model_id: &str, body: &str) -> HttpResponse {
+fn handle_chat(
+    engine: &Arc<Engine>,
+    model_id: &str,
+    body: &str,
+    default_prefill_chunk: Option<usize>,
+) -> HttpResponse {
     let req: Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(e) => {
@@ -164,14 +180,23 @@ fn handle_chat(engine: &Arc<Engine>, model_id: &str, body: &str) -> HttpResponse
     };
 
     let mut config: GenerationConfig = engine.default_config();
+    if let Some(chunk) = default_prefill_chunk {
+        config.prefill_chunk_size = chunk;
+    }
     if let Some(mt) = req.get("max_tokens").and_then(Value::as_u64) {
         config.max_tokens = mt as usize;
     }
     if let Some(t) = req.get("temperature").and_then(Value::as_f64) {
         config.sampling.temperature = t as f32;
     }
+    if let Some(k) = req.get("top_k").and_then(Value::as_u64) {
+        config.sampling.top_k = Some(k as usize);
+    }
     if let Some(p) = req.get("top_p").and_then(Value::as_f64) {
         config.sampling.top_p = Some(p as f32);
+    }
+    if let Some(rp) = req.get("repetition_penalty").and_then(Value::as_f64) {
+        config.sampling.repetition_penalty = Some(rp as f32);
     }
     if let Some(fp) = req.get("frequency_penalty").and_then(Value::as_f64) {
         config.sampling.frequency_penalty = Some(fp as f32);
@@ -238,7 +263,10 @@ fn handle_chat(engine: &Arc<Engine>, model_id: &str, body: &str) -> HttpResponse
                     },
                 }),
             ),
-            Err(e) => json_response(500, error_json("engine_error", &e.to_string())),
+            Err(e) => {
+                let (status, kind) = engine_error_parts(&e);
+                json_response(status, error_json(kind, &e.to_string()))
+            }
         };
     }
 
@@ -281,9 +309,10 @@ fn handle_chat(engine: &Arc<Engine>, model_id: &str, body: &str) -> HttpResponse
                 let _ = send_chunk(json!({}), Some(finish), Some(usage));
             }
             Err(e) => {
+                let (_, kind) = engine_error_parts(&e);
                 let _ = tx.send(format!(
                     "data: {}\n\n",
-                    json!({"error": {"type": "engine_error", "message": e.to_string()}})
+                    json!({"error": {"type": kind, "message": e.to_string()}})
                 ));
             }
         }

@@ -14,9 +14,12 @@ use combs_media::ImagePreprocessor;
 use combs_runtime::{Engine, GenerationConfig};
 
 mod chew;
+mod generate_audio;
 mod generate_image;
+mod http;
 mod pull;
 mod serve;
+mod serve_images;
 
 #[derive(Parser)]
 #[command(name = "combs", version, about = "Combs Engine — cross-platform edge AI inference")]
@@ -91,6 +94,18 @@ enum Command {
     },
     /// Generate an image with a local Stable Diffusion checkpoint.
     GenerateImage(generate_image::GenerateImageArgs),
+    /// Generate speech (WAV) with a local Kokoro ONNX TTS checkpoint.
+    GenerateAudio(generate_audio::GenerateAudioArgs),
+    /// Start a persistent image-generation worker (loads the diffusion
+    /// pipeline once, serves OpenAI-style /v1/images/generations).
+    ServeImages {
+        /// Path to the Diffusers checkpoint (unet/, vae/, text_encoder/).
+        #[arg(long)]
+        model: PathBuf,
+        /// Port to listen on.
+        #[arg(long, default_value_t = 8082)]
+        port: u16,
+    },
     /// Start an OpenAI-compatible HTTP server.
     Serve {
         /// Path to the model directory (HF safetensors layout) or .gguf file.
@@ -99,6 +114,14 @@ enum Command {
         /// Port to listen on.
         #[arg(long, default_value_t = 8080)]
         port: u16,
+        /// KV arena size in tokens. Default: min(model's
+        /// max_position_embeddings, 32768). Raise for long-context models
+        /// when memory allows.
+        #[arg(long)]
+        context_size: Option<usize>,
+        /// Prompt tokens per prefill call (0 = single-shot; default 512).
+        #[arg(long)]
+        prefill_chunk_size: Option<usize>,
     },
     /// Scaffold a UI app from the embedded template (interactive or via flags).
     Chew(ChewCommand),
@@ -140,7 +163,11 @@ fn main() -> Result<()> {
         }
         Command::Convert { .. } => not_yet("convert", "Phase 5 (GGUF/burnpack adapters)"),
         Command::GenerateImage(args) => generate_image::cmd_generate_image(args),
-        Command::Serve { model, port } => cmd_serve(model, port),
+        Command::GenerateAudio(args) => generate_audio::cmd_generate_audio(args),
+        Command::ServeImages { model, port } => serve_images::cmd_serve_images(model, port),
+        Command::Serve { model, port, context_size, prefill_chunk_size } => {
+            cmd_serve(model, port, context_size, prefill_chunk_size)
+        }
         Command::Chew(cmd) => match cmd.mode {
             ChewMode::ChatUi(args) => chew::chew("chat-ui", args),
             ChewMode::DebateUi(args) => chew::chew("debate-ui", args),
@@ -171,10 +198,18 @@ fn resolve_model_arg(model: &PathBuf) -> Result<PathBuf> {
     if let Some(dir) = pull::cached_diffusion_dir(&name) {
         return Ok(dir);
     }
+    if let Some(dir) = pull::cached_tts_dir(&name) {
+        return Ok(dir);
+    }
     anyhow::bail!("model '{name}' not found — download it first: combs pull {name}")
 }
 
-fn cmd_serve(model: PathBuf, port: u16) -> Result<()> {
+fn cmd_serve(
+    model: PathBuf,
+    port: u16,
+    context_size: Option<usize>,
+    prefill_chunk_size: Option<usize>,
+) -> Result<()> {
     let model = resolve_model_arg(&model)?;
     let source = open_model_source(&model)?;
     let model_id = model
@@ -182,8 +217,17 @@ fn cmd_serve(model: PathBuf, port: u16) -> Result<()> {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "combs-model".to_string());
     eprintln!("loading weights...");
-    let engine = std::sync::Arc::new(Engine::load(&source, combs_core::init_device())?);
-    serve::serve(engine, model_id, &format!("0.0.0.0:{port}"))
+    let device = combs_core::init_device();
+    let engine = if let Some(size) = context_size {
+        let mut cc = combs_runtime::CacheConfig::paged(size);
+        if matches!(std::env::var("COMBS_KV").as_deref(), Ok("contiguous")) {
+            cc.kind = combs_runtime::CacheKind::Contiguous;
+        }
+        std::sync::Arc::new(Engine::load_with_cache_config(&source, device, cc)?)
+    } else {
+        std::sync::Arc::new(Engine::load(&source, device)?)
+    };
+    serve::serve(engine, model_id, &format!("0.0.0.0:{port}"), prefill_chunk_size)
 }
 
 fn cmd_devices() -> Result<()> {

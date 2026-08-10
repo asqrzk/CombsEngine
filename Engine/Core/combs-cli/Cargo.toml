@@ -27,3 +27,6 @@ tiny_http.workspace = true
 dialoguer.workspace = true
 console.workspace = true
 ureq.workspace = true
+# TTS (`generate-audio`): Kokoro ONNX runs via onnxruntime — an external
+# runtime by design; the burn-native port is tracked as follow-up work.
+ort = "2.0.0-rc.10"

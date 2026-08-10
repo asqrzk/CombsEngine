@@ -27,6 +27,7 @@ pub const PRESETS: &[(&str, &str, &str)] = &[
     ("smollm2-1.7b", "HuggingFaceTB/SmolLM2-1.7B-Instruct", "smollm2-1.7b"),
     ("smolvlm-256m", "HuggingFaceTB/SmolVLM-256M-Instruct", "smolvlm-256m"),
     ("sd-1.5", "runwayml/stable-diffusion-v1-5", "stable-diffusion-v1-5"),
+    ("kokoro-82m", "onnx-community/Kokoro-82M-v1.0-ONNX", "kokoro-82m"),
 ];
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -41,6 +42,8 @@ enum Kind {
     TextVision,
     Diffusion,
     Gguf,
+    /// Kokoro-style ONNX TTS: voices/*.bin style vectors + an .onnx model.
+    Tts,
 }
 
 pub fn resolve_repo(source: &str) -> (String, String) {
@@ -84,6 +87,17 @@ pub fn cached_dir(source: &str) -> Option<PathBuf> {
     None
 }
 
+/// Returns the cached path for a Kokoro-style ONNX TTS model, if present.
+pub fn cached_tts_dir(source: &str) -> Option<PathBuf> {
+    let (id, _) = resolve_repo(source);
+    let dir = cache_root().ok()?.join(id);
+    if dir.join("voices").is_dir() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
 /// Returns the cached path for a diffusion checkpoint, if present.
 pub fn cached_diffusion_dir(source: &str) -> Option<PathBuf> {
     let (id, _) = resolve_repo(source);
@@ -117,6 +131,7 @@ pub fn pull(source: &str) -> Result<PathBuf> {
         Kind::Diffusion => pull_diffusion(&repo, &dir, &tree),
         Kind::TextVision => pull_text(&repo, &dir, &tree),
         Kind::Gguf => pull_gguf(&repo, &dir, &tree),
+        Kind::Tts => pull_tts(&repo, &dir, &tree),
     }?;
 
     println!("{}", style("model ready").bold().green());
@@ -148,6 +163,13 @@ fn detect_kind(tree: &[TreeEntry]) -> Result<Kind> {
     let paths: HashSet<&str> = tree.iter().map(|e| e.path.as_str()).collect();
     if paths.contains("model_index.json") {
         return Ok(Kind::Diffusion);
+    }
+    // TTS before TextVision: Kokoro-style repos also carry a config.json,
+    // but the voices/ style-vector dir is unique to them.
+    if paths.iter().any(|p| p.starts_with("voices/") && p.ends_with(".bin"))
+        && paths.iter().any(|p| p.ends_with(".onnx"))
+    {
+        return Ok(Kind::Tts);
     }
     if paths.contains("config.json") {
         return Ok(Kind::TextVision);
@@ -206,6 +228,51 @@ fn pull_text(repo: &str, dir: &PathBuf, tree: &[TreeEntry]) -> Result<()> {
         bail!("no safetensors or GGUF weight files found");
     }
 
+    Ok(())
+}
+
+/// Kokoro-style ONNX TTS repo: tokenizer + one .onnx + all voice styles.
+fn pull_tts(repo: &str, dir: &PathBuf, tree: &[TreeEntry]) -> Result<()> {
+    let paths: HashSet<&str> = tree.iter().map(|e| e.path.as_str()).collect();
+
+    download_optional(repo, dir, "config.json")?;
+    if paths.contains("tokenizer.json") {
+        download_required(repo, dir, "tokenizer.json")?;
+    } else {
+        bail!("TTS repo missing tokenizer.json");
+    }
+
+    // Model: prefer the q8 dynamic quant (small, CPU-friendly), then fp32.
+    let onnx_prefs = [
+        "onnx/model_quantized.onnx",
+        "onnx/model.onnx",
+        "model_quantized.onnx",
+        "model.onnx",
+    ];
+    let onnx = onnx_prefs
+        .iter()
+        .find(|p| paths.contains(**p))
+        .map(|p| p.to_string())
+        .or_else(|| {
+            tree.iter()
+                .map(|e| e.path.clone())
+                .find(|p| p.ends_with(".onnx"))
+        })
+        .context("no .onnx model file found in TTS repo")?;
+    download_required(repo, dir, &onnx)?;
+
+    // Voice style vectors (each ~0.5 MB; the voice picker needs them all).
+    let voices: Vec<String> = tree
+        .iter()
+        .filter(|e| e.path.starts_with("voices/") && e.path.ends_with(".bin"))
+        .map(|e| e.path.clone())
+        .collect();
+    if voices.is_empty() {
+        bail!("TTS repo has no voices/*.bin style vectors");
+    }
+    for voice in voices {
+        download_required(repo, dir, &voice)?;
+    }
     Ok(())
 }
 
