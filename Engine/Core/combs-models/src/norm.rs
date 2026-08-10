@@ -2,23 +2,30 @@
 
 use burn::tensor::{Tensor, backend::Backend};
 
+use crate::precision::{to_f32, to_float};
+
 /// `y = x / rms(x) * w` where `rms` is taken over the last dimension and
 /// `eps` is added inside the square root.
+///
+/// The reduction runs in f32 for f16 stability (no-op in f32 builds).
 pub fn rms_norm<B: Backend, const D: usize>(
     x: Tensor<B, D>,
     weight: Tensor<B, 1>,
     eps: f64,
 ) -> Tensor<B, D> {
+    let out_dtype = x.dtype();
     let dims = x.dims();
     let hidden = dims[D - 1];
 
+    let xf = to_f32(x);
     // mean(x^2) over the last dim, keeping rank for broadcasting.
-    let mean_sq = x.clone().powf_scalar(2.0).mean_dim(D - 1);
+    let mean_sq = xf.clone().powf_scalar(2.0).mean_dim(D - 1);
     let inv_rms = mean_sq.add_scalar(eps).sqrt().recip();
 
     let mut shape = [1usize; D];
     shape[D - 1] = hidden;
-    x * inv_rms * weight.reshape(shape)
+    let y = xf * inv_rms * to_f32(weight).reshape(shape);
+    to_float(y, out_dtype)
 }
 
 /// Gemma-style RMSNorm: `y = x / rms(x) * (1 + w)` — the learnable weight
@@ -42,14 +49,18 @@ pub fn layer_norm<B: Backend, const D: usize>(
     let dims = x.dims();
     let hidden = dims[D - 1];
 
-    let mean = x.clone().mean_dim(D - 1);
-    let centered = x - mean;
+    let out_dtype = x.dtype();
+    let xf = to_f32(x);
+    let mean = xf.clone().mean_dim(D - 1);
+    let centered = xf - mean;
     let var = centered.clone().powf_scalar(2.0).mean_dim(D - 1);
     let inv_std = var.add_scalar(eps).sqrt().recip();
 
     let mut shape = [1usize; D];
     shape[D - 1] = hidden;
-    centered * inv_std * weight.reshape(shape) + bias.reshape(shape)
+    let y = centered * inv_std * to_f32(weight).reshape(shape.clone())
+        + to_f32(bias).reshape(shape);
+    to_float(y, out_dtype)
 }
 
 #[cfg(test)]

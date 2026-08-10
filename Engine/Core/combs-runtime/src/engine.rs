@@ -720,6 +720,7 @@ fn req_eos_ids(
 fn readback_logits(logits: Tensor<CombsBackend, 2>) -> Result<Vec<f32>> {
     logits
         .into_data()
+        .convert::<f32>()
         .to_vec::<f32>()
         .map_err(|e| EngineError::Readback(format!("logits must be f32: {e:?}")))
 }

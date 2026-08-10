@@ -10,6 +10,7 @@ mod gemma;
 mod llama;
 mod matmul;
 mod norm;
+mod precision;
 mod quant_linear;
 mod registry;
 mod rope;

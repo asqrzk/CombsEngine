@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Combs Engine core: backend aliases, device helpers, memory facade"
 
+[features]
+f16 = []
+
 [dependencies]
 burn.workspace = true
 serde.workspace = true

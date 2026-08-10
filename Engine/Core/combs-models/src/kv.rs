@@ -16,6 +16,7 @@ use burn::tensor::ops::AttentionModuleOptions;
 use burn::tensor::{Bool, Device, Int, Tensor, TensorData, activation::softmax, backend::Backend};
 
 use crate::matmul::safe_matmul;
+use crate::precision::{to_f32, to_float};
 
 /// Whether to prefer burn's fused (flash) attention kernel over the manual
 /// scores→mask→softmax→matmul path. Controlled by `COMBS_ATTN=flash|manual`
@@ -168,6 +169,12 @@ fn attend<B: Backend>(
     window: Option<usize>,
 ) -> Tensor<B, 4> {
     let device = q.device();
+    // Attention scores + softmax run in f32 for f16 stability (exp overflows
+    // f16); no-op in f32 builds. The heavy weight matmuls + KV stay f16.
+    let out_dtype = q.dtype();
+    let q = to_f32(q);
+    let k = to_f32(k);
+    let v = to_f32(v);
     let [_, n_q, seq, d] = q.dims();
     let [_, n_kv, total, _] = k.dims();
     let n_rep = n_q / n_kv;
@@ -176,7 +183,7 @@ fn attend<B: Backend>(
 
     let default_scale = 1.0 / (d as f64).sqrt();
     if flash_enabled() && window.is_none() && (scale - default_scale).abs() < 1e-12 {
-        return burn::tensor::module::attention(
+        let out = burn::tensor::module::attention(
             q,
             k,
             v,
@@ -190,6 +197,7 @@ fn attend<B: Backend>(
                 is_causal: seq > 1,
             },
         );
+        return to_float(out, out_dtype);
     }
 
     // Reference path: explicit scores, causal (+ optional sliding-window)
@@ -219,7 +227,7 @@ fn attend<B: Backend>(
 
     // `safe_matmul` for the P@V product: with a >= 512-token window this
     // shape (M = seq, K = total) enters the broken wgpu/Metal matmul region.
-    safe_matmul(softmax(scores, 3), v)
+    to_float(safe_matmul(softmax(scores, 3), v), out_dtype)
 }
 
 /// Simple contiguous cache: stores one K and one V tensor per layer and

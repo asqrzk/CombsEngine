@@ -31,6 +31,7 @@ use crate::kv::{CacheConfig, CacheKind, ContiguousKVCache, KVCache, PagedKVCache
 use crate::llama::{linear, load_tensor};
 use crate::matmul::safe_matmul;
 use crate::norm::gemma_rms_norm;
+use crate::precision::{to_f32, to_float};
 use crate::rope::RotaryEmbedding;
 use crate::traits::GenerativeModel;
 use crate::{ModelError, Result};
@@ -80,9 +81,13 @@ pub struct GemmaModel<B: Backend> {
 /// gelu with the tanh approximation (HF `gelu_pytorch_tanh`):
 /// `0.5x(1 + tanh(sqrt(2/pi)(x + 0.044715 x^3)))`.
 fn gelu_tanh<B: Backend>(x: Tensor<B, 3>) -> Tensor<B, 3> {
+    // x^3 overflows f16 for moderately large activations; compute in f32.
+    let out_dtype = x.dtype();
+    let x = to_f32(x);
     const C: f64 = 0.797_884_560_802_865_4; // sqrt(2/pi)
     let inner = (x.clone() + x.clone().powf_scalar(3.0).mul_scalar(0.044715)).mul_scalar(C);
-    x * inner.tanh().add_scalar(1.0).mul_scalar(0.5)
+    let y = x * inner.tanh().add_scalar(1.0).mul_scalar(0.5);
+    to_float(y, out_dtype)
 }
 
 #[cfg(test)]

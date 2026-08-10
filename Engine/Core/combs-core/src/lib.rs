@@ -13,11 +13,28 @@ pub mod quant;
 
 use burn::backend::wgpu::{RuntimeOptions, WgpuDevice, WgpuSetup, graphics::AutoGraphicsApi};
 
-/// The default inference backend: autotuned, fusing wgpu/CubeCL backend.
+/// The default inference backend: autotuned, fusing wgpu/CubeCL backend
+/// (`Fusion<CubeBackend<WgpuRuntime, f32, i32, u32>>`).
 ///
-/// With burn 0.21 + the `fusion` feature this expands to
-/// `Fusion<CubeBackend<WgpuRuntime, f32, i32, u32>>`.
+/// `--features f16` switches to an **unfused f16** backend, which ~halves
+/// weight + KV + activation memory (e.g. a 3B model drops from ~12 GB to
+/// ~6 GB) and is typically faster. The numerically sensitive reductions
+/// (RMS/LayerNorm, attention scores + softmax, gelu) run in f32 regardless
+/// of backend (see `combs-models::precision`), so f16 output stays coherent.
+///
+/// Note: f16 uses the **unfused** `CubeBackend` type directly — burn-fusion
+/// 0.21 panics on reduced-precision tensors, so we bypass the fusion layer
+/// for f16 while keeping f32 fused. bf16 is unavailable (cubecl's matmul has
+/// no bf16 path on Metal/wgpu).
+#[cfg(not(feature = "f16"))]
 pub type CombsBackend = burn::backend::Wgpu<f32, i32, u32>;
+#[cfg(feature = "f16")]
+pub type CombsBackend = burn::backend::wgpu::CubeBackend<
+    burn::backend::wgpu::WgpuRuntime,
+    burn::tensor::f16,
+    i32,
+    u32,
+>;
 
 /// The default device handle type.
 pub type CombsDevice = WgpuDevice;
