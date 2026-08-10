@@ -202,17 +202,30 @@ fused win + ggml fidelity.
 - **Effort: ~1 week.**
 
 ### 1B — Custom CubeCL fused dequant-matmul kernels (native, best)
+
+**STATUS: Q4_0 landed and validated on Metal** (`combs-models/src/qmatmul.rs`):
+- Layout layer: `repack_q4_0` turns GGUF 18-byte blocks into a GPU
+  structure-of-arrays (nibble bytes as `u32` words + f32 scale per block —
+  5.0 bits/weight in VRAM; f32 scales keep bit-exactness, f16-pair packing is
+  a later 0.5-bit saving). `Q40Weight` holds the packed handles device-side.
+- Compute layer: `q4_0_dequant_kernel` (validation) + `q4_0_matmul_kernel`
+  (fused production path, per-block f32 accumulation, scale applied once).
+- Validation per principle #6: dequant kernel is **bit-exact** vs
+  `combs_formats::quants::dequantize_q4_0` (the gguf.rs scalar path, now
+  public as the golden reference); fused matmul matches a reference matmul
+  within 1e-4 for decode (m=1) and prefill (m>1) shapes.
+
+Remaining in 1B:
 - Author `#[cube]` kernels that read **ggml-packed blocks directly**
-  (Q4_0/Q8_0/Q4_K/Q5_K/Q6_K) from a raw `u32` storage buffer and do a **fused
-  dequant-matmul**, accumulating in f32/f16 — the weight is *never* fully
-  materialized. This is the llama.cpp/MLX approach and the only path to true
-  ~0.5 B/param peak.
-- Store weights as raw packed bytes (stop the CPU→f32 expansion in gguf.rs;
-  upload the quant blocks as-is). The existing `gguf.rs` CPU dequant functions
-  become the **golden reference** for kernel unit tests.
-- One kernel per quant family, or a single kernel parameterized by a block-format
-  descriptor (scale offset, bits, superblock size). Start with **Q4_K_M** (the
-  most common) + Q6_K, then Q4_0/Q8_0.
+  (Q8_0/Q4_K/Q5_K/Q6_K) the same way — next: **Q4_K + Q6_K** (Q4_K_M files,
+  the most common), reusing the same layout/kernel/golden-test pattern.
+- Store weights as raw packed bytes end-to-end (stop the CPU→f32 expansion in
+  gguf.rs; upload the quant blocks as-is) — needs a raw-tensor accessor on
+  `GgufSource` + Phase 2's per-tensor dispatch.
+- Device-tensor forward (activation handle in/out, no host round-trip) behind
+  the linear seam; then tiling/vectorized loads for throughput.
+- **Must** respect Metal's 32 KB shared-mem limit (cf. the 512-matmul bug) —
+  tile conservatively, reuse the `safe_matmul` M-slab lesson.
 - **Must** respect Metal's 32 KB shared-mem limit (cf. the 512-matmul bug) —
   tile conservatively, reuse the `safe_matmul` M-slab lesson.
 - **Effort: 2–4 weeks** (new CubeCL competency; per-format kernels + tiling +

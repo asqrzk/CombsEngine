@@ -19,6 +19,14 @@ mod tflite;
 mod tokenizer;
 
 pub use gguf::GgufSource;
+
+/// Reference CPU dequantizers for GGUF quant formats. These scalar
+/// implementations are the golden reference that the fused GPU kernels in
+/// `combs-models` validate against (QUANTIZATION_PLAN.md, principle #6:
+/// every kernel is tested against a portable reference).
+pub mod quants {
+    pub use crate::gguf::dequantize_q4_0;
+}
 pub use metadata::{AttentionPattern, ModelMetadata, VisionConfig};
 pub use safetensors::SafetensorsSource;
 pub use litertlm::{SectionInfo, read_sections as litertlm_read_sections};

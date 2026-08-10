@@ -582,7 +582,10 @@ fn tensor_byte_size(info: &TensorInfo) -> Result<usize> {
 
 /// Dequantizes a Q4_0 tensor to f32. Blocks of 32 values: f16 scale + 16
 /// bytes; value i (i<16) is the low nibble of byte i, value i+16 the high.
-fn dequantize_q4_0(data: &[u8], n: usize) -> Result<Vec<f32>> {
+///
+/// Public via [`crate::quants`]: this scalar path is the golden reference
+/// the fused CubeCL kernels validate against.
+pub fn dequantize_q4_0(data: &[u8], n: usize) -> Result<Vec<f32>> {
     let mut fixed = Vec::with_capacity(n);
     for block in data.chunks_exact(18) {
         let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
