@@ -53,6 +53,7 @@ fn paged(layers: usize, max_seq_len: usize, page_size: usize) -> PagedKVCache<B>
             max_seq_len,
             page_size,
             kind: CacheKind::Paged,
+            quantize_kv: false,
         },
     )
 }

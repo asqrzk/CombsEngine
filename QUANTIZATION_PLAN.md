@@ -342,12 +342,26 @@ DynamicSlidingWindowLayer design mapped onto `PagedKVCache`:
   GPU number covers the worker stream (KV + activations), not the
   load-stream weights; the `combs run` post-load print is the converse.
 
-Next engine phase (planned, not started): KIVI-style KV cache quantization
-(fp16 residual window + group-64 quantized bulk, full-attention layers
-only) behind COMBS_KV_QUANT=1. Note for the implementer: burn Int tensors
-are i32 (no memory win) — true int8/int4 KV packing goes through our
-CubeCL machinery (pack 4×i8 per u32 like qmatmul's layouts), so this is a
-kernel task, not a tensor-op task.
+**KV cache quantization — LANDED (2026-08-10), `COMBS_KV_QUANT=1`.**
+int8, group-32 along head_dim, per-token (self-contained — nothing is
+ever re-quantized), global layers only; sliding layers stay float (they
+hold ≤ w-1 tokens). Contrary to the earlier note, no CubeCL kernel was
+needed: 4 signed bytes pack into one Int element with an exact-fit scheme
+— lanes 0..2 offset-binary (q+128 ∈ [1,255]), lane 3 signed, so the
+extreme corner is exactly i32::MAX; unpack emulates floor-division on the
+truncating int div with a sign-corrected high-lane remainder. Pure burn
+tensor ops ⇒ works on fused wgpu, unfused f16, and ndarray alike.
+- At int8 the KIVI residual window is unnecessary (llama.cpp ships q8_0
+  KV the same way); it becomes required if int4 is added later.
+- Proof: pack/unpack round-trip is bit-exact on grid values across all
+  four lanes; dequant error ≤ scale/2 per element; quantized paged cache
+  tracks fp within 1e-2 across page boundaries/prefill/decode with
+  identical popn/page semantics. E2E: gemma int8-KV answers correctly and
+  the 900-token sliding+quant run is token-identical to full precision;
+  llama diverges only at a greedy near-tie (equally coherent).
+- Measured: llama-3.2-1B worker-stream KV memory 2048 MB → 576 MB
+  (3.6×, matching the theoretical 32/9 exactly); /v1/stats reports
+  kv.quantized and the corrected page_bytes (1048576 → 294912).
 
 ---
 

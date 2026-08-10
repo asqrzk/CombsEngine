@@ -172,6 +172,7 @@ fn stats_response(
             })),
             "kv": {
                 "kind": format!("{:?}", cc.kind).to_lowercase(),
+                "quantized": cc.quantize_kv,
                 "max_seq_len": cc.max_seq_len,
                 "page_size": cc.page_size,
                 "page_bytes": snap.kv_page_bytes,

@@ -342,11 +342,18 @@ impl Engine {
     }
 
     /// Loads a model with an explicit KV cache configuration.
+    ///
+    /// `COMBS_KV_QUANT=1` turns on int8 KV storage for global-attention
+    /// layers regardless of how the config was built (single choke point
+    /// for both the CLI paths).
     pub fn load_with_cache_config(
         source: &dyn ModelSource,
         device: CombsDevice,
-        cache_config: CacheConfig,
+        mut cache_config: CacheConfig,
     ) -> Result<Self> {
+        if matches!(std::env::var("COMBS_KV_QUANT").as_deref(), Ok("1")) {
+            cache_config.quantize_kv = true;
+        }
         let registry = ModelRegistry::<CombsBackend>::new();
         let model = registry.load(source, &device)?;
 
@@ -366,12 +373,19 @@ impl Engine {
             .filter(|&i| pattern.is_global_layer(i))
             .count()
             .max(1);
+        // int8 KV packs to 1 byte/value + one f32 scale per 32 values.
+        let bytes_per_value_x8 = if cache_config.quantize_kv {
+            9 // (1 + 4/32) * 8
+        } else {
+            elem_bytes * 8
+        };
         let stats = Arc::new(Mutex::new(EngineStatsSnapshot {
             max_sessions: MAX_SESSIONS,
             kv_page_bytes: cache_config.page_size as u64
                 * meta.num_key_value_heads as u64
                 * meta.head_dim as u64
-                * elem_bytes
+                * bytes_per_value_x8
+                / 8
                 * 2 // K and V
                 * global_layers as u64,
             ..EngineStatsSnapshot::default()

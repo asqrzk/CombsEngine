@@ -46,6 +46,12 @@ pub struct CacheConfig {
     pub page_size: usize,
     /// Implementation to use.
     pub kind: CacheKind,
+    /// Store global-layer KV pages int8-quantized (group-32 along
+    /// head_dim, packed 4 bytes per int element) — ~3.5× less KV memory
+    /// on the f32 build at near-lossless int8 fidelity. Sliding-window
+    /// layers stay in float (they hold at most `w-1` tokens). Set from
+    /// `COMBS_KV_QUANT=1` by the engine.
+    pub quantize_kv: bool,
 }
 
 impl CacheConfig {
@@ -58,6 +64,7 @@ impl CacheConfig {
             max_seq_len,
             page_size: Self::DEFAULT_PAGE_SIZE,
             kind: CacheKind::Paged,
+            quantize_kv: false,
         }
     }
 
@@ -67,6 +74,7 @@ impl CacheConfig {
             max_seq_len,
             page_size: Self::DEFAULT_PAGE_SIZE,
             kind: CacheKind::Contiguous,
+            quantize_kv: false,
         }
     }
 
@@ -251,6 +259,87 @@ fn attend<B: Backend>(
     to_float(safe_matmul(softmax(scores, 3), v), out_dtype)
 }
 
+/// Values per KV quantization group (along head_dim; one f32 scale each).
+const KV_QUANT_GROUP: usize = 32;
+
+/// Quantizes `x: [b, h, s, d]` to int8 with a per-32-value group scale
+/// (absmax/127), packing 4 signed bytes per int element.
+///
+/// Packing scheme (exact i32 fit): lanes 0..2 are stored offset-binary
+/// (`q+128 ∈ [1, 255]`, since q is clamped to ±127), lane 3 signed as-is:
+/// `p = l0 + l1·2⁸ + l2·2¹⁶ + q3·2²⁴`. The extreme corner
+/// (l0=l1=l2=255, q3=127) is exactly `i32::MAX` — no overflow — and the
+/// backend Int element is at least i32, so pack/unpack round-trips are
+/// integer-exact on every backend.
+///
+/// Returns `(packed [b,h,s,d/4], scales [b,h,s,d/32])`.
+fn kv_quantize<B: Backend>(x: Tensor<B, 4>) -> (Tensor<B, 4, Int>, Tensor<B, 4>) {
+    let [b, h, s, d] = x.dims();
+    debug_assert_eq!(d % KV_QUANT_GROUP, 0);
+    let groups = d / KV_QUANT_GROUP;
+    let g = to_f32(x).reshape([b, h, s, groups, KV_QUANT_GROUP]);
+    let scale = g
+        .clone()
+        .abs()
+        .max_dim(4) // [b, h, s, groups, 1]
+        .div_scalar(127.0)
+        .clamp_min(1e-8);
+    let q = g
+        .div(scale.clone().expand([b, h, s, groups, KV_QUANT_GROUP]))
+        .round()
+        .clamp(-127.0, 127.0)
+        .int()
+        .reshape([b, h, s, d / 4, 4]);
+    let lane = |i: usize| q.clone().narrow(4, i, 1).reshape([b, h, s, d / 4]);
+    let packed = lane(0).add_scalar(128)
+        + lane(1).add_scalar(128).mul_scalar(256)
+        + lane(2).add_scalar(128).mul_scalar(65536)
+        + lane(3).mul_scalar(16777216);
+    (packed, scale.reshape([b, h, s, groups]))
+}
+
+/// Inverse of [`kv_quantize`]: unpack the four lanes (floor-division
+/// emulated exactly on the truncating int div: the high lane's remainder
+/// is sign-corrected, the rest are non-negative) and apply the group
+/// scales. Returns `[b, h, s, d]` float.
+fn kv_dequantize<B: Backend>(
+    packed: Tensor<B, 4, Int>,
+    scales: Tensor<B, 4>,
+    d: usize,
+) -> Tensor<B, 4> {
+    let [b, h, s, _] = packed.dims();
+    let groups = d / KV_QUANT_GROUP;
+    let t = packed.clone().div_scalar(16777216);
+    let r3 = packed - t.clone().mul_scalar(16777216);
+    let neg = r3.clone().lower_elem(0);
+    let q3 = t.clone().mask_where(neg.clone(), t.sub_scalar(1));
+    let r = r3.clone().mask_where(neg, r3.add_scalar(16777216));
+    let l2 = r.clone().div_scalar(65536);
+    let r = r - l2.clone().mul_scalar(65536);
+    let l1 = r.clone().div_scalar(256);
+    let l0 = r - l1.clone().mul_scalar(256);
+    // Stack along a new trailing lane axis → [b, h, s, d/4, 4]; a plain
+    // reshape then restores the original d-ordering (lane i holds value
+    // 4·g+i, exactly how the pack side split them).
+    let q = Tensor::stack::<5>(
+        vec![
+            l0.sub_scalar(128),
+            l1.sub_scalar(128),
+            l2.sub_scalar(128),
+            q3,
+        ],
+        4,
+    )
+    .reshape([b, h, s, d]);
+    let g = q.float().reshape([b, h, s, groups, KV_QUANT_GROUP]);
+    g.mul(
+        scales
+            .reshape([b, h, s, groups, 1])
+            .expand([b, h, s, groups, KV_QUANT_GROUP]),
+    )
+    .reshape([b, h, s, d])
+}
+
 /// Simple contiguous cache: stores one K and one V tensor per layer and
 /// concatenates along the sequence dimension every step.
 ///
@@ -353,13 +442,28 @@ impl PageAllocator {
 /// Steady-state decode therefore writes a single slot and gathers — the
 /// Phase 1 O(seq) `cat`-rewrite per token is gone. (A fused no-gather
 /// CubeCL kernel is a later task.)
+/// A global layer's page arena: float, or int8-quantized (packed 4/int +
+/// per-group scales) when `CacheConfig::quantize_kv` is set.
+enum Arena<B: Backend> {
+    Fp {
+        k: Tensor<B, 4>,
+        v: Tensor<B, 4>,
+    },
+    Quant {
+        k_packed: Tensor<B, 4, Int>,
+        k_scales: Tensor<B, 4>,
+        v_packed: Tensor<B, 4, Int>,
+        v_scales: Tensor<B, 4>,
+    },
+}
+
 pub struct PagedKVCache<B: Backend> {
     config: CacheConfig,
     allocator: PageAllocator,
     /// Page table: logical page index -> physical page id (single sequence).
     table: Vec<usize>,
     seq_len: usize,
-    arenas: Vec<Option<(Tensor<B, 4>, Tensor<B, 4>)>>,
+    arenas: Vec<Option<Arena<B>>>,
     /// Per-layer sliding-window override (transformers' layer-typed cache):
     /// `Some(w)` layers keep only the most recent `w-1` tokens in a rolling
     /// tensor and never touch the paged arena — for gemma's 5 local : 1
@@ -484,26 +588,45 @@ impl<B: Backend> PagedKVCache<B> {
         out
     }
 
+    /// Page-table indices for the first `pages` logical pages, on-device.
+    fn page_indices(&self, pages: usize) -> Tensor<B, 1, Int> {
+        let ids: Vec<i32> = self.table[..pages].iter().map(|&p| p as i32).collect();
+        let device = self
+            .device
+            .as_ref()
+            .expect("device set on first attention call");
+        Tensor::<B, 1, Int>::from_data(TensorData::new(ids, [pages]), device)
+    }
+
     /// Gathers the first `pages` page-table entries of `arena`
-    /// (`[num_pages, n_kv, page_size, head_dim]`) into a contiguous
-    /// `[1, n_kv, total, head_dim]` window.
+    /// (`[num_pages, n_kv, page_size, last]`) into a contiguous
+    /// `[1, n_kv, total, last]` window.
     fn gather_window(
         &self,
         arena: Tensor<B, 4>,
         pages: usize,
         total: usize,
     ) -> Tensor<B, 4> {
-        let [_, n_kv, page_size, head_dim] = arena.dims();
-        let ids: Vec<i32> = self.table[..pages].iter().map(|&p| p as i32).collect();
-        let device = self
-            .device
-            .as_ref()
-            .expect("device set on first attention call");
-        let indices = Tensor::<B, 1, Int>::from_data(TensorData::new(ids, [pages]), device);
+        let [_, n_kv, page_size, last] = arena.dims();
         arena
-            .select(0, indices) // [pages, n_kv, page_size, head_dim]
-            .swap_dims(0, 1) // [n_kv, pages, page_size, head_dim]
-            .reshape([1, n_kv, pages * page_size, head_dim])
+            .select(0, self.page_indices(pages)) // [pages, n_kv, page_size, last]
+            .swap_dims(0, 1) // [n_kv, pages, page_size, last]
+            .reshape([1, n_kv, pages * page_size, last])
+            .narrow(2, 0, total)
+    }
+
+    /// [`Self::gather_window`] for the packed int arenas.
+    fn gather_window_int(
+        &self,
+        arena: Tensor<B, 4, Int>,
+        pages: usize,
+        total: usize,
+    ) -> Tensor<B, 4, Int> {
+        let [_, n_kv, page_size, last] = arena.dims();
+        arena
+            .select(0, self.page_indices(pages))
+            .swap_dims(0, 1)
+            .reshape([1, n_kv, pages * page_size, last])
             .narrow(2, 0, total)
     }
 }
@@ -548,36 +671,101 @@ impl<B: Backend> KVCache<B> for PagedKVCache<B> {
         if let Some(w) = self.layer_windows.get(layer).copied().flatten() {
             return self.sliding_attention(layer, q, k, v, pos, scale, w);
         }
+        let quant = self.config.quantize_kv && head_dim % KV_QUANT_GROUP == 0;
         if self.arenas[layer].is_none() {
             let device = k.device();
-            let shape = [self.config.num_pages(), n_kv, self.config.page_size, head_dim];
-            self.arenas[layer] = Some((
-                Tensor::zeros(shape, &device),
-                Tensor::zeros(shape, &device),
-            ));
+            let np = self.config.num_pages();
+            let ps = self.config.page_size;
+            self.arenas[layer] = Some(if quant {
+                Arena::Quant {
+                    k_packed: Tensor::zeros([np, n_kv, ps, head_dim / 4], &device),
+                    k_scales: Tensor::zeros([np, n_kv, ps, head_dim / KV_QUANT_GROUP], &device),
+                    v_packed: Tensor::zeros([np, n_kv, ps, head_dim / 4], &device),
+                    v_scales: Tensor::zeros([np, n_kv, ps, head_dim / KV_QUANT_GROUP], &device),
+                }
+            } else {
+                let shape = [np, n_kv, ps, head_dim];
+                Arena::Fp {
+                    k: Tensor::zeros(shape, &device),
+                    v: Tensor::zeros(shape, &device),
+                }
+            });
         }
 
         let pages = self.ensure_pages(total);
         let page_size = self.config.page_size;
 
-        // Write the new K/V into page slots: one slice_assign per touched
-        // page (1 per steady-state decode step, seq/page_size per chunk).
-        let (mut arena_k, mut arena_v) = self.arenas[layer].take().expect("arena initialized");
-        let mut written = 0;
-        while written < seq {
-            let global = pos + written;
-            let slot = global % page_size;
-            let run = (page_size - slot).min(seq - written);
-            let phys = self.table[global / page_size];
-            let range = [phys..phys + 1, 0..n_kv, slot..slot + run, 0..head_dim];
-            arena_k = arena_k.slice_assign(range.clone(), k.clone().narrow(2, written, run));
-            arena_v = arena_v.slice_assign(range, v.clone().narrow(2, written, run));
-            written += run;
-        }
-
-        let k_full = self.gather_window(arena_k.clone(), pages, total);
-        let v_full = self.gather_window(arena_v.clone(), pages, total);
-        self.arenas[layer] = Some((arena_k, arena_v));
+        // Write the new K/V into page slots (one slice_assign per touched
+        // page: 1 per steady-state decode step, seq/page_size per chunk),
+        // then gather the full logical window and attend.
+        let (k_full, v_full) = match self.arenas[layer].take().expect("arena initialized") {
+            Arena::Fp { k: mut arena_k, v: mut arena_v } => {
+                let mut written = 0;
+                while written < seq {
+                    let global = pos + written;
+                    let slot = global % page_size;
+                    let run = (page_size - slot).min(seq - written);
+                    let phys = self.table[global / page_size];
+                    let range = [phys..phys + 1, 0..n_kv, slot..slot + run, 0..head_dim];
+                    arena_k =
+                        arena_k.slice_assign(range.clone(), k.clone().narrow(2, written, run));
+                    arena_v = arena_v.slice_assign(range, v.clone().narrow(2, written, run));
+                    written += run;
+                }
+                let k_full = self.gather_window(arena_k.clone(), pages, total);
+                let v_full = self.gather_window(arena_v.clone(), pages, total);
+                self.arenas[layer] = Some(Arena::Fp { k: arena_k, v: arena_v });
+                (k_full, v_full)
+            }
+            Arena::Quant {
+                mut k_packed,
+                mut k_scales,
+                mut v_packed,
+                mut v_scales,
+            } => {
+                // Quantize the incoming chunk once, then place the packed
+                // bytes + scales with the same page-slot arithmetic. Each
+                // token's groups quantize independently, so nothing is ever
+                // re-quantized.
+                let (kq, ks) = kv_quantize(k);
+                let (vq, vs) = kv_quantize(v);
+                let dp = head_dim / 4;
+                let dg = head_dim / KV_QUANT_GROUP;
+                let mut written = 0;
+                while written < seq {
+                    let global = pos + written;
+                    let slot = global % page_size;
+                    let run = (page_size - slot).min(seq - written);
+                    let phys = self.table[global / page_size];
+                    let rp = [phys..phys + 1, 0..n_kv, slot..slot + run, 0..dp];
+                    let rs = [phys..phys + 1, 0..n_kv, slot..slot + run, 0..dg];
+                    k_packed =
+                        k_packed.slice_assign(rp.clone(), kq.clone().narrow(2, written, run));
+                    k_scales =
+                        k_scales.slice_assign(rs.clone(), ks.clone().narrow(2, written, run));
+                    v_packed = v_packed.slice_assign(rp, vq.clone().narrow(2, written, run));
+                    v_scales = v_scales.slice_assign(rs, vs.clone().narrow(2, written, run));
+                    written += run;
+                }
+                let k_full = kv_dequantize(
+                    self.gather_window_int(k_packed.clone(), pages, total),
+                    self.gather_window(k_scales.clone(), pages, total),
+                    head_dim,
+                );
+                let v_full = kv_dequantize(
+                    self.gather_window_int(v_packed.clone(), pages, total),
+                    self.gather_window(v_scales.clone(), pages, total),
+                    head_dim,
+                );
+                self.arenas[layer] = Some(Arena::Quant {
+                    k_packed,
+                    k_scales,
+                    v_packed,
+                    v_scales,
+                });
+                (k_full, v_full)
+            }
+        };
 
         attend(q, k_full, v_full, pos, scale, window)
     }
@@ -680,6 +868,109 @@ mod tests {
         for (i, (x, y)) in av.iter().zip(bv.iter()).enumerate() {
             assert!((x - y).abs() < 1e-5, "{what}[{i}]: {x} vs {y}");
         }
+    }
+
+    /// The int8 pack/unpack must be integer-exact: craft values that are
+    /// exact multiples of the group scale (absmax = 63.5 ⇒ scale = 0.5) so
+    /// the quantize → dequantize round-trip reproduces the input bit-for-
+    /// bit, across all four byte lanes including negative extremes.
+    #[test]
+    fn kv_quant_roundtrip_exact_on_grid_values() {
+        let dev = Default::default();
+        let d = 64usize;
+        // q values sweep [-127, 127] across positions; x = q * 0.5.
+        let data: Vec<f32> = (0..2 * 3 * d)
+            .map(|i| {
+                let q = ((i * 37) % 255) as i64 - 127; // covers all lanes
+                q as f32 * 0.5
+            })
+            .collect();
+        // Force absmax = 63.5 per 32-group: overwrite one slot per group.
+        let mut data = data;
+        for g in 0..(2 * 3 * d) / 32 {
+            data[g * 32] = 63.5;
+        }
+        let x = Tensor::<TB, 4>::from_data(TensorData::new(data.clone(), [1, 2, 3, d]), &dev);
+        let (packed, scales) = kv_quantize(x);
+        let back: Vec<f32> = kv_dequantize(packed, scales, d)
+            .into_data()
+            .to_vec()
+            .unwrap();
+        for (i, (a, b)) in data.iter().zip(back.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-6, "[{i}]: {a} vs {b} (must be exact)");
+        }
+    }
+
+    /// On arbitrary values the dequantization error is bounded by half a
+    /// quantization step (scale/2 = absmax/254) per element.
+    #[test]
+    fn kv_quant_error_bounded_by_half_step() {
+        let dev = Default::default();
+        let d = 64usize;
+        let data: Vec<f32> = (0..1 * 2 * 5 * d)
+            .map(|i| ((i * 7919) % 1000) as f32 / 250.0 - 2.0)
+            .collect();
+        let x = Tensor::<TB, 4>::from_data(TensorData::new(data.clone(), [1, 2, 5, d]), &dev);
+        let (packed, scales) = kv_quantize(x);
+        let back: Vec<f32> = kv_dequantize(packed, scales, d)
+            .into_data()
+            .to_vec()
+            .unwrap();
+        for (g, chunk) in data.chunks(32).enumerate() {
+            let absmax = chunk.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let half_step = absmax / 254.0 + 1e-6;
+            for (j, (a, b)) in chunk
+                .iter()
+                .zip(back[g * 32..g * 32 + 32].iter())
+                .enumerate()
+            {
+                assert!(
+                    (a - b).abs() <= half_step,
+                    "group {g} elem {j}: |{a} - {b}| > {half_step}"
+                );
+            }
+        }
+    }
+
+    /// A quantized paged cache must track the fp cache within int8 noise
+    /// across prefill chunks, page boundaries, and decode steps — and its
+    /// popn/page semantics are unchanged.
+    #[test]
+    fn quantized_paged_cache_matches_fp_within_tolerance() {
+        let (n_kv, n_q, d) = (2usize, 4usize, 32usize);
+        let mut cfg_q = CacheConfig::paged(64);
+        cfg_q.quantize_kv = true;
+        let cfg_f = CacheConfig::paged(64);
+        let scale = 1.0 / (d as f64).sqrt() * 0.9;
+        let mut fp = PagedKVCache::<TB>::new(1, cfg_f);
+        let mut qn = PagedKVCache::<TB>::new(1, cfg_q);
+
+        // Prefill 20 (crosses a page boundary at 16), then decode to 30.
+        let ks: Vec<_> = (0..20).map(|i| kv_tok(i, n_kv, d)).collect();
+        let k20 = Tensor::cat(ks.iter().map(|(k, _)| k.clone()).collect(), 2);
+        let v20 = Tensor::cat(ks.iter().map(|(_, v)| v.clone()).collect(), 2);
+        let q20 = Tensor::cat((0..20).map(|i| q_tok(i, n_q, d)).collect(), 2);
+        let a = fp.attention_opts(0, q20.clone(), k20.clone(), v20.clone(), 0, scale, None);
+        let b = qn.attention_opts(0, q20, k20, v20, 0, scale, None);
+        let av: Vec<f32> = a.into_data().to_vec().unwrap();
+        let bv: Vec<f32> = b.into_data().to_vec().unwrap();
+        for (i, (x, y)) in av.iter().zip(bv.iter()).enumerate() {
+            assert!((x - y).abs() < 1e-2, "prefill[{i}]: {x} vs {y}");
+        }
+        for i in 20..30 {
+            let (k, v) = kv_tok(i, n_kv, d);
+            let q = q_tok(i, n_q, d);
+            let a = fp.attention_opts(0, q.clone(), k.clone(), v.clone(), i, scale, None);
+            let b = qn.attention_opts(0, q, k, v, i, scale, None);
+            let av: Vec<f32> = a.into_data().to_vec().unwrap();
+            let bv: Vec<f32> = b.into_data().to_vec().unwrap();
+            for (j, (x, y)) in av.iter().zip(bv.iter()).enumerate() {
+                assert!((x - y).abs() < 1e-2, "decode {i}[{j}]: {x} vs {y}");
+            }
+        }
+        assert_eq!(qn.pages_used(), fp.pages_used());
+        assert_eq!(qn.popn(5), 5, "quantized rollback works (no sliding)");
+        assert_eq!(qn.seq_len(), 25);
     }
 
     /// The divine invariant: a sliding layer (evict + offset-rebased mask)
@@ -814,6 +1105,7 @@ mod tests {
                 max_seq_len,
                 page_size,
                 kind: CacheKind::Paged,
+                quantize_kv: false,
             },
         )
     }
