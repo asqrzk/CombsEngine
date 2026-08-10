@@ -26,6 +26,36 @@ pub trait ModelSource: Send + Sync {
 
     /// Sampler defaults from `generation_config.json`, if present.
     fn sampler_defaults(&self) -> Option<SamplerConfig>;
+
+    /// Raw *packed* quantized bytes for a tensor, when this source stores it
+    /// in a quant format that has a device kernel (GGUF Q4_0/Q4_K/Q6_K).
+    /// `None` means "no packed representation" — the caller falls back to
+    /// [`ModelSource::open_tensor`], which dequantizes to float. Sources
+    /// without packed formats keep this default.
+    fn open_tensor_quant(&self, _name: &str) -> Result<Option<QuantTensor<'_>>> {
+        Ok(None)
+    }
+}
+
+/// GGUF quant formats with a native device kernel (see `combs-models`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantFormat {
+    /// 32-value blocks, f16 scale + 16 nibble bytes (18 B).
+    Q4_0,
+    /// 256-value superblocks, 6-bit sub-scales + 4-bit quants (144 B).
+    Q4K,
+    /// 256-value superblocks, i8 sub-scales + 6-bit quants (210 B).
+    Q6K,
+}
+
+/// A quantized tensor's packed bytes, exactly as stored in the file.
+pub struct QuantTensor<'a> {
+    /// Block format of `data`.
+    pub format: QuantFormat,
+    /// Logical shape, HF layout (`[out_features, in_features]` for weights).
+    pub shape: Vec<usize>,
+    /// The raw block stream (mmap-backed).
+    pub data: &'a [u8],
 }
 
 /// Element dtypes supported by the loaders.
@@ -281,6 +311,14 @@ impl<T: ModelSource + ?Sized> ModelSource for Box<T> {
     }
     fn sampler_defaults(&self) -> Option<SamplerConfig> {
         (**self).sampler_defaults()
+    }
+    // Every method must be forwarded, including defaulted ones: a missing
+    // forward silently pins callers of `Box<dyn ModelSource>` to the trait
+    // default (this bit `open_tensor_quant` — quantized GGUF weights fell
+    // back to dense for every CLI run while unit tests on the concrete
+    // type passed).
+    fn open_tensor_quant(&self, name: &str) -> Result<Option<QuantTensor<'_>>> {
+        (**self).open_tensor_quant(name)
     }
 }
 

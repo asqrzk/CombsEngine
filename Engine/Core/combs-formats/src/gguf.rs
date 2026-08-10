@@ -923,6 +923,32 @@ impl ModelSource for GgufSource {
         })
     }
 
+    fn open_tensor_quant(&self, name: &str) -> Result<Option<crate::QuantTensor<'_>>> {
+        let Some((_, info)) = self
+            .tensors
+            .iter()
+            .find(|(k, _)| map_tensor_name(k).as_deref() == Some(name))
+        else {
+            return Ok(None);
+        };
+        let format = match info.ggml_type {
+            GGML_Q4_0 => crate::QuantFormat::Q4_0,
+            GGML_Q4_K => crate::QuantFormat::Q4K,
+            GGML_Q6_K => crate::QuantFormat::Q6K,
+            _ => return Ok(None),
+        };
+        let size = tensor_byte_size(info)?;
+        let start = self.data_start + info.offset;
+        let data = self.mmap.get(start..start + size).ok_or_else(|| {
+            FormatError::Safetensors(format!("gguf tensor {} out of bounds", info.name))
+        })?;
+        Ok(Some(crate::QuantTensor {
+            format,
+            shape: info.dims.iter().rev().copied().collect(),
+            data,
+        }))
+    }
+
     fn sampler_defaults(&self) -> Option<SamplerConfig> {
         None
     }
@@ -937,5 +963,30 @@ impl GgufSource {
     /// Model file path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+#[cfg(test)]
+mod quant_access_tests {
+    use super::*;
+    use crate::ModelSource;
+
+    /// Scratch diagnostic against a locally cached model; not part of CI.
+    #[test]
+    #[ignore]
+    fn real_gguf_quant_access() {
+        let path = dirs_home().join(".cache/combs/models/llama-3.2-1b-instruct-gguf/model.gguf");
+        let src = GgufSource::load(&path).unwrap();
+        for name in [
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+        ] {
+            let qt = src.open_tensor_quant(name).unwrap();
+            println!("{name}: {:?}", qt.map(|q| (q.format, q.shape, q.data.len())));
+        }
+    }
+
+    fn dirs_home() -> std::path::PathBuf {
+        std::path::PathBuf::from(std::env::var("HOME").unwrap())
     }
 }

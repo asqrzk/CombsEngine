@@ -12,6 +12,7 @@ mod matmul;
 mod norm;
 mod precision;
 mod qkernel;
+mod qlinear;
 mod qmatmul;
 mod quant_linear;
 mod registry;
@@ -23,6 +24,7 @@ pub use gemma::GemmaModel;
 pub use kv::{CacheConfig, CacheKind, ContiguousKVCache, KVCache, PagedKVCache};
 pub use llama::LlamaModel;
 pub use norm::rms_norm;
+pub use qlinear::{Linear, QuantLinearOp, try_quant_linear};
 pub use qmatmul::{
     Q4KWeight, Q6KWeight, Q40Weight, dequantize_q4_0_gpu, dequantize_q4_k_gpu,
     dequantize_q6_k_gpu, repack_q4_0, repack_q4_k, repack_q6_k,

@@ -30,7 +30,7 @@ pub mod quants {
 pub use metadata::{AttentionPattern, ModelMetadata, VisionConfig};
 pub use safetensors::SafetensorsSource;
 pub use litertlm::{SectionInfo, read_sections as litertlm_read_sections};
-pub use source::{ModelSource, SamplerConfig, TensorDtype, TensorReader};
+pub use source::{ModelSource, QuantFormat, QuantTensor, SamplerConfig, TensorDtype, TensorReader};
 pub use spm::{ensure_tokenizer_json_from_spm, spm_added_tokens};
 pub use tflite::TfliteSource;
 pub use tokenizer::TokenizerSpec;

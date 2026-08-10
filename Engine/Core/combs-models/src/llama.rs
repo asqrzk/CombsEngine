@@ -21,23 +21,26 @@ use combs_formats::{ModelMetadata, ModelSource};
 use crate::kv::{CacheConfig, CacheKind, ContiguousKVCache, KVCache, PagedKVCache};
 use crate::matmul::safe_matmul;
 use crate::norm::rms_norm;
+use crate::qlinear::{Linear, try_quant_linear};
 use crate::rope::RotaryEmbedding;
 use crate::traits::GenerativeModel;
 use crate::{ModelError, Result};
 
-/// One decoder layer's weights. All projections are `[out, in]` (HF layout).
+/// One decoder layer's weights. All projections are `[out, in]` (HF layout);
+/// each is a [`Linear`] — dense tensor or packed-quant kernel dispatch,
+/// decided per tensor at load from the source's stored format.
 struct LlamaLayer<B: Backend> {
-    q: Tensor<B, 2>,
-    k: Tensor<B, 2>,
-    v: Tensor<B, 2>,
-    o: Tensor<B, 2>,
+    q: Linear<B>,
+    k: Linear<B>,
+    v: Linear<B>,
+    o: Linear<B>,
     q_bias: Option<Tensor<B, 1>>,
     k_bias: Option<Tensor<B, 1>>,
     v_bias: Option<Tensor<B, 1>>,
     o_bias: Option<Tensor<B, 1>>,
-    gate: Tensor<B, 2>,
-    up: Tensor<B, 2>,
-    down: Tensor<B, 2>,
+    gate: Linear<B>,
+    up: Linear<B>,
+    down: Linear<B>,
     input_norm: Tensor<B, 1>,
     post_norm: Tensor<B, 1>,
 }
@@ -45,8 +48,10 @@ struct LlamaLayer<B: Backend> {
 /// Llama-family causal LM.
 pub struct LlamaModel<B: Backend> {
     metadata: ModelMetadata,
-    embed: Tensor<B, 2>, // [vocab, hidden]
-    lm_head: Option<Tensor<B, 2>>, // None => tied to `embed`
+    /// `[vocab, hidden]`. Stays dense: embedding lookup needs `select`, and
+    /// the tied-head case reuses it as a dense matmul weight.
+    embed: Tensor<B, 2>,
+    lm_head: Option<Linear<B>>, // None => tied to `embed`
     final_norm: Tensor<B, 1>,
     layers: Vec<LlamaLayer<B>>,
     rotary: RotaryEmbedding<B>,
@@ -98,6 +103,20 @@ pub(crate) fn load_tensor<B: Backend, const D: usize>(
     load_weight(source, device, name)
 }
 
+/// Loads a projection weight as a [`Linear`]: the packed-quant fast path
+/// when the source stores it in a kernel-supported GGUF format *and* the
+/// backend runs on wgpu, else the dense tensor (portable fallback).
+fn load_linear<B: Backend>(
+    source: &dyn ModelSource,
+    device: &Device<B>,
+    name: &str,
+) -> Result<Linear<B>> {
+    if let Some(op) = try_quant_linear::<B>(source, name, device)? {
+        return Ok(Linear::Quant(op));
+    }
+    Ok(Linear::Dense(load_weight(source, device, name)?))
+}
+
 fn load_optional_bias<B: Backend>(
     source: &dyn ModelSource,
     device: &Device<B>,
@@ -140,9 +159,9 @@ impl<B: Backend> LlamaModel<B> {
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             // --- attention block ------------------------------------------------
             let h = rms_norm(x.clone(), layer.input_norm.clone(), m.rms_norm_eps);
-            let q = linear(h.clone(), &layer.q, layer.q_bias.as_ref());
-            let k = linear(h.clone(), &layer.k, layer.k_bias.as_ref());
-            let v = linear(h, &layer.v, layer.v_bias.as_ref());
+            let q = layer.q.forward(h.clone(), layer.q_bias.as_ref());
+            let k = layer.k.forward(h.clone(), layer.k_bias.as_ref());
+            let v = layer.v.forward(h, layer.v_bias.as_ref());
 
             let q = q
                 .reshape([1, seq, m.num_attention_heads, m.head_dim])
@@ -162,14 +181,14 @@ impl<B: Backend> LlamaModel<B> {
             let ctx = ctx
                 .swap_dims(1, 2)
                 .reshape([1, seq, m.num_attention_heads * m.head_dim]);
-            let attn_out = linear(ctx, &layer.o, layer.o_bias.as_ref());
+            let attn_out = layer.o.forward(ctx, layer.o_bias.as_ref());
             x = x + attn_out;
 
             // --- MLP block (SwiGLU) ---------------------------------------------
             let h = rms_norm(x.clone(), layer.post_norm.clone(), m.rms_norm_eps);
-            let gated = burn::tensor::activation::silu(linear(h.clone(), &layer.gate, None))
-                * linear(h.clone(), &layer.up, None);
-            let mlp_out = linear(gated, &layer.down, None);
+            let gated = burn::tensor::activation::silu(layer.gate.forward(h.clone(), None))
+                * layer.up.forward(h.clone(), None);
+            let mlp_out = layer.down.forward(gated, None);
             x = x + mlp_out;
         }
 
@@ -179,9 +198,17 @@ impl<B: Backend> LlamaModel<B> {
     /// Logits of the last sequence position: `[1, hidden] -> [1, vocab]`.
     pub(crate) fn last_logits(&self, hidden: Tensor<B, 3>) -> Tensor<B, 2> {
         let [_, seq, hidden_size] = hidden.dims();
-        let last = hidden.narrow(1, seq - 1, 1).reshape([1, hidden_size]);
-        let w = self.lm_head.as_ref().unwrap_or(&self.embed);
-        safe_matmul(last, w.clone().transpose())
+        let last = hidden.narrow(1, seq - 1, 1); // [1, 1, hidden]
+        let logits = match &self.lm_head {
+            Some(head) => head.forward(last, None),
+            None => {
+                // Tied head: dense matmul against the embedding table.
+                let last = last.reshape([1, hidden_size]);
+                return safe_matmul(last, self.embed.clone().transpose());
+            }
+        };
+        let [_, _, vocab] = logits.dims();
+        logits.reshape([1, vocab])
     }
 }
 
@@ -260,7 +287,7 @@ impl<B: Backend> LlamaModel<B> {
         let lm_head = if m.tie_word_embeddings {
             None
         } else {
-            let w: Tensor<B, 2> = load_weight(source, device, "lm_head.weight")?;
+            let w = load_linear(source, device, "lm_head.weight")?;
             Self::expect_shape("lm_head.weight", &w.dims(), &[m.vocab_size, m.hidden_size])?;
             Some(w)
         };
@@ -271,14 +298,10 @@ impl<B: Backend> LlamaModel<B> {
         let mut layers = Vec::with_capacity(m.num_hidden_layers);
         for i in 0..m.num_hidden_layers {
             let p = format!("{prefix}.layers.{i}");
-            let q: Tensor<B, 2> =
-                load_weight(source, device, &format!("{p}.self_attn.q_proj.weight"))?;
-            let k: Tensor<B, 2> =
-                load_weight(source, device, &format!("{p}.self_attn.k_proj.weight"))?;
-            let v: Tensor<B, 2> =
-                load_weight(source, device, &format!("{p}.self_attn.v_proj.weight"))?;
-            let o: Tensor<B, 2> =
-                load_weight(source, device, &format!("{p}.self_attn.o_proj.weight"))?;
+            let q = load_linear(source, device, &format!("{p}.self_attn.q_proj.weight"))?;
+            let k = load_linear(source, device, &format!("{p}.self_attn.k_proj.weight"))?;
+            let v = load_linear(source, device, &format!("{p}.self_attn.v_proj.weight"))?;
+            let o = load_linear(source, device, &format!("{p}.self_attn.o_proj.weight"))?;
             Self::expect_shape(
                 &format!("{p}.self_attn.q_proj.weight"),
                 &q.dims(),
@@ -313,9 +336,9 @@ impl<B: Backend> LlamaModel<B> {
                 k_bias: bias("self_attn.k_proj")?,
                 v_bias: bias("self_attn.v_proj")?,
                 o_bias: bias("self_attn.o_proj")?,
-                gate: load_weight(source, device, &format!("{p}.mlp.gate_proj.weight"))?,
-                up: load_weight(source, device, &format!("{p}.mlp.up_proj.weight"))?,
-                down: load_weight(source, device, &format!("{p}.mlp.down_proj.weight"))?,
+                gate: load_linear(source, device, &format!("{p}.mlp.gate_proj.weight"))?,
+                up: load_linear(source, device, &format!("{p}.mlp.up_proj.weight"))?,
+                down: load_linear(source, device, &format!("{p}.mlp.down_proj.weight"))?,
                 input_norm: load_weight(source, device, &format!("{p}.input_layernorm.weight"))?,
                 post_norm: load_weight(
                     source,

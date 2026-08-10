@@ -294,6 +294,15 @@ fn cmd_run(args: RunArgs) -> Result<()> {
 
     eprintln!("loading weights...");
     let engine = Engine::load(&source, device)?;
+    // Real GPU-allocator numbers (weights resident after load) — this is
+    // where packed-quant weights show their VRAM win; process RSS/footprint
+    // is dominated by pool reservations and unified-memory accounting.
+    if let Ok(mem) =
+        <cubecl::wgpu::WgpuRuntime as cubecl::prelude::Runtime>::client(&Default::default())
+            .memory_usage()
+    {
+        eprintln!("gpu memory after load: {mem}");
+    }
     let cc = engine.cache_config();
     eprintln!(
         "kv cache: {:?} (max_seq_len {}, page size {})",

@@ -242,19 +242,39 @@ Remaining in 1B:
 
 ## Phase 2 — Per-tensor kernel dispatch ("load the kernel per model")
 
-- The GGUF loader already knows each tensor's `ggml_type`; safetensors carry a
-  dtype. Add a `LinearKind` / `WeightStore` enum and a factory:
-  `build_linear(source, name) -> Box<dyn LinearLayer>` that returns an f32/f16
-  `Linear`, a burn-`QuantizedLinear`, or a `Q4KLinear`/`Q6KLinear` bound to the
-  matching custom kernel — chosen from the **stored format**.
-- `GenerativeModel` construction (llama.rs / gemma.rs / smolvlm.rs) calls the
-  factory instead of `load_weight` directly. Mixed models (some tensors f16,
-  some Q4_K) fall out naturally — this is exactly "the kernel loaded per the
-  model being used."
-- Registry (`combs-models/registry.rs`) stays architecture-keyed; quantization
-  is an orthogonal per-tensor concern layered under the loader.
+**STATUS: LANDED for the Llama family.** Measured on Llama-3.2-1B Q4_K_M
+(Metal): **1.72 GB GPU in use vs 5.01 GB** on the dense fallback (2.9×),
+token-identical greedy output over 30 tokens, decode parity (21.7 vs 21.0
+tok/s), faster TTFT (192 vs 541 ms). Remaining resident f32 is the tied
+embedding (kept dense for `select` + tied head) plus KV/workspace.
 
-**Effort: days**, once 1A/1B provide the layer types.
+How it's wired:
+- `combs-formats`: `ModelSource::open_tensor_quant` hands out the raw packed
+  bytes + `QuantFormat` (GGUF Q4_0/Q4_K/Q6_K); other formats/dtypes return
+  `None`. **Gotcha fixed en route:** the `impl ModelSource for Box<T>`
+  forwarder must forward *defaulted* methods too — a missing forward
+  silently pinned every CLI call to the trait default and the quant path
+  never engaged while concrete-type tests passed.
+- `combs-models/qlinear.rs`: `Linear<B>` seam (`Dense(Tensor)` |
+  `Quant(Box<dyn QuantLinearOp<B>>)`); `try_quant_linear` picks the kernel
+  per tensor at load. Backend dispatch via safe `Any` downcasts:
+  - default fused f32 backend → the matmul enters the fusion stream as a
+    **custom operation** (burn's `OperationIr::Custom` escape hatch);
+  - unfused f32 → direct launch; `--features f16` → activation cast-wrapped.
+  Forwards are dtype-following (burn 0.21 resolves tensor dtypes from
+  per-device defaults, so even an f32 backend can carry f16 tensors).
+- `llama.rs`: the seven per-layer projections + untied `lm_head` load
+  through `load_linear`; embeddings stay dense. Gemma/SmolVLM-vision still
+  dense (follow-up).
+- Escape hatch: `COMBS_NO_QUANT_KERNELS=1` forces the dense path;
+  `COMBS_DEBUG_QUANT=1` logs the per-tensor decision.
+- Shape guard: tensors whose row size isn't a block multiple (ggml itself
+  stores those in 32-block formats — e.g. SmolLM2's hidden 960) fall back
+  to dense per tensor, never error.
+
+Still open in Phase 2: gemma.rs/smolvlm vision linears through the factory;
+Q8_0/Q5_0 kernels for models with non-256-divisible rows; prefill-shape
+tiling for the fused kernels (per-element kernel is decode-optimal).
 
 ---
 

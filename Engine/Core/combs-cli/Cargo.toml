@@ -14,6 +14,7 @@ f16 = ["combs-core/f16", "combs-runtime/f16"]
 
 [dependencies]
 burn.workspace = true
+cubecl = { version = "0.10.0", default-features = false, features = ["wgpu", "std"] }
 combs-core = { path = "../combs-core", version = "0.2.0" }
 combs-formats = { path = "../combs-formats", version = "0.2.0" }
 combs-media = { path = "../combs-media", version = "0.2.0" }

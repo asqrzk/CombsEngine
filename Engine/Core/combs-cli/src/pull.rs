@@ -310,10 +310,14 @@ fn pick_gguf_file(tree: &[TreeEntry]) -> Option<String> {
     if files.is_empty() {
         return None;
     }
-    // Prefer sensible quant ordering; Q4_K_M is a good default.
+    // Prefer sensible quant ordering; Q4_K_M is a good default. Repos name
+    // quants in either case (TheBloke upper, HuggingFaceTB lower).
     let prefs = ["Q4_K_M", "Q4_K_S", "Q4_0", "Q5_K_M", "Q5_K_S", "Q8_0"];
     for pref in prefs {
-        if let Some(f) = files.iter().find(|f| f.contains(pref)) {
+        if let Some(f) = files
+            .iter()
+            .find(|f| f.to_ascii_uppercase().contains(pref))
+        {
             return Some(f.clone());
         }
     }

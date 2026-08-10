@@ -7,6 +7,13 @@ description = "Combs Engine model architecture registry (Llama family)"
 
 [dependencies]
 burn.workspace = true
+# Direct access to burn's backend internals for the quantized linear seam
+# (qlinear.rs): CubeTensor primitives, the fusion custom-op API, and the
+# CubeFusionHandle bridge. Same release train as the workspace `burn`.
+burn-cubecl = { version = "0.21.0", features = ["fusion"] }
+burn-cubecl-fusion = { version = "0.21.0" }
+burn-fusion = { version = "0.21.0" }
+burn-ir = { version = "0.21.0" }
 cubecl = { version = "0.10.0", default-features = false, features = ["wgpu", "std"] }
 combs-core.workspace = true
 combs-formats = { path = "../combs-formats", version = "0.2.0" }

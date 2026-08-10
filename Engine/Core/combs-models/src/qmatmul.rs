@@ -126,8 +126,25 @@ fn q4_0_matmul_kernel(
 /// Threads per cube for the 1-D launches below.
 const CUBE_DIM: u32 = 256;
 
+/// Max cubes per grid dimension (wgpu/Metal limit).
+const MAX_CUBES_PER_DIM: u32 = 65535;
+
 fn cube_count_1d(total: u32) -> CubeCount {
     CubeCount::Static(total.div_ceil(CUBE_DIM).max(1), 1, 1)
+}
+
+/// Like [`cube_count_1d`] but splits across the Y grid dimension when the
+/// thread count exceeds one dimension's limit (large prefill × vocab
+/// launches). Over-provisioned cubes are discarded by the in-kernel bound
+/// guard, which indexes by the linear `ABSOLUTE_POS`.
+fn cube_count_capped(total: u32) -> CubeCount {
+    let cubes = total.div_ceil(CUBE_DIM).max(1);
+    if cubes <= MAX_CUBES_PER_DIM {
+        CubeCount::Static(cubes, 1, 1)
+    } else {
+        let y = cubes.div_ceil(MAX_CUBES_PER_DIM);
+        CubeCount::Static(MAX_CUBES_PER_DIM, y, 1)
+    }
 }
 
 /// Runs the dequant-only kernel over a raw Q4_0 block stream. Exists for
@@ -209,9 +226,32 @@ impl<R: Runtime> Q40Weight<R> {
         n_blocks * (16 + core::mem::size_of::<f32>())
     }
 
+    /// Device path: `y = x @ W^T` with `x` already resident as a contiguous
+    /// f32 buffer of `[m, k]`. Launch only — returns the output handle
+    /// (`[m, n_out]` f32) without any host round-trip.
+    pub fn matmul_device(&self, client: &ComputeClient<R>, x: Handle, m: usize) -> Handle {
+        let out_len = m * self.n_out;
+        let out_h = client.empty(out_len * core::mem::size_of::<f32>());
+        let n_blocks = self.n_out * self.k / Q4_0_BLOCK;
+        unsafe {
+            q4_0_matmul_kernel::launch_unchecked::<R>(
+                client,
+                cube_count_capped(out_len as u32),
+                CubeDim::new_1d(CUBE_DIM),
+                ArrayArg::from_raw_parts(x, m * self.k),
+                ArrayArg::from_raw_parts(self.qs.clone(), n_blocks * 4),
+                ArrayArg::from_raw_parts(self.d.clone(), n_blocks),
+                ArrayArg::from_raw_parts(out_h.clone(), out_len),
+                m,
+                self.k,
+                self.n_out,
+            );
+        }
+        out_h
+    }
+
     /// `y = x @ W^T` for host-side `x: [m, k]`, returning `[m, n_out]`.
-    /// Host-slice convenience for tests/CLI probes; the device-tensor path
-    /// (activation handle in, handle out) lands with the linear-seam wiring.
+    /// Host-slice convenience for tests/CLI probes.
     pub fn matmul_host(&self, client: &ComputeClient<R>, x: &[f32], m: usize) -> Result<Vec<f32>> {
         if m == 0 || x.len() != m * self.k {
             return Err(ModelError::BadShape {
@@ -221,23 +261,7 @@ impl<R: Runtime> Q40Weight<R> {
             });
         }
         let x_h = client.create_from_slice(f32::as_bytes(x));
-        let out_len = m * self.n_out;
-        let out_h = client.empty(out_len * core::mem::size_of::<f32>());
-        let n_blocks = self.n_out * self.k / Q4_0_BLOCK;
-        unsafe {
-            q4_0_matmul_kernel::launch_unchecked::<R>(
-                client,
-                cube_count_1d(out_len as u32),
-                CubeDim::new_1d(CUBE_DIM),
-                ArrayArg::from_raw_parts(x_h, x.len()),
-                ArrayArg::from_raw_parts(self.qs.clone(), n_blocks * 4),
-                ArrayArg::from_raw_parts(self.d.clone(), n_blocks),
-                ArrayArg::from_raw_parts(out_h.clone(), out_len),
-                m,
-                self.k,
-                self.n_out,
-            );
-        }
+        let out_h = self.matmul_device(client, x_h, m);
         let bytes = client.read_one_unchecked(out_h);
         Ok(f32::from_bytes(&bytes).to_vec())
     }
@@ -614,25 +638,18 @@ impl<R: Runtime> Q4KWeight<R> {
         (self.n_out * self.k / K_SUPERBLOCK) * (128 + 12 + 8)
     }
 
-    /// `y = x @ W^T` for host-side `x: [m, k]`, returning `[m, n_out]`.
-    pub fn matmul_host(&self, client: &ComputeClient<R>, x: &[f32], m: usize) -> Result<Vec<f32>> {
-        if m == 0 || x.len() != m * self.k {
-            return Err(ModelError::BadShape {
-                tensor: "q4_k matmul input".into(),
-                expected: vec![m, self.k],
-                got: vec![x.len()],
-            });
-        }
-        let n_sb = self.n_out * self.k / K_SUPERBLOCK;
-        let x_h = client.create_from_slice(f32::as_bytes(x));
+    /// Device path: launch only, output handle returned (see
+    /// [`Q40Weight::matmul_device`]).
+    pub fn matmul_device(&self, client: &ComputeClient<R>, x: Handle, m: usize) -> Handle {
         let out_len = m * self.n_out;
         let out_h = client.empty(out_len * core::mem::size_of::<f32>());
+        let n_sb = self.n_out * self.k / K_SUPERBLOCK;
         unsafe {
             q4_k_matmul_kernel::launch_unchecked::<R>(
                 client,
-                cube_count_1d(out_len as u32),
+                cube_count_capped(out_len as u32),
                 CubeDim::new_1d(CUBE_DIM),
-                ArrayArg::from_raw_parts(x_h, x.len()),
+                ArrayArg::from_raw_parts(x, m * self.k),
                 ArrayArg::from_raw_parts(self.qs.clone(), n_sb * 32),
                 ArrayArg::from_raw_parts(self.dd.clone(), n_sb * 2),
                 ArrayArg::from_raw_parts(self.scales.clone(), n_sb * 3),
@@ -642,6 +659,20 @@ impl<R: Runtime> Q4KWeight<R> {
                 self.n_out,
             );
         }
+        out_h
+    }
+
+    /// `y = x @ W^T` for host-side `x: [m, k]`, returning `[m, n_out]`.
+    pub fn matmul_host(&self, client: &ComputeClient<R>, x: &[f32], m: usize) -> Result<Vec<f32>> {
+        if m == 0 || x.len() != m * self.k {
+            return Err(ModelError::BadShape {
+                tensor: "q4_k matmul input".into(),
+                expected: vec![m, self.k],
+                got: vec![x.len()],
+            });
+        }
+        let x_h = client.create_from_slice(f32::as_bytes(x));
+        let out_h = self.matmul_device(client, x_h, m);
         let bytes = client.read_one_unchecked(out_h);
         Ok(f32::from_bytes(&bytes).to_vec())
     }
@@ -694,25 +725,18 @@ impl<R: Runtime> Q6KWeight<R> {
         (self.n_out * self.k / K_SUPERBLOCK) * (128 + 64 + 16 + 4)
     }
 
-    /// `y = x @ W^T` for host-side `x: [m, k]`, returning `[m, n_out]`.
-    pub fn matmul_host(&self, client: &ComputeClient<R>, x: &[f32], m: usize) -> Result<Vec<f32>> {
-        if m == 0 || x.len() != m * self.k {
-            return Err(ModelError::BadShape {
-                tensor: "q6_k matmul input".into(),
-                expected: vec![m, self.k],
-                got: vec![x.len()],
-            });
-        }
-        let n_sb = self.n_out * self.k / K_SUPERBLOCK;
-        let x_h = client.create_from_slice(f32::as_bytes(x));
+    /// Device path: launch only, output handle returned (see
+    /// [`Q40Weight::matmul_device`]).
+    pub fn matmul_device(&self, client: &ComputeClient<R>, x: Handle, m: usize) -> Handle {
         let out_len = m * self.n_out;
         let out_h = client.empty(out_len * core::mem::size_of::<f32>());
+        let n_sb = self.n_out * self.k / K_SUPERBLOCK;
         unsafe {
             q6_k_matmul_kernel::launch_unchecked::<R>(
                 client,
-                cube_count_1d(out_len as u32),
+                cube_count_capped(out_len as u32),
                 CubeDim::new_1d(CUBE_DIM),
-                ArrayArg::from_raw_parts(x_h, x.len()),
+                ArrayArg::from_raw_parts(x, m * self.k),
                 ArrayArg::from_raw_parts(self.ql.clone(), n_sb * 32),
                 ArrayArg::from_raw_parts(self.qh.clone(), n_sb * 16),
                 ArrayArg::from_raw_parts(self.sc.clone(), n_sb * 4),
@@ -723,8 +747,94 @@ impl<R: Runtime> Q6KWeight<R> {
                 self.n_out,
             );
         }
+        out_h
+    }
+
+    /// `y = x @ W^T` for host-side `x: [m, k]`, returning `[m, n_out]`.
+    pub fn matmul_host(&self, client: &ComputeClient<R>, x: &[f32], m: usize) -> Result<Vec<f32>> {
+        if m == 0 || x.len() != m * self.k {
+            return Err(ModelError::BadShape {
+                tensor: "q6_k matmul input".into(),
+                expected: vec![m, self.k],
+                got: vec![x.len()],
+            });
+        }
+        let x_h = client.create_from_slice(f32::as_bytes(x));
+        let out_h = self.matmul_device(client, x_h, m);
         let bytes = client.read_one_unchecked(out_h);
         Ok(f32::from_bytes(&bytes).to_vec())
+    }
+}
+
+/// A device-resident quantized weight of any supported format, fixed to the
+/// engine's wgpu runtime. This is what the linear seam (`qlinear`) stores;
+/// format dispatch happens once per call, not per element.
+pub enum QuantWeight {
+    /// GGUF Q4_0.
+    Q40(Q40Weight<cubecl::wgpu::WgpuRuntime>),
+    /// GGUF Q4_K.
+    Q4K(Q4KWeight<cubecl::wgpu::WgpuRuntime>),
+    /// GGUF Q6_K.
+    Q6K(Q6KWeight<cubecl::wgpu::WgpuRuntime>),
+}
+
+impl QuantWeight {
+    /// Builds from a raw packed tensor as handed out by
+    /// `combs_formats::ModelSource::open_tensor_quant`.
+    pub fn from_quant_tensor(
+        client: &ComputeClient<cubecl::wgpu::WgpuRuntime>,
+        format: combs_formats::QuantFormat,
+        data: &[u8],
+        n_out: usize,
+        k: usize,
+    ) -> Result<Self> {
+        use combs_formats::QuantFormat;
+        Ok(match format {
+            QuantFormat::Q4_0 => QuantWeight::Q40(Q40Weight::from_gguf_bytes(client, data, n_out, k)?),
+            QuantFormat::Q4K => QuantWeight::Q4K(Q4KWeight::from_gguf_bytes(client, data, n_out, k)?),
+            QuantFormat::Q6K => QuantWeight::Q6K(Q6KWeight::from_gguf_bytes(client, data, n_out, k)?),
+        })
+    }
+
+    /// Output features.
+    pub fn n_out(&self) -> usize {
+        match self {
+            QuantWeight::Q40(w) => w.n_out,
+            QuantWeight::Q4K(w) => w.n_out,
+            QuantWeight::Q6K(w) => w.n_out,
+        }
+    }
+
+    /// Input features.
+    pub fn k(&self) -> usize {
+        match self {
+            QuantWeight::Q40(w) => w.k,
+            QuantWeight::Q4K(w) => w.k,
+            QuantWeight::Q6K(w) => w.k,
+        }
+    }
+
+    /// Bytes this weight occupies in VRAM.
+    pub fn vram_bytes(&self) -> usize {
+        match self {
+            QuantWeight::Q40(w) => w.vram_bytes(),
+            QuantWeight::Q4K(w) => w.vram_bytes(),
+            QuantWeight::Q6K(w) => w.vram_bytes(),
+        }
+    }
+
+    /// Fused dequant-matmul, device handles in and out.
+    pub fn matmul_device(
+        &self,
+        client: &ComputeClient<cubecl::wgpu::WgpuRuntime>,
+        x: Handle,
+        m: usize,
+    ) -> Handle {
+        match self {
+            QuantWeight::Q40(w) => w.matmul_device(client, x, m),
+            QuantWeight::Q4K(w) => w.matmul_device(client, x, m),
+            QuantWeight::Q6K(w) => w.matmul_device(client, x, m),
+        }
     }
 }
 

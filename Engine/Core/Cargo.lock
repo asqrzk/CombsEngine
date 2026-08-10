@@ -1184,6 +1184,7 @@ dependencies = [
  "combs-models",
  "combs-runtime",
  "console",
+ "cubecl",
  "dialoguer",
  "image",
  "ort",
@@ -1292,6 +1293,10 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "burn",
+ "burn-cubecl",
+ "burn-cubecl-fusion",
+ "burn-fusion",
+ "burn-ir",
  "combs-core",
  "combs-formats",
  "cubecl",
