@@ -422,9 +422,27 @@ impl<B: Backend> LlamaModel<B> {
         let lm_head = if m.tie_word_embeddings {
             None
         } else {
-            let w = load_linear(source, device, "lm_head.weight")?;
-            Self::expect_shape("lm_head.weight", &w.dims(), &[m.vocab_size, m.hidden_size])?;
-            Some(w)
+            match load_linear(source, device, "lm_head.weight") {
+                Ok(w) => {
+                    Self::expect_shape(
+                        "lm_head.weight",
+                        &w.dims(),
+                        &[m.vocab_size, m.hidden_size],
+                    )?;
+                    Some(w)
+                }
+                // Configs lie about tying (gemma3 omits the flag entirely
+                // but ships no lm_head): presence decides, like the GGUF
+                // output.weight rule — loudly, since a genuinely untied
+                // checkpoint missing its head would be corrupt.
+                Err(ModelError::MissingTensor(_)) => {
+                    eprintln!(
+                        "[load] lm_head.weight absent; falling back to tied embeddings"
+                    );
+                    None
+                }
+                Err(e) => return Err(e),
+            }
         };
 
         let final_norm: Tensor<B, 1> =

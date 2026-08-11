@@ -75,12 +75,15 @@ impl<B: Backend> ModelRegistry<B> {
             )?))
         });
         // Gemma 3 text ("gemma3_text") and the text trunk of multimodal
-        // Gemma 3 ("gemma3") share this block.
+        // Gemma 3 ("gemma3") ride the universal decoder: ArchSpec supplies
+        // the (1+w) norm flavor, qk/sandwich norms, sqrt(hidden) embed
+        // scale, query_pre_attn_scalar, dual-RoPE local theta, and the
+        // every-Nth-global sliding layout.
         r.register("gemma3_text", |source, device| {
-            Ok(Box::new(crate::gemma::GemmaModel::<B>::load(source, device)?))
+            Ok(Box::new(crate::llama::LlamaModel::<B>::load(source, device)?))
         });
         r.register("gemma3", |source, device| {
-            Ok(Box::new(crate::gemma::GemmaModel::<B>::load(source, device)?))
+            Ok(Box::new(crate::llama::LlamaModel::<B>::load(source, device)?))
         });
         r
     }

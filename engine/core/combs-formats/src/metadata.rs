@@ -398,6 +398,9 @@ impl ModelMetadata {
             .and_then(|x| x.as_str())
             .ok_or_else(|| FormatError::MissingField("model_type".to_string()))?
             .to_string();
+        // HF config classes carry per-family defaults the JSON omits:
+        // gemma3 ties word embeddings unless stated otherwise.
+        let tie_default = matches!(architecture.as_str(), "gemma3" | "gemma3_text");
 
         if hidden_size % num_attention_heads != 0 {
             return Err(FormatError::MissingField(format!(
@@ -423,7 +426,7 @@ impl ModelMetadata {
                 .get("tie_word_embeddings")
                 .or_else(|| text.get("tie_word_embeddings"))
                 .and_then(|x| x.as_bool())
-                .unwrap_or(false),
+                .unwrap_or(tie_default),
             head_dim: text
                 .get("head_dim")
                 .and_then(|x| x.as_u64())
@@ -537,6 +540,31 @@ mod tests {
         absent.as_object_mut().unwrap().remove("use_sliding_window");
         let meta = ModelMetadata::from_hf_config(&absent, None).unwrap();
         assert_eq!(meta.attention_pattern.sliding_window, Some(131072));
+    }
+
+    #[test]
+    fn gemma3_defaults_to_tied_embeddings() {
+        // Gemma3 config.json omits tie_word_embeddings entirely; the HF
+        // config class default (true) must apply — the checkpoints ship no
+        // lm_head.weight.
+        let config = serde_json::json!({
+            "model_type": "gemma3_text", "hidden_size": 8, "intermediate_size": 16,
+            "num_hidden_layers": 1, "num_attention_heads": 2, "vocab_size": 10
+        });
+        let meta = ModelMetadata::from_hf_config(&config, None).unwrap();
+        assert!(meta.tie_word_embeddings);
+
+        // An explicit false still wins (hypothetical untied variant)…
+        let mut untied = config.clone();
+        untied["tie_word_embeddings"] = serde_json::json!(false);
+        let meta = ModelMetadata::from_hf_config(&untied, None).unwrap();
+        assert!(!meta.tie_word_embeddings);
+
+        // …and non-gemma architectures keep the false default.
+        let mut llama = config.clone();
+        llama["model_type"] = serde_json::json!("llama");
+        let meta = ModelMetadata::from_hf_config(&llama, None).unwrap();
+        assert!(!meta.tie_word_embeddings);
     }
 
     #[test]
