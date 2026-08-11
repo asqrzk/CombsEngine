@@ -56,3 +56,8 @@ Engine/Packages/pypi/**/dist/
 Engine/Packages/pypi/**/*.egg-info/
 __pycache__/
 target-f16/
+
+# Internal reasoning / measurement docs — local-only, never publish.
+/QUANTIZATION_PLAN.md
+/docs/
+/documentations/
