@@ -24,13 +24,26 @@ pub struct EngineConfigJson {
     pub prefill_chunk_size: Option<usize>,
 }
 
-/// One chat message in a [`ChatRequestJson`].
+/// One chat message in a [`ChatRequestJson`]. Mirrors the OpenAI message
+/// shape: assistant messages may carry `tool_calls`, tool results arrive
+/// as `role: "tool"` with `tool_call_id`/`name`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatMessageJson {
-    /// `system` | `user` | `assistant` (others are passed through as user).
+    /// `system` | `user` | `assistant` | `tool` | `ipython`.
     pub role: String,
-    /// Text content.
+    /// Text content (may be empty on tool-call-only assistant turns).
+    #[serde(default)]
     pub content: String,
+    /// Assistant tool invocations (OpenAI wire shape; string `arguments`
+    /// are normalized to objects before templating).
+    #[serde(default)]
+    pub tool_calls: Vec<serde_json::Value>,
+    /// Correlation id on `role: "tool"` results.
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    /// Tool name on `role: "tool"` results.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// A generation request (`combs_chat_completion`).

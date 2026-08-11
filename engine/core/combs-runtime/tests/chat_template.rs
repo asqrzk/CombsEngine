@@ -1,11 +1,13 @@
 //! Harmony chat-template renders: fixtures in `tests/data/` pair each real
-//! checkpoint template (llama-3.2, qwen2.5-coder, gemma-3, smollm2 — pulled
-//! from the actual cached models' GGUF metadata / tokenizer_config.json)
-//! with reference output rendered by Python `jinja2` under transformers'
-//! environment settings (trim_blocks + lstrip_blocks, pinned
-//! `strftime_now`). Our minijinja path must match byte-for-byte.
+//! checkpoint template (llama-3.2, qwen2.5-coder, qwen3, gemma-3, smollm2 —
+//! pulled from the actual cached models' GGUF metadata /
+//! tokenizer_config.json) with reference output rendered by Python `jinja2`
+//! under transformers' environment settings (trim_blocks + lstrip_blocks,
+//! pinned `strftime_now`). Our minijinja path must match byte-for-byte —
+//! including tool-definition rendering, assistant `tool_calls` loopback,
+//! and tool-result turns.
 
-use combs_runtime::ChatTemplate;
+use combs_runtime::{ChatMessage, ChatTemplate};
 
 #[derive(serde::Deserialize)]
 struct Fixture {
@@ -14,14 +16,10 @@ struct Fixture {
     bos_token: String,
     eos_token: String,
     date: String,
-    messages: Vec<Message>,
+    messages: Vec<ChatMessage>,
+    #[serde(default)]
+    tools: Option<serde_json::Value>,
     expected: String,
-}
-
-#[derive(serde::Deserialize)]
-struct Message {
-    role: String,
-    content: String,
 }
 
 #[test]
@@ -38,13 +36,8 @@ fn harmony_renders_match_transformers_reference() {
             f.bos_token.clone(),
             f.eos_token.clone(),
         );
-        let messages: Vec<(String, String)> = f
-            .messages
-            .iter()
-            .map(|m| (m.role.clone(), m.content.clone()))
-            .collect();
         let rendered = template
-            .render(&messages)
+            .render(&f.messages, f.tools.as_ref())
             .unwrap_or_else(|e| panic!("{}: render failed: {e}", f.name));
         assert_eq!(
             rendered, f.expected,

@@ -264,11 +264,21 @@ pub unsafe extern "C" fn combs_chat_completion(
 
         let prompt = match (&request.messages, &request.prompt) {
             (Some(messages), _) => {
-                let pairs: Vec<(String, String)> = messages
+                let msgs: Vec<combs_runtime::ChatMessage> = messages
                     .iter()
-                    .map(|m| (m.role.clone(), m.content.clone()))
+                    .map(|m| combs_runtime::ChatMessage {
+                        role: m.role.clone(),
+                        content: m.content.clone(),
+                        tool_calls: m
+                            .tool_calls
+                            .iter()
+                            .filter_map(|c| serde_json::from_value(c.clone()).ok())
+                            .collect(),
+                        tool_call_id: m.tool_call_id.clone(),
+                        name: m.name.clone(),
+                    })
                     .collect();
-                engine.engine.wrap_chat(&pairs)
+                engine.engine.wrap_chat(&msgs)
             }
             (None, Some(p)) => p.clone(),
             (None, None) => return Err("request needs `prompt` or `messages`".into()),

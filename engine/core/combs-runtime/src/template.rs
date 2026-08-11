@@ -1,7 +1,9 @@
 //! Chat-template rendering: evaluates the checkpoint's own Jinja template
 //! (via minijinja) under the transformers contract — context is
-//! `{messages, add_generation_prompt, bos_token, eos_token}` with
-//! `raise_exception` and `strftime_now` available — so llama3/qwen/gemma
+//! `{messages, tools, add_generation_prompt, bos_token, eos_token}` with
+//! `raise_exception`, `strftime_now`, and transformers' `tojson` filter
+//! (plain `json.dumps` semantics: UTF-8 passthrough, `", "`/`": "`
+//! separators, optional `indent`, NO HTML escaping) — so llama3/qwen/gemma
 //! checkpoints get their real prompt format instead of a sniffed builtin.
 //!
 //! The template is re-parsed per render (`render_str`): parsing a few KB of
@@ -28,7 +30,11 @@ impl ChatTemplate {
     /// Renders `(role, content)` messages with the assistant turn left open
     /// (`add_generation_prompt: true`). Errors surface the minijinja message
     /// (including template-raised `raise_exception` texts).
-    pub fn render(&self, messages: &[(String, String)]) -> Result<String, String> {
+    pub fn render(
+        &self,
+        messages: &[crate::ChatMessage],
+        tools: Option<&serde_json::Value>,
+    ) -> Result<String, String> {
         let mut env = Environment::new();
         // transformers compiles templates with trim_blocks + lstrip_blocks.
         env.set_trim_blocks(true);
@@ -40,18 +46,19 @@ impl ChatTemplate {
             },
         );
         env.add_function("strftime_now", |fmt: String| strftime_now(&fmt));
+        env.add_filter("tojson", tojson_filter);
 
-        let msgs: Vec<serde_json::Value> = messages
-            .iter()
-            .map(|(role, content)| {
-                serde_json::json!({ "role": role, "content": content })
-            })
-            .collect();
+        let msgs: Vec<serde_json::Value> =
+            messages.iter().map(|m| m.to_template_value()).collect();
+        // transformers passes `tools=None` when absent; jinja `none` keeps
+        // `{% if tools %}` / `tools is not none` branches false.
+        let tools_value = tools.cloned().unwrap_or(serde_json::Value::Null);
 
         env.render_str(
             &self.source,
             context! {
                 messages => msgs,
+                tools => tools_value,
                 add_generation_prompt => true,
                 bos_token => self.bos_token,
                 eos_token => self.eos_token,
@@ -106,9 +113,102 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// transformers' `tojson` filter: python `json.dumps` semantics —
+/// `", "`/`": "` separators when compact, `indent=N` pretty printing, raw
+/// UTF-8 (`ensure_ascii=False`), no HTML escaping, insertion order (maps
+/// arrive alphabetized via serde_json, matching how references are
+/// authored).
+fn tojson_filter(
+    value: minijinja::Value,
+    kwargs: minijinja::value::Kwargs,
+) -> Result<String, JinjaError> {
+    let json: serde_json::Value = serde_json::to_value(&value).map_err(|e| {
+        JinjaError::new(ErrorKind::InvalidOperation, format!("tojson: {e}"))
+    })?;
+    let indent: Option<usize> = kwargs.get("indent")?;
+    kwargs.assert_all_used()?;
+    let mut out = String::new();
+    write_python_json(&json, indent, 0, &mut out);
+    Ok(out)
+}
+
+/// Serializes like python's `json.dumps`: compact form uses `", "` and
+/// `": "`; `indent` switches to newline-per-item with `": "` after keys
+/// and `,` line separators — byte-compatible with the jinja2 reference
+/// renders.
+fn write_python_json(v: &serde_json::Value, indent: Option<usize>, level: usize, out: &mut String) {
+    match v {
+        serde_json::Value::Array(items) if !items.is_empty() => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                    if indent.is_none() {
+                        out.push(' ');
+                    }
+                }
+                if let Some(n) = indent {
+                    out.push('\n');
+                    out.push_str(&" ".repeat(n * (level + 1)));
+                }
+                write_python_json(item, indent, level + 1, out);
+            }
+            if let Some(n) = indent {
+                out.push('\n');
+                out.push_str(&" ".repeat(n * level));
+            }
+            out.push(']');
+        }
+        serde_json::Value::Object(map) if !map.is_empty() => {
+            out.push('{');
+            for (i, (k, item)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                    if indent.is_none() {
+                        out.push(' ');
+                    }
+                }
+                if let Some(n) = indent {
+                    out.push('\n');
+                    out.push_str(&" ".repeat(n * (level + 1)));
+                }
+                out.push_str(&serde_json::to_string(k).unwrap());
+                out.push_str(": ");
+                write_python_json(item, indent, level + 1, out);
+            }
+            if let Some(n) = indent {
+                out.push('\n');
+                out.push_str(&" ".repeat(n * level));
+            }
+            out.push('}');
+        }
+        // Scalars and empty containers: serde_json compact form matches
+        // python exactly ("[]", "{}", strings as UTF-8 with the same
+        // escape set, true/false/null, integer formatting).
+        other => out.push_str(&serde_json::to_string(other).unwrap()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tojson_matches_python_dumps() {
+        let v: serde_json::Value = serde_json::json!({
+            "b": [1, 2], "a": "héllo <tag>", "empty": {}
+        });
+        let mut compact = String::new();
+        write_python_json(&v, None, 0, &mut compact);
+        // serde_json maps are BTree-ordered: a, b, empty.
+        assert_eq!(compact, r#"{"a": "héllo <tag>", "b": [1, 2], "empty": {}}"#);
+        let mut pretty = String::new();
+        write_python_json(&v, Some(4), 0, &mut pretty);
+        assert_eq!(
+            pretty,
+            "{\n    \"a\": \"héllo <tag>\",\n    \"b\": [\n        1,\n        2\n    ],\n    \"empty\": {}\n}"
+        );
+    }
 
     #[test]
     fn civil_dates_are_correct() {
@@ -125,7 +225,9 @@ mod tests {
             String::new(),
             String::new(),
         );
-        let err = t.render(&[("user".into(), "hi".into())]).unwrap_err();
+        let err = t
+            .render(&[crate::ChatMessage::text("user", "hi")], None)
+            .unwrap_err();
         assert!(err.contains("roles must alternate"), "got: {err}");
     }
 }

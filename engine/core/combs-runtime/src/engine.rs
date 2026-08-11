@@ -484,9 +484,21 @@ impl Engine {
     /// Jinja chat template; falls back to the token-sniffed builtin wraps
     /// (ChatML / Gemma) when no template ships or rendering fails — a bad
     /// template logs once and degrades, it never breaks chat.
-    pub fn wrap_chat(&self, messages: &[(String, String)]) -> String {
+    pub fn wrap_chat(&self, messages: &[crate::ChatMessage]) -> String {
+        self.wrap_chat_with_tools(messages, None)
+    }
+
+    /// [`Self::wrap_chat`] with tool definitions rendered through the
+    /// model's own chat template (OpenAI-shaped schemas, passed verbatim
+    /// like transformers does). The builtin fallback wraps ignore tools —
+    /// they exist for models whose templates predate tool support anyway.
+    pub fn wrap_chat_with_tools(
+        &self,
+        messages: &[crate::ChatMessage],
+        tools: Option<&serde_json::Value>,
+    ) -> String {
         if let Some(template) = &self.template {
-            match template.render(messages) {
+            match template.render(messages, tools) {
                 Ok(prompt) => return prompt,
                 Err(e) => self.template_warned.call_once(|| {
                     tracing::warn!(
@@ -497,7 +509,23 @@ impl Engine {
                 }),
             }
         }
-        self.spec.wrap_messages(messages)
+        let pairs: Vec<(String, String)> = messages
+            .iter()
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect();
+        self.spec.wrap_messages(&pairs)
+    }
+
+    /// Whether this model's chat template can express tool definitions —
+    /// i.e. it references the `tools` context variable (qwen2.5/3,
+    /// llama-3.x do; phi-3, gemma-3, smollm2 don't). Requests carrying
+    /// tools should be rejected when this is false rather than silently
+    /// rendered without them.
+    pub fn supports_tools(&self) -> bool {
+        self.spec
+            .chat_template
+            .as_deref()
+            .is_some_and(|t| t.contains("tools"))
     }
 
     /// Default generation config: [`GenerationConfig::default`] merged with

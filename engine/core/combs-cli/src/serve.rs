@@ -303,7 +303,7 @@ fn handle_chat(
             error_json("invalid_request", "`messages` must be a non-empty array"),
         );
     }
-    let (prompt, images) = match build_prompt(engine, &messages) {
+    let (prompt, images) = match build_prompt(engine, &messages, None) {
         Ok(v) => v,
         Err(msg) => {
             return json_response(400, error_json("invalid_request", &msg));
@@ -485,14 +485,20 @@ fn generate_maybe_media(
 /// into the message text where the part appears (spans before the
 /// question, matching the `combs run --image` convention). Returns
 /// (prompt, pixel_batches).
-fn build_prompt(engine: &Arc<Engine>, messages: &[Value]) -> Result<(String, Vec<PixelBatch>), String> {
+fn build_prompt(
+    engine: &Arc<Engine>,
+    messages: &[Value],
+    tools: Option<&Value>,
+) -> Result<(String, Vec<PixelBatch>), String> {
     let vision = engine.metadata().vision.clone();
     let mut images: Vec<PixelBatch> = Vec::new();
-    let mut pairs: Vec<(String, String)> = Vec::with_capacity(messages.len());
+    let mut msgs: Vec<combs_runtime::ChatMessage> = Vec::with_capacity(messages.len());
     for m in messages {
         let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
+        // Tool-protocol roles pass through — templates dispatch on them
+        // (llama's tool results use "ipython"); only unknown roles coerce.
         let role = match role {
-            "system" | "user" | "assistant" => role,
+            "system" | "user" | "assistant" | "tool" | "ipython" => role,
             _ => "user",
         };
         let mut content = String::new();
@@ -528,7 +534,30 @@ fn build_prompt(engine: &Arc<Engine>, messages: &[Value]) -> Result<(String, Vec
             }
             _ => {}
         }
-        pairs.push((role.to_string(), content));
+        // OpenAI wire fields beyond role/content: assistant tool_calls
+        // (arguments arrive as JSON strings — ChatMessage normalizes them
+        // to objects for the template, the HF convention) and tool-result
+        // correlation ids.
+        let tool_calls: Vec<combs_runtime::ToolCall> = m
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .map(|calls| {
+                calls
+                    .iter()
+                    .filter_map(|c| serde_json::from_value(c.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        msgs.push(combs_runtime::ChatMessage {
+            role: role.to_string(),
+            content,
+            tool_calls,
+            tool_call_id: m
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            name: m.get("name").and_then(Value::as_str).map(str::to_string),
+        });
     }
     // Vision models (Idefics3/SmolVLM) were trained on a specific
     // `<|im_start|>User:<image-tokens>prompt\nAssistant:` format with no
@@ -536,19 +565,19 @@ fn build_prompt(engine: &Arc<Engine>, messages: &[Value]) -> Result<(String, Vec
     // for text-only models but degrades vision output, so we build the
     // vision prompt explicitly when images are present.
     let prompt = if images.is_empty() {
-        engine.wrap_chat(&pairs)
+        engine.wrap_chat_with_tools(&msgs, tools)
     } else {
         let mut prompt = String::from("<|im_start|>User:");
-        for (role, content) in &pairs {
-            match role.as_str() {
+        for m in &msgs {
+            match m.role.as_str() {
                 "system" => {
-                    prompt.push_str(content);
+                    prompt.push_str(&m.content);
                     prompt.push('\n');
                 }
-                "user" => prompt.push_str(content),
+                "user" => prompt.push_str(&m.content),
                 "assistant" => {
                     prompt.push_str("\n<|im_start|>Assistant: ");
-                    prompt.push_str(content);
+                    prompt.push_str(&m.content);
                     prompt.push('\n');
                 }
                 _ => {}

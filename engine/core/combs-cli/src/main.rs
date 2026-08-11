@@ -361,7 +361,10 @@ fn cmd_run(args: RunArgs) -> Result<()> {
     let engine = Engine::load(&source, device)?;
     let prompt = match prompt {
         Some(p) => p,
-        None => engine.wrap_chat(&[("user".to_string(), args.prompt.clone())]),
+        None => engine.wrap_chat(&[combs_runtime::ChatMessage::text(
+            "user",
+            args.prompt.clone(),
+        )]),
     };
     // Real GPU-allocator numbers (weights resident after load) — this is
     // where packed-quant weights show their VRAM win; process RSS/footprint

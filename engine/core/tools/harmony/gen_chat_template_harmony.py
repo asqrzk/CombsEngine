@@ -46,6 +46,8 @@ MODELS = {
                       "<|begin_of_text|>", "<|eot_id|>"),
     "qwen2.5-coder": (gguf_chat_template(f"{BASE}/qwen2.5-coder-7b-instruct-gguf/model.gguf"),
                       "<|endoftext|>", "<|im_end|>"),
+    "qwen3":         (gguf_chat_template(f"{BASE}/qwen3-0.6b-gguf/model.gguf"),
+                      "<|endoftext|>", "<|im_end|>"),
     "gemma-3":       (json.load(open(f"{BASE}/gemma-3-1b-it/tokenizer_config.json"))["chat_template"],
                       "<bos>", "<end_of_turn>"),
     "smollm2":       (json.load(open(f"{BASE}/smollm2-360m/tokenizer_config.json"))["chat_template"],
@@ -67,16 +69,78 @@ SETS = {
     ],
 }
 
+# Tool fixtures. IMPORTANT: every dict a template may `tojson` (tool
+# schemas, tool_call arguments, tool_calls entries) is authored with keys
+# in ALPHABETICAL order — Rust's serde_json sorts map keys, and byte
+# identity requires both renderers to serialize identically. Messages
+# match ChatMessage::to_template_value output exactly (content always
+# present; tool_calls entries as {"function": {...}, "id": ..., "type":
+# "function"}).
+TOOLS = [
+    {
+        "function": {
+            "description": "Get the current weather for a location.",
+            "name": "get_weather",
+            "parameters": {
+                "properties": {
+                    "location": {
+                        "description": "City and country, e.g. Paris, France",
+                        "type": "string",
+                    },
+                    "unit": {"description": "celsius or fahrenheit", "type": "string"},
+                },
+                "required": ["location"],
+                "type": "object",
+            },
+        },
+        "type": "function",
+    }
+]
+
+TOOL_SETS = {
+    "tools-request": [
+        {"role": "user", "content": "What is the weather in Paris?"},
+    ],
+    "tools-loopback": [
+        {"role": "user", "content": "What is the weather in Paris?"},
+        {"role": "assistant", "content": "",
+         "tool_calls": [{
+             "function": {"arguments": {"location": "Paris, France",
+                                        "unit": "celsius"},
+                          "name": "get_weather"},
+             "id": "call_0",
+             "type": "function",
+         }]},
+        {"role": "tool", "content": "22C, clear skies",
+         "name": "get_weather", "tool_call_id": "call_0"},
+    ],
+}
+TOOL_MODELS = ["llama-3.2", "qwen2.5-coder", "qwen3"]
+
 env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
 env.globals["raise_exception"] = lambda m: (_ for _ in ()).throw(ValueError(m))
 env.globals["strftime_now"] = lambda fmt: PINNED_DATE
+
+
+# transformers overrides jinja2's default tojson (which HTML-escapes and
+# sorts keys) with plain json.dumps; the engine's minijinja filter mirrors
+# this exactly.
+def tojson(x, indent=None, separators=None, sort_keys=False):
+    return json.dumps(x, ensure_ascii=False, indent=indent,
+                      separators=separators, sort_keys=sort_keys)
+
+
+env.filters["tojson"] = tojson
 
 fixtures = []
 for model, (tpl_src, bos, eos) in MODELS.items():
     assert tpl_src, f"{model}: no template found"
     tpl = env.from_string(tpl_src)
     for set_name, messages in SETS.items():
-        expected = tpl.render(messages=messages, add_generation_prompt=True,
+        # tools=None always (transformers passes it even when absent; the
+        # Rust side mirrors with Value::Null).
+        expected = tpl.render(messages=messages, tools=None,
+                              add_generation_prompt=True,
                               bos_token=bos, eos_token=eos)
         fixtures.append({
             "name": f"{model}/{set_name}", "template": tpl_src,
@@ -84,6 +148,17 @@ for model, (tpl_src, bos, eos) in MODELS.items():
             "messages": messages, "expected": expected,
         })
         print(f"OK {model}/{set_name}: {len(expected)} chars")
+    if model in TOOL_MODELS:
+        for set_name, messages in TOOL_SETS.items():
+            expected = tpl.render(messages=messages, tools=TOOLS,
+                                  add_generation_prompt=True,
+                                  bos_token=bos, eos_token=eos)
+            fixtures.append({
+                "name": f"{model}/{set_name}", "template": tpl_src,
+                "bos_token": bos, "eos_token": eos, "date": PINNED_DATE,
+                "messages": messages, "tools": TOOLS, "expected": expected,
+            })
+            print(f"OK {model}/{set_name}: {len(expected)} chars")
 
 json.dump(fixtures, open(OUT, "w"), indent=1)
 print(f"wrote {len(fixtures)} fixtures -> {os.path.normpath(OUT)}")
