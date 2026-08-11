@@ -8,7 +8,6 @@
 mod act;
 mod archspec;
 mod kv;
-mod gemma;
 mod llama;
 mod matmul;
 mod norm;
@@ -23,7 +22,6 @@ mod smolvlm;
 mod traits;
 
 pub use archspec::{ArchSpec, LayerKind, NormFlavor};
-pub use gemma::GemmaModel;
 pub use kv::{CacheConfig, CacheKind, ContiguousKVCache, KVCache, PageStats, PagedKVCache};
 pub use llama::LlamaModel;
 pub use norm::rms_norm;

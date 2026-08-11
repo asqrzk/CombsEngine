@@ -676,3 +676,32 @@ with the wave-4 perf work). SPM-vocab GGUFs (tokenizer.ggml.model =
 pull preset stages the original Microsoft one automatically
 (`GGUF_TOKENIZER_COMPANIONS`); a Unigram/byte-fallback synthesis is the
 principled follow-up.
+
+## 2026-08-11 — Wave 2 stage D: gemma3 on the universal decoder, gemma.rs deleted (LANDED)
+
+The registry's gemma3/gemma3_text entries now construct `LlamaModel`;
+ArchSpec supplies the whole family profile ((1+w) norm flavor, per-head
+qk norms, sandwich norms, gelu_tanh, sqrt(hidden) f32 embed scale,
+query_pre_attn_scalar, dual-RoPE local theta, every-Nth-global layout
+into per-layer cache windows). gemma.rs is deleted — one decoder remains.
+
+Gates (all against gemma.rs behavior on gemma-3-1b-it, fused-f32):
+1. token identity — greedy chat + raw byte-identical;
+2. logit parity — top-8 last-position logits identical at the printed
+   4-decimal precision (" Paris" 19.4067 top);
+3. f16 smoke — `--features f16` build, chat output word-identical.
+Sweep: smollm2 safetensors+GGUF, llama-3.2 GGUF raw+chat, phi-3.1 chat
+all token-identical; formats+models suites green.
+
+Gate 1's first run FAILED usefully, catching two loader truths:
+- gemma3 configs omit `tie_word_embeddings` (the HF config class
+  defaults it true) — our parse defaulted false and llama.rs then
+  demanded the lm_head the checkpoint doesn't have. Metadata now carries
+  the per-family default (unit-tested); gemma.rs had been masking this
+  with a silent probe-fallback.
+- `lm_head.weight` absence now falls back to tied embeddings with a loud
+  eprintln (the GGUF `output.weight` presence rule, ported) instead of a
+  fatal MissingTensor.
+
+gemma-3 GGUF still waits on the W2-E arch-aware tensor map (`ffn_norm`
+name collision, qk-norm names, `attention.key_length`, sliding keys).
