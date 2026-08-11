@@ -788,3 +788,42 @@ Full suite after both fixes — every stage within bounds: time 5e-5/1e-6,
 CLIP exact→1.7e-5, UNet per-block ≤2e-4 with **noise_pred 2.1e-6** (was
 0.247), VAE decode 2.9e-5 (first-ever VAE verification). The unused
 combs-models/combs-core deps are dropped from combs-diffusion.
+
+## 2026-08-11 — Native tool calling (harmony rename + message model + parser + wire)
+
+Terminology: reference-derived pinned-value tests are now "harmony"
+tests (`tools/harmony/`, `chat_template_harmony.json`) per project
+preference.
+
+Tool calling rides the checkpoint's own chat template, the transformers
+way: `tools` (OpenAI-shaped schemas) pass verbatim into the jinja
+context; the template renders definitions, assistant `tool_calls`
+(arguments as OBJECTS — the HF/OpenAI divergence, normalized at the
+boundary), and tool-result turns. `(role, content)` tuples became
+`ChatMessage` end-to-end (serve, CLI, FFI); serve stops coercing
+`tool`/`ipython` roles to user. minijinja gained transformers' `tojson`
+(python json.dumps semantics incl. `indent`; jinja2's default would
+HTML-escape and sort). Capability probing: templates referencing `tools`
+(qwen2.5/qwen3/llama-3.2 among cached models) advertise `"tools": true`
+in /v1/models; others 400 on tool requests — phi-3/gemma-3/smollm2
+templates simply cannot express them.
+
+Output parsing is a small fingerprinted state machine
+(combs-runtime/src/toolcall.rs): hermes `<tool_call>{json}</tool_call>`
+blocks (parallel calls, rolling-buffer holdback so only ambiguous marker
+prefixes are withheld) and llama whole-body bare JSON; malformed buffers
+flush as visible text. Ten synthetic-stream unit tests.
+
+The live E2E exposed a detokenizer bug: decode skipped special tokens,
+and qwen GGUF vocabs mark `<tool_call>`/`<think>` as control tokens —
+the model's calls leaked through as unwrapped JSON. Decoding now keeps
+specials (the transformers tool-parsing convention; stop tokens still
+never appear). Sweep: six models byte-identical, qwen3 GGUF chat now
+renders `<think>` exactly like its safetensors twin.
+
+Harmony fixtures: 21 total (12 original unchanged + qwen3 + six tool
+cases: request/loopback per family), all byte-identical to the jinja2
+reference. Live E2E (qwen3-0.6b Q8_0, served): weather request →
+`finish_reason: "tool_calls"` with parsed name/arguments; tool-result
+loopback → fluent answer; streaming delivers `delta.tool_calls`;
+smollm2 rejects tools with a clean 400.

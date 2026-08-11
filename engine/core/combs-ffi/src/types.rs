@@ -80,6 +80,10 @@ pub struct ChatRequestJson {
     pub stop_token_ids: Option<Vec<u32>>,
     /// Per-request prefill chunk size override.
     pub prefill_chunk_size: Option<usize>,
+    /// OpenAI-shaped tool definitions, rendered through the model's chat
+    /// template. Generated tool calls arrive on the `Done` event.
+    #[serde(default)]
+    pub tools: Option<serde_json::Value>,
 }
 
 /// Streaming event kinds emitted to the `CombsStreamCallback`.
@@ -95,8 +99,12 @@ pub enum StreamEvent {
     },
     /// Terminal event with telemetry.
     Done {
-        /// `stop` | `length` | `cancelled`.
+        /// `stop` | `length` | `cancelled` | `tool_calls`.
         finish_reason: String,
+        /// Complete parsed tool calls (OpenAI wire shape, `arguments` as a
+        /// JSON string); empty when the model made none.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        tool_calls: Vec<serde_json::Value>,
         /// Generation stats.
         stats: StatsJson,
     },

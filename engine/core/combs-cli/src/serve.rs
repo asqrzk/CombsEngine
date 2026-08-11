@@ -199,7 +199,29 @@ fn model_card(engine: &Arc<Engine>, model_id: &str) -> Value {
         "created": now_unix(),
         "owned_by": "combs",
         "context_length": engine.metadata().max_position_embeddings,
+        "tools": engine.supports_tools(),
     })
+}
+
+/// OpenAI wire shape for completed tool calls (`arguments` re-serialized
+/// to a JSON string).
+fn tool_calls_json(calls: &[combs_runtime::ToolCall]) -> Value {
+    Value::Array(
+        calls
+            .iter()
+            .map(|c| {
+                json!({
+                    "id": c.id,
+                    "type": "function",
+                    "function": {
+                        "name": c.function.name,
+                        "arguments": serde_json::to_string(&c.function.arguments)
+                            .unwrap_or_else(|_| "{}".to_string()),
+                    },
+                })
+            })
+            .collect(),
+    )
 }
 
 /// Rich model descriptor: real context budget (KV arena), architecture,
@@ -222,6 +244,7 @@ fn model_info(engine: &Arc<Engine>, model_id: &str) -> HttpResponse {
             },
             "vocab_size": meta.vocab_size,
             "vision": meta.vision.is_some(),
+            "tools": engine.supports_tools(),
             "defaults": {
                 "max_tokens": dc.max_tokens,
                 "temperature": dc.sampling.temperature,
@@ -303,7 +326,28 @@ fn handle_chat(
             error_json("invalid_request", "`messages` must be a non-empty array"),
         );
     }
-    let (prompt, images) = match build_prompt(engine, &messages, None) {
+    // OpenAI tools: pass schemas through to the chat template ("auto"),
+    // drop them on tool_choice "none", reject on models whose template
+    // can't express tools (rendering would silently omit them).
+    let tool_choice_none = req
+        .get("tool_choice")
+        .and_then(Value::as_str)
+        .is_some_and(|c| c == "none");
+    let tools: Option<Value> = req
+        .get("tools")
+        .filter(|t| t.as_array().is_some_and(|a| !a.is_empty()) && !tool_choice_none)
+        .cloned();
+    if tools.is_some() && !engine.supports_tools() {
+        return json_response(
+            400,
+            error_json(
+                "invalid_request",
+                "this model's chat template has no tool support — use a \
+                 tool-trained model (qwen2.5/qwen3/llama-3.x)",
+            ),
+        );
+    }
+    let (prompt, images) = match build_prompt(engine, &messages, tools.as_ref()) {
         Ok(v) => v,
         Err(msg) => {
             return json_response(400, error_json("invalid_request", &msg));
@@ -377,30 +421,66 @@ fn handle_chat(
 
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let completion_id = format!("chatcmpl-combs-{}", now_unix());
+    // The parser engages only when the request carries tools — tool-less
+    // requests stream byte-identically to before.
+    let parser_style = if tools.is_some() {
+        engine.tool_call_style()
+    } else {
+        combs_runtime::ToolCallStyle::None
+    };
 
     if !stream {
+        let mut parser = combs_runtime::ToolCallParser::new(parser_style);
         let mut text = String::new();
+        let mut calls: Vec<combs_runtime::ToolCall> = Vec::new();
         counters.in_flight.fetch_add(1, Ordering::Relaxed);
         let result = generate_maybe_media(engine, &tokens, images, &config, |_id, piece| {
-            text.push_str(piece)
+            for ev in parser.push(piece) {
+                match ev {
+                    combs_runtime::ToolEvent::Content(c) => text.push_str(&c),
+                    combs_runtime::ToolEvent::Call(c) => calls.push(c),
+                }
+            }
         });
+        for ev in parser.finish() {
+            match ev {
+                combs_runtime::ToolEvent::Content(c) => text.push_str(&c),
+                combs_runtime::ToolEvent::Call(c) => calls.push(c),
+            }
+        }
         counters.in_flight.fetch_sub(1, Ordering::Relaxed);
         return match result {
-            Ok(stats) => json_response(
-                200,
-                json!({
-                    "id": completion_id,
-                    "object": "chat.completion",
-                    "created": now_unix(),
-                    "model": model_id,
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": text},
-                        "finish_reason": if stats.generated_tokens >= config.max_tokens { "length" } else { "stop" },
-                    }],
-                    "usage": usage_json(&stats, config.session_id.as_deref()),
-                }),
-            ),
+            Ok(stats) => {
+                let finish = if stats.generated_tokens >= config.max_tokens {
+                    "length"
+                } else if !calls.is_empty() {
+                    "tool_calls"
+                } else {
+                    "stop"
+                };
+                let mut message = json!({"role": "assistant", "content": text});
+                if !calls.is_empty() {
+                    if text.trim().is_empty() {
+                        message["content"] = Value::Null;
+                    }
+                    message["tool_calls"] = tool_calls_json(&calls);
+                }
+                json_response(
+                    200,
+                    json!({
+                        "id": completion_id,
+                        "object": "chat.completion",
+                        "created": now_unix(),
+                        "model": model_id,
+                        "choices": [{
+                            "index": 0,
+                            "message": message,
+                            "finish_reason": finish,
+                        }],
+                        "usage": usage_json(&stats, config.session_id.as_deref()),
+                    }),
+                )
+            }
             Err(e) => {
                 let (status, kind) = engine_error_parts(&e);
                 json_response(status, error_json(kind, &e.to_string()))
@@ -430,13 +510,44 @@ fn handle_chat(
             tx.send(format!("data: {chunk}\n\n")).is_ok()
         };
         let _ = send_chunk(json!({"role": "assistant"}), None, None);
+        let mut parser = combs_runtime::ToolCallParser::new(parser_style);
+        let mut call_index = 0usize;
+        let mut emit_event = |ev: combs_runtime::ToolEvent| match ev {
+            combs_runtime::ToolEvent::Content(c) => {
+                let _ = send_chunk(json!({"content": c}), None, None);
+            }
+            combs_runtime::ToolEvent::Call(c) => {
+                // OpenAI wire: arguments as a JSON *string*; one complete
+                // call per chunk.
+                let args = serde_json::to_string(&c.function.arguments)
+                    .unwrap_or_else(|_| "{}".to_string());
+                let _ = send_chunk(
+                    json!({"tool_calls": [{
+                        "index": call_index,
+                        "id": c.id,
+                        "type": "function",
+                        "function": {"name": c.function.name, "arguments": args},
+                    }]}),
+                    None,
+                    None,
+                );
+                call_index += 1;
+            }
+        };
         let result = generate_maybe_media(&engine, &tokens, images, &config, |_id, piece| {
-            let _ = send_chunk(json!({"content": piece}), None, None);
+            for ev in parser.push(piece) {
+                emit_event(ev);
+            }
         });
+        for ev in parser.finish() {
+            emit_event(ev);
+        }
         match result {
             Ok(stats) => {
                 let finish = if stats.generated_tokens >= config.max_tokens {
                     "length"
+                } else if parser.calls_seen() > 0 {
+                    "tool_calls"
                 } else {
                     "stop"
                 };

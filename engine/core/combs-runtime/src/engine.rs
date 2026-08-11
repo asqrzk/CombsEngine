@@ -528,6 +528,12 @@ impl Engine {
             .is_some_and(|t| t.contains("tools"))
     }
 
+    /// The tool-call phrasing this model's template teaches (drives the
+    /// streaming parser).
+    pub fn tool_call_style(&self) -> crate::ToolCallStyle {
+        crate::ToolCallStyle::detect(self.spec.chat_template.as_deref())
+    }
+
     /// Default generation config: [`GenerationConfig::default`] merged with
     /// the model's `generation_config.json` sampler defaults. Callers clone
     /// this and override fields explicitly — explicit values always win.

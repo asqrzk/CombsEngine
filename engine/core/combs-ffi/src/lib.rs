@@ -278,10 +278,18 @@ pub unsafe extern "C" fn combs_chat_completion(
                         name: m.name.clone(),
                     })
                     .collect();
-                engine.engine.wrap_chat(&msgs)
+                engine
+                    .engine
+                    .wrap_chat_with_tools(&msgs, request.tools.as_ref())
             }
             (None, Some(p)) => p.clone(),
             (None, None) => return Err("request needs `prompt` or `messages`".into()),
+        };
+        // Parse tool calls out of the stream only when tools were supplied.
+        let parser_style = if request.tools.is_some() {
+            engine.engine.tool_call_style()
+        } else {
+            combs_runtime::ToolCallStyle::None
         };
         let prompt_tokens = engine
             .engine
@@ -329,29 +337,46 @@ pub unsafe extern "C" fn combs_chat_completion(
             .insert(req_id.clone(), cancel.clone());
         let _guard = scopeguard(req_id.clone());
 
-        let mut first = true;
+        let mut parser = combs_runtime::ToolCallParser::new(parser_style);
+        let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+        let mut handle_event = |ev: combs_runtime::ToolEvent,
+                                token_id: u32,
+                                calls: &mut Vec<serde_json::Value>| match ev {
+            combs_runtime::ToolEvent::Content(text) => {
+                emit(cb, user_data, &StreamEvent::Delta { text, token_id });
+            }
+            combs_runtime::ToolEvent::Call(c) => {
+                calls.push(serde_json::json!({
+                    "id": c.id,
+                    "type": "function",
+                    "function": {
+                        "name": c.function.name,
+                        "arguments": serde_json::to_string(&c.function.arguments)
+                            .unwrap_or_else(|_| "{}".to_string()),
+                    },
+                }));
+            }
+        };
         let outcome = engine.engine.generate_cancellable(
             &prompt_tokens,
             &config,
             cancel,
             |token_id, text| {
-                emit(
-                    cb,
-                    user_data,
-                    &StreamEvent::Delta {
-                        text: text.to_string(),
-                        token_id,
-                    },
-                );
-                first = false;
+                for ev in parser.push(text) {
+                    handle_event(ev, token_id, &mut tool_calls);
+                }
             },
         );
-        let _ = first;
+        for ev in parser.finish() {
+            handle_event(ev, 0, &mut tool_calls);
+        }
 
         match outcome {
             Ok(stats) => {
                 let finish_reason = if stats.generated_tokens >= config.max_tokens {
                     "length"
+                } else if !tool_calls.is_empty() {
+                    "tool_calls"
                 } else {
                     "stop"
                 };
@@ -360,6 +385,7 @@ pub unsafe extern "C" fn combs_chat_completion(
                     user_data,
                     &StreamEvent::Done {
                         finish_reason: finish_reason.into(),
+                        tool_calls,
                         stats: StatsJson {
                             prompt_tokens: stats.prompt_tokens,
                             generated_tokens: stats.generated_tokens,
@@ -381,6 +407,7 @@ pub unsafe extern "C" fn combs_chat_completion(
                         user_data,
                         &StreamEvent::Done {
                             finish_reason: "cancelled".into(),
+                            tool_calls: Vec::new(),
                             stats: StatsJson {
                                 prompt_tokens: 0,
                                 generated_tokens: 0,
