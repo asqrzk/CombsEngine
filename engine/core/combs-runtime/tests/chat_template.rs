@@ -1,4 +1,4 @@
-//! Golden chat-template renders: fixtures in `tests/data/` pair each real
+//! Harmony chat-template renders: fixtures in `tests/data/` pair each real
 //! checkpoint template (llama-3.2, qwen2.5-coder, gemma-3, smollm2 — pulled
 //! from the actual cached models' GGUF metadata / tokenizer_config.json)
 //! with reference output rendered by Python `jinja2` under transformers'
@@ -25,8 +25,8 @@ struct Message {
 }
 
 #[test]
-fn golden_renders_match_transformers_reference() {
-    let data = include_str!("data/chat_template_golden.json");
+fn harmony_renders_match_transformers_reference() {
+    let data = include_str!("data/chat_template_harmony.json");
     let fixtures: Vec<Fixture> = serde_json::from_str(data).expect("parse fixtures");
     assert!(fixtures.len() >= 12, "fixture file looks truncated");
 

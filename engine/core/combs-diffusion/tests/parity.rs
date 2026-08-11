@@ -1,7 +1,7 @@
 //! Component-parity harness vs torch-cpu reference activations.
 //!
 //! Gated on `COMBS_DIFFUSION_PARITY_DIR` (a dump produced by
-//! `tools/goldens/gen_diffusion_reference.py`) and the local
+//! `tools/harmony/gen_diffusion_reference.py`) and the local
 //! stable-diffusion-v1-5 checkpoint. All inputs are READ from the dump —
 //! no cross-language math — and each stage compares against the diffusers
 //! reference on the NdArray backend. Stages run in dependency order; the

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reference inv_freq values for combs-models/src/rope.rs scaling goldens.
+"""Reference inv_freq values for combs-models/src/rope.rs scaling harmony.
 
 Pure-f64 reimplementation of HF modeling_rope_utils: llama3 piecewise and
 YaRN NTK-by-parts. Re-run to audit the constants pinned in rope.rs tests.

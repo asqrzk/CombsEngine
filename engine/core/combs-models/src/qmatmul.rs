@@ -15,7 +15,7 @@
 //!   reference; re-packing scales to f16 pairs is a later small saving).
 //! - **Compute** (`*_dequant_kernel`, `*_matmul_kernel`): unpack, apply
 //!   scales, accumulate in f32. Each dequant-only kernel exists to
-//!   validate the layout bit-exactly against the golden CPU reference
+//!   validate the layout bit-exactly against the harmony CPU reference
 //!   (`combs_formats::quants`); the fused matmuls are the production path.
 //!
 //! The portable fallback (dequantize at load + burn matmul) remains the
@@ -1279,7 +1279,7 @@ mod tests {
         out
     }
 
-    /// The GPU dequant must be **bit-exact** with the golden CPU reference
+    /// The GPU dequant must be **bit-exact** with the harmony CPU reference
     /// (`combs_formats::quants::dequantize_q4_0`) — same unpack, same
     /// arithmetic, same f16→f32 scale conversion. This validates the whole
     /// Layout layer: any repack/indexing slip shows up as a hard mismatch.
@@ -1372,7 +1372,7 @@ mod tests {
         }
     }
 
-    /// Q4_K GPU dequant vs the golden CPU reference. The kernel mirrors the
+    /// Q4_K GPU dequant vs the harmony CPU reference. The kernel mirrors the
     /// reference arithmetic exactly; tolerance only allows for backend FMA
     /// contraction of `d1·q − fmin` (a last-ulp effect, bounded far below
     /// the quantization step).
@@ -1389,7 +1389,7 @@ mod tests {
         assert_close(&got, &expect, 1e-6, "q4_k dequant");
     }
 
-    /// Q6_K GPU dequant vs the golden CPU reference.
+    /// Q6_K GPU dequant vs the harmony CPU reference.
     #[test]
     fn q6_k_dequant_matches_cpu_reference() {
         let n_sb = 9;

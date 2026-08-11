@@ -9,7 +9,7 @@ the dump — no cross-language math — and compares per stage. The first
 failing stage is the bug.
 
 Usage:
-  ~/venv-diff/bin/python tools/goldens/gen_diffusion_reference.py <out-dir>
+  ~/venv-diff/bin/python tools/harmony/gen_diffusion_reference.py <out-dir>
 """
 import json
 import os

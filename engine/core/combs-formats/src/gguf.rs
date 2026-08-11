@@ -749,7 +749,7 @@ fn tensor_byte_size(info: &TensorInfo) -> Result<usize> {
 /// Dequantizes a Q4_0 tensor to f32. Blocks of 32 values: f16 scale + 16
 /// bytes; value i (i<16) is the low nibble of byte i, value i+16 the high.
 ///
-/// Public via [`crate::quants`]: this scalar path is the golden reference
+/// Public via [`crate::quants`]: this scalar path is the harmony reference
 /// the fused CubeCL kernels validate against.
 pub fn dequantize_q4_0(data: &[u8], n: usize) -> Result<Vec<f32>> {
     let mut fixed = Vec::with_capacity(n);
@@ -774,7 +774,7 @@ pub fn dequantize_q4_0(data: &[u8], n: usize) -> Result<Vec<f32>> {
 
 /// Dequantizes a Q8_0 tensor to f32.
 ///
-/// Public via [`crate::quants`] as the golden reference for the GPU kernel.
+/// Public via [`crate::quants`] as the harmony reference for the GPU kernel.
 pub fn dequantize_q8_0(data: &[u8], n: usize) -> Result<Vec<f32>> {
     let mut out = Vec::with_capacity(n);
     for block in data.chunks_exact(34) {
@@ -820,7 +820,7 @@ fn dequantize_q4_1(data: &[u8], n: usize) -> Result<Vec<f32>> {
 /// scale, u32 high bits (bit j → value j, bit j+16 → value j+16), 16
 /// packed nibble bytes; values biased by -16.
 ///
-/// Public via [`crate::quants`] as the golden reference for the GPU kernel.
+/// Public via [`crate::quants`] as the harmony reference for the GPU kernel.
 pub fn dequantize_q5_0(data: &[u8], n: usize) -> Result<Vec<f32>> {
     let mut out = Vec::with_capacity(n);
     for block in data.chunks_exact(22) {
@@ -889,7 +889,7 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
 /// Dequantizes a Q4_K tensor to f32. 256-value superblocks (144 bytes):
 /// f16 d, f16 dmin, 12B packed scales/mins, 128B 4-bit quants.
 ///
-/// Public via [`crate::quants`] as the golden reference for the GPU kernel.
+/// Public via [`crate::quants`] as the harmony reference for the GPU kernel.
 pub fn dequantize_q4_k(data: &[u8], n: usize) -> Result<Vec<f32>> {
     let mut out = Vec::with_capacity(n);
     for sb in data.chunks_exact(144) {
@@ -963,7 +963,7 @@ fn dequantize_q5_k(data: &[u8], n: usize) -> Result<Vec<f32>> {
 /// 128B low nibbles, 64B high 2-bit fields, 16 i8 scales (one per 16
 /// values), f16 super-scale. Values are biased by -32.
 ///
-/// Public via [`crate::quants`] as the golden reference for the GPU kernel.
+/// Public via [`crate::quants`] as the harmony reference for the GPU kernel.
 pub fn dequantize_q6_k(data: &[u8], n: usize) -> Result<Vec<f32>> {
     let mut out = Vec::with_capacity(n);
     for sb in data.chunks_exact(210) {

@@ -29,7 +29,7 @@ pub fn build_tables(
 
 /// Per-frequency scaled `inv_freq` plus the attention (mscale) multiplier
 /// applied to both tables — pure host f64 math matching HF
-/// `modeling_rope_utils` formulas. Exposed for the formula golden tests.
+/// `modeling_rope_utils` formulas. Exposed for the formula harmony tests.
 pub fn scaled_inv_freq(head_dim: usize, theta: f64, scaling: &RopeScaling) -> (Vec<f64>, f64) {
     let half = head_dim / 2;
     let base: Vec<f64> = (0..half)

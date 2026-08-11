@@ -1,5 +1,5 @@
 //! CPU/GPU renderer parity: `CpuRenderer` vs `WgpuRenderer` (feature
-//! `gpu`) must produce identical pixels — golden compare on a fixed atlas.
+//! `gpu`) must produce identical pixels — harmony compare on a fixed atlas.
 //!
 //! GPU tests are ignored by default (CI may have no GPU); run with:
 //! `cargo test --release -p combs-mesh --features gpu --test gpu -- --ignored`

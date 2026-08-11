@@ -63,7 +63,7 @@ impl ChatTemplate {
 
 /// `strftime_now` as HF templates use it (llama-3.x: `%d %b %Y`), over
 /// std::time only. `COMBS_CHAT_DATE` overrides the output verbatim so
-/// golden tests and reproducible runs don't depend on the wall clock.
+/// harmony tests and reproducible runs don't depend on the wall clock.
 fn strftime_now(fmt: &str) -> String {
     if let Ok(pinned) = std::env::var("COMBS_CHAT_DATE") {
         return pinned;

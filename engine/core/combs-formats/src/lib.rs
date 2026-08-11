@@ -21,7 +21,7 @@ mod tokenizer;
 pub use gguf::GgufSource;
 
 /// Reference CPU dequantizers for GGUF quant formats. These scalar
-/// implementations are the golden reference that the fused GPU kernels in
+/// implementations are the harmony reference that the fused GPU kernels in
 /// `combs-models` validate against (QUANTIZATION_PLAN.md, principle #6:
 /// every kernel is tested against a portable reference).
 pub mod quants {

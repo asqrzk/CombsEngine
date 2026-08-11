@@ -219,7 +219,7 @@ fused win + ggml fidelity.
   sub-block.
 - Validation per principle #6: dequant kernels match
   `combs_formats::quants::{dequantize_q4_0, dequantize_q4_k,
-  dequantize_q6_k}` (the gguf.rs scalar paths, now public as the golden
+  dequantize_q6_k}` (the gguf.rs scalar paths, now public as the harmony
   reference) — Q4_0 **bit-exact**, K-quants within 1e-6 relative (FMA
   contraction only); fused matmuls match a reference matmul within 1e-3
   for decode (m=1) and prefill (m>1) shapes.
@@ -473,7 +473,7 @@ render failure (log-once, never a 500). ONE template path now serves
 deleted). `render_str` per call: parsing 4 KB of Jinja is microseconds
 against a generation and keeps renders thread-safe with zero 'static
 gymnastics. `COMBS_CHAT_DATE` pins `strftime_now` for reproducibility.
-Proof: 12 golden fixtures (llama-3.2/qwen2.5/gemma-3/smollm2 real templates
+Proof: 12 harmony fixtures (llama-3.2/qwen2.5/gemma-3/smollm2 real templates
 × 3 message sets) byte-equal vs a Python-jinja2 reference generated under
 transformers' environment settings; the gemma template render proved
 byte-identical to the old hardcoded wrap before switching. smollm2 prompts
@@ -535,7 +535,7 @@ discarded; DDPM@20 under-denoised.
   steps**, fixing the under-denoise. `scheduler` field on the HTTP API,
   `--scheduler` CLI flag, picker in the Create flow.
 
-**Proof**: golden tests against Python-computed diffusers-formula references
+**Proof**: harmony tests against Python-computed diffusers-formula references
 (alphas_cumprod to 1e-9, DDPM posterior coefficients to 1e-9, DDIM and
 DPM++ 2M 20-step scalar chains to f32 tolerance); seeded-noise stream
 reproducibility + Gaussian moments; E2E on SD 1.5 @ 512×512×20: same seed →
@@ -577,19 +577,19 @@ green.
 ## 2026-08-11 — Reference review vs transformers-main: 3 critical diffusion bugs fixed; audio hardened
 
 A structured review against the on-disk HF transformers source found the
-REAL reasons images always under-delivered — none of them in the (golden-
+REAL reasons images always under-delivered — none of them in the (harmony-
 tested) scheduler:
 
 1. **Upsample2D tiled instead of upsampling**: burn's `repeat_dim` is TILE
    (`[r0,r1,r0,r1]`), not neighbor duplication — every UNet/VAE upsample
    (6 stacked) turned the feature map into a 2×2 mosaic. Fixed with
-   `interpolate(..., Nearest)`; golden test added (a 2×2→4×4 fixture that
+   `interpolate(..., Nearest)`; harmony test added (a 2×2→4×4 fixture that
    fails under tiling).
 2. **Timestep embedding frequencies wrong in scale AND direction**: the
    sweep was missing its `ln(10000)` factor and ran inverted — every
    channel sat near cos(0), so the UNet barely saw the timestep. Fixed to
    the diffusers `Timesteps` convention (freq_shift 0, flip_sin_to_cos);
-   golden test added.
+   harmony test added.
 3. **VAE `post_quant_conv` never applied**: AutoencoderKL's 1×1 latent
    projection was skipped entirely. Now loaded and applied (warns when a
    decoder-only extract lacks it).
@@ -598,9 +598,9 @@ Plus: CLIP >77-token truncation now preserves EOS; `steps` clamped to
 1..=1000 (ratio-0 degenerated all timesteps to 1 → NaN in DPM++); DPM++
 multistep guards sequential step order; serve-images validates size/steps/
 guidance with 400s instead of silent fallbacks; non-finite pixels fail
-loudly instead of returning a black 200. Golden-generator scripts for the
+loudly instead of returning a black 200. Harmony-generator scripts for the
 scheduler/rope/chat-template constants are checked in under
-`tools/goldens/` (they regenerate the pinned values byte-identically).
+`tools/harmony/` (they regenerate the pinned values byte-identically).
 
 **Honest status**: seeded determinism still byte-exact, CFG effective, PNG
 entropy dropped ~40% (mosaic gone) — but a SmolVLM look at the outputs
@@ -613,14 +613,14 @@ argv guard; over-budget sentences chunk at word boundaries instead of
 silently truncating; vocab-miss drops are counted and warned; the speech
 endpoint recovers poisoned mutexes, clamps speed to 0.25–4.0, and caps
 request bodies at 1 MB. The full Whisper-port checklist (mel constants,
-conv stem, sinusoid layout, forced prefix, seek loop, golden ladder) is
+conv stem, sinusoid layout, forced prefix, seek loop, harmony ladder) is
 recorded in the wave-4 planning notes.
 
 ## 2026-08-11 — Wave 2 stage C: qwen3 + phi3 presets (LANDED)
 
 (Also the retro-note for stages A/B, whose commits `ec5ae73`/`0d4cf5b`
 landed just before this entry: extended metadata + RoPE scaling
-linear/llama3/yarn with formula goldens + the ArchSpec resolver; then
+linear/llama3/yarn with formula harmony + the ArchSpec resolver; then
 llama.rs parameterized on ArchSpec with the byte-identity gate green over
 smollm2 safetensors+GGUF and llama-3.2 GGUF.)
 
@@ -661,7 +661,7 @@ Plus **LongRope parse + short-context tables**: `rope_scaling.type =
 "longrope"` (phi 128k variants) parses — factors, top-level
 `original_max_position_embeddings`, ratio-derived factor — and
 `scaled_inv_freq` builds the short-factor tables with the HF attention
-temperature `sqrt(1 + ln(factor)/ln(orig))`; golden-tested. The long-table
+temperature `sqrt(1 + ln(factor)/ln(orig))`; harmony-tested. The long-table
 runtime switch lands with the first beyond-original-context preset.
 
 E2E: Phi-3.1-mini-4k-instruct Q4_K_M (bartowski single file, 2.4 GB;
@@ -751,7 +751,7 @@ per-layer attention layouts, scaled RoPE — the universal decoder holds.
 
 ## 2026-08-11 — Diffusion component parity vs torch: two root causes found and fixed
 
-The queued parity harness landed: `tools/goldens/gen_diffusion_reference.py`
+The queued parity harness landed: `tools/harmony/gen_diffusion_reference.py`
 dumps deterministic-input reference activations from the LOCAL SD-1.5 via
 diffusers/transformers (torch-cpu f32) — time embedding, CLIP (with
 per-layer and attention-internal taps via forward hooks), UNet (per-block

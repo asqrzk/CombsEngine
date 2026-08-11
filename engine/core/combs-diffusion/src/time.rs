@@ -76,7 +76,7 @@ mod tests {
 
     type B = NdArray<f32>;
 
-    /// Golden: diffusers `Timesteps` (freq_shift 0, flip_sin_to_cos):
+    /// Harmony: diffusers `Timesteps` (freq_shift 0, flip_sin_to_cos):
     /// dim 8 -> inv_freq [1, 1e-1, 1e-2, 1e-3]; t = 3 -> args
     /// [3, 0.3, 0.03, 0.003], layout [cos.., sin..].
     #[test]

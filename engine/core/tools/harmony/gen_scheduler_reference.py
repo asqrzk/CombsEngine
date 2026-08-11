@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reference values for combs-diffusion/src/scheduler.rs golden tests.
+"""Reference values for combs-diffusion/src/scheduler.rs harmony tests.
 
 Pure-f64 reimplementation of the diffusers formulas (scaled-linear betas,
 "leading" timestep spacing with steps_offset=1, spaced-DDPM fixed_small

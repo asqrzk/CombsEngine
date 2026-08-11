@@ -2,7 +2,7 @@
 //!
 //! All schedulers share the SD 1.5 scaled-linear beta schedule and the
 //! diffusers "leading" timestep spacing with `steps_offset = 1`, computed
-//! in f64 and golden-tested against reference values derived from the
+//! in f64 and harmony-tested against reference values derived from the
 //! diffusers formulas. Three algorithms:
 //!
 //! - [`Ddpm`] — ancestral sampling with the spaced posterior (needs many

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Regenerates combs-runtime/tests/data/chat_template_golden.json.
+"""Regenerates combs-runtime/tests/data/chat_template_harmony.json.
 
 Extracts each cached checkpoint's real chat template (GGUF metadata /
 tokenizer_config.json), renders reference outputs with python-jinja2 under
 transformers' environment settings (ImmutableSandboxedEnvironment,
 trim_blocks + lstrip_blocks, pinned strftime_now), and writes the fixture
-file the Rust golden test compares minijinja against byte-for-byte.
+file the Rust harmony test compares minijinja against byte-for-byte.
 
 Requires: pip install jinja2; the models cached under ~/.cache/combs/models.
 """
@@ -15,7 +15,7 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 PINNED_DATE = "11 Aug 2026"
 BASE = os.path.expanduser("~/.cache/combs/models")
 OUT = os.path.join(os.path.dirname(__file__),
-                   "../../combs-runtime/tests/data/chat_template_golden.json")
+                   "../../combs-runtime/tests/data/chat_template_harmony.json")
 
 def gguf_chat_template(path):
     f = open(path, "rb")
