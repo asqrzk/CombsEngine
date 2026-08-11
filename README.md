@@ -83,12 +83,12 @@ Four layers. Compute lives exclusively in **L0** — every layer above is thin o
 
 ### L0 — Rust Core (`engine/core`)
 
-- **Inference engine** — Llama-family architectures on Burn 0.21 + CubeCL/wgpu; validated with SmolLM2 on Apple Silicon (Metal). New architectures = one line in the `ModelRegistry`.
-- **Model formats** — SafeTensors (Hugging Face layout) and **GGUF v3** (Q8_0 / Q4_0 / F16 / F32) through a single `ModelSource` adapter trait. `combs run --model anything.gguf` just works.
+- **Inference engine** — one universal decoder on Burn 0.21 + CubeCL/wgpu serving Llama/SmolLM2, Qwen2.5, Qwen3, Phi-3, and Gemma-3 (sliding-window + dual-RoPE variants included), plus SmolVLM vision input, Stable Diffusion 1.5 image generation, and Kokoro TTS. New architectures = a registry line + an `ArchSpec` preset.
+- **Model formats** — SafeTensors (Hugging Face layout, causal-LM or bare base exports) and **GGUF v3** (F32 / F16 / Q4_0 / Q5_0 / Q8_0 / Q4_K / Q5_K / Q6_K) through a single `ModelSource` adapter trait. `combs run --model anything.gguf` just works.
 - **Memory** — paged KV cache (page-16 arenas, LIFO free-list, prefix-safe `popn`), chunked prefill, quantized linear layers with weights packed in VRAM.
-- **Sampling** — temperature, top-k, top-p, repetition/frequency/presence penalties, seeded (byte-identical) generation, stop strings & stop tokens.
-- **CLI (`combs`)** — `run` · `serve` · `devices` · `chew` · `pull` · `convert`.
-- **OpenAI-compatible server** — `POST /v1/chat/completions` (SSE streaming + non-streaming), `GET /v1/models`, `GET /health`.
+- **Sampling** — temperature, top-k, top-p, min-p, repetition/frequency/presence penalties, logit_bias, per-token logprobs, seeded (byte-identical) generation, stop strings & stop tokens.
+- **CLI (`combs`)** — `run` · `serve` · `perplexity` · `pull` · `devices` · `chew` · `generate-image` · `generate-audio` · `serve-images` · `serve-audio` · `convert`.
+- **OpenAI-compatible server** — `/v1/chat/completions` (SSE + non-streaming, native **tool calling** through each model's own chat template, `response_format` json_object/json_schema constrained output, logprobs, `n` choices), `/v1/completions` (raw prompt / FIM), `/v1/embeddings` (pooling detection, matryoshka `dimensions`, base64), `/v1/models` + `/v1/model/info` (per-model capability advertisement), `/v1/stats`, `/health` — plus `/v1/images/generations` and `/v1/audio/speech` on the media workers.
 - **`xtask`** — cross-platform build orchestrator: `cargo xtask matrix` shows live toolchain detection; `cargo xtask bundle` produces `dist/<platform>/{lib, combs.h}` for every target.
 - **CombsMesh emoji engine (`combs-mesh`)** — binary `.cmse` block format (10 block types: text/image/todo/functions/api/lifecycle/character/emotion/encryption/orchestration), Unicode PUA tag-character encoding, AES-256-GCM/ChaCha20 crypto with HKDF subkeys, CPU + wgpu sprite renderers, content-addressed registry, wasm32-clean with wasm-bindgen bindings; C ABI via `combs-mesh-ffi` (`combsmesh_*` + `combsmesh_op_json`).
 
@@ -134,8 +134,8 @@ Measured on Apple Silicon (wgpu → Metal), SmolLM2-135M-Instruct:
 |---|---|
 | SafeTensors (HF layout) | ✅ full |
 | GGUF — F32 / F16 | ✅ full |
-| GGUF — Q8_0 / Q4_0 | ✅ full |
-| GGUF — Q4_K / Q5_K / Q6_K | 🚧 planned |
+| GGUF — Q4_0 / Q5_0 / Q8_0 | ✅ full, fused GPU kernels |
+| GGUF — Q4_K / Q5_K / Q6_K | ✅ full, fused GPU kernels |
 
 Model presets **must** use instruction-tuned variants (e.g. `SmolLM2-135M-Instruct`) — base models echo prompts in chat mode.
 

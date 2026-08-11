@@ -24,8 +24,8 @@ combs-mesh-ffi    cdylib: combsmesh_* C ABI + combsmesh_op_json (JSON-FFI)
 | Surface | Owner | Spec |
 |---|---|---|
 | `.cmse` binary + PUA envelope | this crate | this README (frozen wire format) |
-| `/mesh/v1` peer federation | `@combs/mesh` `peer.ts` | `documentations/mesh-protocol.md` |
-| MCP connector | `@combs/mesh` `mcp.ts` | mesh-protocol.md §related surfaces |
+| `/mesh/v1` peer federation | `@combs/mesh` `peer.ts` | `peer.ts` doc comments |
+| MCP connector | `@combs/mesh` `mcp.ts` | `mcp.ts` doc comments |
 | Sealed envelopes | `@combs/zerotrust` | Engine/Js/zerotrust |
 
 Product repos (e.g. the CombsMesh repo: SHARD runtime + M2 fabric crate)
