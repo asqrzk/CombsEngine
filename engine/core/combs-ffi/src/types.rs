@@ -84,6 +84,10 @@ pub struct ChatRequestJson {
     /// template. Generated tool calls arrive on the `Done` event.
     #[serde(default)]
     pub tools: Option<serde_json::Value>,
+    /// OpenAI `response_format`: `json_object` / `json_schema` constrain
+    /// the output through the engine's JSON automaton.
+    #[serde(default)]
+    pub response_format: Option<serde_json::Value>,
 }
 
 /// Streaming event kinds emitted to the `CombsStreamCallback`.

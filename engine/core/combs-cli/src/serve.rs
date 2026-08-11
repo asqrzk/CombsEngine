@@ -200,6 +200,17 @@ fn model_card(engine: &Arc<Engine>, model_id: &str) -> Value {
         "owned_by": "combs",
         "context_length": engine.metadata().max_position_embeddings,
         "tools": engine.supports_tools(),
+        "capabilities": capabilities_json(engine),
+    })
+}
+
+/// What this engine+model can do, detected from the artifacts (template ⇒
+/// tools) and the build (constraints) — advertised so clients
+/// self-configure instead of hardcoding per deployment.
+fn capabilities_json(engine: &Arc<Engine>) -> Value {
+    json!({
+        "tools": engine.supports_tools(),
+        "constraints": ["json_object", "json_schema"],
     })
 }
 
@@ -245,6 +256,7 @@ fn model_info(engine: &Arc<Engine>, model_id: &str) -> HttpResponse {
             "vocab_size": meta.vocab_size,
             "vision": meta.vision.is_some(),
             "tools": engine.supports_tools(),
+            "capabilities": capabilities_json(engine),
             "defaults": {
                 "max_tokens": dc.max_tokens,
                 "temperature": dc.sampling.temperature,
@@ -287,6 +299,7 @@ fn engine_error_parts(e: &combs_runtime::EngineError) -> (u16, &'static str) {
         combs_runtime::EngineError::ContextTooLong { .. } => {
             (400, "context_length_exceeded")
         }
+        combs_runtime::EngineError::Constraint(_) => (400, "constraint_error"),
         _ => (500, "engine_error"),
     }
 }
@@ -403,6 +416,25 @@ fn handle_chat(
             _ => vec![],
         };
         config.stop_strings = stops;
+    }
+    // Structured output: parse AND compile the schema here so malformed
+    // requests are clean 400s before anything is enqueued on the worker.
+    if let Some(rf) = req.get("response_format") {
+        let spec = combs_runtime::ConstraintSpec::from_response_format(rf).and_then(|spec| {
+            if let Some(s) = &spec {
+                s.compile()?;
+            }
+            Ok(spec)
+        });
+        match spec {
+            Ok(spec) => config.constraint = spec,
+            Err(msg) => {
+                return json_response(
+                    400,
+                    error_json("invalid_request", &format!("response_format: {msg}")),
+                );
+            }
+        }
     }
     if let Some(id) = engine.im_end_id() {
         config.stop_token_ids.push(id);

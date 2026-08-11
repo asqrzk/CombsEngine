@@ -19,6 +19,7 @@ use combs_media::PixelBatch;
 use combs_models::{CacheConfig, CacheKind, GenerativeModel, KVCache, ModelRegistry, pixels_to_tensor};
 use tokenizers::Tokenizer;
 
+use crate::constraint::{ConstraintSpec, ConstraintState, TokenByteTable};
 use crate::detok::IncrementalDetokenizer;
 use crate::sampler::{Sampler, SamplingParams, sampler_from_params};
 use crate::stop::StopDetector;
@@ -51,6 +52,11 @@ pub struct GenerationConfig {
     /// requests with the same id share a rolling session, independent of
     /// other ids. `None` uses the anonymous default session.
     pub session_id: Option<String>,
+    /// Structured-output constraint (OpenAI `response_format`): when set,
+    /// the logits row is masked before every sample so only tokens that
+    /// legally continue the JSON output survive. `None` leaves the decode
+    /// path byte-identical to an unconstrained run.
+    pub constraint: Option<ConstraintSpec>,
 }
 
 impl Default for GenerationConfig {
@@ -63,6 +69,7 @@ impl Default for GenerationConfig {
             prefill_chunk_size: 512,
             session_reuse: true,
             session_id: None,
+            constraint: None,
         }
     }
 }
@@ -678,6 +685,10 @@ fn worker_loop(
     // Rolling KV sessions — survive across requests so multi-turn callers
     // (and named per-agent sessions) only prefill the new prompt suffix.
     let mut sessions = SessionSet::new();
+    // Token→bytes table for constrained decoding: derived from the
+    // tokenizer on the first constrained request, then reused for the
+    // worker's lifetime (vocab-sized, so built once, never per request).
+    let mut token_table: Option<TokenByteTable> = None;
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Command::Shutdown => break,
@@ -690,6 +701,7 @@ fn worker_loop(
                     max_position_embeddings,
                     &req,
                     &mut sessions,
+                    &mut token_table,
                 );
                 update_stats(&stats, &result, &sessions, &device);
                 // `req.pieces` closes when `req` drops at the end of this
@@ -765,6 +777,7 @@ fn update_stats(
 /// longest common token prefix with the new prompt and only the suffix is
 /// prefilled. The session is saved on every exit path after prefill, so a
 /// cancelled request still leaves a consistent cache behind.
+#[allow(clippy::too_many_arguments)]
 fn run_generation(
     model: &mut dyn GenerativeModel<CombsBackend>,
     tokenizer: &Tokenizer,
@@ -773,6 +786,7 @@ fn run_generation(
     max_position_embeddings: usize,
     req: &GenerateRequest,
     sessions: &mut SessionSet,
+    token_table: &mut Option<TokenByteTable>,
 ) -> Result<GenerationStats> {
     let prompt_tokens = &req.prompt_tokens;
     let config = &req.config;
@@ -831,10 +845,21 @@ fn run_generation(
     };
 
     let mut sampler: Box<dyn Sampler> = sampler_from_params(&config.sampling);
-    let mut stop = StopDetector::new(
-        req_eos_ids(model, config),
-        config.stop_strings.clone(),
-    );
+    let eos_ids = req_eos_ids(model, config);
+    let mut stop = StopDetector::new(eos_ids.clone(), config.stop_strings.clone());
+    // Structured output: compile the schema at request time and bind the
+    // automaton to this model's token table (built lazily, cached on the
+    // worker). The mask runs engine-side, not in the sampler's processor
+    // chain — the greedy sampler skips that chain, and a constraint must
+    // hold under every sampler.
+    let mut constraint = match &config.constraint {
+        Some(spec) => {
+            let schema = spec.compile().map_err(EngineError::Constraint)?;
+            let table = token_table.get_or_insert_with(|| TokenByteTable::build(tokenizer));
+            Some(ConstraintState::new(schema, table, eos_ids))
+        }
+        None => None,
+    };
     let mut detok = IncrementalDetokenizer::new();
     let mut history: Vec<u32> = prompt_tokens.to_vec();
 
@@ -872,7 +897,15 @@ fn run_generation(
     let logits = logits.expect("nonempty suffix runs at least one chunk");
 
     let mut row = readback_logits(logits)?;
+    if let Some(c) = constraint.as_mut() {
+        if c.mask(&mut row) == 0 {
+            return Err(EngineError::Constraint(DEAD_END.to_string()));
+        }
+    }
     let mut next = sampler.sample(&mut row, &history);
+    if let Some(c) = constraint.as_mut() {
+        c.advance(next);
+    }
     let ttft = t_start.elapsed();
     let t_decode = Instant::now();
 
@@ -930,7 +963,16 @@ fn run_generation(
                 break;
             }
         };
+        if let Some(c) = constraint.as_mut() {
+            if c.mask(&mut row) == 0 {
+                loop_error = Some(EngineError::Constraint(DEAD_END.to_string()));
+                break;
+            }
+        }
         next = sampler.sample(&mut row, &history);
+        if let Some(c) = constraint.as_mut() {
+            c.advance(next);
+        }
     }
 
     // Save the rolling session: history must mirror KV contents exactly
@@ -964,6 +1006,10 @@ fn run_generation(
         None => Ok(stats),
     }
 }
+
+/// Error text for a constraint dead end (no token can legally continue).
+const DEAD_END: &str =
+    "no vocabulary token can continue the constrained JSON output (schema dead end)";
 
 /// Collects the eos ids that apply to a request.
 fn req_eos_ids(

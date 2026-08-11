@@ -329,6 +329,18 @@ pub unsafe extern "C" fn combs_chat_completion(
         if let Some(chunk) = request.prefill_chunk_size.or(engine.prefill_chunk_size) {
             config.prefill_chunk_size = chunk;
         }
+        if let Some(rf) = request.response_format.as_ref() {
+            config.constraint = combs_runtime::ConstraintSpec::from_response_format(rf)
+                .and_then(|spec| {
+                    if let Some(s) = &spec {
+                        // Compile now so schema errors surface as request
+                        // errors, not generation failures.
+                        s.compile()?;
+                    }
+                    Ok(spec)
+                })
+                .map_err(|e| format!("response_format: {e}"))?;
+        }
 
         let cancel = Arc::new(AtomicBool::new(false));
         cancel_registry()
