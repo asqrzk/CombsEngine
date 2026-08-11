@@ -310,6 +310,26 @@ impl<B: Backend> LlamaModel<B> {
         self.norm(x, &self.final_norm)
     }
 
+    /// Logits of every position: `[1, seq, hidden] -> [1, seq, vocab]`
+    /// (the perplexity / speculative-decode head).
+    pub(crate) fn all_logits(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
+        let [_, seq, hidden_size] = hidden.dims();
+        let logits: Tensor<B, 3> = match &self.lm_head {
+            Some(head) => head.forward(hidden, None),
+            None => {
+                // Tied head: dense matmul against the embedding table.
+                let flat = hidden.reshape([seq, hidden_size]);
+                let out = safe_matmul(flat, self.embed.clone().transpose());
+                let [_, vocab] = out.dims();
+                out.reshape([1, seq, vocab])
+            }
+        };
+        match self.spec.final_logit_softcap {
+            Some(cap) => logits.div_scalar(cap as f32).tanh().mul_scalar(cap as f32),
+            None => logits,
+        }
+    }
+
     /// Logits of the last sequence position: `[1, hidden] -> [1, vocab]`.
     pub(crate) fn last_logits(&self, hidden: Tensor<B, 3>) -> Tensor<B, 2> {
         let [_, seq, hidden_size] = hidden.dims();
@@ -421,6 +441,16 @@ impl<B: Backend> GenerativeModel<B> for LlamaModel<B> {
 
     fn supports_hidden_states(&self) -> bool {
         true
+    }
+
+    fn prefill_all_logits(
+        &mut self,
+        input: Tensor<B, 3>,
+        cache: &mut dyn KVCache<B>,
+        pos: Range<u32>,
+    ) -> Result<Tensor<B, 3>> {
+        let hidden = self.prefill_hidden(input, cache, pos)?;
+        Ok(self.all_logits(hidden))
     }
 
     fn decode(&mut self, input: Tensor<B, 3>, cache: &mut dyn KVCache<B>) -> Tensor<B, 2> {

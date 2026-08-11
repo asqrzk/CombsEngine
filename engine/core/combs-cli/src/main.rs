@@ -81,6 +81,24 @@ struct RunArgs {
 enum Command {
     /// Run a local model and stream generated text.
     Run(RunArgs),
+    /// Score a text's perplexity with a local model (quantization QA).
+    Perplexity {
+        /// Path to the model (directory or .gguf file).
+        #[arg(long)]
+        model: PathBuf,
+        /// Text file to score.
+        #[arg(long, conflicts_with = "text")]
+        file: Option<PathBuf>,
+        /// Inline text to score.
+        #[arg(long)]
+        text: Option<String>,
+        /// Positions scored per pass (memory ∝ chunk × vocab; default 256).
+        #[arg(long, default_value_t = 256)]
+        chunk: usize,
+        /// Cap the number of scored tokens (0 = all that fit the context).
+        #[arg(long, default_value_t = 0)]
+        max_tokens: usize,
+    },
     /// Print wgpu device information.
     Devices,
     /// Download a model into the local cache (~/.cache/combs/models).
@@ -179,6 +197,9 @@ fn main() -> Result<()> {
         Command::ServeAudio { model, port } => serve_audio::cmd_serve_audio(model, port),
         Command::Serve { model, port, context_size, prefill_chunk_size } => {
             cmd_serve(model, port, context_size, prefill_chunk_size)
+        }
+        Command::Perplexity { model, file, text, chunk, max_tokens } => {
+            cmd_perplexity(model, file, text, chunk, max_tokens)
         }
         Command::Chew(cmd) => match cmd.mode {
             ChewMode::ChatUi(args) => chew::chew("chat-ui", args),
@@ -305,6 +326,53 @@ fn cmd_devices() -> Result<()> {
     println!("  backend:     {}", info.backend);
     println!("  device type: {}", info.device_type);
     println!("  driver:      {}", info.driver);
+    Ok(())
+}
+
+fn cmd_perplexity(
+    model: PathBuf,
+    file: Option<PathBuf>,
+    text: Option<String>,
+    chunk: usize,
+    max_tokens: usize,
+) -> Result<()> {
+    let text = match (file, text) {
+        (Some(f), None) => std::fs::read_to_string(&f)
+            .with_context(|| format!("reading {}", f.display()))?,
+        (None, Some(t)) => t,
+        _ => anyhow::bail!("pass exactly one of --file or --text"),
+    };
+    let model = resolve_model_arg(&model)?;
+    let source = open_model_source(&model)
+        .with_context(|| format!("loading {}", model.display()))?;
+    let meta = source.metadata();
+    eprintln!(
+        "model: {} (vocab {}), scoring {} chars",
+        meta.architecture,
+        meta.vocab_size,
+        text.len()
+    );
+    let device = combs_core::init_device();
+    let engine = Engine::load(&source, device).context("engine load failed")?;
+    let mut tokens = engine.encode(&text).context("tokenization failed")?;
+    if max_tokens > 1 {
+        tokens.truncate(max_tokens);
+    }
+    let budget = engine.cache_config().max_seq_len;
+    if tokens.len() > budget {
+        eprintln!("truncating {} tokens to the context budget {budget}", tokens.len());
+        tokens.truncate(budget);
+    }
+    let t0 = std::time::Instant::now();
+    let out = engine.perplexity(&tokens, chunk).context("perplexity failed")?;
+    let dt = t0.elapsed().as_secs_f64();
+    println!(
+        "perplexity: {:.4} over {} tokens (nll {:.4} nats/token, {:.1} tok/s)",
+        out.perplexity(),
+        out.tokens,
+        out.nll_sum / out.tokens.max(1) as f64,
+        out.tokens as f64 / dt.max(1e-9),
+    );
     Ok(())
 }
 

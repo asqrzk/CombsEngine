@@ -83,4 +83,20 @@ pub trait GenerativeModel<B: Backend>: Send {
     fn supports_hidden_states(&self) -> bool {
         false
     }
+
+    /// Runs (a chunk of) the prompt and returns logits for **every**
+    /// position, shape `[1, seq, vocab]` — the perplexity / speculative-
+    /// decode path. Same cache/position contract as
+    /// [`GenerativeModel::prefill`]. Memory scales with `seq × vocab`, so
+    /// callers chunk accordingly. Default: unsupported.
+    fn prefill_all_logits(
+        &mut self,
+        _input: Tensor<B, 3>,
+        _cache: &mut dyn KVCache<B>,
+        _pos: Range<u32>,
+    ) -> Result<Tensor<B, 3>> {
+        Err(crate::ModelError::Unsupported(
+            "this model does not expose per-position logits".to_string(),
+        ))
+    }
 }

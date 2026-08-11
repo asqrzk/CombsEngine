@@ -104,6 +104,25 @@ pub struct EmbedOutput {
     pub prompt_tokens: usize,
 }
 
+/// Result of one perplexity evaluation.
+#[derive(Debug, Clone)]
+pub struct PerplexityOutput {
+    /// Sum of per-token negative log-likelihoods (nats).
+    pub nll_sum: f64,
+    /// Number of scored tokens (`input length − 1`).
+    pub tokens: usize,
+}
+
+impl PerplexityOutput {
+    /// `exp(mean NLL)` — the standard perplexity.
+    pub fn perplexity(&self) -> f64 {
+        if self.tokens == 0 {
+            return f64::NAN;
+        }
+        (self.nll_sum / self.tokens as f64).exp()
+    }
+}
+
 /// Telemetry for one generation call.
 #[derive(Debug, Clone)]
 pub struct GenerationStats {
@@ -190,6 +209,11 @@ enum Command {
         texts: Vec<String>,
         opts: EmbedOptions,
         reply: mpsc::Sender<Result<EmbedOutput>>,
+    },
+    Perplexity {
+        tokens: Vec<u32>,
+        chunk: usize,
+        reply: mpsc::Sender<Result<PerplexityOutput>>,
     },
     Shutdown,
 }
@@ -556,6 +580,23 @@ impl Engine {
             .map_err(|_| EngineError::WorkerGone("worker dropped the reply".to_string()))?
     }
 
+    /// Scores `tokens` (chunked, `chunk` positions per pass; 0 = default
+    /// 256) and returns the summed NLL — quantization QA. Position `p`'s
+    /// logits score token `p + 1`.
+    pub fn perplexity(&self, tokens: &[u32], chunk: usize) -> Result<PerplexityOutput> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(Command::Perplexity {
+                tokens: tokens.to_vec(),
+                chunk,
+                reply: reply_tx,
+            })
+            .map_err(|_| EngineError::WorkerGone("worker thread terminated".to_string()))?;
+        reply_rx
+            .recv()
+            .map_err(|_| EngineError::WorkerGone("worker dropped the reply".to_string()))?
+    }
+
     /// Decodes one token id to its display text (specials kept) — the
     /// string OpenAI logprob alternatives carry on the wire.
     pub fn token_piece(&self, id: u32) -> String {
@@ -807,6 +848,21 @@ fn worker_loop(
                 );
                 let _ = reply.send(result);
             }
+            Command::Perplexity {
+                tokens,
+                chunk,
+                reply,
+            } => {
+                let result = run_perplexity(
+                    model.as_mut(),
+                    &device,
+                    &cache_config,
+                    max_position_embeddings,
+                    &tokens,
+                    chunk,
+                );
+                let _ = reply.send(result);
+            }
         }
     }
 }
@@ -909,6 +965,93 @@ fn run_embed(
     Ok(EmbedOutput {
         vectors,
         prompt_tokens,
+    })
+}
+
+/// Evaluates perplexity of a token sequence on the worker thread.
+///
+/// Chunked prefill through the model's all-positions logits head; the
+/// per-token NLL is computed on device (log-sum-exp minus the target
+/// logit) so only one scalar per position is read back. Position `p`'s
+/// logits score token `p + 1`; the final position of the last chunk has
+/// no target and is dropped.
+fn run_perplexity(
+    model: &mut dyn GenerativeModel<CombsBackend>,
+    device: &CombsDevice,
+    cache_config: &CacheConfig,
+    max_position_embeddings: usize,
+    tokens: &[u32],
+    chunk: usize,
+) -> Result<PerplexityOutput> {
+    if tokens.len() < 2 {
+        return Err(EngineError::Tokenizer(
+            "perplexity needs at least 2 tokens".to_string(),
+        ));
+    }
+    check_context_len(
+        tokens.len(),
+        0,
+        cache_config.max_seq_len.min(max_position_embeddings),
+    )?;
+    let chunk = if chunk == 0 { 256 } else { chunk };
+
+    let data: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+    let all = Tensor::from_data(TensorData::new(data, [1, tokens.len()]), device);
+    let embedded = model.embed(all);
+
+    let mut cache = model.create_kv_cache(&CacheConfig {
+        kind: CacheKind::Contiguous,
+        ..*cache_config
+    });
+
+    let mut nll_sum = 0.0f64;
+    let mut scored = 0usize;
+    let mut offset = 0usize;
+    while offset < tokens.len() {
+        let len = chunk.min(tokens.len() - offset);
+        let input = embedded.clone().narrow(1, offset, len);
+        let start = offset as u32;
+        let logits = model.prefill_all_logits(input, cache.as_mut(), start..start + len as u32)?;
+        let [_, l, vocab] = logits.dims();
+
+        // Targets for positions offset..offset+len are tokens shifted by
+        // one; the sequence-final position has none.
+        let n_score = if offset + len == tokens.len() { len - 1 } else { len };
+        if n_score == 0 {
+            break;
+        }
+        let logits = logits.narrow(1, 0, n_score);
+        let targets: Vec<i32> = tokens[offset + 1..offset + 1 + n_score]
+            .iter()
+            .map(|&t| t as i32)
+            .collect();
+        let idx = Tensor::<CombsBackend, 3, burn::tensor::Int>::from_data(
+            TensorData::new(targets, [1, n_score, 1]),
+            device,
+        );
+
+        // lse - target_logit, all on device; readback is [n_score] floats.
+        let max = logits.clone().max_dim(2);
+        let lse = (logits.clone() - max.clone().expand([1, n_score, vocab]))
+            .exp()
+            .sum_dim(2)
+            .log()
+            + max;
+        let target = logits.gather(2, idx);
+        let nll = (lse - target).reshape([n_score]);
+        let host = nll
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .map_err(|e| EngineError::Readback(format!("nll must be f32: {e:?}")))?;
+        nll_sum += host.iter().map(|&v| v as f64).sum::<f64>();
+        scored += n_score;
+        offset += len;
+    }
+
+    Ok(PerplexityOutput {
+        nll_sum,
+        tokens: scored,
     })
 }
 
