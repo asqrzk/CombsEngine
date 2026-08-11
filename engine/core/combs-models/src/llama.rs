@@ -18,9 +18,11 @@ use std::ops::Range;
 use burn::tensor::{Device, Int, Tensor, backend::Backend};
 use combs_formats::{ModelMetadata, ModelSource};
 
+use crate::archspec::{ArchSpec, LayerKind, NormFlavor};
 use crate::kv::{CacheConfig, CacheKind, ContiguousKVCache, KVCache, PagedKVCache};
 use crate::matmul::safe_matmul;
-use crate::norm::rms_norm;
+use crate::norm::{gemma_rms_norm, rms_norm};
+use crate::precision::{to_f32, to_float};
 use crate::qlinear::{Linear, try_quant_linear};
 use crate::rope::RotaryEmbedding;
 use crate::traits::GenerativeModel;
@@ -29,6 +31,11 @@ use crate::{ModelError, Result};
 /// One decoder layer's weights. All projections are `[out, in]` (HF layout);
 /// each is a [`Linear`] — dense tensor or packed-quant kernel dispatch,
 /// decided per tensor at load from the source's stored format.
+///
+/// The optional norms cover the family's variants: `attn_out_norm` /
+/// `mlp_out_norm` are gemma's sandwich norms, `q_norm`/`k_norm` the
+/// per-head QK-norms (gemma-3, qwen-3). For plain llama they're all `None`
+/// and the forward reduces exactly to the classic block.
 struct LlamaLayer<B: Backend> {
     q: Linear<B>,
     k: Linear<B>,
@@ -38,16 +45,25 @@ struct LlamaLayer<B: Backend> {
     k_bias: Option<Tensor<B, 1>>,
     v_bias: Option<Tensor<B, 1>>,
     o_bias: Option<Tensor<B, 1>>,
+    q_norm: Option<Tensor<B, 1>>,
+    k_norm: Option<Tensor<B, 1>>,
     gate: Linear<B>,
     up: Linear<B>,
     down: Linear<B>,
     input_norm: Tensor<B, 1>,
-    post_norm: Tensor<B, 1>,
+    /// Pre-MLP norm: llama's `post_attention_layernorm`, gemma's
+    /// `pre_feedforward_layernorm` (same role, different name).
+    pre_mlp_norm: Tensor<B, 1>,
+    attn_out_norm: Option<Tensor<B, 1>>,
+    mlp_out_norm: Option<Tensor<B, 1>>,
 }
 
-/// Llama-family causal LM.
+/// Llama-family causal LM, parameterized by the resolved [`ArchSpec`] —
+/// llama, smollm2, qwen2, and mistral today; the gemma/qwen3/phi presets
+/// migrate onto it stage by stage (roadmap wave 2).
 pub struct LlamaModel<B: Backend> {
     metadata: ModelMetadata,
+    spec: ArchSpec,
     /// `[vocab, hidden]`. Stays dense: embedding lookup needs `select`, and
     /// the tied-head case reuses it as a dense matmul weight.
     embed: Tensor<B, 2>,
@@ -55,7 +71,9 @@ pub struct LlamaModel<B: Backend> {
     final_norm: Tensor<B, 1>,
     layers: Vec<LlamaLayer<B>>,
     rotary: RotaryEmbedding<B>,
-    /// 1 / sqrt(head_dim)
+    /// Local-theta tables for sliding layers (gemma dual-RoPE).
+    rotary_local: Option<RotaryEmbedding<B>>,
+    /// `1/sqrt(query_pre_attn_scalar || head_dim)`.
     scale: f64,
 }
 
@@ -144,6 +162,26 @@ impl<B: Backend> LlamaModel<B> {
         }
     }
 
+    /// Norm in the spec's flavor (`x̂·w` vs gemma's `x̂·(1+w)`).
+    fn norm<const D: usize>(&self, x: Tensor<B, D>, w: &Tensor<B, 1>) -> Tensor<B, D> {
+        match self.spec.norm_flavor {
+            NormFlavor::RmsNorm => rms_norm(x, w.clone(), self.metadata.rms_norm_eps),
+            NormFlavor::GemmaRmsNorm => {
+                gemma_rms_norm(x, w.clone(), self.metadata.rms_norm_eps)
+            }
+        }
+    }
+
+    /// RoPE tables for a layer: sliding layers rotate with the local theta
+    /// when the spec defines one (gemma dual-RoPE), global layers with the
+    /// (possibly scaled) global tables.
+    fn rotary_for(&self, layer_idx: usize) -> &RotaryEmbedding<B> {
+        match (self.spec.layers.get(layer_idx), &self.rotary_local) {
+            (Some(LayerKind::Sliding(_)), Some(local)) => local,
+            _ => &self.rotary,
+        }
+    }
+
     /// Shared trunk for prefill and decode: embeddings in, final-normed
     /// hidden states out. `pos` is the absolute position of the first input
     /// token.
@@ -157,58 +195,85 @@ impl<B: Backend> LlamaModel<B> {
         let [_, seq, _] = x.dims();
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let window = match self.spec.layers.get(layer_idx) {
+                Some(LayerKind::Sliding(w)) => Some(*w),
+                _ => None,
+            };
+
             // --- attention block ------------------------------------------------
-            let h = rms_norm(x.clone(), layer.input_norm.clone(), m.rms_norm_eps);
+            let h = self.norm(x.clone(), &layer.input_norm);
             let q = layer.q.forward(h.clone(), layer.q_bias.as_ref());
             let k = layer.k.forward(h.clone(), layer.k_bias.as_ref());
             let v = layer.v.forward(h, layer.v_bias.as_ref());
 
-            let q = q
+            let mut q = q
                 .reshape([1, seq, m.num_attention_heads, m.head_dim])
                 .swap_dims(1, 2);
-            let k = k
+            let mut k = k
                 .reshape([1, seq, m.num_key_value_heads, m.head_dim])
                 .swap_dims(1, 2);
             let v = v
                 .reshape([1, seq, m.num_key_value_heads, m.head_dim])
                 .swap_dims(1, 2);
 
-            let q = self.rotary.apply(q, pos);
-            let k = self.rotary.apply(k, pos);
+            // Per-head QK-norm (gemma-3 / qwen-3), over head_dim.
+            if let Some(qn) = &layer.q_norm {
+                q = self.norm(q, qn);
+            }
+            if let Some(kn) = &layer.k_norm {
+                k = self.norm(k, kn);
+            }
 
-            // The cache owns K/V layout, GQA expansion and causal masking.
-            let ctx = cache.attention(layer_idx, q, k, v, pos, self.scale);
+            let rotary = self.rotary_for(layer_idx);
+            let q = rotary.apply(q, pos);
+            let k = rotary.apply(k, pos);
+
+            // The cache owns K/V layout, GQA expansion and masking
+            // (causal + optional sliding window).
+            let ctx = cache.attention_opts(layer_idx, q, k, v, pos, self.scale, window);
             let ctx = ctx
                 .swap_dims(1, 2)
                 .reshape([1, seq, m.num_attention_heads * m.head_dim]);
-            let attn_out = layer.o.forward(ctx, layer.o_bias.as_ref());
+            let mut attn_out = layer.o.forward(ctx, layer.o_bias.as_ref());
+            if let Some(n) = &layer.attn_out_norm {
+                attn_out = self.norm(attn_out, n);
+            }
             x = x + attn_out;
 
-            // --- MLP block (SwiGLU) ---------------------------------------------
-            let h = rms_norm(x.clone(), layer.post_norm.clone(), m.rms_norm_eps);
-            let gated = burn::tensor::activation::silu(layer.gate.forward(h.clone(), None))
+            // --- MLP block (gated) ----------------------------------------------
+            let h = self.norm(x.clone(), &layer.pre_mlp_norm);
+            let gated = crate::act::apply(self.spec.activation, layer.gate.forward(h.clone(), None))
                 * layer.up.forward(h.clone(), None);
-            let mlp_out = layer.down.forward(gated, None);
+            let mut mlp_out = layer.down.forward(gated, None);
+            if let Some(n) = &layer.mlp_out_norm {
+                mlp_out = self.norm(mlp_out, n);
+            }
             x = x + mlp_out;
         }
 
-        rms_norm(x, self.final_norm.clone(), m.rms_norm_eps)
+        self.norm(x, &self.final_norm)
     }
 
     /// Logits of the last sequence position: `[1, hidden] -> [1, vocab]`.
     pub(crate) fn last_logits(&self, hidden: Tensor<B, 3>) -> Tensor<B, 2> {
         let [_, seq, hidden_size] = hidden.dims();
         let last = hidden.narrow(1, seq - 1, 1); // [1, 1, hidden]
-        let logits = match &self.lm_head {
-            Some(head) => head.forward(last, None),
+        let logits: Tensor<B, 2> = match &self.lm_head {
+            Some(head) => {
+                let logits = head.forward(last, None);
+                let [_, _, vocab] = logits.dims();
+                logits.reshape([1, vocab])
+            }
             None => {
                 // Tied head: dense matmul against the embedding table.
                 let last = last.reshape([1, hidden_size]);
-                return safe_matmul(last, self.embed.clone().transpose());
+                safe_matmul(last, self.embed.clone().transpose())
             }
         };
-        let [_, _, vocab] = logits.dims();
-        logits.reshape([1, vocab])
+        match self.spec.final_logit_softcap {
+            Some(cap) => logits.div_scalar(cap as f32).tanh().mul_scalar(cap as f32),
+            None => logits,
+        }
     }
 }
 
@@ -226,9 +291,12 @@ impl<B: Backend> GenerativeModel<B> for LlamaModel<B> {
             CacheKind::Contiguous => {
                 Box::new(ContiguousKVCache::<B>::new(self.metadata.num_hidden_layers))
             }
-            CacheKind::Paged => Box::new(PagedKVCache::<B>::new(
+            // Sliding layers (per the resolved layout) keep a rolling tensor
+            // instead of a paged arena; all-global specs pass all-None.
+            CacheKind::Paged => Box::new(PagedKVCache::<B>::new_with_windows(
                 self.metadata.num_hidden_layers,
                 *config,
+                self.spec.windows(),
             )),
         }
     }
@@ -236,10 +304,20 @@ impl<B: Backend> GenerativeModel<B> for LlamaModel<B> {
     fn embed(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
         let [batch, seq] = tokens.dims();
         let flat = tokens.reshape([batch * seq]);
-        self.embed
+        let embedded = self
+            .embed
             .clone()
             .select(0, flat)
-            .reshape([batch, seq, self.metadata.hidden_size])
+            .reshape([batch, seq, self.metadata.hidden_size]);
+        if self.spec.embed_scale_sqrt_hidden {
+            // Gemma scales embeddings by sqrt(hidden); computed in f32 —
+            // the half-precision product was the f16 garbage-output bug.
+            let out_dtype = embedded.dtype();
+            let scale = (self.metadata.hidden_size as f64).sqrt();
+            to_float(to_f32(embedded).mul_scalar(scale), out_dtype)
+        } else {
+            embedded
+        }
     }
 
     fn prefill(
@@ -275,6 +353,7 @@ impl<B: Backend> LlamaModel<B> {
         prefix: &str,
     ) -> Result<Self> {
         let m = source.metadata().clone();
+        let spec = ArchSpec::resolve(&m);
 
         let embed: Tensor<B, 2> =
             load_weight(source, device, &format!("{prefix}.embed_tokens.weight"))?;
@@ -294,6 +373,14 @@ impl<B: Backend> LlamaModel<B> {
 
         let final_norm: Tensor<B, 1> =
             load_weight(source, device, &format!("{prefix}.norm.weight"))?;
+
+        // Sandwich-norm architectures (gemma) rename the pre-MLP norm and
+        // add output norms around both residual adds.
+        let pre_mlp_name = if spec.sandwich_norms {
+            "pre_feedforward_layernorm"
+        } else {
+            "post_attention_layernorm"
+        };
 
         let mut layers = Vec::with_capacity(m.num_hidden_layers);
         for i in 0..m.num_hidden_layers {
@@ -321,6 +408,16 @@ impl<B: Backend> LlamaModel<B> {
                 load_optional_bias(source, device, &format!("{p}.{proj}.bias"))
             };
 
+            let optional_norm = |name: &str| -> Result<Option<Tensor<B, 1>>> {
+                match source.open_tensor(&format!("{p}.{name}.weight")) {
+                    Ok(reader) => Ok(Some(
+                        reader.load_to_tensor::<B, 1>(device).map_err(ModelError::Format)?,
+                    )),
+                    Err(combs_formats::FormatError::TensorNotFound(_)) => Ok(None),
+                    Err(e) => Err(ModelError::Format(e)),
+                }
+            };
+
             layers.push(LlamaLayer {
                 q,
                 k,
@@ -330,29 +427,56 @@ impl<B: Backend> LlamaModel<B> {
                 k_bias: bias("self_attn.k_proj")?,
                 v_bias: bias("self_attn.v_proj")?,
                 o_bias: bias("self_attn.o_proj")?,
+                q_norm: if spec.qk_norm { optional_norm("self_attn.q_norm")? } else { None },
+                k_norm: if spec.qk_norm { optional_norm("self_attn.k_norm")? } else { None },
                 gate: load_linear(source, device, &format!("{p}.mlp.gate_proj.weight"))?,
                 up: load_linear(source, device, &format!("{p}.mlp.up_proj.weight"))?,
                 down: load_linear(source, device, &format!("{p}.mlp.down_proj.weight"))?,
                 input_norm: load_weight(source, device, &format!("{p}.input_layernorm.weight"))?,
-                post_norm: load_weight(
+                pre_mlp_norm: load_weight(
                     source,
                     device,
-                    &format!("{p}.post_attention_layernorm.weight"),
+                    &format!("{p}.{pre_mlp_name}.weight"),
                 )?,
+                attn_out_norm: if spec.sandwich_norms {
+                    optional_norm("post_attention_layernorm")?
+                } else {
+                    None
+                },
+                mlp_out_norm: if spec.sandwich_norms {
+                    optional_norm("post_feedforward_layernorm")?
+                } else {
+                    None
+                },
             });
         }
 
-        let rotary =
-            RotaryEmbedding::new(m.head_dim, m.rope_theta, m.max_position_embeddings, device);
+        let rotary = RotaryEmbedding::new_scaled(
+            m.head_dim,
+            spec.rope_theta,
+            m.max_position_embeddings,
+            &spec.rope_scaling,
+            device,
+        );
+        let rotary_local = spec.rope_local_theta.map(|theta| {
+            // Local (sliding) layers rotate unscaled at their own base.
+            RotaryEmbedding::new(m.head_dim, theta, m.max_position_embeddings, device)
+        });
 
         Ok(LlamaModel {
-            scale: 1.0 / (m.head_dim as f64).sqrt(),
+            scale: 1.0
+                / spec
+                    .query_pre_attn_scalar
+                    .unwrap_or(m.head_dim as f64)
+                    .sqrt(),
             metadata: m,
+            spec,
             embed,
             lm_head,
             final_norm,
             layers,
             rotary,
+            rotary_local,
         })
     }
 }

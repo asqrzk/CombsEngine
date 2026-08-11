@@ -5,6 +5,7 @@
 //! create_kv_cache` function set); architectures register themselves in the
 //! [`ModelRegistry`]. Phase 1 ships the Llama family (incl. SmolLM2).
 
+mod act;
 mod archspec;
 mod kv;
 mod gemma;
