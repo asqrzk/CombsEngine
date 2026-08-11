@@ -61,4 +61,26 @@ pub trait GenerativeModel<B: Backend>: Send {
     /// Runs one decode step (single new position at the end of the cache).
     /// Returns the logits of that position, shape `[batch, vocab]`.
     fn decode(&mut self, input: Tensor<B, 3>, cache: &mut dyn KVCache<B>) -> Tensor<B, 2>;
+
+    /// Runs (a chunk of) the prompt and returns the final-norm hidden
+    /// states for those positions, shape `[1, seq, hidden]` — the
+    /// embeddings path. Same cache/position contract as
+    /// [`GenerativeModel::prefill`]. Models that cannot expose hidden
+    /// states keep the default error.
+    fn prefill_hidden(
+        &mut self,
+        _input: Tensor<B, 3>,
+        _cache: &mut dyn KVCache<B>,
+        _pos: Range<u32>,
+    ) -> Result<Tensor<B, 3>> {
+        Err(crate::ModelError::Unsupported(
+            "this model does not expose hidden states for embeddings".to_string(),
+        ))
+    }
+
+    /// Whether [`GenerativeModel::prefill_hidden`] is implemented — the
+    /// capability flag `/v1/model/info` advertises as `embeddings`.
+    fn supports_hidden_states(&self) -> bool {
+        false
+    }
 }

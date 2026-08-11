@@ -52,6 +52,11 @@ pub enum ModelError {
     #[error("unsupported media input: {0}")]
     UnsupportedMedia(String),
 
+    /// The model does not implement an optional capability (e.g. hidden
+    /// states for embeddings).
+    #[error("unsupported operation: {0}")]
+    Unsupported(String),
+
     /// A required weight tensor is missing from the source.
     #[error("missing weight tensor: {0}")]
     MissingTensor(String),

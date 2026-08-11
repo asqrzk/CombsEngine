@@ -339,7 +339,19 @@ impl<B: Backend> GenerativeModel<B> for LlamaModel<B> {
     }
 
     fn load(source: &dyn ModelSource, device: &Device<B>) -> Result<Self> {
-        Self::load_with_prefix(source, device, "model")
+        // HF exports either the causal-LM wrapper (model.embed_tokens…) or
+        // the bare base model (embed_tokens…, the sentence-transformers /
+        // embedding-checkpoint layout); detect from the tensor names.
+        let prefix = if source
+            .tensor_names()
+            .iter()
+            .any(|n| n == "model.embed_tokens.weight" || n == "model.embed_tokens")
+        {
+            "model"
+        } else {
+            ""
+        };
+        Self::load_with_prefix(source, device, prefix)
     }
 
     fn create_kv_cache(&self, config: &CacheConfig) -> Box<dyn KVCache<B>> {
@@ -392,6 +404,25 @@ impl<B: Backend> GenerativeModel<B> for LlamaModel<B> {
         self.last_logits(hidden)
     }
 
+    fn prefill_hidden(
+        &mut self,
+        input: Tensor<B, 3>,
+        cache: &mut dyn KVCache<B>,
+        pos: Range<u32>,
+    ) -> Result<Tensor<B, 3>> {
+        let [_, seq, _] = input.dims();
+        assert_eq!(
+            seq,
+            (pos.end - pos.start) as usize,
+            "prefill pos range must match the input sequence length"
+        );
+        Ok(self.forward_hidden(input, cache, pos.start as usize))
+    }
+
+    fn supports_hidden_states(&self) -> bool {
+        true
+    }
+
     fn decode(&mut self, input: Tensor<B, 3>, cache: &mut dyn KVCache<B>) -> Tensor<B, 2> {
         let pos = cache.seq_len();
         let hidden = self.forward_hidden(input, cache, pos);
@@ -401,8 +432,8 @@ impl<B: Backend> GenerativeModel<B> for LlamaModel<B> {
 
 impl<B: Backend> LlamaModel<B> {
     /// Loads the text stack with weight names under `prefix` (e.g. `"model"`
-    /// for plain Llama, `"model.text_model"` for Idefics3/SmolVLM).
-    /// `lm_head.weight` always stays top-level.
+    /// for plain Llama, `"model.text_model"` for Idefics3/SmolVLM, `""` for
+    /// bare base-model exports). `lm_head.weight` always stays top-level.
     pub(crate) fn load_with_prefix(
         source: &dyn ModelSource,
         device: &Device<B>,
@@ -410,9 +441,16 @@ impl<B: Backend> LlamaModel<B> {
     ) -> Result<Self> {
         let m = source.metadata().clone();
         let spec = ArchSpec::resolve(&m);
+        // Dotted prefix, or nothing for bare exports.
+        let prefix = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{prefix}.")
+        };
+        let prefix = prefix.as_str();
 
         let embed: Tensor<B, 2> =
-            load_weight(source, device, &format!("{prefix}.embed_tokens.weight"))?;
+            load_weight(source, device, &format!("{prefix}embed_tokens.weight"))?;
         Self::expect_shape(
             "embed_tokens.weight",
             &embed.dims(),
@@ -446,7 +484,7 @@ impl<B: Backend> LlamaModel<B> {
         };
 
         let final_norm: Tensor<B, 1> =
-            load_weight(source, device, &format!("{prefix}.norm.weight"))?;
+            load_weight(source, device, &format!("{prefix}norm.weight"))?;
 
         // Sandwich-norm architectures (gemma) rename the pre-MLP norm and
         // add output norms around both residual adds.
@@ -460,7 +498,7 @@ impl<B: Backend> LlamaModel<B> {
         let kv_rows = m.num_key_value_heads * m.head_dim;
         let mut layers = Vec::with_capacity(m.num_hidden_layers);
         for i in 0..m.num_hidden_layers {
-            let p = format!("{prefix}.layers.{i}");
+            let p = format!("{prefix}layers.{i}");
             // Phi-family checkpoints fuse the attention input projections
             // (`qkv_proj` = [q|k|v] rows); probe the split names first.
             let (q, k, v, fused_qkv_bias) =

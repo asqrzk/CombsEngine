@@ -391,6 +391,19 @@ impl<B: Backend> GenerativeModel<B> for SmolVlmModel<B> {
         let hidden = self.text.forward_hidden(input, cache, pos);
         self.text.last_logits(hidden)
     }
+
+    fn prefill_hidden(
+        &mut self,
+        input: Tensor<B, 3>,
+        cache: &mut dyn KVCache<B>,
+        pos: Range<u32>,
+    ) -> Result<Tensor<B, 3>> {
+        self.text.prefill_hidden(input, cache, pos)
+    }
+
+    fn supports_hidden_states(&self) -> bool {
+        true
+    }
 }
 
 /// Builds the Idefics3 prompt expansion for one image:

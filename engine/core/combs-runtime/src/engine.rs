@@ -74,6 +74,36 @@ impl Default for GenerationConfig {
     }
 }
 
+/// Pooling strategy for the embeddings path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pooling {
+    /// Hidden state of the last position (decoder-model convention,
+    /// e.g. qwen3-embedding).
+    Last,
+    /// Mean over all positions.
+    Mean,
+}
+
+/// Options for one [`Engine::embed_texts`] call — plain per-request data.
+#[derive(Debug, Clone, Default)]
+pub struct EmbedOptions {
+    /// Pooling override; `None` uses the pooling detected from the
+    /// checkpoint (`1_Pooling/config.json`, else last-token).
+    pub pooling: Option<Pooling>,
+    /// Keep only the first N dimensions, then re-normalize (matryoshka
+    /// truncation). `None` returns the full hidden size.
+    pub dimensions: Option<usize>,
+}
+
+/// Result of one embeddings call.
+#[derive(Debug, Clone)]
+pub struct EmbedOutput {
+    /// One L2-normalized vector per input text, in order.
+    pub vectors: Vec<Vec<f32>>,
+    /// Total input tokens across all texts.
+    pub prompt_tokens: usize,
+}
+
 /// Telemetry for one generation call.
 #[derive(Debug, Clone)]
 pub struct GenerationStats {
@@ -155,6 +185,11 @@ struct GenerateRequest {
 /// Instruction for the engine worker thread.
 enum Command {
     Generate(Box<GenerateRequest>),
+    Embed {
+        texts: Vec<String>,
+        opts: EmbedOptions,
+        reply: mpsc::Sender<Result<EmbedOutput>>,
+    },
     Shutdown,
 }
 
@@ -318,6 +353,11 @@ pub struct Engine {
     tx: mpsc::Sender<Command>,
     worker: Mutex<Option<JoinHandle<()>>>,
     stats: Arc<Mutex<EngineStatsSnapshot>>,
+    /// Whether the model implements `prefill_hidden` (captured before the
+    /// model moves to the worker) — the `embeddings` capability.
+    supports_embeddings: bool,
+    /// Pooling convention detected from the checkpoint artifacts.
+    default_pooling: Pooling,
     #[allow(dead_code)] // facade used by later phases for arena management
     pool: BufferPool,
 }
@@ -367,8 +407,10 @@ impl Engine {
         }
         let registry = ModelRegistry::<CombsBackend>::new();
         let model = registry.load(source, &device)?;
+        let supports_embeddings = model.supports_hidden_states();
 
         let spec = source.tokenizer()?;
+        let default_pooling = detect_pooling(&spec.tokenizer_json);
         let tokenizer = Tokenizer::from_file(&spec.tokenizer_json)
             .map_err(|e| EngineError::Tokenizer(e.to_string()))?;
 
@@ -451,6 +493,8 @@ impl Engine {
             tx,
             worker: Mutex::new(Some(worker)),
             stats,
+            supports_embeddings,
+            default_pooling,
             pool: BufferPool::new(),
         })
     }
@@ -474,6 +518,41 @@ impl Engine {
     /// The KV cache configuration new sessions are created with.
     pub fn cache_config(&self) -> CacheConfig {
         self.cache_config
+    }
+
+    /// Whether the model exposes hidden states for `/v1/embeddings`.
+    pub fn supports_embeddings(&self) -> bool {
+        self.supports_embeddings
+    }
+
+    /// Pooling convention detected from the checkpoint
+    /// (`1_Pooling/config.json`, else last-token).
+    pub fn default_pooling(&self) -> Pooling {
+        self.default_pooling
+    }
+
+    /// Embeds `texts` into L2-normalized vectors on the worker thread.
+    /// Request-level pooling/dimensions come from `opts`; an unset pooling
+    /// uses the checkpoint's detected default.
+    pub fn embed_texts(&self, texts: &[String], opts: &EmbedOptions) -> Result<EmbedOutput> {
+        if !self.supports_embeddings {
+            return Err(EngineError::Model(combs_models::ModelError::Unsupported(
+                "this model does not expose hidden states for embeddings".to_string(),
+            )));
+        }
+        let mut opts = opts.clone();
+        opts.pooling = Some(opts.pooling.unwrap_or(self.default_pooling));
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(Command::Embed {
+                texts: texts.to_vec(),
+                opts,
+                reply: reply_tx,
+            })
+            .map_err(|_| EngineError::WorkerGone("worker thread terminated".to_string()))?;
+        reply_rx
+            .recv()
+            .map_err(|_| EngineError::WorkerGone("worker dropped the reply".to_string()))?
     }
 
     /// The `<|im_end|>` token id, if the tokenizer defines one (chat models).
@@ -709,8 +788,151 @@ fn worker_loop(
                 // sees all pieces followed by the result.
                 let _ = req.reply.send(result);
             }
+            Command::Embed { texts, opts, reply } => {
+                let result = run_embed(
+                    model.as_mut(),
+                    &tokenizer,
+                    &device,
+                    &cache_config,
+                    max_position_embeddings,
+                    &texts,
+                    &opts,
+                );
+                let _ = reply.send(result);
+            }
         }
     }
+}
+
+/// Prompt tokens per `prefill_hidden` call on the embeddings path — the
+/// same attention-memory bound chunked generation prefill uses.
+const EMBED_CHUNK: usize = 512;
+
+/// Executes one embeddings request on the worker thread.
+///
+/// Each text runs on a fresh contiguous cache (dropped afterwards — no
+/// session interaction) through the model's hidden-state path, chunked
+/// like generation prefill. Pooling accumulates across chunks: last-token
+/// keeps the final chunk's last position, mean keeps a running sum (the
+/// final L2 normalization makes the 1/n scale irrelevant). Tokenization
+/// is the tokenizer's own (post-processor included): embedding
+/// checkpoints bake their bos/eos convention into `tokenizer.json`, so
+/// no engine-side BOS logic applies.
+fn run_embed(
+    model: &mut dyn GenerativeModel<CombsBackend>,
+    tokenizer: &Tokenizer,
+    device: &CombsDevice,
+    cache_config: &CacheConfig,
+    max_position_embeddings: usize,
+    texts: &[String],
+    opts: &EmbedOptions,
+) -> Result<EmbedOutput> {
+    let pooling = opts.pooling.unwrap_or(Pooling::Last);
+    let mut vectors = Vec::with_capacity(texts.len());
+    let mut prompt_tokens = 0usize;
+
+    let embed_cache_config = CacheConfig {
+        kind: CacheKind::Contiguous,
+        ..*cache_config
+    };
+
+    for text in texts {
+        let ids: Vec<u32> = tokenizer
+            .encode(text.as_str(), true)
+            .map_err(|e| EngineError::Tokenizer(e.to_string()))?
+            .get_ids()
+            .to_vec();
+        if ids.is_empty() {
+            return Err(EngineError::Tokenizer("empty embedding input".to_string()));
+        }
+        check_context_len(
+            ids.len(),
+            0,
+            cache_config.max_seq_len.min(max_position_embeddings),
+        )?;
+        prompt_tokens += ids.len();
+
+        let data: Vec<i32> = ids.iter().map(|&t| t as i32).collect();
+        let tokens = Tensor::from_data(TensorData::new(data, [1, ids.len()]), device);
+        let embedded = model.embed(tokens);
+
+        let mut cache = model.create_kv_cache(&embed_cache_config);
+        let mut last_hidden: Option<Tensor<CombsBackend, 3>> = None;
+        let mut sum_hidden: Option<Tensor<CombsBackend, 3>> = None;
+        let mut offset = 0usize;
+        while offset < ids.len() {
+            let len = EMBED_CHUNK.min(ids.len() - offset);
+            let input = embedded.clone().narrow(1, offset, len);
+            let start = offset as u32;
+            let hidden = model.prefill_hidden(input, cache.as_mut(), start..start + len as u32)?;
+            match pooling {
+                Pooling::Last => last_hidden = Some(hidden.narrow(1, len - 1, 1)),
+                Pooling::Mean => {
+                    let chunk_sum = hidden.sum_dim(1);
+                    sum_hidden = Some(match sum_hidden.take() {
+                        Some(acc) => acc + chunk_sum,
+                        None => chunk_sum,
+                    });
+                }
+            }
+            offset += len;
+        }
+
+        let pooled = match pooling {
+            Pooling::Last => last_hidden.expect("nonempty text ran at least one chunk"),
+            Pooling::Mean => sum_hidden.expect("nonempty text ran at least one chunk"),
+        };
+        let mut v = pooled
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .map_err(|e| EngineError::Readback(format!("hidden state must be f32: {e:?}")))?;
+        if let Some(n) = opts.dimensions {
+            if n == 0 || n > v.len() {
+                return Err(EngineError::Model(combs_models::ModelError::Unsupported(
+                    format!("dimensions must be 1..={}, got {n}", v.len()),
+                )));
+            }
+            v.truncate(n);
+        }
+        l2_normalize(&mut v);
+        vectors.push(v);
+    }
+
+    Ok(EmbedOutput {
+        vectors,
+        prompt_tokens,
+    })
+}
+
+/// In-place L2 normalization (no-op on a zero vector).
+fn l2_normalize(v: &mut [f32]) {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in v {
+            *x /= norm;
+        }
+    }
+}
+
+/// Detects the checkpoint's pooling convention: sentence-transformers
+/// layouts ship `1_Pooling/config.json` next to the weights; absent (or
+/// unrecognized), decoder embedding models pool the last token.
+fn detect_pooling(tokenizer_json: &std::path::Path) -> Pooling {
+    let path = match tokenizer_json.parent() {
+        Some(dir) => dir.join("1_Pooling").join("config.json"),
+        None => return Pooling::Last,
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Pooling::Last;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Pooling::Last;
+    };
+    if v.get("pooling_mode_mean_tokens").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Pooling::Mean;
+    }
+    Pooling::Last
 }
 
 /// Refreshes the shared snapshot after a generation. Runs on the worker so
