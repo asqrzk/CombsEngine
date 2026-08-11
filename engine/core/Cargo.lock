@@ -1209,9 +1209,7 @@ name = "combs-diffusion"
 version = "0.2.0"
 dependencies = [
  "burn",
- "combs-core",
  "combs-formats",
- "combs-models",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",
