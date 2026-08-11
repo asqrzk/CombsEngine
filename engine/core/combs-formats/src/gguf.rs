@@ -925,7 +925,7 @@ pub fn dequantize_q4_k(data: &[u8], n: usize) -> Result<Vec<f32>> {
 
 /// Dequantizes a Q5_K tensor to f32. Like Q4_K plus 32 high-bit bytes:
 /// group j reads bit 2j (low sub-block) / 2j+1 (high sub-block) of qh.
-fn dequantize_q5_k(data: &[u8], n: usize) -> Result<Vec<f32>> {
+pub fn dequantize_q5_k(data: &[u8], n: usize) -> Result<Vec<f32>> {
     let mut out = Vec::with_capacity(n);
     for sb in data.chunks_exact(176) {
         let d = half::f16::from_le_bytes([sb[0], sb[1]]).to_f32();
@@ -1238,8 +1238,7 @@ impl ModelSource for GgufSource {
             GGML_Q5_0 => crate::QuantFormat::Q5_0,
             GGML_Q8_0 => crate::QuantFormat::Q8_0,
             GGML_Q4_K => crate::QuantFormat::Q4K,
-            // No Q5_K kernel yet: fused phi qkv slices in Q5_K files take
-            // the dense path (dequantized on load) instead.
+            GGML_Q5_K => crate::QuantFormat::Q5K,
             GGML_Q6_K => crate::QuantFormat::Q6K,
             _ => return Ok(None),
         };

@@ -276,6 +276,7 @@ fn weights_report(source: &dyn combs_formats::ModelSource) -> serde_json::Value 
                     combs_formats::QuantFormat::Q5_0 => "q5_0",
                     combs_formats::QuantFormat::Q8_0 => "q8_0",
                     combs_formats::QuantFormat::Q4K => "q4_k",
+                    combs_formats::QuantFormat::Q5K => "q5_k",
                     combs_formats::QuantFormat::Q6K => "q6_k",
                 };
                 let e = by_format.entry(key).or_default();

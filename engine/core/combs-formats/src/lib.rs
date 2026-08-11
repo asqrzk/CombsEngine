@@ -26,7 +26,8 @@ pub use gguf::GgufSource;
 /// every kernel is tested against a portable reference).
 pub mod quants {
     pub use crate::gguf::{
-        dequantize_q4_0, dequantize_q4_k, dequantize_q5_0, dequantize_q6_k, dequantize_q8_0,
+        dequantize_q4_0, dequantize_q4_k, dequantize_q5_0, dequantize_q5_k, dequantize_q6_k,
+        dequantize_q8_0,
     };
 }
 pub use metadata::{Activation, AttentionPattern, ModelMetadata, RopeScaling, VisionConfig};

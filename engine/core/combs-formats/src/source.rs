@@ -48,6 +48,8 @@ pub enum QuantFormat {
     Q8_0,
     /// 256-value superblocks, 6-bit sub-scales + 4-bit quants (144 B).
     Q4K,
+    /// 256-value superblocks, 6-bit sub-scales + 5-bit quants (176 B).
+    Q5K,
     /// 256-value superblocks, i8 sub-scales + 6-bit quants (210 B).
     Q6K,
 }
