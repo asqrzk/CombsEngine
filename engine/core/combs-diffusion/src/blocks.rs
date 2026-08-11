@@ -39,7 +39,7 @@ impl<B: Backend> ResnetBlock2D<B> {
             .with_epsilon(eps)
             .init(device);
         let conv1 = Conv2dConfig::new([in_channels, out_channels], [3, 3])
-            .with_padding(burn::nn::PaddingConfig2d::Same)
+            .with_padding(burn::nn::PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
         let time_emb_proj = time_emb_dim.map(|d| {
             LinearConfig::new(d, out_channels)
@@ -49,7 +49,7 @@ impl<B: Backend> ResnetBlock2D<B> {
             .with_epsilon(eps)
             .init(device);
         let conv2 = Conv2dConfig::new([out_channels, out_channels], [3, 3])
-            .with_padding(burn::nn::PaddingConfig2d::Same)
+            .with_padding(burn::nn::PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
         let conv_shortcut = if in_channels != out_channels {
             Some(Conv2dConfig::new([in_channels, out_channels], [1, 1]).init(device))
@@ -462,7 +462,7 @@ impl<B: Backend> Downsample2D<B> {
     pub fn new(channels: usize, device: &burn::tensor::Device<B>) -> Self {
         let conv = Conv2dConfig::new([channels, channels], [3, 3])
             .with_stride([2, 2])
-            .with_padding(burn::nn::PaddingConfig2d::Same)
+            .with_padding(burn::nn::PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
         Self { conv }
     }
@@ -490,7 +490,7 @@ pub struct Upsample2D<B: Backend> {
 impl<B: Backend> Upsample2D<B> {
     pub fn new(channels: usize, device: &burn::tensor::Device<B>) -> Self {
         let conv = Conv2dConfig::new([channels, channels], [3, 3])
-            .with_padding(burn::nn::PaddingConfig2d::Same)
+            .with_padding(burn::nn::PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
         Self { conv }
     }

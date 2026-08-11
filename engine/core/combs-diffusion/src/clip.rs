@@ -29,8 +29,13 @@ fn quick_gelu<B: Backend>(x: Tensor<B, 3>) -> Tensor<B, 3> {
 /// Causal mask for CLIP self-attention: lower-triangular attend, upper-triangular
 /// blocked with a large negative value.
 fn causal_mask<B: Backend>(seq_len: usize, device: &B::Device) -> Tensor<B, 4> {
+    // burn's triangle masks are complements: `tril_mask(offset 0)` is FALSE
+    // on the lower triangle + diagonal and TRUE strictly above it — exactly
+    // the future positions to block. (`triu_mask(1)` is the inverse and
+    // silently produced an ANTI-causal mask — every token attended only to
+    // its future; caught by the torch parity harness.)
     let mask: Tensor<B, 2, Bool> =
-        Tensor::triu_mask([seq_len, seq_len], 1, device);
+        Tensor::tril_mask([seq_len, seq_len], 0, device);
     Tensor::<B, 4>::zeros([1, 1, seq_len, seq_len], device)
         .mask_fill(mask.reshape([1, 1, seq_len, seq_len]), -1e9f32)
 }
@@ -398,5 +403,19 @@ mod tests {
         let device = Default::default();
         let mask = causal_mask::<B>(3, &device);
         assert_eq!(mask.dims(), [1, 1, 3, 3]);
+        // VALUES, not just shape (the original dims-only assertion let an
+        // anti-causal mask ship): row i must be 0 for j <= i and blocked
+        // for j > i.
+        let v = mask.into_data().to_vec::<f32>().unwrap();
+        for i in 0..3 {
+            for j in 0..3 {
+                let x = v[i * 3 + j];
+                if j <= i {
+                    assert_eq!(x, 0.0, "past ({i},{j}) must be visible");
+                } else {
+                    assert!(x <= -1e8, "future ({i},{j}) must be blocked, got {x}");
+                }
+            }
+        }
     }
 }

@@ -748,3 +748,43 @@ byte-identity), C (qwen3+phi3, fused split, sliding E2E, EOG, LongRope),
 D (gemma migrated, gemma.rs deleted), E (arch-aware GGUF map) — ALL
 LANDED. One decoder, five architectures, two formats, quant + dense,
 per-layer attention layouts, scaled RoPE — the universal decoder holds.
+
+## 2026-08-11 — Diffusion component parity vs torch: two root causes found and fixed
+
+The queued parity harness landed: `tools/goldens/gen_diffusion_reference.py`
+dumps deterministic-input reference activations from the LOCAL SD-1.5 via
+diffusers/transformers (torch-cpu f32) — time embedding, CLIP (with
+per-layer and attention-internal taps via forward hooks), UNet (per-block
+taps), VAE decode — and `combs-diffusion/tests/parity.rs` (env-gated on
+`COMBS_DIFFUSION_PARITY_DIR`) replays the same dumped inputs through our
+components on NdArray, comparing stage by stage. The UNet gained
+`forward_traced` (the plain forward delegates to it) so per-block taps
+can't drift. The first failing stage names the bug; two were found, both
+burn-API-semantics traps in the `repeat_dim` family:
+
+1. **CLIP ran anti-causal.** burn's triangle masks are complements:
+   `triu_mask(offset 1)` returns TRUE at-and-below the diagonal (the doc
+   example makes it explicit), so `mask_fill` blocked the PAST and kept
+   the FUTURE — every text token attended only to later tokens, in all 12
+   layers. The old unit test asserted only the mask's SHAPE, which is how
+   it shipped. Fixed with `tril_mask(0)` (TRUE strictly above the
+   diagonal); the unit test now asserts values. Bisect evidence:
+   embeddings bit-exact, q/k/v exact, manual narrow-per-head attention
+   matched torch only under the corrected mask (reference ctx[0] == v[0]
+   proved torch causal). After: attention 2.7e-6, last hidden 1.7e-5.
+
+2. **Downsample convs shifted the scene half a pixel per level.**
+   `load_conv2d` hardcoded `PaddingConfig2d::Same`; for the stride-2 3×3
+   downsample convs burn-Same places the single required pad bottom/right
+   (TF convention) while torch/diffusers pad (1,1) symmetrically — same
+   output size, spatially shifted content, compounding across the three
+   down levels. All convs now carry explicit k/2 padding (identical math
+   for stride 1, corrected for stride 2). Isolation evidence: conv_in,
+   down0's resnet0 and spatial transformer all exact on reference inputs,
+   while the down0 block tap (which includes its downsampler) diverged at
+   7.15.
+
+Full suite after both fixes — every stage within bounds: time 5e-5/1e-6,
+CLIP exact→1.7e-5, UNet per-block ≤2e-4 with **noise_pred 2.1e-6** (was
+0.247), VAE decode 2.9e-5 (first-ever VAE verification). The unused
+combs-models/combs-core deps are dropped from combs-diffusion.

@@ -77,7 +77,7 @@ impl<B: Backend> UNet2DConditionModel<B> {
         let n_blocks = block_out_channels.len();
 
         let conv_in = Conv2dConfig::new([4, block_out_channels[0]], [3, 3])
-            .with_padding(burn::nn::PaddingConfig2d::Same)
+            .with_padding(burn::nn::PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
         let time_emb = TimeEmbedding::new(block_out_channels[0], TIME_EMBED_DIM, device);
 
@@ -179,7 +179,7 @@ impl<B: Backend> UNet2DConditionModel<B> {
             .with_epsilon(NORM_EPS)
             .init(device);
         let conv_out = Conv2dConfig::new([block_out_channels[0], 4], [3, 3])
-            .with_padding(burn::nn::PaddingConfig2d::Same)
+            .with_padding(burn::nn::PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
 
         Self {
@@ -354,6 +354,20 @@ impl<B: Backend> UNet2DConditionModel<B> {
         timestep: f32,
         context: Tensor<B, 3>,
     ) -> Tensor<B, 4> {
+        self.forward_traced(latent, timestep, context).0
+    }
+
+    /// Forward with per-stage taps for the torch parity harness. The plain
+    /// [`Self::forward`] delegates here, so the traced path can never drift
+    /// from the real one. Taps are cheap clones of Arc-backed tensors.
+    #[doc(hidden)]
+    pub fn forward_traced(
+        &self,
+        latent: Tensor<B, 4>,
+        timestep: f32,
+        context: Tensor<B, 3>,
+    ) -> (Tensor<B, 4>, Vec<(String, Tensor<B, 4>)>) {
+        let mut taps: Vec<(String, Tensor<B, 4>)> = Vec::new();
         let [b, _c, _h, _w] = latent.dims();
         // One timestep entry per batch row: the resnet time projection is
         // reshaped to [batch, C, 1, 1], so CFG's batched [uncond; cond]
@@ -366,15 +380,17 @@ impl<B: Backend> UNet2DConditionModel<B> {
         let t_emb = self.time_emb.forward(t_emb);
 
         let mut h = self.conv_in.forward(latent);
+        taps.push(("conv_in".into(), h.clone()));
         let mut skip_connections: Vec<Tensor<B, 4>> = vec![h.clone()];
 
         // Down.
-        for down in &self.down_blocks {
+        for (i, down) in self.down_blocks.iter().enumerate() {
             let (h_out, mut states) = match down {
                 DownBlock::Basic(db) => db.forward(h, &t_emb),
                 DownBlock::CrossAttn(cb) => cb.forward(h, &t_emb, &context),
             };
             h = h_out;
+            taps.push((format!("down{i}"), h.clone()));
             skip_connections.append(&mut states);
         }
 
@@ -382,9 +398,10 @@ impl<B: Backend> UNet2DConditionModel<B> {
         h = self.mid_block.resnet_1.forward(h, Some(&t_emb));
         h = self.mid_block.attention.forward(h, &context);
         h = self.mid_block.resnet_2.forward(h, Some(&t_emb));
+        taps.push(("mid".into(), h.clone()));
 
         // Up.
-        for up in &self.up_blocks {
+        for (i, up) in self.up_blocks.iter().enumerate() {
             let n_resnets = match up {
                 UpBlock::Basic(ub) => ub.resnets.len(),
                 UpBlock::CrossAttn(cub) => cub.resnets.len(),
@@ -397,10 +414,11 @@ impl<B: Backend> UNet2DConditionModel<B> {
                 UpBlock::Basic(ub) => ub.forward(h, &res_xs, &t_emb),
                 UpBlock::CrossAttn(cub) => cub.forward(h, &res_xs, &t_emb, &context),
             };
+            taps.push((format!("up{i}"), h.clone()));
         }
 
         let h = silu(self.conv_norm_out.forward(h));
-        self.conv_out.forward(h)
+        (self.conv_out.forward(h), taps)
     }
 }
 

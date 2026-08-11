@@ -92,7 +92,17 @@ pub(crate) fn load_conv2d<B: Backend>(
         kernel_size,
         dilation: [1, 1],
         groups: 1,
-        padding: burn::nn::PaddingConfig2d::Same,
+        // Explicit symmetric k/2 padding, matching diffusers' `padding=1`
+        // 3×3 convs (and 0 for 1×1). NOT `Same`: for the stride-2
+        // downsample convs burn's Same places the single required pad
+        // bottom/right (TF convention) where torch pads (1,1) — same
+        // output size, half-pixel spatial shift at every down level.
+        padding: burn::nn::PaddingConfig2d::Explicit(
+            kernel_size[0] / 2,
+            kernel_size[1] / 2,
+            kernel_size[0] / 2,
+            kernel_size[1] / 2,
+        ),
     })
 }
 

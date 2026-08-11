@@ -180,7 +180,7 @@ impl<B: Backend> VAEDecoder<B> {
     /// Build a randomly initialized SD 1.5 VAE decoder.
     pub fn new(device: &burn::tensor::Device<B>) -> Self {
         let conv_in = Conv2dConfig::new([LATENT_CHANNELS, BLOCK_OUT_CHANNELS[3]], [3, 3])
-            .with_padding(burn::nn::PaddingConfig2d::Same)
+            .with_padding(burn::nn::PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
 
         let mid_block = MidBlock::new(BLOCK_OUT_CHANNELS[3], device);
@@ -209,7 +209,7 @@ impl<B: Backend> VAEDecoder<B> {
             .with_epsilon(NORM_EPS)
             .init(device);
         let conv_out = Conv2dConfig::new([BLOCK_OUT_CHANNELS[0], OUT_CHANNELS], [3, 3])
-            .with_padding(burn::nn::PaddingConfig2d::Same)
+            .with_padding(burn::nn::PaddingConfig2d::Explicit(1, 1, 1, 1))
             .init(device);
 
         Self {
