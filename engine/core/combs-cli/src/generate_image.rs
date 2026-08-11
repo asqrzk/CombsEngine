@@ -103,11 +103,18 @@ pub(crate) fn tensor_to_rgb_image(
     anyhow::ensure!(batch == 1, "expected batch size 1, got {batch}");
     anyhow::ensure!(channels == 3, "expected 3 channels, got {channels}");
 
+    // NaN clamps to 0 and casts to black — a numerically-exploded latent
+    // would silently return a 200 with an all-black PNG. Fail loudly.
     let data: Vec<f32> = tensor
         .clone()
         .into_data()
         .to_vec()
         .map_err(|e| anyhow::anyhow!("tensor data conversion failed: {e}"))?;
+    anyhow::ensure!(
+        data.iter().all(|v| v.is_finite()),
+        "generation produced non-finite pixels (NaN/inf latent — check \
+         guidance_scale/steps)"
+    );
 
     let img = image::RgbImage::from_fn(width as u32, height as u32, |x, y| {
         let y = y as usize;

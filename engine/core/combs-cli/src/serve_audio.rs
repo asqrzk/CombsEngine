@@ -91,8 +91,18 @@ pub fn cmd_serve_audio(model: PathBuf, port: u16) -> Result<()> {
                     ));
                 }
                 ("POST", "/v1/audio/speech") => {
+                    // Cap the body — an unbounded read_to_string hands any
+                    // client an arbitrary-allocation primitive.
                     let mut body = String::new();
-                    if request.as_reader().read_to_string(&mut body).is_err() {
+                    let ok = {
+                        use std::io::Read;
+                        request
+                            .as_reader()
+                            .take(1_000_000)
+                            .read_to_string(&mut body)
+                            .is_ok()
+                    };
+                    if !ok {
                         let _ = request.respond(json_response(
                             400,
                             error_json("invalid_request", "unreadable body"),
@@ -142,13 +152,18 @@ fn handle_speech(
         return;
     }
     let voice = req.get("voice").and_then(Value::as_str).unwrap_or("af_heart");
-    let speed = req.get("speed").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+    // OpenAI's contract range; also keeps a hostile value from producing
+    // hours of audio under the mutex.
+    let speed = (req.get("speed").and_then(Value::as_f64).unwrap_or(1.0) as f32)
+        .clamp(0.25, 4.0);
     let lang = req.get("lang").and_then(Value::as_str);
 
     let started = std::time::Instant::now();
     let result = {
-        // Single in-flight synthesis: the ONNX session is stateful.
-        let mut engine = engine.lock().unwrap();
+        // Single in-flight synthesis: the ONNX session is stateful. A
+        // panicked previous request must not brick the endpoint forever —
+        // recover the poisoned mutex.
+        let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
         engine.synthesize(text, voice, speed, lang)
     };
 

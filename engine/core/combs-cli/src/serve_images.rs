@@ -139,9 +139,46 @@ fn handle_generate(pipeline: &SharedPipeline, body: &str, stats: &ImageStats) ->
     if let Some(h) = req.get("height").and_then(Value::as_u64) {
         height = h as u32;
     }
+    // Validate dimensions/steps/guidance BEFORE taking the pipeline mutex:
+    // a silent fallback here returns the wrong image with a 200, and an
+    // absurd size would stall every queued request.
+    if let Some(size) = req.get("size").and_then(Value::as_str) {
+        let parsed = size
+            .split_once('x')
+            .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)));
+        if parsed.is_none() {
+            return json_response(
+                400,
+                error_json("invalid_request", &format!("bad size {size:?} (expected WxH)")),
+            );
+        }
+    }
+    for (name, v) in [("width", width), ("height", height)] {
+        if v % 8 != 0 || !(64..=1024).contains(&v) {
+            return json_response(
+                400,
+                error_json(
+                    "invalid_request",
+                    &format!("{name} must be a multiple of 8 in 64..=1024, got {v}"),
+                ),
+            );
+        }
+    }
     let steps = req.get("steps").and_then(Value::as_u64).unwrap_or(20) as usize;
+    if !(1..=1000).contains(&steps) {
+        return json_response(
+            400,
+            error_json("invalid_request", &format!("steps must be 1..=1000, got {steps}")),
+        );
+    }
     let guidance =
         req.get("guidance_scale").and_then(Value::as_f64).unwrap_or(7.5) as f32;
+    if !guidance.is_finite() || !(0.0..=50.0).contains(&guidance) {
+        return json_response(
+            400,
+            error_json("invalid_request", "guidance_scale must be finite in 0..=50"),
+        );
+    }
     let seed = req.get("seed").and_then(Value::as_u64);
     let scheduler = match req.get("scheduler").and_then(Value::as_str) {
         None => SchedulerKind::default(),

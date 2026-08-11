@@ -87,12 +87,16 @@ pub struct TtsEngine {
     vocab: HashMap<char, i64>,
     model_dir: PathBuf,
     styles: HashMap<String, Vec<f32>>,
+    /// espeak-ng binary, resolved ONCE at load — probing per sentence spawned
+    /// hundreds of `--version` children on long inputs.
+    espeak: String,
 }
 
 impl TtsEngine {
     pub fn load(model_dir: &Path) -> Result<Self> {
         let onnx = find_onnx(model_dir)?;
         let vocab = load_vocab(model_dir)?;
+        let espeak = find_espeak()?;
         // ort's error type carries non-Send state, so it can't ride `?`
         // into anyhow — flatten every ort error to a string via `ort_err`.
         let session = ort::session::Session::builder()
@@ -107,6 +111,7 @@ impl TtsEngine {
             vocab,
             model_dir: model_dir.to_path_buf(),
             styles: HashMap::new(),
+            espeak,
         })
     }
 
@@ -140,24 +145,66 @@ impl TtsEngine {
         });
 
         let mut waveform: Vec<f32> = Vec::new();
+        let mut dropped_chars = 0usize;
         for sentence in split_sentences(text) {
-            let phonemes = phonemize(&sentence, &lang)?;
+            let phonemes = phonemize(&self.espeak, &sentence, &lang)?;
             if phonemes.is_empty() {
                 continue;
             }
-            let ids = tokenize(&phonemes, &self.vocab);
-            if ids.len() <= 2 {
-                continue;
+            // A single sentence can exceed the model's 510-phoneme context
+            // (long unpunctuated input). Chunk at word boundaries instead of
+            // silently truncating the user's text.
+            for window in split_phonemes_to_budget(&phonemes, &self.vocab) {
+                let (ids, dropped) = tokenize(&window, &self.vocab);
+                dropped_chars += dropped;
+                if ids.len() <= 2 {
+                    continue;
+                }
+                let chunk = run_inference(&mut self.session, &ids, &style, speed)
+                    .with_context(|| format!("synthesizing: {}", truncate(&sentence, 60)))?;
+                waveform.extend_from_slice(&chunk);
             }
-            let chunk = run_inference(&mut self.session, &ids, &style, speed)
-                .with_context(|| format!("synthesizing: {}", truncate(&sentence, 60)))?;
-            waveform.extend_from_slice(&chunk);
+        }
+        if dropped_chars > 0 {
+            eprintln!(
+                "[tts] warning: {dropped_chars} phoneme character(s) not in the \
+                 model vocab were skipped (espeak/vocab drift?)"
+            );
         }
         if waveform.is_empty() {
             bail!("no audio produced (text phonemized to nothing)");
         }
         Ok(waveform)
     }
+}
+
+/// Splits a phoneme string into word-boundary windows that each tokenize
+/// to at most the model context. Returns the input unchanged when it fits.
+fn split_phonemes_to_budget(phonemes: &str, vocab: &HashMap<char, i64>) -> Vec<String> {
+    let count = |s: &str| s.chars().filter(|c| vocab.contains_key(c)).count();
+    if count(phonemes) <= MAX_PHONEME_TOKENS {
+        return vec![phonemes.to_string()];
+    }
+    let mut windows = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0usize;
+    for word in phonemes.split_whitespace() {
+        // +1 for the joining space (usually in-vocab).
+        let word_len = count(word) + 1;
+        if current_len + word_len > MAX_PHONEME_TOKENS && !current.is_empty() {
+            windows.push(std::mem::take(&mut current));
+            current_len = 0;
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+        current_len += word_len;
+    }
+    if !current.is_empty() {
+        windows.push(current);
+    }
+    windows
 }
 
 // ── Model discovery ─────────────────────────────────────────────────
@@ -274,13 +321,42 @@ fn split_sentences(text: &str) -> Vec<String> {
 }
 
 /// IPA phonemes for `text` via the espeak-ng CLI, post-processed the way
-/// Kokoro's (misaki espeak-fallback) pipeline expects.
-fn phonemize(text: &str, lang: &str) -> Result<String> {
-    let bin = find_espeak()?;
-    let output = ProcessCommand::new(&bin)
-        .args(["-q", "--ipa", "-v", lang, text])
-        .output()
+/// Kokoro's (misaki espeak-fallback) pipeline expects. `--` guards text
+/// starting with `-`; a 30 s watchdog kills a hung espeak instead of
+/// wedging the worker (which holds the engine mutex while synthesizing).
+fn phonemize(bin: &str, text: &str, lang: &str) -> Result<String> {
+    use std::process::Stdio;
+    let mut child = ProcessCommand::new(bin)
+        .args(["-q", "--ipa", "-v", lang, "--", text])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .spawn()
         .with_context(|| format!("running {bin}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if std::time::Instant::now() > deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("espeak-ng timed out after 30s");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    };
+    let output = {
+        use std::io::Read;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        if let Some(mut s) = child.stdout.take() {
+            let _ = s.read_to_end(&mut stdout);
+        }
+        if let Some(mut s) = child.stderr.take() {
+            let _ = s.read_to_end(&mut stderr);
+        }
+        std::process::Output { status, stdout, stderr }
+    };
     if !output.status.success() {
         bail!(
             "espeak-ng failed: {}",
@@ -317,7 +393,10 @@ fn phonemize(text: &str, lang: &str) -> Result<String> {
 
 fn find_espeak() -> Result<String> {
     if let Ok(bin) = std::env::var("COMBS_ESPEAK_NG") {
-        return Ok(bin);
+        if ProcessCommand::new(&bin).arg("--version").output().is_ok_and(|o| o.status.success()) {
+            return Ok(bin);
+        }
+        bail!("COMBS_ESPEAK_NG={bin} is not a runnable espeak-ng binary");
     }
     let candidates = [
         "espeak-ng",
@@ -340,19 +419,24 @@ fn find_espeak() -> Result<String> {
     )
 }
 
-/// Char-level encoding with `$` (id 0) boundary pads, skipping any char
-/// not in the vocab (espeak occasionally emits marks Kokoro never saw).
-fn tokenize(phonemes: &str, vocab: &HashMap<char, i64>) -> Vec<i64> {
+/// Char-level encoding with `$` (id 0) boundary pads, skipping (and
+/// counting) any char not in the vocab — espeak occasionally emits marks
+/// Kokoro never saw, and the caller warns when that happens. The truncate
+/// is a hard safety net; `split_phonemes_to_budget` chunks before it bites.
+fn tokenize(phonemes: &str, vocab: &HashMap<char, i64>) -> (Vec<i64>, usize) {
     let mut ids = Vec::with_capacity(phonemes.len() + 2);
+    let mut dropped = 0usize;
     ids.push(0);
     for c in phonemes.chars() {
         if let Some(&id) = vocab.get(&c) {
             ids.push(id);
+        } else if !c.is_whitespace() {
+            dropped += 1;
         }
     }
     ids.truncate(MAX_PHONEME_TOKENS + 1);
     ids.push(0);
-    ids
+    (ids, dropped)
 }
 
 // ── Inference + WAV ─────────────────────────────────────────────────

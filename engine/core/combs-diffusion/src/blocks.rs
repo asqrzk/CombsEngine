@@ -506,9 +506,21 @@ impl<B: Backend> Upsample2D<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
-        let x = x.repeat_dim(2, 2).repeat_dim(3, 2);
-        self.conv.forward(x)
+        self.conv.forward(upsample_nearest_2x(x))
     }
+}
+
+/// Nearest-neighbor 2× spatial upsample. NOT `repeat_dim`: burn's
+/// `repeat_dim` TILES the map (`[r0, r1, r0, r1]`), which turns every
+/// upsample into a 2×2 mosaic of the whole feature map instead of
+/// duplicating neighbors (`[r0, r0, r1, r1]`).
+pub(crate) fn upsample_nearest_2x<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {
+    let [_, _, h, w] = x.dims();
+    burn::tensor::module::interpolate(
+        x,
+        [h * 2, w * 2],
+        burn::tensor::ops::InterpolateOptions::new(burn::tensor::ops::InterpolateMode::Nearest),
+    )
 }
 
 /// Self-attention block used in the VAE mid block.
@@ -561,5 +573,31 @@ fn norm_groups(channels: usize) -> usize {
         NORM_GROUPS
     } else {
         channels.max(1)
+    }
+}
+
+#[cfg(test)]
+mod upsample_tests {
+    use super::*;
+    use burn::backend::NdArray;
+    use burn::tensor::TensorData;
+
+    /// Nearest-neighbor duplicates NEIGHBORS ([[1,1,2,2],..]), it does not
+    /// tile the map ([[1,2],[3,4],[1,2],..] — the repeat_dim bug).
+    #[test]
+    fn upsample_nearest_duplicates_neighbors() {
+        let device = Default::default();
+        let x = Tensor::<NdArray<f32>, 4>::from_data(
+            TensorData::new(vec![1.0f32, 2.0, 3.0, 4.0], [1, 1, 2, 2]),
+            &device,
+        );
+        let up: Vec<f32> = upsample_nearest_2x(x).into_data().to_vec().unwrap();
+        let expected = [
+            1.0, 1.0, 2.0, 2.0, //
+            1.0, 1.0, 2.0, 2.0, //
+            3.0, 3.0, 4.0, 4.0, //
+            3.0, 3.0, 4.0, 4.0,
+        ];
+        assert_eq!(up, expected);
     }
 }

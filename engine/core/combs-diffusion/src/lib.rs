@@ -273,10 +273,13 @@ fn tokenize_clip(tokenizer_json: &std::path::Path, text: &str) -> Result<Vec<u32
         combs_formats::FormatError::Safetensors(format!("tokenize failed: {e}"))
     })?;
     let mut ids = encoding.get_ids().to_vec();
-    if ids.len() > MAX_LEN {
-        ids.truncate(MAX_LEN);
-    }
     let pad_id = tokenizer.token_to_id("<|endoftext|>").unwrap_or(49407);
+    if ids.len() > MAX_LEN {
+        // Keep the trailing EOS — CLIP's pooled/text semantics assume every
+        // sequence ends with it; a bare truncate would chop it off.
+        ids.truncate(MAX_LEN - 1);
+        ids.push(pad_id);
+    }
     while ids.len() < MAX_LEN {
         ids.push(pad_id);
     }

@@ -44,7 +44,9 @@ pub(crate) fn leading_timesteps(train_steps: usize, n: usize) -> Vec<usize> {
 
 /// One denoising algorithm over the shared schedule. `step` consumes the
 /// model's epsilon prediction for `timesteps()[step_index]` and returns the
-/// latent advanced one step (the final step lands fully denoised).
+/// latent advanced one step. DDPM and DPM++ land exactly on x0 at the final
+/// step; DDIM (`set_alpha_to_one = false`) keeps the SD-conventional
+/// `sqrt(1 - ac[0]) ≈ 0.029` noise residual.
 pub trait Scheduler<B: Backend>: Send {
     fn timesteps(&self) -> &[usize];
 
@@ -100,12 +102,15 @@ impl SchedulerKind {
         }
     }
 
-    /// Builds the scheduler prepared for `num_inference_steps`.
+    /// Builds the scheduler prepared for `num_inference_steps` (clamped to
+    /// `1..=TRAIN_STEPS`: above the training length the integer step ratio
+    /// collapses to 0, degenerating every timestep to 1 — NaNs in DPM++).
     pub fn build<B: Backend>(self, num_inference_steps: usize) -> Box<dyn Scheduler<B>> {
+        let n = num_inference_steps.clamp(1, TRAIN_STEPS);
         match self {
-            Self::Ddpm => Box::new(Ddpm::new(num_inference_steps)),
-            Self::Ddim => Box::new(Ddim::new(num_inference_steps)),
-            Self::DpmPP2M => Box::new(DpmPP2M::new(num_inference_steps)),
+            Self::Ddpm => Box::new(Ddpm::new(n)),
+            Self::Ddim => Box::new(Ddim::new(n)),
+            Self::DpmPP2M => Box::new(DpmPP2M::new(n)),
         }
     }
 }
@@ -234,6 +239,8 @@ pub struct DpmPP2M<B: Backend> {
     lambda: Vec<f64>,
     prev_x0: Option<Tensor<B, 4>>,
     prev_h: Option<f64>,
+    /// Multistep history is keyed to sequential stepping; guard misuse.
+    next_index: usize,
 }
 
 impl<B: Backend> DpmPP2M<B> {
@@ -264,6 +271,7 @@ impl<B: Backend> DpmPP2M<B> {
             lambda,
             prev_x0: None,
             prev_h: None,
+            next_index: 0,
         }
     }
 }
@@ -280,6 +288,13 @@ impl<B: Backend> Scheduler<B> for DpmPP2M<B> {
         latent: Tensor<B, 4>,
         _noise: &mut NoiseSource,
     ) -> Tensor<B, 4> {
+        assert_eq!(
+            i, self.next_index,
+            "DPM++ 2M is multistep: steps must be taken in order (expected \
+             step {}, got {i})",
+            self.next_index
+        );
+        self.next_index += 1;
         let n = self.timesteps.len();
         let x0 = (latent.clone() - noise_pred.mul_scalar(self.sigma_t[i] as f32))
             .div_scalar(self.alpha_t[i] as f32);

@@ -166,6 +166,9 @@ impl<B: Backend> MidBlock<B> {
 
 /// Stable Diffusion 1.5 VAE decoder.
 pub struct VAEDecoder<B: Backend> {
+    /// AutoencoderKL's top-level 1×1 latent projection, applied BEFORE the
+    /// decoder proper. `None` only for random-init scaffolds.
+    post_quant_conv: Option<Conv2d<B>>,
     conv_in: Conv2d<B>,
     mid_block: MidBlock<B>,
     up_blocks: Vec<UpDecoderBlock2D<B>>,
@@ -210,6 +213,7 @@ impl<B: Backend> VAEDecoder<B> {
             .init(device);
 
         Self {
+            post_quant_conv: None,
             conv_in,
             mid_block,
             up_blocks,
@@ -220,6 +224,29 @@ impl<B: Backend> VAEDecoder<B> {
 
     /// Load SD 1.5 VAE decoder weights from a `ModelSource`.
     pub fn load_from(source: &dyn ModelSource, device: &burn::tensor::Device<B>) -> Result<Self> {
+        // AutoencoderKL applies a 1x1 `post_quant_conv` to the latent before
+        // the decoder; skipping it decodes an un-projected latent. Absent
+        // only from decoder-only extracts — warn, don't fail.
+        let post_quant_conv = if source
+            .tensor_names()
+            .contains(&"post_quant_conv.weight".to_string())
+        {
+            Some(load_conv2d(
+                source,
+                "post_quant_conv",
+                [LATENT_CHANNELS, LATENT_CHANNELS],
+                [1, 1],
+                [1, 1],
+                device,
+            )?)
+        } else {
+            eprintln!(
+                "[vae] warning: checkpoint has no post_quant_conv — decoding \
+                 raw latents (image quality will suffer)"
+            );
+            None
+        };
+
         let conv_in = load_conv2d(
             source,
             "decoder.conv_in",
@@ -276,6 +303,7 @@ impl<B: Backend> VAEDecoder<B> {
         )?;
 
         Ok(Self {
+            post_quant_conv,
             conv_in,
             mid_block,
             up_blocks,
@@ -289,6 +317,10 @@ impl<B: Backend> VAEDecoder<B> {
     /// - input:  `[batch, 4, height, width]`
     /// - output: `[batch, 3, height * 8, width * 8]`
     pub fn forward(&self, latent: Tensor<B, 4>) -> Tensor<B, 4> {
+        let latent = match &self.post_quant_conv {
+            Some(conv) => conv.forward(latent),
+            None => latent,
+        };
         let mut h = self.conv_in.forward(latent);
         h = self.mid_block.forward(h);
         for up in &self.up_blocks {

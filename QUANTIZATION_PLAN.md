@@ -571,3 +571,47 @@ RIFF/WAVE @ 24 kHz > 10 KB, and 400 on empty input. Live E2E: two speech
 requests at 1.6 s / 1.4 s against the resident engine (the subprocess path
 re-paid session build + espeak per call); `/v1/stats` live. Deno checks
 green.
+
+---
+
+## 2026-08-11 — Reference review vs transformers-main: 3 critical diffusion bugs fixed; audio hardened
+
+A structured review against the on-disk HF transformers source found the
+REAL reasons images always under-delivered — none of them in the (golden-
+tested) scheduler:
+
+1. **Upsample2D tiled instead of upsampling**: burn's `repeat_dim` is TILE
+   (`[r0,r1,r0,r1]`), not neighbor duplication — every UNet/VAE upsample
+   (6 stacked) turned the feature map into a 2×2 mosaic. Fixed with
+   `interpolate(..., Nearest)`; golden test added (a 2×2→4×4 fixture that
+   fails under tiling).
+2. **Timestep embedding frequencies wrong in scale AND direction**: the
+   sweep was missing its `ln(10000)` factor and ran inverted — every
+   channel sat near cos(0), so the UNet barely saw the timestep. Fixed to
+   the diffusers `Timesteps` convention (freq_shift 0, flip_sin_to_cos);
+   golden test added.
+3. **VAE `post_quant_conv` never applied**: AutoencoderKL's 1×1 latent
+   projection was skipped entirely. Now loaded and applied (warns when a
+   decoder-only extract lacks it).
+
+Plus: CLIP >77-token truncation now preserves EOS; `steps` clamped to
+1..=1000 (ratio-0 degenerated all timesteps to 1 → NaN in DPM++); DPM++
+multistep guards sequential step order; serve-images validates size/steps/
+guidance with 400s instead of silent fallbacks; non-finite pixels fail
+loudly instead of returning a black 200. Golden-generator scripts for the
+scheduler/rope/chat-template constants are checked in under
+`tools/goldens/` (they regenerate the pinned values byte-identically).
+
+**Honest status**: seeded determinism still byte-exact, CFG effective, PNG
+entropy dropped ~40% (mosaic gone) — but a SmolVLM look at the outputs
+shows scenes still incoherent; at least one defect remains in the UNet
+path. Next diffusion step: a component-parity harness against torch-cpu
+reference activations (time_proj → resnet → attention → single UNet step →
+VAE) to isolate it. Audio hardening from the same review: espeak resolved
+once at load (was re-probed per sentence) with a 30 s watchdog and `--`
+argv guard; over-budget sentences chunk at word boundaries instead of
+silently truncating; vocab-miss drops are counted and warned; the speech
+endpoint recovers poisoned mutexes, clamps speed to 0.25–4.0, and caps
+request bodies at 1 MB. The full Whisper-port checklist (mel constants,
+conv stem, sinusoid layout, forced prefix, seek loop, golden ladder) is
+recorded in the wave-4 planning notes.
