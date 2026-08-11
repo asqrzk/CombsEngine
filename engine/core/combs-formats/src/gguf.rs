@@ -293,6 +293,28 @@ impl GgufSource {
         // GGUF llama files usually include output.weight; if absent, lm_head
         // is tied to the embedding matrix.
         source.metadata.tie_word_embeddings = !source.tensors.contains_key("output.weight");
+
+        // A tensor the map doesn't know is a loud one-line warning, never a
+        // silent drop — unmapped weights mean wrong output, not no output.
+        let arch = source.metadata.architecture.clone();
+        let mut unmapped: Vec<&str> = source
+            .tensors
+            .keys()
+            .filter(|k| {
+                map_tensor_name(k, &arch).is_none()
+                    && !KNOWN_UNMAPPED.contains(&k.as_str())
+                    && !is_fused_source(k, &arch)
+            })
+            .map(String::as_str)
+            .collect();
+        if !unmapped.is_empty() {
+            unmapped.sort();
+            eprintln!(
+                "[gguf] {} unmapped tensors (arch {arch}); first: {}",
+                unmapped.len(),
+                unmapped[0]
+            );
+        }
         Ok(source)
     }
 
@@ -368,7 +390,11 @@ fn build_model_metadata(kv: &HashMap<String, MetaValue>) -> Result<ModelMetadata
         rope_theta: get_f32(&format!("{prefix}.rope.freq_base")).unwrap_or(10000.0) as f64,
         // GGUF files usually include output.weight; if absent, the head is tied.
         tie_word_embeddings: false, // refined in load() via tensor presence
-        head_dim: hidden / heads,
+        // Explicit head size when present — gemma3 (256) and qwen3 (128)
+        // decouple it from hidden/heads.
+        head_dim: field("attention.key_length")
+            .map(|v| v as usize)
+            .unwrap_or(hidden / heads),
         // Bias loading is presence-driven (the loader probes bias tensors),
         // so this flag is informational only for GGUF.
         attention_bias: false,
@@ -611,7 +637,11 @@ fn ensure_tokenizer_json(path: &Path, kv: &HashMap<String, MetaValue>) -> Result
 }
 
 /// Maps a ggml tensor name to its HF equivalent (`None` = skip tensor).
-fn map_tensor_name(ggml: &str) -> Option<String> {
+/// Arch-keyed where a ggml name means different HF norms per family:
+/// llama's `ffn_norm` is the pre-MLP `post_attention_layernorm`, but
+/// gemma3's `ffn_norm` is `pre_feedforward_layernorm` (its
+/// `post_attention_norm`/`post_ffw_norm` are the sandwich norms).
+fn map_tensor_name(ggml: &str, arch: &str) -> Option<String> {
     if ggml == "token_embd.weight" {
         return Some("model.embed_tokens.weight".into());
     }
@@ -623,9 +653,17 @@ fn map_tensor_name(ggml: &str) -> Option<String> {
     }
     let rest = ggml.strip_prefix("blk.")?;
     let (layer, rest) = rest.split_once('.')?;
+    let gemma = matches!(arch, "gemma3" | "gemma3_text");
     let hf = match rest {
         "attn_norm.weight" => "input_layernorm.weight",
+        "ffn_norm.weight" if gemma => "pre_feedforward_layernorm.weight",
+        "post_attention_norm.weight" if gemma => "post_attention_layernorm.weight",
+        "post_ffw_norm.weight" if gemma => "post_feedforward_layernorm.weight",
         "ffn_norm.weight" => "post_attention_layernorm.weight",
+        // Per-head QK norms (qwen3, gemma3); the loader probes these only
+        // when the resolved spec asks for them.
+        "attn_q_norm.weight" => "self_attn.q_norm.weight",
+        "attn_k_norm.weight" => "self_attn.k_norm.weight",
         "attn_q.weight" => "self_attn.q_proj.weight",
         "attn_k.weight" => "self_attn.k_proj.weight",
         "attn_v.weight" => "self_attn.v_proj.weight",
@@ -640,6 +678,25 @@ fn map_tensor_name(ggml: &str) -> Option<String> {
         _ => return None,
     };
     Some(format!("model.layers.{layer}.{hf}"))
+}
+
+/// Tensors some converters emit that the engine deliberately does not map
+/// (suppressed from the unmapped-tensor warning).
+const KNOWN_UNMAPPED: &[&str] = &[
+    // llama-3.1+ long-rope frequency table; scaling comes from metadata
+    // keys when present.
+    "rope_freqs.weight",
+];
+
+/// Fused ggml tensors served through `fused_slice` instead of the name map
+/// (phi3's `attn_qkv`; its fused `ffn_up` also feeds gate/up slices but
+/// maps directly as `up_proj`). Consumed, so not "unmapped".
+fn is_fused_source(ggml: &str, arch: &str) -> bool {
+    arch == "phi3"
+        && ggml
+            .strip_prefix("blk.")
+            .and_then(|r| r.split_once('.'))
+            .is_some_and(|(_, rest)| rest == "attn_qkv.weight" || rest == "attn_qkv.bias")
 }
 
 /// Number of elements in a ggml tensor.
@@ -1011,9 +1068,10 @@ impl GgufSource {
                 return Some((k, info, Some((start, len))));
             }
         }
+        let arch = self.metadata.architecture.as_str();
         self.tensors
             .iter()
-            .find(|(k, _)| map_tensor_name(k).as_deref() == Some(name))
+            .find(|(k, _)| map_tensor_name(k, arch).as_deref() == Some(name))
             .map(|(k, info)| (k, info, None))
     }
 
@@ -1040,9 +1098,10 @@ impl ModelSource for GgufSource {
     }
 
     fn tensor_names(&self) -> Vec<String> {
+        let arch = self.metadata.architecture.as_str();
         self.tensors
             .keys()
-            .filter_map(|k| map_tensor_name(k))
+            .filter_map(|k| map_tensor_name(k, arch))
             .collect()
     }
 
@@ -1082,9 +1141,33 @@ impl ModelSource for GgufSource {
         // Fused slices and RoPE de-permutation never co-occur (phi3 vs
         // llama/mistral arch gates).
         let permute = self.depermute_heads(ggml_name);
+        // llama.cpp's gemma converters bake the `(1+w)` into stored norm
+        // weights (their graph applies plain x̂·w); the engine keeps HF
+        // semantics (x̂·(1+w) via the gemma norm flavor), so the +1 is
+        // removed here — the same normalize-at-the-adapter rule as the
+        // RoPE de-permutation. Verified: gemma-3-1b GGUF norms are exactly
+        // safetensors + 1.0.
+        let gemma_norm_offset = matches!(
+            self.metadata.architecture.as_str(),
+            "gemma3" | "gemma3_text"
+        ) && ggml_name.ends_with("norm.weight");
 
         // Passthrough dtypes: serve the mmap slice, unless the rows must be
         // de-interleaved (RoPE de-permutation) — then copy row-reordered.
+        if gemma_norm_offset {
+            if info.ggml_type != GGML_F32 {
+                return Err(FormatError::UnsupportedDtype {
+                    tensor: info.name.clone(),
+                    dtype: format!("gemma norm must be F32, got ggml_type {}", info.ggml_type),
+                });
+            }
+            let values: Vec<f32> = data
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()) - 1.0)
+                .collect();
+            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            return Ok(TensorReader::owned(name.to_string(), shape, bytes));
+        }
         if let GGML_F32 | GGML_F16 | GGML_BF16 = info.ggml_type {
             let dtype = match info.ggml_type {
                 GGML_F32 => TensorDtype::F32,

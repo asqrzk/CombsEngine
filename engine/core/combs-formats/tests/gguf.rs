@@ -384,6 +384,132 @@ fn phi3_fused_tensors_serve_split_names() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Builds a tiny gemma3 GGUF: the family's norm names (`ffn_norm` meaning
+/// PRE-feedforward — llama's same-named tensor is the pre-MLP post-attn
+/// norm — plus sandwich + qk norms), an explicit `attention.key_length`
+/// decoupled from hidden/heads, a sliding-window key, and an
+/// `<end_of_turn>` control token beyond the declared eos. Each norm is
+/// filled with a distinct constant so the mapping is provable.
+fn write_gemma3_test_gguf(path: &std::path::Path) {
+    let mut out: Vec<u8> = Vec::new();
+    let w32 = |v: u32, out: &mut Vec<u8>| out.extend_from_slice(&v.to_le_bytes());
+    let w64 = |v: u64, out: &mut Vec<u8>| out.extend_from_slice(&v.to_le_bytes());
+    let wstr = |s: &str, out: &mut Vec<u8>| {
+        out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    };
+
+    out.extend_from_slice(b"GGUF");
+    w32(3, &mut out);
+    w64(6, &mut out); // tensors: 6 norms
+    w64(12, &mut out); // kv count
+
+    wstr("general.architecture", &mut out);
+    w32(8, &mut out);
+    wstr("gemma3", &mut out);
+    for (key, val) in [
+        ("gemma3.embedding_length", 8u32),
+        ("gemma3.attention.head_count", 2),
+        ("gemma3.attention.head_count_kv", 1),
+        ("gemma3.attention.key_length", 6), // ≠ hidden/heads = 4
+        ("gemma3.block_count", 1),
+        ("gemma3.context_length", 64),
+        ("gemma3.feed_forward_length", 16),
+        ("gemma3.attention.sliding_window", 512),
+    ] {
+        wstr(key, &mut out);
+        w32(4, &mut out);
+        w32(val, &mut out);
+    }
+    wstr("tokenizer.ggml.eos_token_id", &mut out);
+    w32(4, &mut out);
+    w32(1, &mut out);
+    wstr("tokenizer.ggml.tokens", &mut out);
+    w32(9, &mut out);
+    w32(8, &mut out);
+    w64(4, &mut out);
+    for tok in ["<bos>", "<eos>", "<end_of_turn>", "a"] {
+        wstr(tok, &mut out);
+    }
+    wstr("tokenizer.ggml.token_type", &mut out);
+    w32(9, &mut out);
+    w32(5, &mut out);
+    w64(4, &mut out);
+    for ty in [3i32, 3, 3, 1] {
+        out.extend_from_slice(&ty.to_le_bytes());
+    }
+
+    // Six F32 norm tensors, [8] each, row value = index in this list.
+    let norms = [
+        "blk.0.attn_norm.weight",
+        "blk.0.ffn_norm.weight",
+        "blk.0.post_attention_norm.weight",
+        "blk.0.post_ffw_norm.weight",
+        "blk.0.attn_q_norm.weight",
+        "blk.0.attn_k_norm.weight",
+    ];
+    for (i, name) in norms.iter().enumerate() {
+        wstr(name, &mut out);
+        w32(1, &mut out);
+        w64(8, &mut out);
+        w32(0, &mut out); // F32
+        w64((i * 8 * 4) as u64, &mut out);
+    }
+
+    let pad = (32 - (out.len() % 32)) % 32;
+    out.extend(std::iter::repeat(0u8).take(pad));
+    for i in 0..norms.len() {
+        for _ in 0..8 {
+            out.extend_from_slice(&(i as f32).to_le_bytes());
+        }
+    }
+    std::fs::write(path, &out).unwrap();
+}
+
+#[test]
+fn gemma3_norm_names_and_metadata_map() {
+    let dir = std::env::temp_dir().join(format!("combs-gguf-gemma3-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("gemma3.gguf");
+    write_gemma3_test_gguf(&path);
+
+    let source = GgufSource::load(&path).expect("parse");
+    let md = source.metadata();
+    assert_eq!(md.architecture, "gemma3");
+    // Explicit key_length wins over hidden/heads (6 vs 4).
+    assert_eq!(md.head_dim, 6);
+    assert_eq!(md.attention_pattern.sliding_window, Some(512));
+    // Defaults mirror llama.cpp's gemma3 hardcoding.
+    assert_eq!(md.attention_pattern.pattern, 6);
+    assert_eq!(md.attention_pattern.rope_local_theta, 10_000.0);
+    // `<end_of_turn>` (id 2) joins the declared eos (id 1).
+    assert_eq!(md.eos_token_ids, vec![1, 2]);
+
+    // The gemma3 norm-name arms: same ggml `ffn_norm` maps to a DIFFERENT
+    // HF tensor than llama's, and the sandwich/qk norms resolve. llama.cpp
+    // bakes `(1+w)` into gemma norm weights, so the adapter serves each
+    // fill value MINUS 1 (back to HF semantics).
+    let expect = [
+        ("model.layers.0.input_layernorm.weight", 0.0f32),
+        ("model.layers.0.pre_feedforward_layernorm.weight", 1.0),
+        ("model.layers.0.post_attention_layernorm.weight", 2.0),
+        ("model.layers.0.post_feedforward_layernorm.weight", 3.0),
+        ("model.layers.0.self_attn.q_norm.weight", 4.0),
+        ("model.layers.0.self_attn.k_norm.weight", 5.0),
+    ];
+    for (name, fill) in expect {
+        let reader = source.open_tensor(name).expect(name);
+        let values = reader.load_data().unwrap().to_vec::<f32>().unwrap();
+        let want = fill - 1.0;
+        assert!(
+            values.iter().all(|v| *v == want),
+            "{name} must serve fill {fill} minus the baked gemma +1"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn split_shard_gguf_is_rejected() {
     let dir = std::env::temp_dir().join(format!("combs-gguf-split-test-{}", std::process::id()));

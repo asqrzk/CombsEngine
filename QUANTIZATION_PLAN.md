@@ -705,3 +705,46 @@ Gate 1's first run FAILED usefully, catching two loader truths:
 
 gemma-3 GGUF still waits on the W2-E arch-aware tensor map (`ffn_norm`
 name collision, qk-norm names, `attention.key_length`, sliding keys).
+
+## 2026-08-11 — Wave 2 stage E: arch-aware GGUF tensor map — WAVE 2 COMPLETE
+
+`map_tensor_name` takes the architecture: gemma3's `ffn_norm` maps to
+`pre_feedforward_layernorm` (llama's same-named tensor is the pre-MLP
+post-attention norm — the collision that motivated this stage), its
+`post_attention_norm`/`post_ffw_norm` are the sandwich norms, and
+`attn_{q,k}_norm` resolve for every family (the loader probes them only
+when the spec asks). `attention.key_length` now feeds `head_dim` —
+mandatory for gemma3 (256 vs hidden/heads 288) and qwen3 GGUF (128 vs
+64); verified present-and-equal (llama-3.2) or absent (rest) across the
+cached set, so nothing shifted. Unmapped tensors warn loudly at load
+(count + first name) instead of dropping silently, with a known-skip
+list (`rope_freqs.weight`) and a fused-source exemption (phi3
+`attn_qkv` is consumed by the row-slicer, not the name map).
+
+**The bug the first gemma-GGUF load exposed**: llama.cpp's gemma
+converters bake `(1+w)` into every stored norm weight (their graph runs
+plain `x̂·w`); the engine keeps HF semantics (`x̂·(1+w)` via the gemma
+norm flavor), so the model computed `x̂·(2+w)` across all ~157 norms —
+multilingual token soup with a perfect prompt render. Proven with a
+numpy cross-check (GGUF norm == safetensors norm + 1.0 exactly, max
+diff 0.0) and fixed by removing the offset at the adapter boundary —
+the same normalize-at-the-adapter rule as the RoPE de-permutation.
+Synthetic gemma3 fixture asserts the name collision mapping, key_length
+head_dim, sliding key, `<end_of_turn>` EOG join, and the −1 offset.
+
+E2E: gemma-3-1b-it Q4_K_M GGUF (`gemma-3-1b-gguf` preset,
+tokenizer.json staged from the safetensors twin — gated repo companion)
+loads warning-free, one-sentence chat answer, stops at `<end_of_turn>`,
+raw "The capital of France is → Paris." — near-identical to safetensors
+modulo Q4 quant noise. Qwen3-0.6B Q8_0 GGUF (`qwen3-0.6b-gguf` preset)
+is **token-identical to its safetensors twin for all 120 generated
+tokens** (sole rendered diff: the HF tokenizer prints `<think>`, the
+GGUF detok drops it as a control token). Regression sweep
+token-identical across smollm2 ×2, llama-3.2 raw+chat, phi-3.1, gemma
+safetensors; formats+models suites green.
+
+Wave 2 status: A (metadata/RoPE/ArchSpec), B (universal decoder,
+byte-identity), C (qwen3+phi3, fused split, sliding E2E, EOG, LongRope),
+D (gemma migrated, gemma.rs deleted), E (arch-aware GGUF map) — ALL
+LANDED. One decoder, five architectures, two formats, quant + dense,
+per-layer attention layouts, scaled RoPE — the universal decoder holds.

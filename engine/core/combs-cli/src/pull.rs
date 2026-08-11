@@ -26,7 +26,9 @@ pub const PRESETS: &[(&str, &str, &str)] = &[
     ("smollm2-360m", "HuggingFaceTB/SmolLM2-360M-Instruct", "smollm2-360m"),
     ("smollm2-1.7b", "HuggingFaceTB/SmolLM2-1.7B-Instruct", "smollm2-1.7b"),
     ("qwen3-0.6b", "Qwen/Qwen3-0.6B", "qwen3-0.6b"),
+    ("qwen3-0.6b-gguf", "Qwen/Qwen3-0.6B-GGUF", "qwen3-0.6b-gguf"),
     ("phi-3.1-mini", "bartowski/Phi-3.1-mini-4k-instruct-GGUF", "phi-3.1-mini-4k-instruct-gguf"),
+    ("gemma-3-1b-gguf", "ggml-org/gemma-3-1b-it-GGUF", "gemma-3-1b-it-gguf"),
     ("smolvlm-256m", "HuggingFaceTB/SmolVLM-256M-Instruct", "smolvlm-256m"),
     ("sd-1.5", "runwayml/stable-diffusion-v1-5", "stable-diffusion-v1-5"),
     ("kokoro-82m", "onnx-community/Kokoro-82M-v1.0-ONNX", "kokoro-82m"),
@@ -38,6 +40,9 @@ pub const PRESETS: &[(&str, &str, &str)] = &[
 /// ship the file. Keyed by cache slug → source repo for the tokenizer.
 const GGUF_TOKENIZER_COMPANIONS: &[(&str, &str)] = &[
     ("phi-3.1-mini-4k-instruct-gguf", "microsoft/Phi-3-mini-4k-instruct"),
+    // Gated repo: needs the same HF auth that pulling the safetensors
+    // variant does.
+    ("gemma-3-1b-it-gguf", "google/gemma-3-1b-it"),
 ];
 
 #[derive(Debug, Clone, serde::Deserialize)]

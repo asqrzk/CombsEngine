@@ -232,9 +232,9 @@ pub struct AttentionPattern {
     pub query_pre_attn_scalar: Option<f64>,
     /// Qwen2-style partition, stored raw: the first N layers are global and
     /// layers >= N slide — the inverse of `pattern`'s every-Nth-global.
-    /// Not consumed yet; the per-layer `AttentionLayout` (roadmap wave 2)
-    /// resolves it. All shipped qwen2.5 checkpoints disable sliding anyway
-    /// (`use_sliding_window: false` nulls `sliding_window` at parse).
+    /// `ArchSpec::resolve` turns it into the per-layer layout. All shipped
+    /// qwen2.5 checkpoints disable sliding anyway (`use_sliding_window:
+    /// false` nulls `sliding_window` at parse).
     pub max_window_layers: Option<usize>,
 }
 
