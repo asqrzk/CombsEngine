@@ -7,6 +7,7 @@
 //! [`LogitsProcessor`]s, incremental detokenization and stop detection.
 //! Batching and the action scheduler are Phase 3.
 
+mod constraint;
 mod detok;
 mod engine;
 mod logits;
@@ -16,6 +17,7 @@ mod template;
 mod toolcall;
 
 pub use combs_models::{CacheConfig, CacheKind};
+pub use constraint::{CompiledSchema, ConstraintSpec, ConstraintState, TokenByteTable};
 pub use engine::{
     Engine, EngineStatsSnapshot, GenerationConfig, GenerationStats, LastGeneration, SessionInfo,
     check_context_len,
@@ -65,6 +67,12 @@ pub enum EngineError {
         /// Context limit (cache capacity).
         max_position_embeddings: usize,
     },
+
+    /// Structured-output constraint failure: an invalid `response_format`
+    /// spec/schema, or a generation dead end where no vocabulary token can
+    /// legally continue the constrained output.
+    #[error("constraint error: {0}")]
+    Constraint(String),
 
     /// Generation was aborted via the request's cancel flag (or the caller
     /// dropped the streaming channel).
