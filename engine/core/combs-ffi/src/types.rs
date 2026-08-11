@@ -90,6 +90,28 @@ pub struct ChatRequestJson {
     pub response_format: Option<serde_json::Value>,
 }
 
+/// An embeddings request (`combs_embed_json`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbedRequestJson {
+    /// One text or an array of texts (≤ 64).
+    pub input: serde_json::Value,
+    /// Matryoshka truncation: keep the first N dims, re-normalize.
+    #[serde(default)]
+    pub dimensions: Option<usize>,
+    /// `"last"` | `"mean"`; absent uses the checkpoint's detected default.
+    #[serde(default)]
+    pub pooling: Option<String>,
+}
+
+/// Embeddings response payload (`combs_embed_json`).
+#[derive(Debug, Serialize)]
+pub struct EmbedResponseJson {
+    /// One L2-normalized vector per input text, in order.
+    pub vectors: Vec<Vec<f32>>,
+    /// Total input tokens across all texts.
+    pub prompt_tokens: usize,
+}
+
 /// Streaming event kinds emitted to the `CombsStreamCallback`.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

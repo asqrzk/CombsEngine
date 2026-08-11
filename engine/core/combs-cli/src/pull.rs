@@ -211,6 +211,11 @@ fn pull_text(repo: &str, dir: &PathBuf, tree: &[TreeEntry]) -> Result<()> {
     }
     download_optional(repo, dir, "generation_config.json")?;
     download_optional(repo, dir, "tokenizer_config.json")?;
+    // Sentence-transformers pooling convention (embedding checkpoints);
+    // the engine reads it to pick the embeddings pooling default.
+    if paths.contains("1_Pooling/config.json") {
+        download_optional(repo, dir, "1_Pooling/config.json")?;
+    }
 
     // Weight files: single → sharded → GGUF.
     if paths.contains("model.safetensors") {

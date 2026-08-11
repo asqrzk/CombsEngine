@@ -219,6 +219,79 @@ pub unsafe extern "C" fn combs_engine_metadata_json(engine: *const CombsEngine) 
     })
 }
 
+/// Embeds texts into L2-normalized vectors. Blocking; returns the response
+/// JSON (`{"vectors": [[...]], "prompt_tokens": n}`) or NULL on error (see
+/// `combs_last_error`). Free with `combs_string_free`.
+///
+/// Request: `{"input": "..." | ["..."], "dimensions"?: n,
+/// "pooling"?: "last" | "mean"}` — absent pooling uses the checkpoint's
+/// detected default (`1_Pooling/config.json`, else last-token).
+///
+/// # Safety
+/// `engine` must be a valid handle and `request_json` a valid
+/// NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn combs_embed_json(
+    engine: *const CombsEngine,
+    request_json: *const c_char,
+) -> *mut c_char {
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<EmbedResponseJson, String> {
+        if engine.is_null() {
+            return Err("engine is NULL".to_string());
+        }
+        let engine = unsafe { &*engine };
+        let json = unsafe { read_str(request_json, "request_json") }?;
+        let request: EmbedRequestJson = serde_json::from_str(json)
+            .map_err(|e| format!("invalid embed request JSON: {e}"))?;
+
+        let texts: Vec<String> = match &request.input {
+            serde_json::Value::String(s) => vec![s.clone()],
+            serde_json::Value::Array(a) => a
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| "input array entries must be strings".to_string())
+                })
+                .collect::<Result<_, _>>()?,
+            _ => return Err("input must be a string or an array of strings".to_string()),
+        };
+        if texts.is_empty() || texts.len() > 64 {
+            return Err("input must contain 1..=64 texts".to_string());
+        }
+        let pooling = match request.pooling.as_deref() {
+            None => None,
+            Some("last") => Some(combs_runtime::Pooling::Last),
+            Some("mean") => Some(combs_runtime::Pooling::Mean),
+            Some(other) => return Err(format!("unknown pooling: {other:?}")),
+        };
+        let opts = combs_runtime::EmbedOptions {
+            pooling,
+            dimensions: request.dimensions,
+        };
+        let out = engine
+            .engine
+            .embed_texts(&texts, &opts)
+            .map_err(|e| e.to_string())?;
+        Ok(EmbedResponseJson {
+            vectors: out.vectors,
+            prompt_tokens: out.prompt_tokens,
+        })
+    }));
+
+    match result {
+        Ok(Ok(resp)) => into_raw_json(&resp),
+        Ok(Err(e)) => {
+            set_last_error(e);
+            ptr::null_mut()
+        }
+        Err(_) => {
+            set_last_error("panic during embeddings");
+            ptr::null_mut()
+        }
+    }
+}
+
 /// Streaming callback: receives a NUL-terminated JSON event
 /// (`{"type":"delta"|"done"|"error", ...}`) and the opaque user pointer.
 /// Called from the thread running `combs_chat_completion` — embedders must

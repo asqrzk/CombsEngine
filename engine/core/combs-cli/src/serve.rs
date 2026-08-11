@@ -91,6 +91,14 @@ pub fn serve(
                         handle_chat(&engine, &model_id, &body, default_prefill_chunk, &counters)
                     }
                 }
+                ("POST", "/v1/embeddings") => {
+                    let mut body = String::new();
+                    if request.as_reader().read_to_string(&mut body).is_err() {
+                        json_response(400, error_json("invalid_request", "unreadable body"))
+                    } else {
+                        handle_embeddings(&engine, &model_id, &body)
+                    }
+                }
                 _ => json_response(404, error_json("not_found", "unknown endpoint")),
             };
             let _ = request.respond(response);
@@ -205,13 +213,142 @@ fn model_card(engine: &Arc<Engine>, model_id: &str) -> Value {
 }
 
 /// What this engine+model can do, detected from the artifacts (template ⇒
-/// tools) and the build (constraints) — advertised so clients
+/// tools, hidden-state path ⇒ embeddings, pooling config ⇒ pooling
+/// default) and the build (constraints) — advertised so clients
 /// self-configure instead of hardcoding per deployment.
 fn capabilities_json(engine: &Arc<Engine>) -> Value {
     json!({
         "tools": engine.supports_tools(),
         "constraints": ["json_object", "json_schema"],
+        "embeddings": engine.supports_embeddings(),
+        "pooling": match engine.default_pooling() {
+            combs_runtime::Pooling::Last => "last",
+            combs_runtime::Pooling::Mean => "mean",
+        },
     })
+}
+
+/// `POST /v1/embeddings` — OpenAI shape: `input` string | [string] (≤ 64),
+/// `encoding_format` float | base64, `dimensions` matryoshka truncation,
+/// plus a `pooling` extension (`last` | `mean`) overriding the detected
+/// checkpoint default.
+fn handle_embeddings(engine: &Arc<Engine>, model_id: &str, body: &str) -> HttpResponse {
+    let req: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return json_response(
+                400,
+                error_json("invalid_request", &format!("bad JSON: {e}")),
+            );
+        }
+    };
+    if !engine.supports_embeddings() {
+        return json_response(
+            400,
+            error_json(
+                "invalid_request",
+                "this model does not expose hidden states for embeddings",
+            ),
+        );
+    }
+    let texts: Vec<String> = match req.get("input") {
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(a)) => {
+            let mut out = Vec::with_capacity(a.len());
+            for v in a {
+                match v.as_str() {
+                    Some(s) => out.push(s.to_string()),
+                    None => {
+                        return json_response(
+                            400,
+                            error_json(
+                                "invalid_request",
+                                "`input` array entries must be strings",
+                            ),
+                        );
+                    }
+                }
+            }
+            out
+        }
+        _ => {
+            return json_response(
+                400,
+                error_json(
+                    "invalid_request",
+                    "`input` must be a string or an array of strings",
+                ),
+            );
+        }
+    };
+    if texts.is_empty() || texts.len() > 64 {
+        return json_response(
+            400,
+            error_json("invalid_request", "`input` must contain 1..=64 texts"),
+        );
+    }
+    let mut opts = combs_runtime::EmbedOptions::default();
+    if let Some(d) = req.get("dimensions").and_then(Value::as_u64) {
+        opts.dimensions = Some(d as usize);
+    }
+    match req.get("pooling").and_then(Value::as_str) {
+        None => {}
+        Some("last") => opts.pooling = Some(combs_runtime::Pooling::Last),
+        Some("mean") => opts.pooling = Some(combs_runtime::Pooling::Mean),
+        Some(other) => {
+            return json_response(
+                400,
+                error_json("invalid_request", &format!("unknown pooling: {other:?}")),
+            );
+        }
+    }
+    let as_base64 = match req.get("encoding_format").and_then(Value::as_str) {
+        None | Some("float") => false,
+        Some("base64") => true,
+        Some(other) => {
+            return json_response(
+                400,
+                error_json(
+                    "invalid_request",
+                    &format!("unknown encoding_format: {other:?}"),
+                ),
+            );
+        }
+    };
+
+    let out = match engine.embed_texts(&texts, &opts) {
+        Ok(o) => o,
+        Err(e) => {
+            let (code, kind) = engine_error_parts(&e);
+            return json_response(code, error_json(kind, &e.to_string()));
+        }
+    };
+    let data: Vec<Value> = out
+        .vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let embedding = if as_base64 {
+                let bytes: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+                json!(B64.encode(&bytes))
+            } else {
+                json!(v)
+            };
+            json!({"object": "embedding", "index": i, "embedding": embedding})
+        })
+        .collect();
+    json_response(
+        200,
+        json!({
+            "object": "list",
+            "data": data,
+            "model": model_id,
+            "usage": {
+                "prompt_tokens": out.prompt_tokens,
+                "total_tokens": out.prompt_tokens,
+            },
+        }),
+    )
 }
 
 /// OpenAI wire shape for completed tool calls (`arguments` re-serialized
@@ -300,6 +437,9 @@ fn engine_error_parts(e: &combs_runtime::EngineError) -> (u16, &'static str) {
             (400, "context_length_exceeded")
         }
         combs_runtime::EngineError::Constraint(_) => (400, "constraint_error"),
+        combs_runtime::EngineError::Model(combs_models::ModelError::Unsupported(_)) => {
+            (400, "invalid_request")
+        }
         _ => (500, "engine_error"),
     }
 }
