@@ -48,10 +48,24 @@ impl<B: Backend> ModelRegistry<B> {
             reject_active_sliding(source, "qwen2")?;
             Ok(Box::new(crate::llama::LlamaModel::<B>::load(source, device)?))
         });
+        // Qwen3 is qwen2 plus per-head q/k RMSNorm (ArchSpec `qk_norm`) and
+        // an explicit `head_dim` decoupled from hidden/heads; all released
+        // configs ship `use_sliding_window: false`.
+        r.register("qwen3", |source, device| {
+            reject_active_sliding(source, "qwen3")?;
+            Ok(Box::new(crate::llama::LlamaModel::<B>::load(source, device)?))
+        });
         // Mistral v0.3+/Nemo report `sliding_window: null` and are plain
         // llama; v0.1's all-layer sliding window is not supported yet.
         r.register("mistral", |source, device| {
             reject_active_sliding(source, "mistral")?;
+            Ok(Box::new(crate::llama::LlamaModel::<B>::load(source, device)?))
+        });
+        // Phi-3/3.5/4-mini: llama-structured with fused qkv/gate_up
+        // projections (split at load) and an all-layer sliding window that
+        // the per-layer attention layout expresses directly — every shipped
+        // mini config activates it, so no sliding guard here.
+        r.register("phi3", |source, device| {
             Ok(Box::new(crate::llama::LlamaModel::<B>::load(source, device)?))
         });
         // SmolVLM reports model_type "idefics3" (SigLIP + pixel-shuffle + SmolLM2).
@@ -127,6 +141,6 @@ mod tests {
         assert!(r.supports("smollm2"));
         assert!(r.supports("qwen2"));
         assert!(r.supports("mistral"));
-        assert!(!r.supports("qwen3"));
+        assert!(r.supports("qwen3"));
     }
 }

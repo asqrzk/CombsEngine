@@ -149,6 +149,62 @@ fn load_optional_bias<B: Backend>(
     }
 }
 
+/// Loads a fused projection dense and splits its rows into `N` groups (phi
+/// `qkv_proj` = `[q|k|v]`, `gate_up_proj` = `[gate|up]`, HF phi3 order).
+/// Dense-only on purpose: fused checkpoints are safetensors; GGUF phi files
+/// are row-sliced into split names by the format adapter before reaching
+/// this loader.
+fn split_fused_rows<B: Backend, const N: usize>(
+    source: &dyn ModelSource,
+    device: &Device<B>,
+    name: &str,
+    rows: [usize; N],
+) -> Result<[Linear<B>; N]> {
+    let w: Tensor<B, 2> = load_weight(source, device, name)?;
+    let [total, cols] = w.dims();
+    let expect: usize = rows.iter().sum();
+    if total != expect {
+        return Err(ModelError::BadShape {
+            tensor: name.to_string(),
+            expected: vec![expect, cols],
+            got: vec![total, cols],
+        });
+    }
+    let mut at = 0;
+    Ok(rows.map(|r| {
+        let part = w.clone().narrow(0, at, r);
+        at += r;
+        Linear::Dense(part)
+    }))
+}
+
+/// Row-splits a fused projection's bias when present.
+fn split_fused_bias<B: Backend, const N: usize>(
+    source: &dyn ModelSource,
+    device: &Device<B>,
+    name: &str,
+    rows: [usize; N],
+) -> Result<Option<[Tensor<B, 1>; N]>> {
+    let Some(b) = load_optional_bias(source, device, name)? else {
+        return Ok(None);
+    };
+    let [total] = b.dims();
+    let expect: usize = rows.iter().sum();
+    if total != expect {
+        return Err(ModelError::BadShape {
+            tensor: name.to_string(),
+            expected: vec![expect],
+            got: vec![total],
+        });
+    }
+    let mut at = 0;
+    Ok(Some(rows.map(|r| {
+        let part = b.clone().narrow(0, at, r);
+        at += r;
+        part
+    })))
+}
+
 impl<B: Backend> LlamaModel<B> {
     pub(crate) fn expect_shape(name: &str, got: &[usize], expected: &[usize]) -> Result<()> {
         if got == expected {
@@ -382,23 +438,68 @@ impl<B: Backend> LlamaModel<B> {
             "post_attention_layernorm"
         };
 
+        let q_rows = m.num_attention_heads * m.head_dim;
+        let kv_rows = m.num_key_value_heads * m.head_dim;
         let mut layers = Vec::with_capacity(m.num_hidden_layers);
         for i in 0..m.num_hidden_layers {
             let p = format!("{prefix}.layers.{i}");
-            let q = load_linear(source, device, &format!("{p}.self_attn.q_proj.weight"))?;
-            let k = load_linear(source, device, &format!("{p}.self_attn.k_proj.weight"))?;
-            let v = load_linear(source, device, &format!("{p}.self_attn.v_proj.weight"))?;
+            // Phi-family checkpoints fuse the attention input projections
+            // (`qkv_proj` = [q|k|v] rows); probe the split names first.
+            let (q, k, v, fused_qkv_bias) =
+                match load_linear(source, device, &format!("{p}.self_attn.q_proj.weight")) {
+                    Ok(q) => (
+                        q,
+                        load_linear(source, device, &format!("{p}.self_attn.k_proj.weight"))?,
+                        load_linear(source, device, &format!("{p}.self_attn.v_proj.weight"))?,
+                        None,
+                    ),
+                    Err(ModelError::MissingTensor(_)) => {
+                        let name = format!("{p}.self_attn.qkv_proj");
+                        let [q, k, v] = split_fused_rows(
+                            source,
+                            device,
+                            &format!("{name}.weight"),
+                            [q_rows, kv_rows, kv_rows],
+                        )?;
+                        let b = split_fused_bias(
+                            source,
+                            device,
+                            &format!("{name}.bias"),
+                            [q_rows, kv_rows, kv_rows],
+                        )?;
+                        (q, k, v, b)
+                    }
+                    Err(e) => return Err(e),
+                };
             let o = load_linear(source, device, &format!("{p}.self_attn.o_proj.weight"))?;
             Self::expect_shape(
                 &format!("{p}.self_attn.q_proj.weight"),
                 &q.dims(),
-                &[m.num_attention_heads * m.head_dim, m.hidden_size],
+                &[q_rows, m.hidden_size],
             )?;
             Self::expect_shape(
                 &format!("{p}.self_attn.k_proj.weight"),
                 &k.dims(),
-                &[m.num_key_value_heads * m.head_dim, m.hidden_size],
+                &[kv_rows, m.hidden_size],
             )?;
+            // Same fusion for the MLP input (`gate_up_proj` = [gate|up]).
+            let (gate, up) =
+                match load_linear(source, device, &format!("{p}.mlp.gate_proj.weight")) {
+                    Ok(gate) => (
+                        gate,
+                        load_linear(source, device, &format!("{p}.mlp.up_proj.weight"))?,
+                    ),
+                    Err(ModelError::MissingTensor(_)) => {
+                        let [gate, up] = split_fused_rows(
+                            source,
+                            device,
+                            &format!("{p}.mlp.gate_up_proj.weight"),
+                            [m.intermediate_size, m.intermediate_size],
+                        )?;
+                        (gate, up)
+                    }
+                    Err(e) => return Err(e),
+                };
 
             // Bias loading is presence-driven: HF Qwen2 configs never emit
             // `attention_bias` (the bias is implicit in the modeling code),
@@ -406,6 +507,14 @@ impl<B: Backend> LlamaModel<B> {
             // Plain llama/smollm checkpoints have none and probe to `None`.
             let bias = |proj: &str| -> Result<Option<Tensor<B, 1>>> {
                 load_optional_bias(source, device, &format!("{p}.{proj}.bias"))
+            };
+            let (q_bias, k_bias, v_bias) = match fused_qkv_bias {
+                Some([qb, kb, vb]) => (Some(qb), Some(kb), Some(vb)),
+                None => (
+                    bias("self_attn.q_proj")?,
+                    bias("self_attn.k_proj")?,
+                    bias("self_attn.v_proj")?,
+                ),
             };
 
             let optional_norm = |name: &str| -> Result<Option<Tensor<B, 1>>> {
@@ -423,14 +532,14 @@ impl<B: Backend> LlamaModel<B> {
                 k,
                 v,
                 o,
-                q_bias: bias("self_attn.q_proj")?,
-                k_bias: bias("self_attn.k_proj")?,
-                v_bias: bias("self_attn.v_proj")?,
+                q_bias,
+                k_bias,
+                v_bias,
                 o_bias: bias("self_attn.o_proj")?,
                 q_norm: if spec.qk_norm { optional_norm("self_attn.q_norm")? } else { None },
                 k_norm: if spec.qk_norm { optional_norm("self_attn.k_norm")? } else { None },
-                gate: load_linear(source, device, &format!("{p}.mlp.gate_proj.weight"))?,
-                up: load_linear(source, device, &format!("{p}.mlp.up_proj.weight"))?,
+                gate,
+                up,
                 down: load_linear(source, device, &format!("{p}.mlp.down_proj.weight"))?,
                 input_norm: load_weight(source, device, &format!("{p}.input_layernorm.weight"))?,
                 pre_mlp_norm: load_weight(

@@ -100,6 +100,20 @@ pub enum RopeScaling {
         /// `0.1·ln(factor) + 1`.
         attention_factor: Option<f64>,
     },
+    /// Phi-3 LongRoPE: per-dimension frequency divisors, one set for
+    /// prompts within the pretraining context and one beyond it.
+    LongRope {
+        short_factor: Vec<f64>,
+        long_factor: Vec<f64>,
+        original_max_position_embeddings: usize,
+        /// Context extension ratio `max_position / original_max` (phi
+        /// derives the attention temperature from it, not from a config
+        /// `factor` key).
+        factor: f64,
+        /// Explicit attention scaling; `None` = the LongRoPE default
+        /// `sqrt(1 + ln(factor)/ln(original_max))` (1.0 when factor ≤ 1).
+        attention_factor: Option<f64>,
+    },
 }
 
 impl RopeScaling {
@@ -136,8 +150,42 @@ impl RopeScaling {
                 beta_slow: f("beta_slow", 1.0),
                 attention_factor: rs.get("attention_factor").and_then(|v| v.as_f64()),
             }),
+            "longrope" => {
+                let factors = |key: &str| -> Result<Vec<f64>> {
+                    rs.get(key)
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|x| x.as_f64()).collect())
+                        .ok_or_else(|| {
+                            FormatError::MissingField(format!("rope_scaling.{key}"))
+                        })
+                };
+                // Phi-3 keeps the pretraining context length top-level (not
+                // inside rope_scaling), with max_position_embeddings already
+                // raised to the extended value; their ratio drives the
+                // attention temperature.
+                let original = rs
+                    .get("original_max_position_embeddings")
+                    .or_else(|| config.get("original_max_position_embeddings"))
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| {
+                        FormatError::MissingField(
+                            "original_max_position_embeddings (longrope)".to_string(),
+                        )
+                    })? as usize;
+                let max_pos = config
+                    .get("max_position_embeddings")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(original as u64) as usize;
+                Ok(RopeScaling::LongRope {
+                    short_factor: factors("short_factor")?,
+                    long_factor: factors("long_factor")?,
+                    original_max_position_embeddings: original,
+                    factor: max_pos as f64 / original as f64,
+                    attention_factor: rs.get("attention_factor").and_then(|v| v.as_f64()),
+                })
+            }
             other => Err(FormatError::MissingField(format!(
-                "unsupported rope_scaling type {other:?} (supported: linear, llama3, yarn)"
+                "unsupported rope_scaling type {other:?} (supported: linear, llama3, yarn, longrope)"
             ))),
         }
     }
@@ -489,6 +537,41 @@ mod tests {
         absent.as_object_mut().unwrap().remove("use_sliding_window");
         let meta = ModelMetadata::from_hf_config(&absent, None).unwrap();
         assert_eq!(meta.attention_pattern.sliding_window, Some(131072));
+    }
+
+    #[test]
+    fn parses_phi3_longrope_with_toplevel_original_max() {
+        // Phi-3-mini-128k shape: `original_max_position_embeddings` lives at
+        // the TOP level (not inside rope_scaling), max_position already
+        // extended; factor derives from the ratio.
+        let config = serde_json::json!({
+            "model_type": "phi3", "hidden_size": 3072, "intermediate_size": 8192,
+            "num_hidden_layers": 32, "num_attention_heads": 32, "vocab_size": 32064,
+            "max_position_embeddings": 131072,
+            "original_max_position_embeddings": 4096,
+            "rope_scaling": {
+                "type": "longrope",
+                "short_factor": [1.0, 1.05, 1.1],
+                "long_factor": [2.0, 2.5, 3.0]
+            }
+        });
+        let meta = ModelMetadata::from_hf_config(&config, None).unwrap();
+        match &meta.rope_scaling {
+            RopeScaling::LongRope {
+                short_factor,
+                long_factor,
+                original_max_position_embeddings,
+                factor,
+                attention_factor,
+            } => {
+                assert_eq!(short_factor, &[1.0, 1.05, 1.1]);
+                assert_eq!(long_factor, &[2.0, 2.5, 3.0]);
+                assert_eq!(*original_max_position_embeddings, 4096);
+                assert_eq!(*factor, 32.0);
+                assert_eq!(*attention_factor, None);
+            }
+            other => panic!("expected LongRope, got {other:?}"),
+        }
     }
 
     #[test]

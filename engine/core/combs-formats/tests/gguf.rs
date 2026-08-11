@@ -259,6 +259,131 @@ fn qwen_gguf_add_bos_and_single_digit_pretokenizer() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Builds a tiny phi3 GGUF: fused `attn_qkv` (hidden 4, 2 heads / 1 kv
+/// head → rows [q0 q1 q2 q3 | k0 k1 | v0 v1]) and fused `ffn_up`
+/// (intermediate 3 → rows [g0 g1 g2 | u0 u1 u2]), each row filled with its
+/// global row index so slices are recognizable. Plus phi3's sliding-window
+/// key and an `<|end|>` control token beyond the declared eos.
+fn write_phi3_test_gguf(path: &std::path::Path) {
+    let mut out: Vec<u8> = Vec::new();
+    let w32 = |v: u32, out: &mut Vec<u8>| out.extend_from_slice(&v.to_le_bytes());
+    let w64 = |v: u64, out: &mut Vec<u8>| out.extend_from_slice(&v.to_le_bytes());
+    let wstr = |s: &str, out: &mut Vec<u8>| {
+        out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    };
+
+    out.extend_from_slice(b"GGUF");
+    w32(3, &mut out);
+    w64(2, &mut out); // tensors: attn_qkv + ffn_up
+    w64(11, &mut out); // kv count
+
+    wstr("general.architecture", &mut out);
+    w32(8, &mut out);
+    wstr("phi3", &mut out);
+    for (key, val) in [
+        ("phi3.embedding_length", 4u32),
+        ("phi3.attention.head_count", 2),
+        ("phi3.attention.head_count_kv", 1),
+        ("phi3.block_count", 1),
+        ("phi3.context_length", 64),
+        ("phi3.feed_forward_length", 3),
+        ("phi3.attention.sliding_window", 2047),
+    ] {
+        wstr(key, &mut out);
+        w32(4, &mut out);
+        w32(val, &mut out);
+    }
+    wstr("tokenizer.ggml.eos_token_id", &mut out);
+    w32(4, &mut out);
+    w32(1, &mut out);
+    wstr("tokenizer.ggml.tokens", &mut out);
+    w32(9, &mut out);
+    w32(8, &mut out);
+    w64(4, &mut out);
+    for tok in ["<s>", "<|endoftext|>", "<|end|>", "a"] {
+        wstr(tok, &mut out);
+    }
+    wstr("tokenizer.ggml.token_type", &mut out);
+    w32(9, &mut out);
+    w32(5, &mut out); // i32 array
+    w64(4, &mut out);
+    for ty in [3i32, 3, 3, 1] {
+        out.extend_from_slice(&ty.to_le_bytes());
+    }
+
+    // tensor infos (ggml dims: in-dim first): attn_qkv [4, 8], ffn_up [4, 6]
+    wstr("blk.0.attn_qkv.weight", &mut out);
+    w32(2, &mut out);
+    w64(4, &mut out);
+    w64(8, &mut out);
+    w32(0, &mut out); // F32
+    w64(0, &mut out);
+    wstr("blk.0.ffn_up.weight", &mut out);
+    w32(2, &mut out);
+    w64(4, &mut out);
+    w64(6, &mut out);
+    w32(0, &mut out);
+    w64(4 * 8 * 4, &mut out); // after attn_qkv (128 B, 32-aligned)
+
+    let pad = (32 - (out.len() % 32)) % 32;
+    out.extend(std::iter::repeat(0u8).take(pad));
+
+    // attn_qkv rows 0..8, ffn_up rows 0..6, each row constant = row index.
+    for row in 0..8 {
+        for _ in 0..4 {
+            out.extend_from_slice(&(row as f32).to_le_bytes());
+        }
+    }
+    for row in 0..6 {
+        for _ in 0..4 {
+            out.extend_from_slice(&(row as f32).to_le_bytes());
+        }
+    }
+    std::fs::write(path, &out).unwrap();
+}
+
+#[test]
+fn phi3_fused_tensors_serve_split_names() {
+    let dir = std::env::temp_dir().join(format!("combs-gguf-phi3-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("phi3.gguf");
+    write_phi3_test_gguf(&path);
+
+    let source = GgufSource::load(&path).expect("parse");
+    let md = source.metadata();
+    assert_eq!(md.architecture, "phi3");
+    // Sliding-window key surfaces in the attention pattern.
+    assert_eq!(md.attention_pattern.sliding_window, Some(2047));
+    // `<|end|>` (id 2) joins the declared eos (id 1) via the EOG scan.
+    assert_eq!(md.eos_token_ids, vec![1, 2]);
+
+    // Fused attn_qkv [8,4] serves q/k/v as row ranges [0..4 | 4..6 | 6..8].
+    let expect = [
+        ("model.layers.0.self_attn.q_proj.weight", vec![4usize, 4], 0.0f32),
+        ("model.layers.0.self_attn.k_proj.weight", vec![2, 4], 4.0),
+        ("model.layers.0.self_attn.v_proj.weight", vec![2, 4], 6.0),
+        ("model.layers.0.mlp.gate_proj.weight", vec![3, 4], 0.0),
+        ("model.layers.0.mlp.up_proj.weight", vec![3, 4], 3.0),
+    ];
+    for (name, shape, first_row) in expect {
+        let reader = source.open_tensor(name).expect(name);
+        assert_eq!(reader.shape(), &shape[..], "{name} shape");
+        let values = reader.load_data().unwrap().to_vec::<f32>().unwrap();
+        for (i, v) in values.iter().enumerate() {
+            let row = i / shape[1];
+            assert_eq!(
+                *v,
+                first_row + row as f32,
+                "{name} row {row} must come from fused row {}",
+                first_row + row as f32
+            );
+        }
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn split_shard_gguf_is_rejected() {
     let dir = std::env::temp_dir().join(format!("combs-gguf-split-test-{}", std::process::id()));

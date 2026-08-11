@@ -96,6 +96,32 @@ pub fn scaled_inv_freq(head_dim: usize, theta: f64, scaling: &RopeScaling) -> (V
             let mscale = attention_factor.unwrap_or(0.1 * factor.ln() + 1.0);
             (scaled, mscale)
         }
+        RopeScaling::LongRope {
+            short_factor,
+            long_factor: _,
+            original_max_position_embeddings,
+            factor,
+            attention_factor,
+        } => {
+            // v1 builds the short-context tables (exact for sequences within
+            // the pretraining context, e.g. 4096 for phi-3 128k variants);
+            // the runtime long-table switch lands with the first
+            // beyond-original-context preset.
+            let scaled = base
+                .iter()
+                .enumerate()
+                .map(|(i, f)| f / short_factor.get(i).copied().unwrap_or(1.0))
+                .collect();
+            let mscale = attention_factor.unwrap_or_else(|| {
+                if *factor <= 1.0 {
+                    1.0
+                } else {
+                    (1.0 + factor.ln() / (*original_max_position_embeddings as f64).ln())
+                        .sqrt()
+                }
+            });
+            (scaled, mscale)
+        }
     }
 }
 
@@ -275,6 +301,41 @@ mod tests {
             assert!(rel < 1e-6, "yarn inv[{i}]: {} vs {e}", inv[i]);
         }
         assert!((mscale - 1.138629436112).abs() < 1e-9, "mscale {mscale}");
+    }
+
+    #[test]
+    fn longrope_scaling_matches_reference() {
+        // Synthetic phi-style config: dim 8 (base inv_freq 1/0.1/0.01/0.001),
+        // short divisors [1,2,4,8], context extended 4096 → 131072
+        // (factor 32). HF `_compute_longrope_parameters`:
+        //   inv_freq[i] = base[i] / short_factor[i]
+        //   attention_factor = sqrt(1 + ln(32)/ln(4096)) = sqrt(17/12).
+        let scaling = RopeScaling::LongRope {
+            short_factor: vec![1.0, 2.0, 4.0, 8.0],
+            long_factor: vec![1.0; 4],
+            original_max_position_embeddings: 4096,
+            factor: 32.0,
+            attention_factor: None,
+        };
+        let (inv, mscale) = scaled_inv_freq(8, 10_000.0, &scaling);
+        let expected = [1.0, 0.05, 0.0025, 0.000125];
+        for (i, e) in expected.iter().enumerate() {
+            assert!((inv[i] - e).abs() < 1e-15, "longrope inv[{i}]: {}", inv[i]);
+        }
+        assert!(
+            (mscale - (17.0f64 / 12.0).sqrt()).abs() < 1e-12,
+            "mscale {mscale}"
+        );
+        // Unextended context (factor 1) keeps attention untouched.
+        let scaling = RopeScaling::LongRope {
+            short_factor: vec![1.0; 4],
+            long_factor: vec![1.0; 4],
+            original_max_position_embeddings: 4096,
+            factor: 1.0,
+            attention_factor: None,
+        };
+        let (_, mscale) = scaled_inv_freq(8, 10_000.0, &scaling);
+        assert_eq!(mscale, 1.0);
     }
 
     #[test]

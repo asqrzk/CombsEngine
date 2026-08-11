@@ -70,17 +70,18 @@ impl ArchSpec {
                     }
                 })
                 .collect(),
-            // Qwen2 partition: the first `max_window_layers` layers are
+            // Qwen2/3 partition: the first `max_window_layers` layers are
             // full attention, the rest slide. HF defaults the split to the
             // layer count, i.e. nothing slides.
-            ("qwen2", Some(w)) => {
+            ("qwen2" | "qwen3", Some(w)) => {
                 let full = pattern.max_window_layers.unwrap_or(n);
                 (0..n)
                     .map(|i| if i < full { LayerKind::Global } else { LayerKind::Sliding(w) })
                     .collect()
             }
-            // Mistral v0.1: every layer slides.
-            ("mistral", Some(w)) => vec![LayerKind::Sliding(w); n],
+            // Mistral v0.1 and phi-3: every layer slides (phi-3-mini ships
+            // sliding_window 2047 alongside its 4k context).
+            ("mistral" | "phi3", Some(w)) => vec![LayerKind::Sliding(w); n],
             // Unknown sliding semantics: run global rather than guess a
             // wrong mask (the registry guards refuse the risky cases).
             (_, Some(_)) => vec![LayerKind::Global; n],

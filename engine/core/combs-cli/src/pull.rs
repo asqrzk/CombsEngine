@@ -25,9 +25,19 @@ pub const PRESETS: &[(&str, &str, &str)] = &[
     ("smollm2-135m", "HuggingFaceTB/SmolLM2-135M-Instruct", "smollm2-135m"),
     ("smollm2-360m", "HuggingFaceTB/SmolLM2-360M-Instruct", "smollm2-360m"),
     ("smollm2-1.7b", "HuggingFaceTB/SmolLM2-1.7B-Instruct", "smollm2-1.7b"),
+    ("qwen3-0.6b", "Qwen/Qwen3-0.6B", "qwen3-0.6b"),
+    ("phi-3.1-mini", "bartowski/Phi-3.1-mini-4k-instruct-GGUF", "phi-3.1-mini-4k-instruct-gguf"),
     ("smolvlm-256m", "HuggingFaceTB/SmolVLM-256M-Instruct", "smolvlm-256m"),
     ("sd-1.5", "runwayml/stable-diffusion-v1-5", "stable-diffusion-v1-5"),
     ("kokoro-82m", "onnx-community/Kokoro-82M-v1.0-ONNX", "kokoro-82m"),
+];
+
+/// Quant-GGUF repos that need the original checkpoint's `tokenizer.json`
+/// staged as a sibling: SPM-vocab GGUFs (phi-3's `tokenizer.ggml.model =
+/// "llama"`) can't ride the BPE tokenizer synthesis, and quant repos don't
+/// ship the file. Keyed by cache slug → source repo for the tokenizer.
+const GGUF_TOKENIZER_COMPANIONS: &[(&str, &str)] = &[
+    ("phi-3.1-mini-4k-instruct-gguf", "microsoft/Phi-3-mini-4k-instruct"),
 ];
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -289,6 +299,17 @@ fn pull_gguf(repo: &str, dir: &PathBuf, tree: &[TreeEntry]) -> Result<()> {
     };
     let target = dir.join("model.gguf");
     download_required_as(repo, &target, &format!("{repo}/resolve/main/{file}"))?;
+    // SPM-vocab quants need the original tokenizer.json next to the file.
+    let slug = dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if let Some((_, tok_repo)) =
+        GGUF_TOKENIZER_COMPANIONS.iter().find(|(s, _)| *s == slug)
+    {
+        download_required_as(
+            tok_repo,
+            &dir.join("tokenizer.json"),
+            &format!("{tok_repo}/resolve/main/tokenizer.json"),
+        )?;
+    }
     Ok(())
 }
 

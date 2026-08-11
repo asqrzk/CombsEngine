@@ -615,3 +615,64 @@ endpoint recovers poisoned mutexes, clamps speed to 0.25–4.0, and caps
 request bodies at 1 MB. The full Whisper-port checklist (mel constants,
 conv stem, sinusoid layout, forced prefix, seek loop, golden ladder) is
 recorded in the wave-4 planning notes.
+
+## 2026-08-11 — Wave 2 stage C: qwen3 + phi3 presets (LANDED)
+
+(Also the retro-note for stages A/B, whose commits `ec5ae73`/`0d4cf5b`
+landed just before this entry: extended metadata + RoPE scaling
+linear/llama3/yarn with formula goldens + the ArchSpec resolver; then
+llama.rs parameterized on ArchSpec with the byte-identity gate green over
+smollm2 safetensors+GGUF and llama-3.2 GGUF.)
+
+**qwen3** — registry entry riding the W2-B decoder unchanged: ArchSpec
+already set `qk_norm` for the family, the loader already probed
+`self_attn.{q,k}_norm.weight`. Qwen3-0.6B E2E (safetensors, bf16 1.5 GB):
+raw greedy coding prompt and `--chat` (its Jinja template, `<think>` mode)
+both coherent. The 0.6B config has explicit `head_dim: 128` against
+`hidden/heads = 64` — the decoupled-head-dim path is now exercised for
+real. (Qwen3-1.7B+ ship sharded safetensors — blocked on multi-file
+loading, same backlog as split-GGUF. Qwen3 GGUF waits for the W2-E
+tensor map: `attn_q_norm`/`attn_k_norm`.)
+
+**phi3** — three mechanisms, all load-time (zero forward-pass changes):
+1. *Fused projections*: HF phi stores `qkv_proj` (`[q|k|v]` rows) and
+   `gate_up_proj` (`[gate|up]` rows). Safetensors: probe-then-split dense
+   via `narrow` in the llama loader (biases analogous). GGUF stores fused
+   `attn_qkv`/`ffn_up` too (verified in a metadata dump of the Q4_K_M
+   file): the adapter's `fused_slice` serves the split HF names as packed
+   row ranges — exact for every kernel dtype (whole superblocks per row),
+   `Cow::Borrowed` off the mmap. Synthetic tests both sides: a fused
+   safetensors checkpoint reproduces its pre-split twin bit-for-bit, and
+   a fused GGUF fixture serves the five split names with the right rows.
+2. *All-layer sliding window*: every shipped mini activates
+   `sliding_window: 2047`; ArchSpec maps phi3 → all-`Sliding(w)` (HF
+   semantics) and the GGUF reader now parses `attention.sliding_window`.
+   E2E at 3126 prompt tokens (past the window, real KV eviction on all 32
+   layers): answers the tail question correctly ("2, 3, and 5.") — the
+   W2-B sliding plumbing's first beyond-window proof. A synthetic test
+   pins dormant-window ≡ global for short contexts.
+3. *EOG token scan* (llama.cpp `special_eog_ids` equivalent): phi GGUFs
+   declare eos 32000 (`<|endoftext|>`) but chat turns end with `<|end|>`
+   (32007) — generation never stopped. Control tokens matching the known
+   end-of-turn set (`<|end|>`, `<|eot_id|>`, `<|eom_id|>`, `<|im_end|>`,
+   `<end_of_turn>`, `<|end_of_text|>`, `<EOT>`) now join `eos_token_ids`.
+
+Plus **LongRope parse + short-context tables**: `rope_scaling.type =
+"longrope"` (phi 128k variants) parses — factors, top-level
+`original_max_position_embeddings`, ratio-derived factor — and
+`scaled_inv_freq` builds the short-factor tables with the HF attention
+temperature `sqrt(1 + ln(factor)/ln(orig))`; golden-tested. The long-table
+runtime switch lands with the first beyond-original-context preset.
+
+E2E: Phi-3.1-mini-4k-instruct Q4_K_M (bartowski single file, 2.4 GB;
+`phi-3.1-mini` preset): chat "In one sentence, what is mmap?" → one
+correct sentence, stops at `<|end|>` (44 < 80 max tokens); raw docstring
+continuation coherent; 5.78 GB in use after load; 5.6–9.4 tok/s decode.
+
+Known gaps recorded: Q5_K has no GPU kernel — phi's Q5_K `attn_qkv`
+dequantizes to dense f32 at load (≈3.6 GB extra; a Q5_K kernel is queued
+with the wave-4 perf work). SPM-vocab GGUFs (tokenizer.ggml.model =
+"llama") skip the BPE synthesis and need a sibling tokenizer.json — the
+pull preset stages the original Microsoft one automatically
+(`GGUF_TOKENIZER_COMPANIONS`); a Unigram/byte-fallback synthesis is the
+principled follow-up.

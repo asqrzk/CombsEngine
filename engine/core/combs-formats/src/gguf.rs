@@ -375,10 +375,13 @@ fn build_model_metadata(kv: &HashMap<String, MetaValue>) -> Result<ModelMetadata
         bos_token_id: bos_id,
         eos_token_ids: eos_ids,
         vision: None,
-        // GGUF: llama-family defaults (all-global). Gemma GGUF keys
-        // (attention.sliding_window etc.) are a follow-up — the
-        // safetensors path is the Gemma reference for U1.
-        attention_pattern: crate::metadata::AttentionPattern::default(),
+        // Sliding window when the file declares one (phi3 writes
+        // `attention.sliding_window`); the remaining gemma layout keys
+        // (pattern, local rope base) land with the arch-aware map.
+        attention_pattern: crate::metadata::AttentionPattern {
+            sliding_window: field("attention.sliding_window").map(|v| v as usize),
+            ..Default::default()
+        },
         // GGUF stores no activation key; the per-arch resolver supplies it.
         activation: crate::metadata::Activation::default(),
         rope_scaling: gguf_rope_scaling(kv, &prefix)?,
@@ -423,6 +426,20 @@ fn gguf_rope_scaling(
     }
 }
 
+/// End-of-generation control tokens that chat finetunes emit to terminate a
+/// turn while the file's declared eos stays the base `<|endoftext|>`-style id
+/// (phi-3's `<|end|>`, llama-3's `<|eot_id|>`, gemma's `<end_of_turn>`).
+/// Mirrors llama.cpp's `special_eog_ids` name scan.
+const EOG_TOKENS: &[&str] = &[
+    "<|end|>",
+    "<|eot_id|>",
+    "<|eom_id|>",
+    "<|im_end|>",
+    "<end_of_turn>",
+    "<|end_of_text|>",
+    "<EOT>",
+];
+
 fn tokenizer_ids(kv: &HashMap<String, MetaValue>) -> (Vec<u32>, Option<u32>, HashMap<u32, String>) {
     let mut eos = Vec::new();
     let mut bos = None;
@@ -440,6 +457,9 @@ fn tokenizer_ids(kv: &HashMap<String, MetaValue>) -> (Vec<u32>, Option<u32>, Has
         for (i, (tok, ty)) in tokens.iter().zip(types.iter()).enumerate() {
             if *ty == 3 {
                 added.insert(i as u32, tok.clone());
+            }
+            if *ty == 3 && EOG_TOKENS.contains(&tok.as_str()) && !eos.contains(&(i as u32)) {
+                eos.push(i as u32);
             }
         }
     }
@@ -954,6 +974,49 @@ fn depermute_rows_f32(values: Vec<f32>, rows: usize, n_head: usize) -> Vec<f32> 
 }
 
 impl GgufSource {
+    /// Fused-projection resolution: phi3 GGUFs store `attn_qkv` = `[q|k|v]`
+    /// rows and `ffn_up` = `[gate|up]` rows (HF phi3 order). Given a split
+    /// HF name, returns the fused ggml name plus the `(start, len)` row
+    /// range to slice. Row slicing is exact for every supported dtype:
+    /// packed formats store whole blocks per row (the column count is a
+    /// multiple of the 256-value superblock), so a row range is a
+    /// contiguous byte range.
+    fn fused_slice(&self, name: &str) -> Option<(String, usize, usize)> {
+        if self.metadata.architecture != "phi3" {
+            return None;
+        }
+        let m = &self.metadata;
+        let rest = name.strip_prefix("model.layers.")?;
+        let (layer, rest) = rest.split_once('.')?;
+        let q_rows = m.num_attention_heads * m.head_dim;
+        let kv_rows = m.num_key_value_heads * m.head_dim;
+        let ffn = m.intermediate_size;
+        let (fused, start, len) = match rest {
+            "self_attn.q_proj.weight" => ("attn_qkv.weight", 0, q_rows),
+            "self_attn.k_proj.weight" => ("attn_qkv.weight", q_rows, kv_rows),
+            "self_attn.v_proj.weight" => ("attn_qkv.weight", q_rows + kv_rows, kv_rows),
+            "mlp.gate_proj.weight" => ("ffn_up.weight", 0, ffn),
+            "mlp.up_proj.weight" => ("ffn_up.weight", ffn, ffn),
+            _ => return None,
+        };
+        Some((format!("blk.{layer}.{fused}"), start, len))
+    }
+
+    /// Looks up the ggml tensor serving HF `name`, with the row range to
+    /// slice when it lives inside a fused projection (`None` range = whole
+    /// tensor).
+    fn resolve_tensor(&self, name: &str) -> Option<(&String, &TensorInfo, Option<(usize, usize)>)> {
+        if let Some((fused, start, len)) = self.fused_slice(name) {
+            if let Some((k, info)) = self.tensors.get_key_value(&fused) {
+                return Some((k, info, Some((start, len))));
+            }
+        }
+        self.tensors
+            .iter()
+            .find(|(k, _)| map_tensor_name(k).as_deref() == Some(name))
+            .map(|(k, info)| (k, info, None))
+    }
+
     /// Head count to de-permute `ggml_name` with, when this file's arch
     /// stores Q/K in llama.cpp's interleaved-pairs layout. `None` = serve
     /// the tensor verbatim.
@@ -984,11 +1047,10 @@ impl ModelSource for GgufSource {
     }
 
     fn open_tensor(&self, name: &str) -> Result<TensorReader<'_>> {
-        // Find the ggml tensor mapping to this HF name.
-        let (ggml_name, info) = self
-            .tensors
-            .iter()
-            .find(|(k, _)| map_tensor_name(k).as_deref() == Some(name))
+        // Find the ggml tensor mapping to this HF name (possibly a row
+        // range of a fused projection).
+        let (ggml_name, info, slice) = self
+            .resolve_tensor(name)
             .ok_or_else(|| FormatError::TensorNotFound(name.to_string()))?;
 
         let size = tensor_byte_size(info)?;
@@ -999,9 +1061,26 @@ impl ModelSource for GgufSource {
             .ok_or_else(|| FormatError::Safetensors(format!("gguf tensor {} out of bounds", info.name)))?;
 
         // HF layout = ggml dims reversed (row-major data needs no movement).
-        let shape: Vec<usize> = info.dims.iter().rev().copied().collect();
-        let n = num_elements(&info.dims);
+        let mut shape: Vec<usize> = info.dims.iter().rev().copied().collect();
+        let data = match slice {
+            None => data,
+            Some((row_start, row_len)) => {
+                let rows_total = shape.first().copied().unwrap_or(1).max(1);
+                if size % rows_total != 0 {
+                    return Err(FormatError::Safetensors(format!(
+                        "gguf tensor {}: rows not byte-addressable for fused split",
+                        info.name
+                    )));
+                }
+                let row_bytes = size / rows_total;
+                shape[0] = row_len;
+                &data[row_start * row_bytes..(row_start + row_len) * row_bytes]
+            }
+        };
+        let n: usize = shape.iter().product();
         let rows = shape.first().copied().unwrap_or(1).max(1);
+        // Fused slices and RoPE de-permutation never co-occur (phi3 vs
+        // llama/mistral arch gates).
         let permute = self.depermute_heads(ggml_name);
 
         // Passthrough dtypes: serve the mmap slice, unless the rows must be
@@ -1068,11 +1147,7 @@ impl ModelSource for GgufSource {
     }
 
     fn open_tensor_quant(&self, name: &str) -> Result<Option<crate::QuantTensor<'_>>> {
-        let Some((ggml_name, info)) = self
-            .tensors
-            .iter()
-            .find(|(k, _)| map_tensor_name(k).as_deref() == Some(name))
-        else {
+        let Some((ggml_name, info, slice)) = self.resolve_tensor(name) else {
             return Ok(None);
         };
         let format = match info.ggml_type {
@@ -1080,6 +1155,8 @@ impl ModelSource for GgufSource {
             GGML_Q5_0 => crate::QuantFormat::Q5_0,
             GGML_Q8_0 => crate::QuantFormat::Q8_0,
             GGML_Q4_K => crate::QuantFormat::Q4K,
+            // No Q5_K kernel yet: fused phi qkv slices in Q5_K files take
+            // the dense path (dequantized on load) instead.
             GGML_Q6_K => crate::QuantFormat::Q6K,
             _ => return Ok(None),
         };
@@ -1088,7 +1165,21 @@ impl ModelSource for GgufSource {
         let data = self.mmap.get(start..start + size).ok_or_else(|| {
             FormatError::Safetensors(format!("gguf tensor {} out of bounds", info.name))
         })?;
-        let shape: Vec<usize> = info.dims.iter().rev().copied().collect();
+        let mut shape: Vec<usize> = info.dims.iter().rev().copied().collect();
+        // Row range of a fused projection: a contiguous packed byte range
+        // (whole blocks per row), so the mmap slice narrows in place.
+        let data = match slice {
+            None => data,
+            Some((row_start, row_len)) => {
+                let rows_total = shape.first().copied().unwrap_or(1).max(1);
+                if size % rows_total != 0 {
+                    return Ok(None);
+                }
+                let row_bytes = size / rows_total;
+                shape[0] = row_len;
+                &data[row_start * row_bytes..(row_start + row_len) * row_bytes]
+            }
+        };
 
         // RoPE de-permutation for packed weights: every supported block
         // format stores whole blocks per row, so reordering the packed
