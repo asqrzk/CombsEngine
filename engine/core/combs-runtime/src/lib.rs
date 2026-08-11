@@ -27,7 +27,10 @@ pub use logits::{
     FrequencyPenalty, LogitsProcessor, LogitsProcessorChain, PresencePenalty,
     RepetitionPenalty, TemperatureScaler, TopK, TopP,
 };
-pub use sampler::{GreedySampler, MultinomialSampler, Sampler, SamplingParams, sampler_from_params};
+pub use sampler::{
+    GreedySampler, MultinomialSampler, SampleOutcome, Sampler, SamplingParams, TokenLogprobs,
+    sampler_from_params,
+};
 pub use stop::{StopDetector, StopStringMatcher};
 pub use template::ChatTemplate;
 pub use toolcall::{

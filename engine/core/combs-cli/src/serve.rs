@@ -91,6 +91,14 @@ pub fn serve(
                         handle_chat(&engine, &model_id, &body, default_prefill_chunk, &counters)
                     }
                 }
+                ("POST", "/v1/completions") => {
+                    let mut body = String::new();
+                    if request.as_reader().read_to_string(&mut body).is_err() {
+                        json_response(400, error_json("invalid_request", "unreadable body"))
+                    } else {
+                        handle_completions(&engine, &model_id, &body, default_prefill_chunk, &counters)
+                    }
+                }
                 ("POST", "/v1/embeddings") => {
                     let mut body = String::new();
                     if request.as_reader().read_to_string(&mut body).is_err() {
@@ -225,6 +233,9 @@ fn capabilities_json(engine: &Arc<Engine>) -> Value {
             combs_runtime::Pooling::Last => "last",
             combs_runtime::Pooling::Mean => "mean",
         },
+        "logprobs": true,
+        "min_p": true,
+        "completions": true,
     })
 }
 
@@ -451,6 +462,150 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Applies the sampling/stop/constraint request fields shared by the chat
+/// and completions endpoints. `Err` is a client-fixable message (400).
+fn apply_sampling_params(req: &Value, config: &mut GenerationConfig) -> Result<(), String> {
+    // `max_completion_tokens` is the current OpenAI name; `max_tokens` the
+    // legacy alias (the explicit new name wins when both are present).
+    if let Some(mt) = req
+        .get("max_completion_tokens")
+        .or_else(|| req.get("max_tokens"))
+        .and_then(Value::as_u64)
+    {
+        config.max_tokens = mt as usize;
+    }
+    if let Some(t) = req.get("temperature").and_then(Value::as_f64) {
+        config.sampling.temperature = t as f32;
+    }
+    if let Some(k) = req.get("top_k").and_then(Value::as_u64) {
+        config.sampling.top_k = Some(k as usize);
+    }
+    if let Some(p) = req.get("top_p").and_then(Value::as_f64) {
+        config.sampling.top_p = Some(p as f32);
+    }
+    if let Some(p) = req.get("min_p").and_then(Value::as_f64) {
+        config.sampling.min_p = Some(p as f32);
+    }
+    if let Some(rp) = req.get("repetition_penalty").and_then(Value::as_f64) {
+        config.sampling.repetition_penalty = Some(rp as f32);
+    }
+    if let Some(fp) = req.get("frequency_penalty").and_then(Value::as_f64) {
+        config.sampling.frequency_penalty = Some(fp as f32);
+    }
+    if let Some(pp) = req.get("presence_penalty").and_then(Value::as_f64) {
+        config.sampling.presence_penalty = Some(pp as f32);
+    }
+    if let Some(seed) = req.get("seed").and_then(Value::as_u64) {
+        config.sampling.seed = Some(seed);
+    }
+    if let Some(bias) = req.get("logit_bias") {
+        let obj = bias
+            .as_object()
+            .ok_or("logit_bias must be an object of token-id strings to numbers")?;
+        let mut map = std::collections::HashMap::with_capacity(obj.len());
+        for (k, v) in obj {
+            let id: u32 = k
+                .parse()
+                .map_err(|_| format!("logit_bias key is not a token id: {k:?}"))?;
+            let b = v
+                .as_f64()
+                .ok_or_else(|| format!("logit_bias value for {k:?} is not a number"))?;
+            map.insert(id, b as f32);
+        }
+        config.sampling.logit_bias = Some(map);
+    }
+    if let Some(stop) = req.get("stop") {
+        let stops: Vec<String> = match stop {
+            Value::String(s) => vec![s.clone()],
+            Value::Array(a) => a
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            _ => vec![],
+        };
+        config.stop_strings = stops;
+    }
+    // Structured output: parse AND compile the schema here so malformed
+    // requests are clean 400s before anything is enqueued on the worker.
+    if let Some(rf) = req.get("response_format") {
+        config.constraint = combs_runtime::ConstraintSpec::from_response_format(rf)
+            .and_then(|spec| {
+                if let Some(s) = &spec {
+                    s.compile()?;
+                }
+                Ok(spec)
+            })
+            .map_err(|msg| format!("response_format: {msg}"))?;
+    }
+    Ok(())
+}
+
+/// Multi-choice count: OpenAI `n`, capped at 4 sequential generations.
+fn parse_n_choices(req: &Value, stream: bool) -> Result<usize, String> {
+    let n = req.get("n").and_then(Value::as_u64).unwrap_or(1) as usize;
+    if n == 0 || n > 4 {
+        return Err("n must be 1..=4".to_string());
+    }
+    if stream && n > 1 {
+        return Err("n > 1 is not supported with stream".to_string());
+    }
+    Ok(n)
+}
+
+/// Per-choice sampling config: distinct seeds keep multinomial choices
+/// distinct while an explicit seed stays reproducible per index.
+fn choice_config(config: &GenerationConfig, index: usize) -> GenerationConfig {
+    let mut cfg = config.clone();
+    if index > 0 {
+        if let Some(seed) = cfg.sampling.seed {
+            cfg.sampling.seed = Some(seed.wrapping_add(index as u64));
+        }
+    }
+    cfg
+}
+
+/// One OpenAI `logprobs.content[]` entry for a sampled token.
+fn logprob_entry_json(
+    engine: &Arc<Engine>,
+    piece: &str,
+    lp: &combs_runtime::TokenLogprobs,
+) -> Value {
+    let top: Vec<Value> = lp
+        .top
+        .iter()
+        .map(|(id, l)| {
+            let text = engine.token_piece(*id);
+            json!({"token": text, "logprob": l, "bytes": text.as_bytes()})
+        })
+        .collect();
+    json!({
+        "token": piece,
+        "logprob": lp.logprob,
+        "bytes": piece.as_bytes(),
+        "top_logprobs": top,
+    })
+}
+
+/// `usage` for multi-choice responses: prompt counted once, completions
+/// summed. Single-choice keeps the full timing/cache detail.
+fn usage_json_choices(all: &[GenerationStats], session_id: Option<&str>) -> Value {
+    if all.len() == 1 {
+        return usage_json(&all[0], session_id);
+    }
+    let prompt = all.first().map(|s| s.prompt_tokens).unwrap_or(0);
+    let completion: usize = all.iter().map(|s| s.generated_tokens).sum();
+    json!({
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+        "prompt_tokens_details": {
+            "cached_tokens": all.first().map(|s| s.cached_tokens).unwrap_or(0),
+        },
+        "session_id": session_id,
+    })
+}
+
 fn handle_chat(
     engine: &Arc<Engine>,
     model_id: &str,
@@ -521,60 +676,17 @@ fn handle_chat(
     if let Some(chunk) = default_prefill_chunk {
         config.prefill_chunk_size = chunk;
     }
-    if let Some(mt) = req.get("max_tokens").and_then(Value::as_u64) {
-        config.max_tokens = mt as usize;
+    if let Err(msg) = apply_sampling_params(&req, &mut config) {
+        return json_response(400, error_json("invalid_request", &msg));
     }
-    if let Some(t) = req.get("temperature").and_then(Value::as_f64) {
-        config.sampling.temperature = t as f32;
-    }
-    if let Some(k) = req.get("top_k").and_then(Value::as_u64) {
-        config.sampling.top_k = Some(k as usize);
-    }
-    if let Some(p) = req.get("top_p").and_then(Value::as_f64) {
-        config.sampling.top_p = Some(p as f32);
-    }
-    if let Some(rp) = req.get("repetition_penalty").and_then(Value::as_f64) {
-        config.sampling.repetition_penalty = Some(rp as f32);
-    }
-    if let Some(fp) = req.get("frequency_penalty").and_then(Value::as_f64) {
-        config.sampling.frequency_penalty = Some(fp as f32);
-    }
-    if let Some(pp) = req.get("presence_penalty").and_then(Value::as_f64) {
-        config.sampling.presence_penalty = Some(pp as f32);
-    }
-    if let Some(seed) = req.get("seed").and_then(Value::as_u64) {
-        config.sampling.seed = Some(seed);
-    }
-    if let Some(stop) = req.get("stop") {
-        let stops: Vec<String> = match stop {
-            Value::String(s) => vec![s.clone()],
-            Value::Array(a) => a
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect(),
-            _ => vec![],
-        };
-        config.stop_strings = stops;
-    }
-    // Structured output: parse AND compile the schema here so malformed
-    // requests are clean 400s before anything is enqueued on the worker.
-    if let Some(rf) = req.get("response_format") {
-        let spec = combs_runtime::ConstraintSpec::from_response_format(rf).and_then(|spec| {
-            if let Some(s) = &spec {
-                s.compile()?;
-            }
-            Ok(spec)
-        });
-        match spec {
-            Ok(spec) => config.constraint = spec,
-            Err(msg) => {
-                return json_response(
-                    400,
-                    error_json("invalid_request", &format!("response_format: {msg}")),
-                );
-            }
-        }
+    // OpenAI chat logprobs: `logprobs: true` + `top_logprobs` 0..=20.
+    if req.get("logprobs").and_then(Value::as_bool) == Some(true) {
+        let n = req
+            .get("top_logprobs")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(20) as usize;
+        config.sampling.logprobs = Some(n);
     }
     if let Some(id) = engine.im_end_id() {
         config.stop_token_ids.push(id);
@@ -592,6 +704,10 @@ fn handle_chat(
     }
 
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let n_choices = match parse_n_choices(&req, stream) {
+        Ok(n) => n,
+        Err(msg) => return json_response(400, error_json("invalid_request", &msg)),
+    };
     let completion_id = format!("chatcmpl-combs-{}", now_unix());
     // The parser engages only when the request carries tools — tool-less
     // requests stream byte-identically to before.
@@ -602,62 +718,81 @@ fn handle_chat(
     };
 
     if !stream {
-        let mut parser = combs_runtime::ToolCallParser::new(parser_style);
-        let mut text = String::new();
-        let mut calls: Vec<combs_runtime::ToolCall> = Vec::new();
+        let want_logprobs = config.sampling.logprobs.is_some();
+        let mut choices: Vec<Value> = Vec::with_capacity(n_choices);
+        let mut all_stats: Vec<GenerationStats> = Vec::with_capacity(n_choices);
         counters.in_flight.fetch_add(1, Ordering::Relaxed);
-        let result = generate_maybe_media(engine, &tokens, images, &config, |_id, piece| {
-            for ev in parser.push(piece) {
+        for index in 0..n_choices {
+            let cfg = choice_config(&config, index);
+            let mut parser = combs_runtime::ToolCallParser::new(parser_style);
+            let mut text = String::new();
+            let mut calls: Vec<combs_runtime::ToolCall> = Vec::new();
+            let mut lp_entries: Vec<Value> = Vec::new();
+            let result =
+                generate_maybe_media(engine, &tokens, images.clone(), &cfg, |_id, piece, lp| {
+                    if let Some(lp) = lp {
+                        lp_entries.push(logprob_entry_json(engine, piece, lp));
+                    }
+                    for ev in parser.push(piece) {
+                        match ev {
+                            combs_runtime::ToolEvent::Content(c) => text.push_str(&c),
+                            combs_runtime::ToolEvent::Call(c) => calls.push(c),
+                        }
+                    }
+                });
+            for ev in parser.finish() {
                 match ev {
                     combs_runtime::ToolEvent::Content(c) => text.push_str(&c),
                     combs_runtime::ToolEvent::Call(c) => calls.push(c),
                 }
             }
-        });
-        for ev in parser.finish() {
-            match ev {
-                combs_runtime::ToolEvent::Content(c) => text.push_str(&c),
-                combs_runtime::ToolEvent::Call(c) => calls.push(c),
+            let stats = match result {
+                Ok(stats) => stats,
+                Err(e) => {
+                    counters.in_flight.fetch_sub(1, Ordering::Relaxed);
+                    let (status, kind) = engine_error_parts(&e);
+                    return json_response(status, error_json(kind, &e.to_string()));
+                }
+            };
+            let finish = if stats.generated_tokens >= cfg.max_tokens {
+                "length"
+            } else if !calls.is_empty() {
+                "tool_calls"
+            } else {
+                "stop"
+            };
+            let mut message = json!({"role": "assistant", "content": text});
+            if !calls.is_empty() {
+                if text.trim().is_empty() {
+                    message["content"] = Value::Null;
+                }
+                message["tool_calls"] = tool_calls_json(&calls);
             }
+            let logprobs = if want_logprobs {
+                json!({"content": lp_entries})
+            } else {
+                Value::Null
+            };
+            choices.push(json!({
+                "index": index,
+                "message": message,
+                "logprobs": logprobs,
+                "finish_reason": finish,
+            }));
+            all_stats.push(stats);
         }
         counters.in_flight.fetch_sub(1, Ordering::Relaxed);
-        return match result {
-            Ok(stats) => {
-                let finish = if stats.generated_tokens >= config.max_tokens {
-                    "length"
-                } else if !calls.is_empty() {
-                    "tool_calls"
-                } else {
-                    "stop"
-                };
-                let mut message = json!({"role": "assistant", "content": text});
-                if !calls.is_empty() {
-                    if text.trim().is_empty() {
-                        message["content"] = Value::Null;
-                    }
-                    message["tool_calls"] = tool_calls_json(&calls);
-                }
-                json_response(
-                    200,
-                    json!({
-                        "id": completion_id,
-                        "object": "chat.completion",
-                        "created": now_unix(),
-                        "model": model_id,
-                        "choices": [{
-                            "index": 0,
-                            "message": message,
-                            "finish_reason": finish,
-                        }],
-                        "usage": usage_json(&stats, config.session_id.as_deref()),
-                    }),
-                )
-            }
-            Err(e) => {
-                let (status, kind) = engine_error_parts(&e);
-                json_response(status, error_json(kind, &e.to_string()))
-            }
-        };
+        return json_response(
+            200,
+            json!({
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": now_unix(),
+                "model": model_id,
+                "choices": choices,
+                "usage": usage_json_choices(&all_stats, config.session_id.as_deref()),
+            }),
+        );
     }
 
     // SSE: channel-backed reader fed by the engine callback thread.
@@ -668,25 +803,29 @@ fn handle_chat(
     let counters = counters.clone();
     std::thread::spawn(move || {
         counters.in_flight.fetch_add(1, Ordering::Relaxed);
-        let send_chunk = |delta: Value, finish: Option<&str>, usage: Option<Value>| -> bool {
-            let mut chunk = json!({
-                "id": chunk_id,
-                "object": "chat.completion.chunk",
-                "created": now_unix(),
-                "model": model_id,
-                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
-            });
-            if let Some(u) = usage {
-                chunk["usage"] = u;
-            }
-            tx.send(format!("data: {chunk}\n\n")).is_ok()
-        };
-        let _ = send_chunk(json!({"role": "assistant"}), None, None);
+        let send_chunk =
+            |delta: Value, finish: Option<&str>, usage: Option<Value>, logprobs: Option<Value>| -> bool {
+                let mut chunk = json!({
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": now_unix(),
+                    "model": model_id,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                });
+                if let Some(lp) = logprobs {
+                    chunk["choices"][0]["logprobs"] = lp;
+                }
+                if let Some(u) = usage {
+                    chunk["usage"] = u;
+                }
+                tx.send(format!("data: {chunk}\n\n")).is_ok()
+            };
+        let _ = send_chunk(json!({"role": "assistant"}), None, None, None);
         let mut parser = combs_runtime::ToolCallParser::new(parser_style);
         let mut call_index = 0usize;
         let mut emit_event = |ev: combs_runtime::ToolEvent| match ev {
             combs_runtime::ToolEvent::Content(c) => {
-                let _ = send_chunk(json!({"content": c}), None, None);
+                let _ = send_chunk(json!({"content": c}), None, None, None);
             }
             combs_runtime::ToolEvent::Call(c) => {
                 // OpenAI wire: arguments as a JSON *string*; one complete
@@ -702,15 +841,23 @@ fn handle_chat(
                     }]}),
                     None,
                     None,
+                    None,
                 );
                 call_index += 1;
             }
         };
-        let result = generate_maybe_media(&engine, &tokens, images, &config, |_id, piece| {
-            for ev in parser.push(piece) {
-                emit_event(ev);
-            }
-        });
+        let result =
+            generate_maybe_media(&engine, &tokens, images, &config, |_id, piece, lp| {
+                for ev in parser.push(piece) {
+                    emit_event(ev);
+                }
+                // Logprob entries ride their own chunk so tool-call
+                // buffering can never displace them.
+                if let Some(lp) = lp {
+                    let entry = json!({"content": [logprob_entry_json(&engine, piece, lp)]});
+                    let _ = send_chunk(json!({}), None, None, Some(entry));
+                }
+            });
         for ev in parser.finish() {
             emit_event(ev);
         }
@@ -724,7 +871,7 @@ fn handle_chat(
                     "stop"
                 };
                 let usage = usage_json(&stats, config.session_id.as_deref());
-                let _ = send_chunk(json!({}), Some(finish), Some(usage));
+                let _ = send_chunk(json!({}), Some(finish), Some(usage), None);
             }
             Err(e) => {
                 let (_, kind) = engine_error_parts(&e);
@@ -745,6 +892,199 @@ fn handle_chat(
         .with_header(cors_header())
 }
 
+/// `POST /v1/completions` — the legacy raw-prompt endpoint: no chat
+/// template, no turn stops, same sampling surface as chat. Unlocks
+/// client-side FIM for coder models. `logprobs` here is the legacy int
+/// form (top-n; presence turns capture on).
+fn handle_completions(
+    engine: &Arc<Engine>,
+    model_id: &str,
+    body: &str,
+    default_prefill_chunk: Option<usize>,
+    counters: &Arc<ServeCounters>,
+) -> HttpResponse {
+    let req: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return json_response(
+                400,
+                error_json("invalid_request", &format!("bad JSON: {e}")),
+            );
+        }
+    };
+    let Some(prompt) = req.get("prompt").and_then(Value::as_str) else {
+        return json_response(
+            400,
+            error_json("invalid_request", "`prompt` must be a string"),
+        );
+    };
+
+    let mut config: GenerationConfig = engine.default_config();
+    if let Some(chunk) = default_prefill_chunk {
+        config.prefill_chunk_size = chunk;
+    }
+    if let Err(msg) = apply_sampling_params(&req, &mut config) {
+        return json_response(400, error_json("invalid_request", &msg));
+    }
+    if let Some(n) = req.get("logprobs").and_then(Value::as_u64) {
+        config.sampling.logprobs = Some(n.min(20) as usize);
+    }
+    let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let n_choices = match parse_n_choices(&req, stream) {
+        Ok(n) => n,
+        Err(msg) => return json_response(400, error_json("invalid_request", &msg)),
+    };
+
+    let tokens = match engine.encode(prompt) {
+        Ok(t) => t,
+        Err(e) => {
+            return json_response(
+                500,
+                error_json("engine_error", &format!("tokenization failed: {e}")),
+            );
+        }
+    };
+    let completion_id = format!("cmpl-combs-{}", now_unix());
+
+    if !stream {
+        let want_logprobs = config.sampling.logprobs.is_some();
+        let mut choices: Vec<Value> = Vec::with_capacity(n_choices);
+        let mut all_stats: Vec<GenerationStats> = Vec::with_capacity(n_choices);
+        counters.in_flight.fetch_add(1, Ordering::Relaxed);
+        for index in 0..n_choices {
+            let cfg = choice_config(&config, index);
+            let mut text = String::new();
+            let mut lp = LegacyLogprobs::default();
+            let result = engine.generate(&tokens, &cfg, |_id, piece, token_lp| {
+                if let Some(l) = token_lp {
+                    lp.push(engine, &text, piece, l);
+                }
+                text.push_str(piece);
+            });
+            let stats = match result {
+                Ok(stats) => stats,
+                Err(e) => {
+                    counters.in_flight.fetch_sub(1, Ordering::Relaxed);
+                    let (status, kind) = engine_error_parts(&e);
+                    return json_response(status, error_json(kind, &e.to_string()));
+                }
+            };
+            let finish = if stats.generated_tokens >= cfg.max_tokens {
+                "length"
+            } else {
+                "stop"
+            };
+            choices.push(json!({
+                "index": index,
+                "text": text,
+                "logprobs": if want_logprobs { lp.into_json() } else { Value::Null },
+                "finish_reason": finish,
+            }));
+            all_stats.push(stats);
+        }
+        counters.in_flight.fetch_sub(1, Ordering::Relaxed);
+        return json_response(
+            200,
+            json!({
+                "id": completion_id,
+                "object": "text_completion",
+                "created": now_unix(),
+                "model": model_id,
+                "choices": choices,
+                "usage": usage_json_choices(&all_stats, None),
+            }),
+        );
+    }
+
+    // SSE: text_completion chunks, one per piece.
+    let (tx, rx) = mpsc::channel::<String>();
+    let engine = engine.clone();
+    let model_id = model_id.to_string();
+    let counters = counters.clone();
+    std::thread::spawn(move || {
+        counters.in_flight.fetch_add(1, Ordering::Relaxed);
+        let send_chunk = |text: &str, finish: Option<&str>, usage: Option<Value>| -> bool {
+            let mut chunk = json!({
+                "id": completion_id,
+                "object": "text_completion",
+                "created": now_unix(),
+                "model": model_id,
+                "choices": [{"index": 0, "text": text, "finish_reason": finish}],
+            });
+            if let Some(u) = usage {
+                chunk["usage"] = u;
+            }
+            tx.send(format!("data: {chunk}\n\n")).is_ok()
+        };
+        let result = engine.generate(&tokens, &config, |_id, piece, _lp| {
+            let _ = send_chunk(piece, None, None);
+        });
+        match result {
+            Ok(stats) => {
+                let finish = if stats.generated_tokens >= config.max_tokens {
+                    "length"
+                } else {
+                    "stop"
+                };
+                let _ = send_chunk("", Some(finish), Some(usage_json(&stats, None)));
+            }
+            Err(e) => {
+                let (_, kind) = engine_error_parts(&e);
+                let _ = tx.send(format!(
+                    "data: {}\n\n",
+                    json!({"error": {"type": kind, "message": e.to_string()}})
+                ));
+            }
+        }
+        counters.in_flight.fetch_sub(1, Ordering::Relaxed);
+        let _ = tx.send("data: [DONE]\n\n".to_string());
+    });
+
+    tiny_http::Response::empty(200)
+        .with_data(Box::new(ChannelReader::new(rx)) as Box<dyn Read + Send>, None)
+        .with_header(tiny_http::Header::from_bytes("Content-Type", "text/event-stream").unwrap())
+        .with_header(tiny_http::Header::from_bytes("Cache-Control", "no-cache").unwrap())
+        .with_header(cors_header())
+}
+
+/// Accumulator for the legacy completions `logprobs` object
+/// (tokens / token_logprobs / top_logprobs / text_offset arrays).
+#[derive(Default)]
+struct LegacyLogprobs {
+    tokens: Vec<Value>,
+    token_logprobs: Vec<Value>,
+    top_logprobs: Vec<Value>,
+    text_offset: Vec<Value>,
+}
+
+impl LegacyLogprobs {
+    fn push(
+        &mut self,
+        engine: &Arc<Engine>,
+        text_so_far: &str,
+        piece: &str,
+        lp: &combs_runtime::TokenLogprobs,
+    ) {
+        self.tokens.push(json!(piece));
+        self.token_logprobs.push(json!(lp.logprob));
+        let mut alts = serde_json::Map::new();
+        for (id, l) in &lp.top {
+            alts.insert(engine.token_piece(*id), json!(l));
+        }
+        self.top_logprobs.push(Value::Object(alts));
+        self.text_offset.push(json!(text_so_far.len()));
+    }
+
+    fn into_json(self) -> Value {
+        json!({
+            "tokens": self.tokens,
+            "token_logprobs": self.token_logprobs,
+            "top_logprobs": self.top_logprobs,
+            "text_offset": self.text_offset,
+        })
+    }
+}
+
 /// Route to the media-aware engine path when the request carries images
 /// (image turns bypass the KV session cache engine-side by design).
 fn generate_maybe_media(
@@ -752,7 +1092,7 @@ fn generate_maybe_media(
     tokens: &[u32],
     images: Vec<PixelBatch>,
     config: &GenerationConfig,
-    on_token: impl FnMut(u32, &str),
+    on_token: impl FnMut(u32, &str, Option<&combs_runtime::TokenLogprobs>),
 ) -> combs_runtime::Result<GenerationStats> {
     if images.is_empty() {
         engine.generate(tokens, config, on_token)

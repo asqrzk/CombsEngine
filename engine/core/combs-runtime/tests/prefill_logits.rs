@@ -42,7 +42,7 @@ fn chunked_prefill_logits_stay_close() {
                     prefill_chunk_size: chunk,
                     ..Default::default()
                 },
-                |id, _| ids.push(id),
+                |id, _, _| ids.push(id),
             )
             .expect("generate");
         ids

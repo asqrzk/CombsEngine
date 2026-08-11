@@ -383,6 +383,12 @@ pub unsafe extern "C" fn combs_chat_completion(
                 .or(config.sampling.frequency_penalty),
             presence_penalty: request.presence_penalty.or(config.sampling.presence_penalty),
             seed: request.seed.or(config.sampling.seed),
+            min_p: request.min_p.or(config.sampling.min_p),
+            logit_bias: request
+                .logit_bias
+                .clone()
+                .or_else(|| config.sampling.logit_bias.clone()),
+            logprobs: request.logprobs.or(config.sampling.logprobs),
         };
         config.sampling = sampling;
         if let Some(mt) = request.max_tokens {
@@ -426,9 +432,18 @@ pub unsafe extern "C" fn combs_chat_completion(
         let mut tool_calls: Vec<serde_json::Value> = Vec::new();
         let mut handle_event = |ev: combs_runtime::ToolEvent,
                                 token_id: u32,
+                                logprob: Option<f32>,
                                 calls: &mut Vec<serde_json::Value>| match ev {
             combs_runtime::ToolEvent::Content(text) => {
-                emit(cb, user_data, &StreamEvent::Delta { text, token_id });
+                emit(
+                    cb,
+                    user_data,
+                    &StreamEvent::Delta {
+                        text,
+                        token_id,
+                        logprob,
+                    },
+                );
             }
             combs_runtime::ToolEvent::Call(c) => {
                 calls.push(serde_json::json!({
@@ -446,14 +461,15 @@ pub unsafe extern "C" fn combs_chat_completion(
             &prompt_tokens,
             &config,
             cancel,
-            |token_id, text| {
+            |token_id, text, lp| {
+                let logprob = lp.map(|l| l.logprob);
                 for ev in parser.push(text) {
-                    handle_event(ev, token_id, &mut tool_calls);
+                    handle_event(ev, token_id, logprob, &mut tool_calls);
                 }
             },
         );
         for ev in parser.finish() {
-            handle_event(ev, 0, &mut tool_calls);
+            handle_event(ev, 0, None, &mut tool_calls);
         }
 
         match outcome {

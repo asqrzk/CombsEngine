@@ -148,6 +148,64 @@ impl LogitsProcessor for PresencePenalty {
     }
 }
 
+/// Per-token logit offsets (OpenAI `logit_bias`), added before any other
+/// processing. Lives in the shared penalty chain so BOTH samplers honor
+/// it — a bias changes the argmax, so greedy must see it too.
+pub struct LogitBias {
+    bias: std::collections::HashMap<u32, f32>,
+}
+
+impl LogitBias {
+    /// Creates the processor. An empty map is a no-op.
+    pub fn new(bias: std::collections::HashMap<u32, f32>) -> Self {
+        LogitBias { bias }
+    }
+}
+
+impl LogitsProcessor for LogitBias {
+    fn process(&self, logits: &mut [f32], _history: &[u32]) {
+        for (&id, &b) in &self.bias {
+            if let Some(v) = logits.get_mut(id as usize) {
+                *v += b;
+            }
+        }
+    }
+}
+
+/// Min-p filtering: keeps tokens whose probability is at least `p` times
+/// the top token's probability. Works in logit space — the condition
+/// `prob(i)/prob(max) >= p` is exactly `logit(i) >= logit(max) + ln(p)` —
+/// so no softmax is needed. Multinomial-chain only: the filter can never
+/// change an argmax.
+pub struct MinP {
+    p: f32,
+}
+
+impl MinP {
+    /// Creates the processor. `p <= 0` disables the filter.
+    pub fn new(p: f32) -> Self {
+        MinP { p }
+    }
+}
+
+impl LogitsProcessor for MinP {
+    fn process(&self, logits: &mut [f32], _history: &[u32]) {
+        if self.p <= 0.0 || logits.is_empty() {
+            return;
+        }
+        let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        if !max.is_finite() {
+            return;
+        }
+        let threshold = max + self.p.ln();
+        for v in logits.iter_mut() {
+            if *v < threshold {
+                *v = f32::NEG_INFINITY;
+            }
+        }
+    }
+}
+
 /// Keeps the `k` largest logits and sets the rest to `-inf`.
 pub struct TopK {
     k: usize,
@@ -309,6 +367,35 @@ mod tests {
         let mut logits = vec![4.0f32, -2.0];
         p.process(&mut logits, &[]);
         assert_eq!(logits, vec![2.0, -1.0]);
+    }
+
+    #[test]
+    fn logit_bias_offsets_named_tokens() {
+        let bias = std::collections::HashMap::from([(0u32, -100.0f32), (2, 3.0)]);
+        let p = LogitBias::new(bias);
+        let mut logits = vec![5.0f32, 1.0, 1.0];
+        p.process(&mut logits, &[]);
+        assert_eq!(logits, vec![-95.0, 1.0, 4.0]);
+    }
+
+    #[test]
+    fn min_p_keeps_relative_mass() {
+        // p = 0.5 with max logit 2.0 → threshold 2.0 + ln(0.5) ≈ 1.307.
+        let p = MinP::new(0.5);
+        let mut logits = vec![2.0f32, 1.5, 1.0, -3.0];
+        p.process(&mut logits, &[]);
+        assert!(logits[0].is_finite());
+        assert!(logits[1].is_finite());
+        assert_eq!(logits[2], f32::NEG_INFINITY);
+        assert_eq!(logits[3], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn min_p_zero_is_noop() {
+        let p = MinP::new(0.0);
+        let mut logits = vec![2.0f32, -10.0];
+        p.process(&mut logits, &[]);
+        assert_eq!(logits, vec![2.0, -10.0]);
     }
 
     #[test]

@@ -88,6 +88,16 @@ pub struct ChatRequestJson {
     /// the output through the engine's JSON automaton.
     #[serde(default)]
     pub response_format: Option<serde_json::Value>,
+    /// Min-p probability floor relative to the top token (multinomial).
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    /// Per-token logit offsets; JSON keys are token-id strings.
+    #[serde(default)]
+    pub logit_bias: Option<std::collections::HashMap<u32, f32>>,
+    /// Capture per-token log-probabilities (top-n; may be 0). Deltas gain
+    /// a `logprob` field.
+    #[serde(default)]
+    pub logprobs: Option<usize>,
 }
 
 /// An embeddings request (`combs_embed_json`).
@@ -122,6 +132,10 @@ pub enum StreamEvent {
         text: String,
         /// The token id.
         token_id: u32,
+        /// ln P of this token when the request asked for logprobs; absent
+        /// otherwise (and on buffered tool-parse flushes).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        logprob: Option<f32>,
     },
     /// Terminal event with telemetry.
     Done {

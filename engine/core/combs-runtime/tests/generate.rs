@@ -24,7 +24,7 @@ fn generates_text_on_gpu() {
                 max_tokens: 16,
                 ..Default::default() // greedy
             },
-            |_id, piece| text.push_str(piece),
+            |_id, piece, _lp| text.push_str(piece),
         )
         .expect("generate");
 
@@ -64,7 +64,7 @@ fn cancel_flag_stops_generation_between_tokens() {
             ..Default::default()
         },
         cancel,
-        |_id, _piece| pieces += 1,
+        |_id, _piece, _lp| pieces += 1,
     );
     assert!(matches!(result, Err(combs_runtime::EngineError::Cancelled)));
     assert!(pieces > 0 && pieces < 512, "partial stream: {pieces} pieces");
@@ -90,7 +90,7 @@ fn concurrent_generates_queue_single_flight() {
                         max_tokens: 8,
                         ..Default::default()
                     },
-                    |_id, piece| text.push_str(piece),
+                    |_id, piece, _lp| text.push_str(piece),
                 )
                 .expect("generate");
             assert_eq!(stats.generated_tokens, 8);

@@ -432,7 +432,7 @@ fn cmd_run(args: RunArgs) -> Result<()> {
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let mut emit = |_id: u32, piece: &str| {
+    let mut emit = |_id: u32, piece: &str, _lp: Option<&combs_runtime::TokenLogprobs>| {
         let _ = out.write_all(piece.as_bytes());
         let _ = out.flush();
     };

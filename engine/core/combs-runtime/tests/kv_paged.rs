@@ -29,7 +29,7 @@ fn greedy_tokens(kind: CacheKind, prompt: &str, max_tokens: usize, chunk: usize)
                 prefill_chunk_size: chunk,
                 ..Default::default() // greedy
             },
-            |id, _piece| ids.push(id),
+            |id, _piece, _lp| ids.push(id),
         )
         .expect("generate");
     ids

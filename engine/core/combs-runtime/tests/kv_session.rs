@@ -96,10 +96,10 @@ fn reused_prefix_matches_cold_generation() {
 fn divergent_prompt_gets_no_reuse() {
     let engine = load_engine();
     let a = engine.encode("One two three").unwrap();
-    engine.generate(&a, &greedy(4), |_, _| {}).expect("gen a");
+    engine.generate(&a, &greedy(4), |_, _, _| {}).expect("gen a");
 
     let b = engine.encode("Completely different words altogether").unwrap();
-    let stats = engine.generate(&b, &greedy(4), |_, _| {}).expect("gen b");
+    let stats = engine.generate(&b, &greedy(4), |_, _, _| {}).expect("gen b");
     assert_eq!(stats.cached_tokens, 0, "unrelated prompt must cold-start");
 }
 

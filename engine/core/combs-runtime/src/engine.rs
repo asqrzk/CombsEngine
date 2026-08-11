@@ -21,7 +21,7 @@ use tokenizers::Tokenizer;
 
 use crate::constraint::{ConstraintSpec, ConstraintState, TokenByteTable};
 use crate::detok::IncrementalDetokenizer;
-use crate::sampler::{Sampler, SamplingParams, sampler_from_params};
+use crate::sampler::{Sampler, SamplingParams, TokenLogprobs, sampler_from_params};
 use crate::stop::StopDetector;
 use crate::{EngineError, Result};
 
@@ -176,8 +176,9 @@ struct GenerateRequest {
     images: Vec<PixelBatch>,
     config: GenerationConfig,
     cancel: Arc<AtomicBool>,
-    /// Streaming channel: (token id, new text piece) per generated token.
-    pieces: mpsc::Sender<(u32, String)>,
+    /// Streaming channel: (token id, new text piece, logprob capture) per
+    /// generated token; the capture is `None` unless the request asked.
+    pieces: mpsc::Sender<(u32, String, Option<TokenLogprobs>)>,
     /// Final outcome, sent once after `pieces` closes.
     reply: mpsc::Sender<Result<GenerationStats>>,
 }
@@ -555,6 +556,12 @@ impl Engine {
             .map_err(|_| EngineError::WorkerGone("worker dropped the reply".to_string()))?
     }
 
+    /// Decodes one token id to its display text (specials kept) — the
+    /// string OpenAI logprob alternatives carry on the wire.
+    pub fn token_piece(&self, id: u32) -> String {
+        self.tokenizer.decode(&[id], false).unwrap_or_default()
+    }
+
     /// The `<|im_end|>` token id, if the tokenizer defines one (chat models).
     pub fn im_end_id(&self) -> Option<u32> {
         self.spec.special_token_id("<|im_end|>")
@@ -648,7 +655,7 @@ impl Engine {
         &self,
         prompt_tokens: &[u32],
         config: &GenerationConfig,
-        on_token: impl FnMut(u32, &str),
+        on_token: impl FnMut(u32, &str, Option<&TokenLogprobs>),
     ) -> Result<GenerationStats> {
         self.generate_cancellable(
             prompt_tokens,
@@ -667,7 +674,7 @@ impl Engine {
         prompt_tokens: &[u32],
         images: Vec<PixelBatch>,
         config: &GenerationConfig,
-        on_token: impl FnMut(u32, &str),
+        on_token: impl FnMut(u32, &str, Option<&TokenLogprobs>),
     ) -> Result<GenerationStats> {
         self.generate_media_cancellable(
             prompt_tokens,
@@ -686,7 +693,7 @@ impl Engine {
         prompt_tokens: &[u32],
         config: &GenerationConfig,
         cancel: Arc<AtomicBool>,
-        on_token: impl FnMut(u32, &str),
+        on_token: impl FnMut(u32, &str, Option<&TokenLogprobs>),
     ) -> Result<GenerationStats> {
         self.generate_media_cancellable(prompt_tokens, Vec::new(), config, cancel, on_token)
     }
@@ -698,7 +705,7 @@ impl Engine {
         images: Vec<PixelBatch>,
         config: &GenerationConfig,
         cancel: Arc<AtomicBool>,
-        mut on_token: impl FnMut(u32, &str),
+        mut on_token: impl FnMut(u32, &str, Option<&TokenLogprobs>),
     ) -> Result<GenerationStats> {
         // HF `add_special_tokens` semantics: prompts start with BOS when the
         // model declares one. Gemma collapses without it; templates that
@@ -728,8 +735,8 @@ impl Engine {
 
         // Stream pieces until the worker closes the channel, then collect
         // the final result (already sent by then).
-        while let Ok((id, piece)) = pieces_rx.recv() {
-            on_token(id, &piece);
+        while let Ok((id, piece, logprobs)) = pieces_rx.recv() {
+            on_token(id, &piece, logprobs.as_ref());
         }
         reply_rx
             .recv()
@@ -1124,7 +1131,9 @@ fn run_generation(
             return Err(EngineError::Constraint(DEAD_END.to_string()));
         }
     }
-    let mut next = sampler.sample(&mut row, &history);
+    let outcome = sampler.sample(&mut row, &history);
+    let mut next = outcome.token;
+    let mut next_logprobs = outcome.logprobs;
     if let Some(c) = constraint.as_mut() {
         c.advance(next);
     }
@@ -1156,14 +1165,19 @@ fn run_generation(
         // Emit the piece, truncating at a stop string if one completes.
         match stop.push_text(&piece) {
             Some(cut) => {
-                if cut > 0 && req.pieces.send((next, piece[..cut].to_string())).is_err() {
+                if cut > 0
+                    && req
+                        .pieces
+                        .send((next, piece[..cut].to_string(), next_logprobs.take()))
+                        .is_err()
+                {
                     loop_error = Some(EngineError::Cancelled); // caller hung up
                 }
                 generated += 1;
                 break;
             }
             None => {
-                if req.pieces.send((next, piece)).is_err() {
+                if req.pieces.send((next, piece, next_logprobs.take())).is_err() {
                     loop_error = Some(EngineError::Cancelled); // caller hung up
                     break;
                 }
@@ -1191,7 +1205,9 @@ fn run_generation(
                 break;
             }
         }
-        next = sampler.sample(&mut row, &history);
+        let outcome = sampler.sample(&mut row, &history);
+        next = outcome.token;
+        next_logprobs = outcome.logprobs;
         if let Some(c) = constraint.as_mut() {
             c.advance(next);
         }
