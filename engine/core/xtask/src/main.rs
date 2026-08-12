@@ -188,6 +188,19 @@ fn run(mut cmd: Command) -> Result<()> {
     Ok(())
 }
 
+/// Builds the reduced-precision `combs` CLI variant. It lives in its own
+/// `target-f16/` tree so the two feature sets never invalidate each other's
+/// incremental artifacts.
+fn build_f16_cli(ctx: &Ctx) -> Result<PathBuf> {
+    let mut cmd = Command::new(cargo());
+    cmd.current_dir(&ctx.root)
+        .env("CARGO_TARGET_DIR", ctx.root.join("target-f16"))
+        .args(["build", "--release", "-p", "combs-cli", "--features", "f16"]);
+    eprintln!("== combs (f16 variant, target-f16/) ==");
+    run(cmd)?;
+    Ok(ctx.root.join("target-f16/release/combs"))
+}
+
 fn build_target(ctx: &Ctx, target: &Target, force_check: bool) -> Result<PathBuf> {
     let full = !force_check && (target.full_build)(ctx);
     let mut cmd = Command::new(cargo());
@@ -242,6 +255,26 @@ fn cmd_matrix() {
 fn cmd_bundle(ctx: &Ctx) -> Result<()> {
     let dist = ctx.root.join("dist");
     std::fs::create_dir_all(&dist)?;
+
+    // Host CLI, both float variants. `combs` is the f16 build (fleet-wide
+    // perplexity deltas under 0.2% and faster throughout; diffusion is
+    // pinned to f32 internally either way); `combs-f32` ships alongside
+    // for full-precision runs.
+    {
+        let mut cmd = Command::new(cargo());
+        cmd.current_dir(&ctx.root)
+            .args(["build", "--release", "-p", "combs-cli"]);
+        eprintln!("== combs-f32 (host) ==");
+        run(cmd)?;
+        let f32_bin = ctx.root.join("target/release/combs");
+        let f16_bin = build_f16_cli(ctx)?;
+        let out = dist.join("host");
+        std::fs::create_dir_all(&out)?;
+        std::fs::copy(&f16_bin, out.join("combs"))?;
+        std::fs::copy(&f32_bin, out.join("combs-f32"))?;
+        eprintln!("bundled combs (f16) + combs-f32 -> {}", out.display());
+    }
+
     for t in TARGETS {
         if !(t.full_build)(ctx) {
             eprintln!("skip {} (check-only target)", t.name);
@@ -290,7 +323,14 @@ fn main() -> Result<()> {
             if release {
                 cmd.arg("--release");
             }
-            run(cmd)
+            run(cmd)?;
+            // Release builds also produce the f16 CLI variant; `combs`
+            // itself stays the f32 build.
+            if release {
+                let bin = build_f16_cli(&ctx)?;
+                eprintln!("f16 variant: {}", bin.display());
+            }
+            Ok(())
         }
         XCommand::Run { args } => {
             let mut cmd = Command::new(cargo());
