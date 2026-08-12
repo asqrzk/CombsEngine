@@ -28,6 +28,12 @@ use burn::backend::wgpu::{RuntimeOptions, WgpuDevice, WgpuSetup, graphics::AutoG
 /// no bf16 path on Metal/wgpu).
 #[cfg(not(feature = "f16"))]
 pub type CombsBackend = burn::backend::Wgpu<f32, i32, u32>;
+
+/// Always-f32 backend on the same wgpu runtime. The diffusion pipeline is
+/// pinned to it in every build: SD-1.5's UNet/VAE collapse to black output
+/// under f16 (range, not rounding), so image generation computes in f32
+/// regardless of the text stack's dtype.
+pub type CombsBackendF32 = burn::backend::Wgpu<f32, i32, u32>;
 #[cfg(feature = "f16")]
 pub type CombsBackend = burn::backend::wgpu::CubeBackend<
     burn::backend::wgpu::WgpuRuntime,

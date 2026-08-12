@@ -27,7 +27,7 @@ use combs_diffusion::{
 use crate::generate_image::tensor_to_rgb_image;
 use crate::http::{HttpResponse, error_json, json_response, respond_preflight};
 
-type SharedPipeline = Arc<Mutex<Box<dyn DiffusionModel<combs_core::CombsBackend>>>>;
+type SharedPipeline = Arc<Mutex<Box<dyn DiffusionModel<combs_core::CombsBackendF32>>>>;
 
 /// Worker observability for `/v1/stats`: rolling counters written after
 /// each generation (u64 atomics; durations stored as milliseconds).
@@ -46,7 +46,7 @@ pub fn cmd_serve_images(model: PathBuf, port: u16) -> Result<()> {
 
     eprintln!("[serve-images] loading diffusion pipeline...");
     let device = combs_core::init_device();
-    let pipeline = load_diffusion_model::<combs_core::CombsBackend>(
+    let pipeline = load_diffusion_model::<combs_core::CombsBackendF32>(
         architecture,
         &model_dir,
         &device,
