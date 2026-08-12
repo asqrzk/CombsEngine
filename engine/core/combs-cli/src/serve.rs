@@ -17,20 +17,20 @@
 //! streaming is a channel-backed `Read` fed by the engine's token callback.
 
 use std::io::Read;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-use serde_json::{Value, json};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use serde_json::{json, Value};
 
 use combs_media::{ImagePreprocessor, PixelBatch, SiglipPreprocessor};
 use combs_models::image_prompt_expansion;
 use combs_runtime::{Engine, GenerationConfig, GenerationStats};
 
-use crate::http::{HttpResponse, cors_header, error_json, json_response, respond_preflight};
+use crate::http::{cors_header, error_json, json_response, respond_preflight, HttpResponse};
 
 /// Server-process counters for `/v1/stats` (the engine snapshot carries the
 /// per-generation numbers; these cover the HTTP surface).
@@ -80,9 +80,7 @@ pub fn serve(
                     json!({"object": "list", "data": [model_card(&engine, &model_id)]}),
                 ),
                 ("GET", "/v1/model/info") => model_info(&engine, &model_id),
-                ("GET", "/v1/stats") => {
-                    stats_response(&engine, &model_id, &counters, &static_info)
-                }
+                ("GET", "/v1/stats") => stats_response(&engine, &model_id, &counters, &static_info),
                 ("POST", "/v1/chat/completions") => {
                     let mut body = String::new();
                     if request.as_reader().read_to_string(&mut body).is_err() {
@@ -96,7 +94,13 @@ pub fn serve(
                     if request.as_reader().read_to_string(&mut body).is_err() {
                         json_response(400, error_json("invalid_request", "unreadable body"))
                     } else {
-                        handle_completions(&engine, &model_id, &body, default_prefill_chunk, &counters)
+                        handle_completions(
+                            &engine,
+                            &model_id,
+                            &body,
+                            default_prefill_chunk,
+                            &counters,
+                        )
                     }
                 }
                 ("POST", "/v1/embeddings") => {
@@ -272,10 +276,7 @@ fn handle_embeddings(engine: &Arc<Engine>, model_id: &str, body: &str) -> HttpRe
                     None => {
                         return json_response(
                             400,
-                            error_json(
-                                "invalid_request",
-                                "`input` array entries must be strings",
-                            ),
+                            error_json("invalid_request", "`input` array entries must be strings"),
                         );
                     }
                 }
@@ -444,9 +445,7 @@ fn usage_json(stats: &GenerationStats, session_id: Option<&str>) -> Value {
 /// client-fixable 400, everything else stays a 500.
 fn engine_error_parts(e: &combs_runtime::EngineError) -> (u16, &'static str) {
     match e {
-        combs_runtime::EngineError::ContextTooLong { .. } => {
-            (400, "context_length_exceeded")
-        }
+        combs_runtime::EngineError::ContextTooLong { .. } => (400, "context_length_exceeded"),
         combs_runtime::EngineError::Constraint(_) => (400, "constraint_error"),
         combs_runtime::EngineError::Model(combs_models::ModelError::Unsupported(_)) => {
             (400, "invalid_request")
@@ -728,8 +727,13 @@ fn handle_chat(
             let mut text = String::new();
             let mut calls: Vec<combs_runtime::ToolCall> = Vec::new();
             let mut lp_entries: Vec<Value> = Vec::new();
-            let result =
-                generate_maybe_media(engine, &tokens, images.clone(), &cfg, |_id, piece, lp| {
+            let result = generate_maybe_media(
+                engine,
+                &tokens,
+                images.clone(),
+                &cfg,
+                Arc::new(AtomicBool::new(false)),
+                |_id, piece, lp| {
                     if let Some(lp) = lp {
                         lp_entries.push(logprob_entry_json(engine, piece, lp));
                     }
@@ -739,7 +743,8 @@ fn handle_chat(
                             combs_runtime::ToolEvent::Call(c) => calls.push(c),
                         }
                     }
-                });
+                },
+            );
             for ev in parser.finish() {
                 match ev {
                     combs_runtime::ToolEvent::Content(c) => text.push_str(&c),
@@ -803,23 +808,34 @@ fn handle_chat(
     let counters = counters.clone();
     std::thread::spawn(move || {
         counters.in_flight.fetch_add(1, Ordering::Relaxed);
-        let send_chunk =
-            |delta: Value, finish: Option<&str>, usage: Option<Value>, logprobs: Option<Value>| -> bool {
-                let mut chunk = json!({
-                    "id": chunk_id,
-                    "object": "chat.completion.chunk",
-                    "created": now_unix(),
-                    "model": model_id,
-                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
-                });
-                if let Some(lp) = logprobs {
-                    chunk["choices"][0]["logprobs"] = lp;
-                }
-                if let Some(u) = usage {
-                    chunk["usage"] = u;
-                }
-                tx.send(format!("data: {chunk}\n\n")).is_ok()
-            };
+        // Client-disconnect abort: a failed SSE send means the socket is
+        // gone — flag the engine to stop at its next decode step.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_flag = cancel.clone();
+        let send_chunk = |delta: Value,
+                          finish: Option<&str>,
+                          usage: Option<Value>,
+                          logprobs: Option<Value>|
+         -> bool {
+            let mut chunk = json!({
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": now_unix(),
+                "model": model_id,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            });
+            if let Some(lp) = logprobs {
+                chunk["choices"][0]["logprobs"] = lp;
+            }
+            if let Some(u) = usage {
+                chunk["usage"] = u;
+            }
+            let ok = tx.send(format!("data: {chunk}\n\n")).is_ok();
+            if !ok {
+                cancel_flag.store(true, Ordering::Relaxed);
+            }
+            ok
+        };
         let _ = send_chunk(json!({"role": "assistant"}), None, None, None);
         let mut parser = combs_runtime::ToolCallParser::new(parser_style);
         let mut call_index = 0usize;
@@ -846,8 +862,13 @@ fn handle_chat(
                 call_index += 1;
             }
         };
-        let result =
-            generate_maybe_media(&engine, &tokens, images, &config, |_id, piece, lp| {
+        let result = generate_maybe_media(
+            &engine,
+            &tokens,
+            images,
+            &config,
+            cancel,
+            |_id, piece, lp| {
                 for ev in parser.push(piece) {
                     emit_event(ev);
                 }
@@ -857,7 +878,8 @@ fn handle_chat(
                     let entry = json!({"content": [logprob_entry_json(&engine, piece, lp)]});
                     let _ = send_chunk(json!({}), None, None, Some(entry));
                 }
-            });
+            },
+        );
         for ev in parser.finish() {
             emit_event(ev);
         }
@@ -873,6 +895,15 @@ fn handle_chat(
                 let usage = usage_json(&stats, config.session_id.as_deref());
                 let _ = send_chunk(json!({}), Some(finish), Some(usage), None);
             }
+            Err(combs_runtime::EngineError::Cancelled) => {
+                // Client hung up: the worker stopped within one decode step
+                // and the session snapshot is already consistent. No error
+                // frame (nobody is listening) — but loud on stderr, because
+                // a silent abort would hide client-side bugs.
+                eprintln!(
+                    "combs serve: [cancelled] chat stream {chunk_id} — client disconnected, generation aborted"
+                );
+            }
             Err(e) => {
                 let (_, kind) = engine_error_parts(&e);
                 let _ = tx.send(format!(
@@ -886,7 +917,10 @@ fn handle_chat(
     });
 
     tiny_http::Response::empty(200)
-        .with_data(Box::new(ChannelReader::new(rx)) as Box<dyn Read + Send>, None)
+        .with_data(
+            Box::new(ChannelReader::new(rx)) as Box<dyn Read + Send>,
+            None,
+        )
         .with_header(tiny_http::Header::from_bytes("Content-Type", "text/event-stream").unwrap())
         .with_header(tiny_http::Header::from_bytes("Cache-Control", "no-cache").unwrap())
         .with_header(cors_header())
@@ -1003,6 +1037,9 @@ fn handle_completions(
     let counters = counters.clone();
     std::thread::spawn(move || {
         counters.in_flight.fetch_add(1, Ordering::Relaxed);
+        // Same client-disconnect abort contract as the chat stream.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_flag = cancel.clone();
         let send_chunk = |text: &str, finish: Option<&str>, usage: Option<Value>| -> bool {
             let mut chunk = json!({
                 "id": completion_id,
@@ -1014,9 +1051,13 @@ fn handle_completions(
             if let Some(u) = usage {
                 chunk["usage"] = u;
             }
-            tx.send(format!("data: {chunk}\n\n")).is_ok()
+            let ok = tx.send(format!("data: {chunk}\n\n")).is_ok();
+            if !ok {
+                cancel_flag.store(true, Ordering::Relaxed);
+            }
+            ok
         };
-        let result = engine.generate(&tokens, &config, |_id, piece, _lp| {
+        let result = engine.generate_cancellable(&tokens, &config, cancel, |_id, piece, _lp| {
             let _ = send_chunk(piece, None, None);
         });
         match result {
@@ -1027,6 +1068,13 @@ fn handle_completions(
                     "stop"
                 };
                 let _ = send_chunk("", Some(finish), Some(usage_json(&stats, None)));
+            }
+            Err(combs_runtime::EngineError::Cancelled) => {
+                // Client hung up — no error frame, session already
+                // consistent; loud on stderr so aborts are never invisible.
+                eprintln!(
+                    "combs serve: [cancelled] completion stream {completion_id} — client disconnected, generation aborted"
+                );
             }
             Err(e) => {
                 let (_, kind) = engine_error_parts(&e);
@@ -1041,7 +1089,10 @@ fn handle_completions(
     });
 
     tiny_http::Response::empty(200)
-        .with_data(Box::new(ChannelReader::new(rx)) as Box<dyn Read + Send>, None)
+        .with_data(
+            Box::new(ChannelReader::new(rx)) as Box<dyn Read + Send>,
+            None,
+        )
         .with_header(tiny_http::Header::from_bytes("Content-Type", "text/event-stream").unwrap())
         .with_header(tiny_http::Header::from_bytes("Cache-Control", "no-cache").unwrap())
         .with_header(cors_header())
@@ -1092,12 +1143,13 @@ fn generate_maybe_media(
     tokens: &[u32],
     images: Vec<PixelBatch>,
     config: &GenerationConfig,
+    cancel: Arc<AtomicBool>,
     on_token: impl FnMut(u32, &str, Option<&combs_runtime::TokenLogprobs>),
 ) -> combs_runtime::Result<GenerationStats> {
     if images.is_empty() {
-        engine.generate(tokens, config, on_token)
+        engine.generate_cancellable(tokens, config, cancel, on_token)
     } else {
-        engine.generate_with_media(tokens, images, config, on_token)
+        engine.generate_media_cancellable(tokens, images, config, cancel, on_token)
     }
 }
 
