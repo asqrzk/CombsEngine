@@ -20,6 +20,7 @@ mod registry;
 mod rope;
 mod smolvlm;
 mod traits;
+mod whisper;
 
 pub use archspec::{ArchSpec, LayerKind, NormFlavor};
 pub use kv::{CacheConfig, CacheKind, ContiguousKVCache, KVCache, PageStats, PagedKVCache};
@@ -36,7 +37,8 @@ pub use quant_linear::QuantizedLinear;
 pub use registry::ModelRegistry;
 pub use rope::RotaryEmbedding;
 pub use smolvlm::{SmolVlmModel, image_prompt_expansion, pixels_to_tensor};
-pub use traits::GenerativeModel;
+pub use whisper::{WhisperModel, load_speech_model};
+pub use traits::{GenerativeModel, SpeechToTextModel};
 
 /// Errors produced while constructing or running models.
 #[derive(Debug, thiserror::Error)]

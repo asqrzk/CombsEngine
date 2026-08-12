@@ -100,3 +100,24 @@ pub trait GenerativeModel<B: Backend>: Send {
         ))
     }
 }
+
+/// Speech-to-text models (Whisper-style encoder–decoder). A separate
+/// contract from [`GenerativeModel`]: the encoder runs once per audio
+/// window, then the decoder is stepped over token prefixes against the
+/// fixed encoder states.
+pub trait SpeechToTextModel<B: Backend>: Send {
+    /// Architecture + hyperparameter metadata.
+    fn metadata(&self) -> &ModelMetadata;
+
+    /// Mel bins the encoder expects (derived from its conv stem weights).
+    fn n_mels(&self) -> usize;
+
+    /// Encodes one `[1, n_mels, frames]` log-mel window into encoder
+    /// states `[1, frames/2, hidden]`.
+    fn encode_audio(&self, mel: Tensor<B, 3>) -> crate::Result<Tensor<B, 3>>;
+
+    /// Runs the decoder over the whole token prefix and returns the final
+    /// position's logits `[vocab]`.
+    fn decode_step(&self, tokens: &[u32], encoded: &Tensor<B, 3>)
+    -> crate::Result<Tensor<B, 1>>;
+}

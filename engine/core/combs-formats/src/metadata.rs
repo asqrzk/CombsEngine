@@ -363,6 +363,32 @@ impl ModelMetadata {
         config: &serde_json::Value,
         generation_config: Option<&serde_json::Value>,
     ) -> Result<Self> {
+        // Whisper names its dimensions differently (d_model, encoder_layers,
+        // …). Remap them onto the shared keys and re-enter; the guard on
+        // `hidden_size` keeps the second pass out of this branch. Whisper-only
+        // geometry (mel bins, audio positions) is derived from tensor shapes
+        // at model load, so nothing else needs a slot here.
+        if config.get("model_type").and_then(|x| x.as_str()) == Some("whisper")
+            && config.get("hidden_size").is_none()
+        {
+            let mut remapped = config.clone();
+            let obj = remapped
+                .as_object_mut()
+                .ok_or_else(|| FormatError::MissingField("config object".to_string()))?;
+            for (from, to) in [
+                ("d_model", "hidden_size"),
+                ("encoder_attention_heads", "num_attention_heads"),
+                ("encoder_ffn_dim", "intermediate_size"),
+                ("encoder_layers", "num_hidden_layers"),
+                ("max_target_positions", "max_position_embeddings"),
+            ] {
+                if let Some(v) = config.get(from).cloned() {
+                    obj.insert(to.to_string(), v);
+                }
+            }
+            obj.insert("tie_word_embeddings".to_string(), serde_json::json!(true));
+            return Self::from_hf_config(&remapped, generation_config);
+        }
         // Multimodal configs (Idefics3/SmolVLM) nest the text hyperparameters
         // under `text_config`; the architecture id stays at the root.
         let text = config.get("text_config").unwrap_or(config);
