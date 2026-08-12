@@ -1282,6 +1282,7 @@ fn run_generation(
     }
     let ttft = t_start.elapsed();
     let t_decode = Instant::now();
+    let mut trace = DecodeTrace::from_env();
 
     // Tokens actually fed through `decode` (i.e. present in the KV cache).
     // The final sampled token and stop tokens never enter the cache.
@@ -1331,9 +1332,11 @@ fn run_generation(
         if generated >= config.max_tokens {
             break;
         }
+        trace.step_start();
         let data = vec![next as i32];
         let input = model.embed(Tensor::from_data(TensorData::new(data, [1, 1]), device));
         let logits = model.decode(input, cache.as_mut());
+        trace.submitted();
         decoded.push(next); // `next` is now in the KV cache
         let mut row = match readback_logits(logits) {
             Ok(r) => r,
@@ -1342,6 +1345,7 @@ fn run_generation(
                 break;
             }
         };
+        trace.read_back();
         if let Some(c) = constraint.as_mut() {
             if c.mask(&mut row) == 0 {
                 loop_error = Some(EngineError::Constraint(DEAD_END.to_string()));
@@ -1354,6 +1358,7 @@ fn run_generation(
         if let Some(c) = constraint.as_mut() {
             c.advance(next);
         }
+        trace.sampled();
     }
 
     // Save the rolling session: history must mirror KV contents exactly
@@ -1372,6 +1377,7 @@ fn run_generation(
         );
     }
 
+    trace.report();
     let decode_time = t_decode.elapsed();
     let stats = GenerationStats {
         prompt_tokens: prompt_tokens.len(),
@@ -1413,6 +1419,82 @@ fn readback_logits(logits: Tensor<CombsBackend, 2>) -> Result<Vec<f32>> {
         .convert::<f32>()
         .to_vec::<f32>()
         .map_err(|e| EngineError::Readback(format!("logits must be f32: {e:?}")))
+}
+
+/// Per-step decode timing behind `COMBS_TRACE_DECODE=1`: accumulates the
+/// wall split of kernel submission (embed + decode enqueue), logits
+/// readback (the host sync that absorbs GPU execution time), and host-side
+/// mask + sample, then prints one stderr summary line per generation.
+/// Inert when the env var is unset.
+struct DecodeTrace {
+    enabled: bool,
+    t: Instant,
+    submit: Duration,
+    readback: Duration,
+    sample: Duration,
+    steps: u32,
+}
+
+impl DecodeTrace {
+    fn from_env() -> Self {
+        DecodeTrace {
+            enabled: matches!(std::env::var("COMBS_TRACE_DECODE").as_deref(), Ok("1")),
+            t: Instant::now(),
+            submit: Duration::ZERO,
+            readback: Duration::ZERO,
+            sample: Duration::ZERO,
+            steps: 0,
+        }
+    }
+
+    fn step_start(&mut self) {
+        if self.enabled {
+            self.t = Instant::now();
+        }
+    }
+
+    fn submitted(&mut self) {
+        if self.enabled {
+            let now = Instant::now();
+            self.submit += now - self.t;
+            self.t = now;
+        }
+    }
+
+    fn read_back(&mut self) {
+        if self.enabled {
+            let now = Instant::now();
+            self.readback += now - self.t;
+            self.t = now;
+        }
+    }
+
+    fn sampled(&mut self) {
+        if self.enabled {
+            self.sample += self.t.elapsed();
+            self.steps += 1;
+        }
+    }
+
+    fn report(&self) {
+        if !self.enabled || self.steps == 0 {
+            return;
+        }
+        let total = self.submit + self.readback + self.sample;
+        let per = |d: Duration| d.as_secs_f64() * 1e3 / self.steps as f64;
+        let pct = |d: Duration| 100.0 * d.as_secs_f64() / total.as_secs_f64().max(f64::EPSILON);
+        eprintln!(
+            "[trace] decode: {} steps, {:.2} ms/step — submit {:.2} ms ({:.0}%), readback {:.2} ms ({:.0}%), sample {:.3} ms ({:.0}%)",
+            self.steps,
+            per(total),
+            per(self.submit),
+            pct(self.submit),
+            per(self.readback),
+            pct(self.readback),
+            per(self.sample),
+            pct(self.sample),
+        );
+    }
 }
 
 /// Merges `generation_config.json` sampler defaults over the built-in
