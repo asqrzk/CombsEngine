@@ -34,7 +34,7 @@ fn second_turn_reuses_prefix() {
 
     let mut reply1 = Vec::new();
     let stats1 = engine
-        .generate(&prompt1, &greedy(16), |id, _| reply1.push(id))
+        .generate(&prompt1, &greedy(16), |id, _, _| reply1.push(id))
         .expect("generate turn 1");
     assert_eq!(stats1.cached_tokens, 0, "first request is a cold start");
     assert!(!reply1.is_empty());
@@ -47,7 +47,7 @@ fn second_turn_reuses_prefix() {
 
     let mut reply2 = Vec::new();
     let stats2 = engine
-        .generate(&prompt2, &greedy(16), |id, _| reply2.push(id))
+        .generate(&prompt2, &greedy(16), |id, _, _| reply2.push(id))
         .expect("generate turn 2");
     assert!(
         stats2.cached_tokens >= prompt1.len(),
@@ -66,7 +66,7 @@ fn reused_prefix_matches_cold_generation() {
     let prompt1 = engine.encode("Water is made of").unwrap();
     let mut reply1 = Vec::new();
     engine
-        .generate(&prompt1, &greedy(8), |id, _| reply1.push(id))
+        .generate(&prompt1, &greedy(8), |id, _, _| reply1.push(id))
         .expect("generate turn 1");
 
     let suffix = engine.encode(" Hydrogen is").unwrap();
@@ -77,7 +77,7 @@ fn reused_prefix_matches_cold_generation() {
     // Warm (session reuse) generation.
     let mut warm = Vec::new();
     let stats = engine
-        .generate(&prompt2, &greedy(24), |id, _| warm.push(id))
+        .generate(&prompt2, &greedy(24), |id, _, _| warm.push(id))
         .expect("warm generate");
     assert!(stats.cached_tokens > 0);
 
@@ -85,7 +85,7 @@ fn reused_prefix_matches_cold_generation() {
     let cold_engine = load_engine();
     let mut cold = Vec::new();
     cold_engine
-        .generate(&prompt2, &greedy(24), |id, _| cold.push(id))
+        .generate(&prompt2, &greedy(24), |id, _, _| cold.push(id))
         .expect("cold generate");
 
     assert_eq!(warm, cold, "prefix reuse must not change greedy output");
@@ -118,7 +118,7 @@ fn agent_turn(
                 session_id: Some(session.to_string()),
                 ..Default::default()
             },
-            |id, _| ids.push(id),
+            |id, _, _| ids.push(id),
         )
         .expect("agent turn");
     (ids, stats)
