@@ -62,6 +62,25 @@ pub trait GenerativeModel<B: Backend>: Send {
     /// Returns the logits of that position, shape `[batch, vocab]`.
     fn decode(&mut self, input: Tensor<B, 3>, cache: &mut dyn KVCache<B>) -> Tensor<B, 2>;
 
+    /// Decodes `n` tokens at the cache tail and returns logits for every
+    /// position (`[1, n, vocab]`), not just the last row — the seam
+    /// multi-token verification needs. Architectures without it never take
+    /// the speculative path.
+    fn decode_all_logits(
+        &mut self,
+        _input: Tensor<B, 3>,
+        _cache: &mut dyn KVCache<B>,
+    ) -> crate::Result<Tensor<B, 3>> {
+        Err(crate::ModelError::Unsupported(
+            "this model does not expose per-position decode logits".to_string(),
+        ))
+    }
+
+    /// Whether [`GenerativeModel::decode_all_logits`] is implemented.
+    fn supports_decode_all_logits(&self) -> bool {
+        false
+    }
+
     /// Runs (a chunk of) the prompt and returns the final-norm hidden
     /// states for those positions, shape `[1, seq, hidden]` — the
     /// embeddings path. Same cache/position contract as

@@ -12,6 +12,7 @@ mod detok;
 mod engine;
 mod logits;
 mod sampler;
+mod spec;
 mod stop;
 mod template;
 mod toolcall;

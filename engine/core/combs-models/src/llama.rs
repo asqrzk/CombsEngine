@@ -458,6 +458,20 @@ impl<B: Backend> GenerativeModel<B> for LlamaModel<B> {
         let hidden = self.forward_hidden(input, cache, pos);
         self.last_logits(hidden)
     }
+
+    fn decode_all_logits(
+        &mut self,
+        input: Tensor<B, 3>,
+        cache: &mut dyn KVCache<B>,
+    ) -> Result<Tensor<B, 3>> {
+        let pos = cache.seq_len();
+        let hidden = self.forward_hidden(input, cache, pos);
+        Ok(self.all_logits(hidden))
+    }
+
+    fn supports_decode_all_logits(&self) -> bool {
+        true
+    }
 }
 
 impl<B: Backend> LlamaModel<B> {

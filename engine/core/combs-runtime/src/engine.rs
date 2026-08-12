@@ -21,6 +21,7 @@ use tokenizers::Tokenizer;
 
 use crate::constraint::{ConstraintSpec, ConstraintState, TokenByteTable};
 use crate::detok::IncrementalDetokenizer;
+use crate::spec;
 use crate::sampler::{Sampler, SamplingParams, TokenLogprobs, sampler_from_params};
 use crate::stop::StopDetector;
 use crate::{EngineError, Result};
@@ -1284,6 +1285,28 @@ fn run_generation(
     let t_decode = Instant::now();
     let mut trace = DecodeTrace::from_env();
 
+    // Speculative decoding (prompt-lookup drafts + multi-token verify):
+    // greedy-only and only where raw argmax IS the sampler (no penalties,
+    // bias, or logprob capture), never under constraints, and only on
+    // non-sliding models with a paged cache — there `popn` rollback is
+    // always total. Every other request takes the normal path untouched.
+    let spec_active = spec_enabled()
+        && constraint.is_none()
+        && config.sampling.temperature <= 0.0
+        && config.sampling.repetition_penalty.map_or(true, |v| v == 1.0)
+        && config.sampling.frequency_penalty.map_or(true, |v| v == 0.0)
+        && config.sampling.presence_penalty.map_or(true, |v| v == 0.0)
+        && config.sampling.logit_bias.is_none()
+        && config.sampling.logprobs.is_none()
+        && model.supports_decode_all_logits()
+        && model.metadata().attention_pattern.sliding_window.is_none()
+        && cache.pages_used().is_some();
+    // Pre-verified tokens waiting to be emitted, and how many cache rows
+    // sit beyond `decoded` (drained back to zero as pending empties).
+    let mut pending: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+    let mut cache_ahead = 0usize;
+    let mut spec_cooldown = 0usize;
+
     // Tokens actually fed through `decode` (i.e. present in the KV cache).
     // The final sampled token and stop tokens never enter the cache.
     let mut decoded: Vec<u32> = Vec::new();
@@ -1332,33 +1355,112 @@ fn run_generation(
         if generated >= config.max_tokens {
             break;
         }
-        trace.step_start();
-        let data = vec![next as i32];
-        let input = model.embed(Tensor::from_data(TensorData::new(data, [1, 1]), device));
-        let logits = model.decode(input, cache.as_mut());
-        trace.submitted();
-        decoded.push(next); // `next` is now in the KV cache
-        let mut row = match readback_logits(logits) {
-            Ok(r) => r,
-            Err(e) => {
-                loop_error = Some(e);
-                break;
+        if let Some(t) = pending.pop_front() {
+            // Pre-verified by the last speculative round: `next` is already
+            // in the cache and `t` was proven to follow it.
+            decoded.push(next);
+            cache_ahead -= 1;
+            next = t;
+            next_logprobs = None;
+        } else if let Some(draft) = (spec_active && spec_cooldown == 0)
+            .then(|| spec::propose(&history, SPEC_DRAFT, SPEC_MIN_NGRAM, SPEC_MAX_NGRAM))
+            .flatten()
+        {
+            // Feed [next, draft…] in one pass; row i's argmax is the
+            // model's true next token after position i, so the longest
+            // matching prefix of the draft is exactly what greedy decoding
+            // would have produced one at a time.
+            let k = draft.len();
+            let mut ids: Vec<i32> = Vec::with_capacity(k + 1);
+            ids.push(next as i32);
+            ids.extend(draft.iter().map(|&t| t as i32));
+            let input =
+                model.embed(Tensor::from_data(TensorData::new(ids, [1, k + 1]), device));
+            let all = match model.decode_all_logits(input, cache.as_mut()) {
+                Ok(t) => t,
+                Err(e) => {
+                    loop_error = Some(e.into());
+                    break;
+                }
+            };
+            let rows: Vec<f32> = match all.into_data().convert::<f32>().to_vec::<f32>() {
+                Ok(v) => v,
+                Err(e) => {
+                    loop_error = Some(EngineError::Readback(format!("spec logits: {e:?}")));
+                    break;
+                }
+            };
+            let vocab = rows.len() / (k + 1);
+            let argmax = |r: usize| -> u32 {
+                rows[r * vocab..(r + 1) * vocab]
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .map(|(i, _)| i as u32)
+                    .unwrap_or(0)
+            };
+            let mut accepted = 0usize;
+            while accepted < k && argmax(accepted) == draft[accepted] {
+                accepted += 1;
             }
-        };
-        trace.read_back();
-        if let Some(c) = constraint.as_mut() {
-            if c.mask(&mut row) == 0 {
-                loop_error = Some(EngineError::Constraint(DEAD_END.to_string()));
-                break;
+            let correction = argmax(accepted.min(k));
+            // Roll the rejected tail out of the cache. The static guards
+            // make a partial rollback impossible; treat one as fatal
+            // rather than continuing on divergent state.
+            let unwanted = k - accepted;
+            if unwanted > 0 {
+                let popped = cache.popn(unwanted);
+                if popped != unwanted {
+                    loop_error = Some(EngineError::Readback(format!(
+                        "speculative rollback popped {popped} of {unwanted} rows"
+                    )));
+                    break;
+                }
             }
+            decoded.push(next);
+            cache_ahead += accepted;
+            spec_cooldown = if accepted == 0 { SPEC_BACKOFF } else { 0 };
+            pending.extend(draft[..accepted].iter().copied());
+            pending.push_back(correction);
+            next = pending.pop_front().expect("correction token is always queued");
+            next_logprobs = None;
+        } else {
+            spec_cooldown = spec_cooldown.saturating_sub(1);
+            trace.step_start();
+            let data = vec![next as i32];
+            let input = model.embed(Tensor::from_data(TensorData::new(data, [1, 1]), device));
+            let logits = model.decode(input, cache.as_mut());
+            trace.submitted();
+            decoded.push(next); // `next` is now in the KV cache
+            let mut row = match readback_logits(logits) {
+                Ok(r) => r,
+                Err(e) => {
+                    loop_error = Some(e);
+                    break;
+                }
+            };
+            trace.read_back();
+            if let Some(c) = constraint.as_mut() {
+                if c.mask(&mut row) == 0 {
+                    loop_error = Some(EngineError::Constraint(DEAD_END.to_string()));
+                    break;
+                }
+            }
+            let outcome = sampler.sample(&mut row, &history);
+            next = outcome.token;
+            next_logprobs = outcome.logprobs;
+            if let Some(c) = constraint.as_mut() {
+                c.advance(next);
+            }
+            trace.sampled();
         }
-        let outcome = sampler.sample(&mut row, &history);
-        next = outcome.token;
-        next_logprobs = outcome.logprobs;
-        if let Some(c) = constraint.as_mut() {
-            c.advance(next);
-        }
-        trace.sampled();
+    }
+
+    // Pre-verified rows that never got emitted must leave the cache before
+    // the session snapshot (history must mirror KV contents exactly).
+    if cache_ahead > 0 {
+        let popped = cache.popn(cache_ahead);
+        debug_assert_eq!(popped, cache_ahead, "speculative exit rollback");
     }
 
     // Save the rolling session: history must mirror KV contents exactly
@@ -1392,6 +1494,25 @@ fn run_generation(
         Some(e) => Err(e),
         None => Ok(stats),
     }
+}
+
+/// Draft length proposed per speculative round.
+const SPEC_DRAFT: usize = 6;
+/// Shortest history suffix n-gram accepted as a draft trigger — bigrams
+/// recur incidentally in all text and produce failed rounds that cost more
+/// than they save.
+const SPEC_MIN_NGRAM: usize = 3;
+/// Longest history suffix n-gram searched for a recurrence.
+const SPEC_MAX_NGRAM: usize = 8;
+/// Tokens decoded normally after a fully-rejected round before drafting
+/// again (a miss usually means this region of text is not repetitive).
+const SPEC_BACKOFF: usize = 16;
+
+/// Speculative decoding ships opt-in behind `COMBS_SPEC=1` until its
+/// measured speedup clears the bar for default-on; checked once.
+fn spec_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("COMBS_SPEC").as_deref(), Ok("1")))
 }
 
 /// Error text for a constraint dead end (no token can legally continue).
