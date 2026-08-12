@@ -15,6 +15,7 @@ mod sampler;
 mod stop;
 mod template;
 mod toolcall;
+mod transcribe;
 
 pub use combs_models::{CacheConfig, CacheKind};
 pub use constraint::{CompiledSchema, ConstraintSpec, ConstraintState, TokenByteTable};
@@ -36,6 +37,7 @@ pub use template::ChatTemplate;
 pub use toolcall::{
     ChatMessage, ToolCall, ToolCallParser, ToolCallStyle, ToolEvent, ToolFunction,
 };
+pub use transcribe::SpeechEngine;
 
 /// Errors produced by the runtime.
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +53,10 @@ pub enum EngineError {
     /// Tokenizer failure.
     #[error("tokenizer error: {0}")]
     Tokenizer(String),
+
+    /// Media payload (audio) could not be decoded.
+    #[error("media error: {0}")]
+    Media(String),
 
     /// Tensor data could not be read back from the device.
     #[error("tensor readback error: {0}")]
