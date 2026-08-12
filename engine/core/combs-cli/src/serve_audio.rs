@@ -3,8 +3,8 @@
 //! Loads the Kokoro TTS engine ONCE (ONNX session + vocab; voice style
 //! tables cache on first use) and serves speech requests, removing the
 //! per-request espeak+ONNX cold start of the `combs generate-audio`
-//! subprocess. Requests are serialized through a mutex. STT
-//! (`/v1/audio/transcriptions`) joins this worker in roadmap wave 4.
+//! subprocess. With `--transcribe-model`, a Whisper speech-to-text engine
+//! loads alongside it. Each engine serializes its requests through a mutex.
 //!
 //! Endpoints:
 //! - `GET  /health` → `{"status":"ok"}`
@@ -12,6 +12,8 @@
 //! - `GET  /v1/audio/voices` → `{"voices": [...], "default": "af_heart"}`
 //! - `POST /v1/audio/speech` → `audio/wav` bytes (OpenAI-style binary
 //!   response); body `{input | text, voice?, speed?, lang?}`
+//! - `POST /v1/audio/transcriptions` → `{"text": …}`; multipart form-data
+//!   (`file` part) or a raw WAV body
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -30,13 +32,29 @@ struct AudioStats {
     last_bytes: std::sync::atomic::AtomicU64,
 }
 
-pub fn cmd_serve_audio(model: PathBuf, port: u16) -> Result<()> {
+pub fn cmd_serve_audio(
+    model: PathBuf,
+    port: u16,
+    transcribe_model: Option<PathBuf>,
+    language: String,
+) -> Result<()> {
     let model_dir = super::resolve_model_arg(&model)?;
 
     eprintln!("[serve-audio] loading TTS engine...");
     let engine = TtsEngine::load(&model_dir).context("loading TTS engine")?;
     let voices = engine.voices().unwrap_or_default();
     let engine = Arc::new(Mutex::new(engine));
+
+    let stt = match transcribe_model {
+        Some(p) => {
+            let dir = super::resolve_model_arg(&p)?;
+            eprintln!("[serve-audio] loading speech-to-text engine...");
+            let e = combs_runtime::SpeechEngine::load(&dir, &language)
+                .map_err(|e| anyhow::anyhow!("loading speech model: {e}"))?;
+            Some(Arc::new(Mutex::new(e)))
+        }
+        None => None,
+    };
 
     let addr = format!("0.0.0.0:{port}");
     let server =
@@ -53,6 +71,7 @@ pub fn cmd_serve_audio(model: PathBuf, port: u16) -> Result<()> {
     let stats = Arc::new(AudioStats::default());
     for mut request in server.incoming_requests() {
         let engine = engine.clone();
+        let stt = stt.clone();
         let stats = stats.clone();
         let model_id = model_id.clone();
         let voices = voices.clone();
@@ -110,6 +129,9 @@ pub fn cmd_serve_audio(model: PathBuf, port: u16) -> Result<()> {
                         return;
                     }
                     handle_speech(request, &engine, &body, &stats);
+                }
+                ("POST", "/v1/audio/transcriptions") => {
+                    handle_transcription(request, stt.as_deref(), &stats);
                 }
                 _ => {
                     let _ = request
@@ -204,4 +226,133 @@ fn handle_speech(
                 .respond(json_response(500, error_json("engine_error", &format!("{e:#}"))));
         }
     }
+}
+
+/// POST /v1/audio/transcriptions — multipart form-data (`file` part) or a
+/// raw WAV body. Response: OpenAI-style `{"text": "..."}`.
+fn handle_transcription(
+    mut request: tiny_http::Request,
+    stt: Option<&Mutex<combs_runtime::SpeechEngine>>,
+    stats: &AudioStats,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(engine) = stt else {
+        let _ = request.respond(json_response(
+            501,
+            error_json(
+                "not_configured",
+                "no transcription model loaded (start serve-audio with --transcribe-model)",
+            ),
+        ));
+        return;
+    };
+    let content_type = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Content-Type"))
+        .map(|h| h.value.as_str().to_string())
+        .unwrap_or_default();
+    // Cap the body: 64 MB covers ~35 min of 16-bit 16 kHz mono.
+    let mut body = Vec::new();
+    let ok = {
+        use std::io::Read;
+        request
+            .as_reader()
+            .take(64_000_000)
+            .read_to_end(&mut body)
+            .is_ok()
+    };
+    if !ok || body.is_empty() {
+        let _ = request.respond(json_response(
+            400,
+            error_json("invalid_request", "unreadable body"),
+        ));
+        return;
+    }
+    let wav = match multipart_boundary(&content_type) {
+        Some(b) => match multipart_file(&body, &b) {
+            Some(f) => f,
+            None => {
+                let _ = request.respond(json_response(
+                    400,
+                    error_json("invalid_request", "multipart body has no file part"),
+                ));
+                return;
+            }
+        },
+        None => body,
+    };
+
+    stats.requests_total.fetch_add(1, Relaxed);
+    let start = std::time::Instant::now();
+    let result = engine.lock().unwrap().transcribe_wav(&wav);
+    match result {
+        Ok(text) => {
+            stats
+                .last_duration_ms
+                .store(start.elapsed().as_millis() as u64, Relaxed);
+            stats.last_bytes.store(text.len() as u64, Relaxed);
+            let _ = request.respond(json_response(200, json!({ "text": text })));
+        }
+        Err(e) => {
+            stats.errors_total.fetch_add(1, Relaxed);
+            let _ = request.respond(json_response(
+                500,
+                error_json("transcription_failed", &e.to_string()),
+            ));
+        }
+    }
+}
+
+/// Extracts the boundary parameter from a multipart/form-data Content-Type.
+fn multipart_boundary(content_type: &str) -> Option<String> {
+    if !content_type
+        .to_ascii_lowercase()
+        .starts_with("multipart/form-data")
+    {
+        return None;
+    }
+    content_type.split(';').find_map(|p| {
+        p.trim()
+            .strip_prefix("boundary=")
+            .map(|b| b.trim_matches('"').to_string())
+    })
+}
+
+/// Minimal multipart parser: returns the bytes of the `file` part, or the
+/// first part carrying a filename. Enough for OpenAI-style clients; not a
+/// general RFC 2046 implementation.
+fn multipart_file(body: &[u8], boundary: &str) -> Option<Vec<u8>> {
+    let delim = format!("--{boundary}");
+    let delim = delim.as_bytes();
+    let find = |hay: &[u8], needle: &[u8], from: usize| -> Option<usize> {
+        hay.get(from..)?
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .map(|p| p + from)
+    };
+    let mut fallback: Option<Vec<u8>> = None;
+    let mut pos = find(body, delim, 0)?;
+    loop {
+        pos += delim.len();
+        if body.get(pos..pos + 2) == Some(b"--".as_slice()) {
+            break; // closing delimiter
+        }
+        let head_start = find(body, b"\r\n", pos)? + 2;
+        let head_end = find(body, b"\r\n\r\n", head_start)?;
+        let headers = String::from_utf8_lossy(&body[head_start..head_end]).to_ascii_lowercase();
+        let content_start = head_end + 4;
+        let next = find(body, delim, content_start)?;
+        // Content ends before the \r\n that precedes the next delimiter.
+        let content_end = next.saturating_sub(2).max(content_start);
+        let content = body[content_start..content_end].to_vec();
+        if headers.contains("name=\"file\"") {
+            return Some(content);
+        }
+        if fallback.is_none() && headers.contains("filename=") {
+            fallback = Some(content);
+        }
+        pos = next;
+    }
+    fallback
 }

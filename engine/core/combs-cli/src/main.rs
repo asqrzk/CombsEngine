@@ -134,6 +134,25 @@ enum Command {
         /// Port to listen on.
         #[arg(long, default_value_t = 8083)]
         port: u16,
+        /// Whisper checkpoint directory (or preset id) enabling
+        /// POST /v1/audio/transcriptions.
+        #[arg(long)]
+        transcribe_model: Option<PathBuf>,
+        /// Transcription language (Whisper language token, e.g. `en`).
+        #[arg(long, default_value = "en")]
+        language: String,
+    },
+    /// Transcribe a WAV file with a local speech model.
+    Transcribe {
+        /// Whisper checkpoint directory (or a preset id like `whisper-base`).
+        #[arg(long)]
+        model: PathBuf,
+        /// 16-bit PCM WAV file to transcribe.
+        #[arg(long)]
+        file: PathBuf,
+        /// Whisper language token (e.g. `en`).
+        #[arg(long, default_value = "en")]
+        language: String,
     },
     /// Start an OpenAI-compatible HTTP server.
     Serve {
@@ -194,7 +213,10 @@ fn main() -> Result<()> {
         Command::GenerateImage(args) => generate_image::cmd_generate_image(args),
         Command::GenerateAudio(args) => generate_audio::cmd_generate_audio(args),
         Command::ServeImages { model, port } => serve_images::cmd_serve_images(model, port),
-        Command::ServeAudio { model, port } => serve_audio::cmd_serve_audio(model, port),
+        Command::ServeAudio { model, port, transcribe_model, language } => {
+            serve_audio::cmd_serve_audio(model, port, transcribe_model, language)
+        }
+        Command::Transcribe { model, file, language } => cmd_transcribe(model, file, language),
         Command::Serve { model, port, context_size, prefill_chunk_size } => {
             cmd_serve(model, port, context_size, prefill_chunk_size)
         }
@@ -235,6 +257,21 @@ fn resolve_model_arg(model: &PathBuf) -> Result<PathBuf> {
         return Ok(dir);
     }
     anyhow::bail!("model '{name}' not found — download it first: combs pull {name}")
+}
+
+fn cmd_transcribe(model: PathBuf, file: PathBuf, language: String) -> Result<()> {
+    let dir = resolve_model_arg(&model)?;
+    eprintln!("loading speech model from {}...", dir.display());
+    let engine = combs_runtime::SpeechEngine::load(&dir, &language)
+        .map_err(|e| anyhow::anyhow!("loading speech model: {e}"))?;
+    let wav = std::fs::read(&file)?;
+    let start = std::time::Instant::now();
+    let text = engine
+        .transcribe_wav(&wav)
+        .map_err(|e| anyhow::anyhow!("transcribing: {e}"))?;
+    eprintln!("transcribed in {:.2} s", start.elapsed().as_secs_f64());
+    println!("{text}");
+    Ok(())
 }
 
 fn cmd_serve(

@@ -32,6 +32,7 @@ pub const PRESETS: &[(&str, &str, &str)] = &[
     ("smolvlm-256m", "HuggingFaceTB/SmolVLM-256M-Instruct", "smolvlm-256m"),
     ("sd-1.5", "runwayml/stable-diffusion-v1-5", "stable-diffusion-v1-5"),
     ("kokoro-82m", "onnx-community/Kokoro-82M-v1.0-ONNX", "kokoro-82m"),
+    ("whisper-base", "openai/whisper-base", "whisper-base"),
 ];
 
 /// Quant-GGUF repos that need the original checkpoint's `tokenizer.json`
