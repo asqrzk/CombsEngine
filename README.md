@@ -73,23 +73,23 @@ Four layers. Compute lives exclusively in **L0** — every layer above is thin o
 
 | Layer | Location | What it is |
 |---|---|---|
-| L0 Core | [`Core/`](Core) | Cargo workspace: `combs-core`, `combs-formats`, `combs-media`, `combs-models`, `combs-runtime`, `combs-ffi`, `combs-mesh`, `combs-mesh-ffi`, `combs-cli`, `xtask` |
-| L2 Framework | [`Js/`](Js) | Deno workspace of 9 `@combs/*` packages |
-| L3 UI | [`Ui/`](Ui) | Svelte 5 + Vite template consumed by `combs chew` |
-| L3 Android | [`Android/`](Android) | JNI glue + Kotlin API over the FFI `.so` |
-| L3 iOS | [`Ios/`](Ios) | Swift wrapper over the FFI static lib |
+| L0 Core | [`engine/core`](engine/core) | Cargo workspace: `combs-core`, `combs-formats`, `combs-media`, `combs-models`, `combs-runtime`, `combs-ffi`, `combs-mesh`, `combs-mesh-ffi`, `combs-cli`, `xtask` |
+| L2 Framework | [`engine/js`](engine/js) | Deno workspace of 9 `@combs/*` packages |
+| L3 UI | [`engine/ui`](engine/ui) | Svelte 5 + Vite template consumed by `combs chew` |
+| L3 Android | [`engine/android`](engine/android) | JNI glue + Kotlin API over the FFI `.so` |
+| L3 iOS | [`engine/ios`](engine/ios) | Swift wrapper over the FFI static lib |
 
 ## What's Available
 
 ### L0 — Rust Core (`engine/core`)
 
-- **Inference engine** — one universal decoder on Burn 0.21 + CubeCL/wgpu serving Llama/SmolLM2, Qwen2.5, Qwen3, Phi-3, and Gemma-3 (sliding-window + dual-RoPE variants included), plus SmolVLM vision input, Stable Diffusion 1.5 image generation, and Kokoro TTS. New architectures = a registry line + an `ArchSpec` preset.
+- **Inference engine** — one universal decoder on Burn 0.21 + CubeCL/wgpu serving Llama/SmolLM2, Qwen2.5, Qwen3, Phi-3, and Gemma-3 (sliding-window + dual-RoPE variants included), plus SmolVLM vision input, Stable Diffusion 1.5 image generation, Kokoro TTS, and **Whisper speech-to-text** (WAV → 16 kHz log-mel → encoder-decoder transcription). New architectures = a registry line + an `ArchSpec` preset.
 - **Model formats** — SafeTensors (Hugging Face layout, causal-LM or bare base exports) and **GGUF v3** (F32 / F16 / Q4_0 / Q5_0 / Q8_0 / Q4_K / Q5_K / Q6_K) through a single `ModelSource` adapter trait. `combs run --model anything.gguf` just works.
 - **Memory** — paged KV cache (page-16 arenas, LIFO free-list, prefix-safe `popn`), chunked prefill, quantized linear layers with weights packed in VRAM.
-- **Sampling** — temperature, top-k, top-p, min-p, repetition/frequency/presence penalties, logit_bias, per-token logprobs, seeded (byte-identical) generation, stop strings & stop tokens.
-- **CLI (`combs`)** — `run` · `serve` · `perplexity` · `pull` · `devices` · `chew` · `generate-image` · `generate-audio` · `serve-images` · `serve-audio` · `convert`.
-- **OpenAI-compatible server** — `/v1/chat/completions` (SSE + non-streaming, native **tool calling** through each model's own chat template, `response_format` json_object/json_schema constrained output, logprobs, `n` choices), `/v1/completions` (raw prompt / FIM), `/v1/embeddings` (pooling detection, matryoshka `dimensions`, base64), `/v1/models` + `/v1/model/info` (per-model capability advertisement), `/v1/stats`, `/health` — plus `/v1/images/generations` and `/v1/audio/speech` on the media workers.
-- **`xtask`** — cross-platform build orchestrator: `cargo xtask matrix` shows live toolchain detection; `cargo xtask bundle` produces `dist/<platform>/{lib, combs.h}` for every target.
+- **Sampling** — temperature, top-k, top-p, min-p, repetition/frequency/presence penalties, logit_bias, per-token logprobs, seeded (byte-identical) generation, stop strings & stop tokens; opt-in prompt-lookup speculative decoding for greedy runs (`COMBS_SPEC=1`).
+- **CLI (`combs`)** — `run` · `serve` · `perplexity` · `transcribe` · `pull` · `devices` · `chew` · `generate-image` · `generate-audio` · `serve-images` · `serve-audio` · `convert`.
+- **OpenAI-compatible server** — `/v1/chat/completions` (SSE + non-streaming, native **tool calling** through each model's own chat template, `response_format` json_object/json_schema constrained output, logprobs, `n` choices), `/v1/completions` (raw prompt / FIM), `/v1/embeddings` (pooling detection, matryoshka `dimensions`, base64), `/v1/models` + `/v1/model/info` (per-model capability advertisement), `/v1/stats`, `/health` — plus `/v1/images/generations`, `/v1/audio/speech`, and `/v1/audio/transcriptions` (multipart or raw WAV) on the media workers.
+- **`xtask`** — cross-platform build orchestrator: `cargo xtask matrix` shows live toolchain detection; `cargo xtask bundle` produces `dist/host/{combs, combs-f32}` (the default `combs` computes in f16, with image generation pinned to f32 internally; `combs-f32` is the full-precision build) plus `dist/<platform>/{lib, combs.h}` for every target.
 - **CombsMesh emoji engine (`combs-mesh`)** — binary `.cmse` block format (10 block types: text/image/todo/functions/api/lifecycle/character/emotion/encryption/orchestration), Unicode PUA tag-character encoding, AES-256-GCM/ChaCha20 crypto with HKDF subkeys, CPU + wgpu sprite renderers, content-addressed registry, wasm32-clean with wasm-bindgen bindings; C ABI via `combs-mesh-ffi` (`combsmesh_*` + `combsmesh_op_json`).
 
 ### L2 — TypeScript Framework (`engine/js`)
@@ -154,7 +154,7 @@ Run `cargo xtask matrix` for live detection of your local toolchains.
 ## Development
 
 ```bash
-# Rust — 53 tests (release profile saves disk)
+# Rust — full workspace suite (release profile saves disk)
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"   # rustup is keg-only on macOS
 cargo test --release --workspace
 
@@ -164,8 +164,6 @@ cd Js && deno task test
 # Cross-build everything into dist/
 cargo xtask bundle
 ```
-
-Repo conventions live in the root [`AGENTS.md`](../AGENTS.md).
 
 ## Contributing
 
