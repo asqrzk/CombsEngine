@@ -22,6 +22,7 @@
 //! default; these kernels are the opt-in fast path behind the linear seam.
 
 use core::marker::PhantomData;
+use std::sync::OnceLock;
 
 use cubecl::prelude::*;
 use cubecl::server::Handle;
@@ -145,6 +146,23 @@ fn cube_count_capped(total: u32) -> CubeCount {
         let y = cubes.div_ceil(MAX_CUBES_PER_DIM);
         CubeCount::Static(MAX_CUBES_PER_DIM, y, 1)
     }
+}
+
+/// Grid for the tiled matmul kernels: one cube per (row, CUBE_DIM-wide
+/// column block) — X = column blocks, Y = rows. Both stay far under
+/// [`MAX_CUBES_PER_DIM`] for real weights (n_out ≤ 262k → ≤ 1024 column
+/// blocks; m is a prefill chunk).
+fn cube_count_tiled(n_out: u32, m: u32) -> CubeCount {
+    CubeCount::Static(n_out.div_ceil(CUBE_DIM).max(1), m.max(1), 1)
+}
+
+/// The tiled prefill kernels can be disabled with `COMBS_NO_TILED_MATMUL=1`
+/// (runtime A/B comparisons and triage); checked once per process.
+fn tiled_enabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    !*DISABLED.get_or_init(|| {
+        matches!(std::env::var("COMBS_NO_TILED_MATMUL").as_deref(), Ok("1"))
+    })
 }
 
 /// Runs the dequant-only kernel over a raw Q4_0 block stream. Exists for
@@ -451,6 +469,63 @@ fn q8_0_matmul_kernel(
     }
 }
 
+/// Tiled variant of [`q8_0_matmul_kernel`] for m > 1: one cube per
+/// (row, CUBE_DIM-wide column block). Each 256-value k-tile of the row's
+/// activations is staged in shared memory once by the whole cube instead of
+/// being re-read from global memory by every column. Per-output arithmetic
+/// (ascending k, per-block sum then one scale multiply) is identical to the
+/// untiled kernel, so outputs are bit-identical; only the `x` load path
+/// changes. Both barriers sit outside the column guard: every thread of the
+/// cube reaches them even in a ragged final column block.
+#[cube(launch_unchecked)]
+fn q8_0_matmul_tiled_kernel(
+    x: &Array<f32>,
+    qs: &Array<u32>,
+    d: &Array<f32>,
+    out: &mut Array<f32>,
+    k: usize,
+    n_out: usize,
+) {
+    let mut staged = SharedMemory::<f32>::new(256usize);
+    let unit = UNIT_POS as usize;
+    let row = CUBE_POS_Y as usize;
+    let col = (CUBE_POS_X * CUBE_DIM + UNIT_POS) as usize;
+    let blocks_per_row = k / 32;
+    let n_tiles = (k + 255) / 256;
+    let mut acc = 0.0f32;
+    for t in 0..n_tiles {
+        let k0 = t * 256;
+        if k0 + unit < k {
+            staged[unit] = x[row * k + k0 + unit];
+        }
+        sync_cube();
+        if col < n_out {
+            let mut kb_end = (k0 + 256) / 32;
+            if blocks_per_row < kb_end {
+                kb_end = blocks_per_row;
+            }
+            for kb in (k0 / 32)..kb_end {
+                let block = col * blocks_per_row + kb;
+                let s_base = kb * 32 - k0;
+                let mut block_acc = 0.0f32;
+                for w in 0..8usize {
+                    let word = qs[block * 8 + w];
+                    for b in 0..4usize {
+                        let byte = (word >> (u32::cast_from(b) * 8)) & 0xFF;
+                        let q = (i32::cast_from(byte) << 24) >> 24;
+                        block_acc += f32::cast_from(q) * staged[s_base + w * 4 + b];
+                    }
+                }
+                acc += d[block] * block_acc;
+            }
+        }
+        sync_cube();
+    }
+    if col < n_out {
+        out[row * n_out + col] = acc;
+    }
+}
+
 /// Runs the Q5_0 dequant-only kernel (validation/debugging path).
 pub fn dequantize_q5_0_gpu<R: Runtime>(client: &ComputeClient<R>, data: &[u8]) -> Result<Vec<f32>> {
     let (qs, qh, d) = repack_q5_0(data)?;
@@ -620,24 +695,54 @@ impl<R: Runtime> Q80Weight<R> {
         (self.n_out * self.k / Q4_0_BLOCK) * 36
     }
 
-    /// Device path: launch only, output handle returned.
+    /// Device path: launch only, output handle returned. Decode (`m == 1`)
+    /// keeps the untiled kernel; prefill (`m > 1`) takes the shared-memory
+    /// tiled kernel unless `COMBS_NO_TILED_MATMUL=1`.
     pub fn matmul_device(&self, client: &ComputeClient<R>, x: Handle, m: usize) -> Handle {
+        self.matmul_device_with(client, x, m, m > 1 && tiled_enabled())
+    }
+
+    /// Launch with an explicit kernel choice (the parity tests compare
+    /// tiled vs untiled on identical inputs).
+    pub(crate) fn matmul_device_with(
+        &self,
+        client: &ComputeClient<R>,
+        x: Handle,
+        m: usize,
+        tiled: bool,
+    ) -> Handle {
         let out_len = m * self.n_out;
         let out_h = client.empty(out_len * core::mem::size_of::<f32>());
         let n_blocks = self.n_out * self.k / Q4_0_BLOCK;
-        unsafe {
-            q8_0_matmul_kernel::launch_unchecked::<R>(
-                client,
-                cube_count_capped(out_len as u32),
-                CubeDim::new_1d(CUBE_DIM),
-                ArrayArg::from_raw_parts(x, m * self.k),
-                ArrayArg::from_raw_parts(self.qs.clone(), n_blocks * 8),
-                ArrayArg::from_raw_parts(self.d.clone(), n_blocks),
-                ArrayArg::from_raw_parts(out_h.clone(), out_len),
-                m,
-                self.k,
-                self.n_out,
-            );
+        if tiled {
+            unsafe {
+                q8_0_matmul_tiled_kernel::launch_unchecked::<R>(
+                    client,
+                    cube_count_tiled(self.n_out as u32, m as u32),
+                    CubeDim::new_1d(CUBE_DIM),
+                    ArrayArg::from_raw_parts(x, m * self.k),
+                    ArrayArg::from_raw_parts(self.qs.clone(), n_blocks * 8),
+                    ArrayArg::from_raw_parts(self.d.clone(), n_blocks),
+                    ArrayArg::from_raw_parts(out_h.clone(), out_len),
+                    self.k,
+                    self.n_out,
+                );
+            }
+        } else {
+            unsafe {
+                q8_0_matmul_kernel::launch_unchecked::<R>(
+                    client,
+                    cube_count_capped(out_len as u32),
+                    CubeDim::new_1d(CUBE_DIM),
+                    ArrayArg::from_raw_parts(x, m * self.k),
+                    ArrayArg::from_raw_parts(self.qs.clone(), n_blocks * 8),
+                    ArrayArg::from_raw_parts(self.d.clone(), n_blocks),
+                    ArrayArg::from_raw_parts(out_h.clone(), out_len),
+                    m,
+                    self.k,
+                    self.n_out,
+                );
+            }
         }
         out_h
     }
@@ -820,6 +925,69 @@ fn q4_k_matmul_kernel(
                 acc += d * sc2 * sum_hi - dmin * mn2 * xs_hi;
             }
         }
+        out[row * n_out + col] = acc;
+    }
+}
+
+/// Tiled variant of [`q4_k_matmul_kernel`] for m > 1: the 256-value
+/// K-superblock is exactly one shared-memory tile (`k % 256 == 0` always
+/// holds for K-quants, so there is no ragged tail). The cube stages the
+/// superblock's activation slice once, barriers, and every column applies
+/// the same sum-split in the same ascending-k order as the untiled kernel —
+/// outputs are bit-identical; only the `x` load path changes.
+#[cube(launch_unchecked)]
+fn q4_k_matmul_tiled_kernel(
+    x: &Array<f32>,
+    qs: &Array<u32>,
+    dd: &Array<f32>,
+    scales: &Array<u32>,
+    out: &mut Array<f32>,
+    k: usize,
+    n_out: usize,
+) {
+    let mut staged = SharedMemory::<f32>::new(256usize);
+    let unit = UNIT_POS as usize;
+    let row = CUBE_POS_Y as usize;
+    let col = (CUBE_POS_X * CUBE_DIM + UNIT_POS) as usize;
+    let sb_per_row = k / 256;
+    let mut acc = 0.0f32;
+    for sbi in 0..sb_per_row {
+        staged[unit] = x[row * k + sbi * 256 + unit];
+        sync_cube();
+        if col < n_out {
+            let sb = col * sb_per_row + sbi;
+            let d = dd[sb * 2];
+            let dmin = dd[sb * 2 + 1];
+            let s_base = sb * 12;
+            for j in 0..4usize {
+                let mut sum_lo = 0.0f32;
+                let mut sum_hi = 0.0f32;
+                let mut xs_lo = 0.0f32;
+                let mut xs_hi = 0.0f32;
+                for w in 0..8usize {
+                    let word = qs[sb * 32 + j * 8 + w];
+                    for b in 0..4usize {
+                        let byte = (word >> (u32::cast_from(b) * 8)) & 0xFF;
+                        let l = 4 * w + b;
+                        let x1 = staged[64 * j + l];
+                        let x2 = staged[64 * j + 32 + l];
+                        sum_lo += f32::cast_from(byte & 0xF) * x1;
+                        sum_hi += f32::cast_from(byte >> 4) * x2;
+                        xs_lo += x1;
+                        xs_hi += x2;
+                    }
+                }
+                let sc1 = f32::cast_from(k4_scale(scales, s_base, 2 * j));
+                let mn1 = f32::cast_from(k4_min(scales, s_base, 2 * j));
+                let sc2 = f32::cast_from(k4_scale(scales, s_base, 2 * j + 1));
+                let mn2 = f32::cast_from(k4_min(scales, s_base, 2 * j + 1));
+                acc += d * sc1 * sum_lo - dmin * mn1 * xs_lo;
+                acc += d * sc2 * sum_hi - dmin * mn2 * xs_hi;
+            }
+        }
+        sync_cube();
+    }
+    if col < n_out {
         out[row * n_out + col] = acc;
     }
 }
@@ -1181,26 +1349,56 @@ impl<R: Runtime> Q4KWeight<R> {
         (self.n_out * self.k / K_SUPERBLOCK) * (128 + 12 + 8)
     }
 
-    /// Device path: launch only, output handle returned (see
-    /// [`Q40Weight::matmul_device`]).
+    /// Device path: launch only, output handle returned. Decode (`m == 1`)
+    /// keeps the untiled kernel; prefill (`m > 1`) takes the shared-memory
+    /// tiled kernel unless `COMBS_NO_TILED_MATMUL=1`.
     pub fn matmul_device(&self, client: &ComputeClient<R>, x: Handle, m: usize) -> Handle {
+        self.matmul_device_with(client, x, m, m > 1 && tiled_enabled())
+    }
+
+    /// Launch with an explicit kernel choice (the parity tests compare
+    /// tiled vs untiled on identical inputs).
+    pub(crate) fn matmul_device_with(
+        &self,
+        client: &ComputeClient<R>,
+        x: Handle,
+        m: usize,
+        tiled: bool,
+    ) -> Handle {
         let out_len = m * self.n_out;
         let out_h = client.empty(out_len * core::mem::size_of::<f32>());
         let n_sb = self.n_out * self.k / K_SUPERBLOCK;
-        unsafe {
-            q4_k_matmul_kernel::launch_unchecked::<R>(
-                client,
-                cube_count_capped(out_len as u32),
-                CubeDim::new_1d(CUBE_DIM),
-                ArrayArg::from_raw_parts(x, m * self.k),
-                ArrayArg::from_raw_parts(self.qs.clone(), n_sb * 32),
-                ArrayArg::from_raw_parts(self.dd.clone(), n_sb * 2),
-                ArrayArg::from_raw_parts(self.scales.clone(), n_sb * 3),
-                ArrayArg::from_raw_parts(out_h.clone(), out_len),
-                m,
-                self.k,
-                self.n_out,
-            );
+        if tiled {
+            unsafe {
+                q4_k_matmul_tiled_kernel::launch_unchecked::<R>(
+                    client,
+                    cube_count_tiled(self.n_out as u32, m as u32),
+                    CubeDim::new_1d(CUBE_DIM),
+                    ArrayArg::from_raw_parts(x, m * self.k),
+                    ArrayArg::from_raw_parts(self.qs.clone(), n_sb * 32),
+                    ArrayArg::from_raw_parts(self.dd.clone(), n_sb * 2),
+                    ArrayArg::from_raw_parts(self.scales.clone(), n_sb * 3),
+                    ArrayArg::from_raw_parts(out_h.clone(), out_len),
+                    self.k,
+                    self.n_out,
+                );
+            }
+        } else {
+            unsafe {
+                q4_k_matmul_kernel::launch_unchecked::<R>(
+                    client,
+                    cube_count_capped(out_len as u32),
+                    CubeDim::new_1d(CUBE_DIM),
+                    ArrayArg::from_raw_parts(x, m * self.k),
+                    ArrayArg::from_raw_parts(self.qs.clone(), n_sb * 32),
+                    ArrayArg::from_raw_parts(self.dd.clone(), n_sb * 2),
+                    ArrayArg::from_raw_parts(self.scales.clone(), n_sb * 3),
+                    ArrayArg::from_raw_parts(out_h.clone(), out_len),
+                    m,
+                    self.k,
+                    self.n_out,
+                );
+            }
         }
         out_h
     }
@@ -1844,6 +2042,73 @@ mod tests {
         assert!(
             Q6KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &synth_q6_k(1), 1, 128).is_err()
         );
+    }
+
+    /// Compares the tiled and untiled kernels on identical device inputs
+    /// and demands **bit-identical** outputs (`to_bits`, not a tolerance):
+    /// the tiled kernels change only the activation load path, never the
+    /// accumulation order.
+    fn assert_tiled_bit_identical(
+        untiled: &[f32],
+        tiled: &[f32],
+        label: &str,
+    ) {
+        assert_eq!(untiled.len(), tiled.len(), "{label}: length mismatch");
+        for (i, (u, t)) in untiled.iter().zip(tiled.iter()).enumerate() {
+            assert_eq!(
+                u.to_bits(),
+                t.to_bits(),
+                "{label} out[{i}]: untiled {u} vs tiled {t} — accumulation order drifted"
+            );
+        }
+    }
+
+    /// Q8_0 tiled-vs-untiled bit identity across ragged shapes: n_out not a
+    /// multiple of the cube dim (ragged final column block), k not a
+    /// multiple of the tile (ragged final k-tile), m from tiny to a full
+    /// prefill chunk.
+    #[test]
+    fn tiled_q8_0_matmul_is_bit_identical() {
+        let (n_out, k) = (300, 320);
+        let n_blocks = n_out * k / Q4_0_BLOCK;
+        let data = synth_q8_0(n_blocks);
+        let device = Default::default();
+        let client = WgpuRuntime::client(&device);
+        let w = Q80Weight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
+        for m in [2usize, 3, 17, 256, 1024] {
+            let x: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 11 % 29) as f32 - 14.0) / 16.0)
+                .collect();
+            let x_h = client.create_from_slice(f32::as_bytes(&x));
+            let un_h = w.matmul_device_with(&client, x_h.clone(), m, false);
+            let ti_h = w.matmul_device_with(&client, x_h, m, true);
+            let un = f32::from_bytes(&client.read_one_unchecked(un_h)).to_vec();
+            let ti = f32::from_bytes(&client.read_one_unchecked(ti_h)).to_vec();
+            assert_tiled_bit_identical(&un, &ti, &format!("q8_0 m={m}"));
+        }
+    }
+
+    /// Q4_K tiled-vs-untiled bit identity (superblock-aligned k by
+    /// construction; ragged final column block still exercised).
+    #[test]
+    fn tiled_q4_k_matmul_is_bit_identical() {
+        let (n_out, k) = (300, 512);
+        let n_sb = n_out * k / K_SUPERBLOCK;
+        let data = synth_q4_k(n_sb);
+        let device = Default::default();
+        let client = WgpuRuntime::client(&device);
+        let w = Q4KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
+        for m in [2usize, 3, 17, 256, 1024] {
+            let x: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 13 % 31) as f32 - 15.0) / 16.0)
+                .collect();
+            let x_h = client.create_from_slice(f32::as_bytes(&x));
+            let un_h = w.matmul_device_with(&client, x_h.clone(), m, false);
+            let ti_h = w.matmul_device_with(&client, x_h, m, true);
+            let un = f32::from_bytes(&client.read_one_unchecked(un_h)).to_vec();
+            let ti = f32::from_bytes(&client.read_one_unchecked(ti_h)).to_vec();
+            assert_tiled_bit_identical(&un, &ti, &format!("q4_k m={m}"));
+        }
     }
 
     /// Malformed inputs must be rejected, not mis-indexed.
