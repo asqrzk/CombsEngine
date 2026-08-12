@@ -10,6 +10,7 @@ description = "Host-side media preprocessing (SigLIP image pipeline) for multimo
 image.workspace = true
 thiserror.workspace = true
 combs-core.workspace = true
+realfft.workspace = true
 
 [dev-dependencies]
 image = { workspace = true, features = ["png"] }
