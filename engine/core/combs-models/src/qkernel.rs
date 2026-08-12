@@ -1,7 +1,7 @@
-//! Custom CubeCL kernels (native, owned by us — see QUANTIZATION_PLAN.md
-//! "Kernel architecture"). This module starts with a minimal proof that the
-//! CubeCL toolchain compiles and launches on our wgpu runtime; the fused Q4
-//! dequant-matmul kernel builds on the same launch machinery.
+//! Custom CubeCL kernels (native, owned by us). This module starts with a
+//! minimal proof that the CubeCL toolchain compiles and launches on our
+//! wgpu runtime; the fused dequant-matmul kernels build on the same launch
+//! machinery.
 
 #![allow(dead_code)]
 

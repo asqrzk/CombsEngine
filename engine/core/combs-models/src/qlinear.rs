@@ -1,12 +1,13 @@
-//! The quantized linear seam (QUANTIZATION_PLAN.md Phase 2): per-tensor
+//! The quantized linear seam: per-tensor
 //! kernel dispatch behind a stable `Linear` type, so model code calls
 //! `layer.q.forward(x, bias)` and never knows whether the weight is a dense
 //! burn tensor or packed GGUF blocks fed to our fused CubeCL kernels.
 //!
 //! Dispatch happens **once, at load time**: [`try_quant_linear`] returns a
-//! backend-specific op only when (a) the source stores the tensor packed
-//! (GGUF Q4_0/Q4_K/Q6_K), and (b) the backend runs on the wgpu runtime the
-//! kernels target. Every other combination falls back to the portable dense
+//! backend-specific op only when (a) the source stores the tensor packed in
+//! a supported GGUF format (Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K), and (b) the
+//! backend runs on the wgpu runtime the kernels target. Every other
+//! combination falls back to the portable dense
 //! path — HF-kernels principle #2 (kernels are accelerators, never
 //! load-bearing for correctness).
 //!

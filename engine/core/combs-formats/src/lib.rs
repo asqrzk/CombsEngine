@@ -22,8 +22,8 @@ pub use gguf::GgufSource;
 
 /// Reference CPU dequantizers for GGUF quant formats. These scalar
 /// implementations are the harmony reference that the fused GPU kernels in
-/// `combs-models` validate against (QUANTIZATION_PLAN.md, principle #6:
-/// every kernel is tested against a portable reference).
+/// `combs-models` validate against: every kernel is tested against a
+/// portable reference.
 pub mod quants {
     pub use crate::gguf::{
         dequantize_q4_0, dequantize_q4_k, dequantize_q5_0, dequantize_q5_k, dequantize_q6_k,

@@ -1,6 +1,6 @@
 //! TFLite flatbuffer model source (`.tflite` / raw `.task` — `TFL3`).
 //!
-//! Recon-verified layout (see `documentations/formats-recon.md`):
+//! Recon-verified layout:
 //! - `Model { subgraphs, buffers, metadata }` at the flatbuffer root
 //! - weight tensors live in `Buffer { offset, size }` absolute file ranges
 //!   (no inline data vectors in ODML exports)

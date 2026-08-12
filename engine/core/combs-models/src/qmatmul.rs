@@ -1,14 +1,14 @@
-//! Fused GGUF dequant-matmul CubeCL kernels (QUANTIZATION_PLAN.md Phase
-//! 1B): Q4_0, Q4_K and Q6_K — the formats Q4_K_M model files actually use.
+//! Fused GGUF dequant-matmul CubeCL kernels: Q4_0, Q5_0, Q8_0 and the
+//! K-quants Q4_K, Q5_K, Q6_K — the formats real model files actually use.
 //!
 //! Weights stay packed at 4–6 bits in VRAM and are dequantized *inside*
 //! the matmul kernel — never materialized as f32. This is the memory win
 //! that lets a 7B Q4 model run in ~4 GB instead of ~28 GB of weight VRAM.
 //!
-//! Follows the two-layer design from the plan's "Kernel architecture":
+//! Follows a two-layer design:
 //!
-//! - **Layout** (`repack_*`, `Q40Weight`/`Q4KWeight`/`Q6KWeight`): GGUF
-//!   block streams are not word-aligned (18/144/210-byte blocks), so at
+//! - **Layout** (`repack_*` plus a per-format weight struct): GGUF
+//!   block streams are not word-aligned (18–210-byte blocks), so at
 //!   load we repack once into a GPU-friendly structure-of-arrays — packed
 //!   quant bytes as `u32` words plus `f32` super-scales (f16→f32 host
 //!   conversion is exact, keeping the kernels bit-comparable with the CPU
