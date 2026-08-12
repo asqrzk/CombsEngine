@@ -546,6 +546,13 @@ impl Engine {
         self.cache_config
     }
 
+    /// Per-layer attention window layout resolved for this model — the
+    /// same shape the KV cache is built with (`None` = global arena,
+    /// `Some(w)` = rolling window).
+    pub fn attention_windows(&self) -> Vec<Option<usize>> {
+        combs_models::ArchSpec::resolve(&self.metadata).windows()
+    }
+
     /// Whether the model exposes hidden states for `/v1/embeddings`.
     pub fn supports_embeddings(&self) -> bool {
         self.supports_embeddings

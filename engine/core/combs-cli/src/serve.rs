@@ -196,10 +196,13 @@ fn stats_response(
                 "max_seq_len": cc.max_seq_len,
                 "page_size": cc.page_size,
                 "page_bytes": snap.kv_page_bytes,
+                "arena_bytes": cc.num_pages() as u64 * snap.kv_page_bytes,
+                "bytes_per_token": snap.kv_page_bytes / cc.page_size.max(1) as u64,
                 "max_sessions": snap.max_sessions,
                 "evictions": snap.session_evictions,
                 "sessions": sessions,
             },
+            "attention": attention_json(engine),
             "weights": static_info.get("weights").cloned().unwrap_or(Value::Null),
             "device": static_info.get("device").cloned().unwrap_or(Value::Null),
             "build": {
@@ -384,6 +387,31 @@ fn tool_calls_json(calls: &[combs_runtime::ToolCall]) -> Value {
     )
 }
 
+/// Compact per-layer window summary: 0 = global arena, w = sliding.
+fn window_layers(windows: &[Option<usize>]) -> (Vec<usize>, usize) {
+    let layers: Vec<usize> = windows.iter().map(|w| w.unwrap_or(0)).collect();
+    let global = windows.iter().filter(|w| w.is_none()).count();
+    (layers, global)
+}
+
+/// Attention identity: GQA head geometry plus the resolved per-layer
+/// window layout. Static per checkpoint.
+fn attention_json(engine: &Arc<Engine>) -> Value {
+    let meta = engine.metadata();
+    let windows = engine.attention_windows();
+    let (layers, global_layers) = window_layers(&windows);
+    json!({
+        "num_attention_heads": meta.num_attention_heads,
+        "num_key_value_heads": meta.num_key_value_heads,
+        "head_dim": meta.head_dim,
+        "num_layers": meta.num_hidden_layers,
+        "gqa_ratio": meta.num_attention_heads / meta.num_key_value_heads.max(1),
+        "sliding_window": meta.attention_pattern.sliding_window,
+        "global_layers": global_layers,
+        "layers": layers,
+    })
+}
+
 /// Rich model descriptor: real context budget (KV arena), architecture,
 /// and generation defaults — everything a client needs to size requests.
 fn model_info(engine: &Arc<Engine>, model_id: &str) -> HttpResponse {
@@ -399,9 +427,11 @@ fn model_info(engine: &Arc<Engine>, model_id: &str) -> HttpResponse {
             "context_length": meta.max_position_embeddings,
             "kv_cache": {
                 "kind": format!("{:?}", cc.kind).to_lowercase(),
+                "quantized": cc.quantize_kv,
                 "max_seq_len": cc.max_seq_len,
                 "page_size": cc.page_size,
             },
+            "attention": attention_json(engine),
             "vocab_size": meta.vocab_size,
             "vision": meta.vision.is_some(),
             "tools": engine.supports_tools(),
@@ -1304,5 +1334,24 @@ impl Read for ChannelReader {
             *slot = self.buf.pop_front().expect("buf non-empty");
         }
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::window_layers;
+
+    #[test]
+    fn window_layer_summary_encodes_global_as_zero() {
+        let (layers, global) = window_layers(&[None, Some(512), None, Some(512)]);
+        assert_eq!(layers, vec![0, 512, 0, 512]);
+        assert_eq!(global, 2);
+    }
+
+    #[test]
+    fn window_layer_summary_all_global() {
+        let (layers, global) = window_layers(&[None; 3]);
+        assert_eq!(layers, vec![0, 0, 0]);
+        assert_eq!(global, 3);
     }
 }
