@@ -40,25 +40,21 @@ impl<B: Backend> ModelRegistry<B> {
             Ok(Box::new(crate::llama::LlamaModel::<B>::load(source, device)?))
         });
         // Qwen2/2.5 is llama-structured plus q/k/v projection biases (loaded
-        // by presence) — but its optional upper-layer sliding partition
-        // (`use_sliding_window: true`) is not expressible yet; all shipped
-        // qwen2.5 checkpoints have it off, which the metadata parse maps to
-        // `sliding_window: None`.
+        // by presence); an active upper-layer sliding partition
+        // (`use_sliding_window: true`) maps onto the per-layer attention
+        // layout (ArchSpec: first `max_window_layers` global, rest sliding).
         r.register("qwen2", |source, device| {
-            reject_active_sliding(source, "qwen2")?;
             Ok(Box::new(crate::llama::LlamaModel::<B>::load(source, device)?))
         });
         // Qwen3 is qwen2 plus per-head q/k RMSNorm (ArchSpec `qk_norm`) and
-        // an explicit `head_dim` decoupled from hidden/heads; all released
-        // configs ship `use_sliding_window: false`.
+        // an explicit `head_dim` decoupled from hidden/heads.
         r.register("qwen3", |source, device| {
-            reject_active_sliding(source, "qwen3")?;
             Ok(Box::new(crate::llama::LlamaModel::<B>::load(source, device)?))
         });
         // Mistral v0.3+/Nemo report `sliding_window: null` and are plain
-        // llama; v0.1's all-layer sliding window is not supported yet.
+        // llama; v0.1's all-layer sliding window rides the same per-layer
+        // layout phi3 uses.
         r.register("mistral", |source, device| {
-            reject_active_sliding(source, "mistral")?;
             Ok(Box::new(crate::llama::LlamaModel::<B>::load(source, device)?))
         });
         // Phi-3/3.5/4-mini: llama-structured with fused qkv/gate_up
@@ -118,19 +114,6 @@ impl<B: Backend> ModelRegistry<B> {
             .ok_or_else(|| ModelError::UnsupportedArchitecture(arch.clone()))?;
         loader(source, device)
     }
-}
-
-/// Rejects checkpoints whose sliding window is actually active — the llama
-/// block runs all layers global and unmasked, which would be silently wrong.
-/// Landing in roadmap wave 2 (per-layer `AttentionLayout`).
-fn reject_active_sliding(source: &dyn ModelSource, arch: &str) -> Result<()> {
-    if let Some(w) = source.metadata().attention_pattern.sliding_window {
-        return Err(ModelError::UnsupportedArchitecture(format!(
-            "{arch} with an active sliding window (w={w}) — supported once the \
-             per-layer attention layout lands (roadmap wave 2)"
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
