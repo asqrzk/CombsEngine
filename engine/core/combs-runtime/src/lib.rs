@@ -22,7 +22,7 @@ pub use combs_models::{CacheConfig, CacheKind};
 pub use constraint::{CompiledSchema, ConstraintSpec, ConstraintState, TokenByteTable};
 pub use engine::{
     EmbedOptions, EmbedOutput, Engine, EngineStatsSnapshot, GenerationConfig, GenerationStats,
-    LastGeneration, PerplexityOutput, Pooling, SessionInfo, check_context_len,
+    LastGeneration, PerplexityOutput, Pooling, SessionInfo, check_context_len, default_arena_len,
 };
 
 pub use logits::{

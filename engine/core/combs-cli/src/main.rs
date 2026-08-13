@@ -167,6 +167,9 @@ enum Command {
         /// when memory allows.
         #[arg(long)]
         context_size: Option<usize>,
+        /// Tokens per KV page (paged cache; default 16).
+        #[arg(long)]
+        page_size: Option<usize>,
         /// Prompt tokens per prefill call (0 = single-shot; default 512).
         #[arg(long)]
         prefill_chunk_size: Option<usize>,
@@ -217,8 +220,8 @@ fn main() -> Result<()> {
             serve_audio::cmd_serve_audio(model, port, transcribe_model, language)
         }
         Command::Transcribe { model, file, language } => cmd_transcribe(model, file, language),
-        Command::Serve { model, port, context_size, prefill_chunk_size } => {
-            cmd_serve(model, port, context_size, prefill_chunk_size)
+        Command::Serve { model, port, context_size, page_size, prefill_chunk_size } => {
+            cmd_serve(model, port, context_size, page_size, prefill_chunk_size)
         }
         Command::Perplexity { model, file, text, chunk, max_tokens } => {
             cmd_perplexity(model, file, text, chunk, max_tokens)
@@ -278,6 +281,7 @@ fn cmd_serve(
     model: PathBuf,
     port: u16,
     context_size: Option<usize>,
+    page_size: Option<usize>,
     prefill_chunk_size: Option<usize>,
 ) -> Result<()> {
     let model = resolve_model_arg(&model)?;
@@ -294,8 +298,18 @@ fn cmd_serve(
     // cubecl 0.10 ("Service already initialized").
     let device_caps =
         serde_json::to_value(combs_core::device_caps(&device)).unwrap_or(serde_json::Value::Null);
-    let engine = if let Some(size) = context_size {
-        let mut cc = combs_runtime::CacheConfig::paged(size);
+    let engine = if context_size.is_some() || page_size.is_some() {
+        let arena = context_size.unwrap_or_else(|| {
+            combs_runtime::default_arena_len(source.metadata().max_position_embeddings)
+        });
+        let mut cc = combs_runtime::CacheConfig::paged(arena);
+        if let Some(ps) = page_size {
+            anyhow::ensure!(
+                ps >= 1 && ps <= arena,
+                "--page-size must be 1..=arena ({arena})"
+            );
+            cc.page_size = ps;
+        }
         if matches!(std::env::var("COMBS_KV").as_deref(), Ok("contiguous")) {
             cc.kind = combs_runtime::CacheKind::Contiguous;
         }

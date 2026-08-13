@@ -81,6 +81,10 @@ pub fn serve(
                 ),
                 ("GET", "/v1/model/info") => model_info(&engine, &model_id),
                 ("GET", "/v1/stats") => stats_response(&engine, &model_id, &counters, &static_info),
+                ("GET", "/v1/sessions") => sessions_response(&engine),
+                ("DELETE", p) if p == "/v1/sessions" || p.starts_with("/v1/sessions/") => {
+                    clear_sessions_response(&engine, p)
+                }
                 ("POST", "/v1/chat/completions") => {
                     let mut body = String::new();
                     if request.as_reader().read_to_string(&mut body).is_err() {
@@ -385,6 +389,39 @@ fn tool_calls_json(calls: &[combs_runtime::ToolCall]) -> Value {
             })
             .collect(),
     )
+}
+
+/// `GET /v1/sessions` — live KV sessions from the stats snapshot
+/// (non-blocking; the worker refreshes it after every generation and
+/// every clear).
+fn sessions_response(engine: &Arc<Engine>) -> HttpResponse {
+    let snap = engine.stats_snapshot();
+    let data: Vec<Value> = snap
+        .sessions
+        .iter()
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "history_tokens": s.history_len,
+                "pages_used": s.pages.map(|p| p.pages_used),
+            })
+        })
+        .collect();
+    json_response(200, json!({ "object": "list", "data": data }))
+}
+
+/// `DELETE /v1/sessions` (all) / `DELETE /v1/sessions/{id}` — drops KV
+/// sessions and frees their arenas. `(anonymous)` addresses the
+/// empty-key session. Single-flight: waits behind a running generation.
+fn clear_sessions_response(engine: &Arc<Engine>, path: &str) -> HttpResponse {
+    let id = path
+        .strip_prefix("/v1/sessions/")
+        .filter(|s| !s.is_empty())
+        .map(|s| if s == "(anonymous)" { "" } else { s });
+    match engine.clear_sessions(id) {
+        Ok(cleared) => json_response(200, json!({ "object": "sessions.cleared", "cleared": cleared })),
+        Err(e) => json_response(500, error_json("engine_error", &e.to_string())),
+    }
 }
 
 /// Compact per-layer window summary: 0 = global arena, w = sliding.
@@ -989,6 +1026,14 @@ fn handle_completions(
     }
     if let Err(msg) = apply_sampling_params(&req, &mut config) {
         return json_response(400, error_json("invalid_request", &msg));
+    }
+    // Same named-session semantics as chat completions — raw-prompt
+    // callers were previously forced onto the anonymous session.
+    if let Some(sid) = req.get("session_id").and_then(Value::as_str) {
+        let sid: String = sid.chars().take(64).collect();
+        if !sid.is_empty() {
+            config.session_id = Some(sid);
+        }
     }
     if let Some(n) = req.get("logprobs").and_then(Value::as_u64) {
         config.sampling.logprobs = Some(n.min(20) as usize);

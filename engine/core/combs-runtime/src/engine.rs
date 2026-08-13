@@ -216,6 +216,13 @@ enum Command {
         chunk: usize,
         reply: mpsc::Sender<Result<PerplexityOutput>>,
     },
+    /// Drops one named session (or all when `id` is None), freeing its
+    /// arena. Single-flight like everything else: waits behind an
+    /// in-flight generation.
+    ClearSessions {
+        id: Option<String>,
+        reply: mpsc::Sender<usize>,
+    },
     Shutdown,
 }
 
@@ -246,6 +253,14 @@ const DEFAULT_KV_ARENA_CAP: usize = 32768;
 #[cfg(feature = "f16")]
 const DEFAULT_KV_ARENA_CAP: usize = 65536;
 
+/// The arena length [`Engine::load`] would pick for a model with the given
+/// `max_position_embeddings` — for callers composing a partial
+/// [`CacheConfig`] override (e.g. `combs serve --page-size` without
+/// `--context-size`).
+pub fn default_arena_len(max_position_embeddings: usize) -> usize {
+    max_position_embeddings.min(DEFAULT_KV_ARENA_CAP)
+}
+
 /// The worker's session table: named rolling sessions with LRU eviction.
 /// The anonymous session (empty key) serves requests without a session id.
 struct SessionSet {
@@ -267,6 +282,13 @@ impl SessionSet {
     /// after generation, or drops it to free its pages).
     fn take(&mut self, key: &str) -> Option<SessionState> {
         self.map.remove(key)
+    }
+
+    /// Drops every session, returning how many were removed.
+    fn clear_all(&mut self) -> usize {
+        let n = self.map.len();
+        self.map.clear();
+        n
     }
 
     /// Inserts a session, evicting the least-recently-used one past
@@ -551,6 +573,22 @@ impl Engine {
     /// `Some(w)` = rolling window).
     pub fn attention_windows(&self) -> Vec<Option<usize>> {
         combs_models::ArchSpec::resolve(&self.metadata).windows()
+    }
+
+    /// Drops one named KV session (`Some(id)`) or every session (`None`),
+    /// freeing the arena memory. Returns how many sessions were removed.
+    /// Single-flight: waits behind an in-flight generation.
+    pub fn clear_sessions(&self, id: Option<&str>) -> Result<usize> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(Command::ClearSessions {
+                id: id.map(str::to_string),
+                reply: reply_tx,
+            })
+            .map_err(|_| EngineError::WorkerGone("worker thread terminated".to_string()))?;
+        reply_rx
+            .recv()
+            .map_err(|_| EngineError::WorkerGone("worker dropped the reply".to_string()))
     }
 
     /// Whether the model exposes hidden states for `/v1/embeddings`.
@@ -871,6 +909,16 @@ fn worker_loop(
                 );
                 let _ = reply.send(result);
             }
+            Command::ClearSessions { id, reply } => {
+                let removed = match id {
+                    Some(key) => sessions.take(&key).map(|_| 1).unwrap_or(0),
+                    None => sessions.clear_all(),
+                };
+                if let Ok(mut snap) = stats.lock() {
+                    snap.sessions = session_infos(&sessions);
+                }
+                let _ = reply.send(removed);
+            }
         }
     }
 }
@@ -1096,14 +1144,8 @@ fn detect_pooling(tokenizer_json: &std::path::Path) -> Pooling {
 /// Refreshes the shared snapshot after a generation. Runs on the worker so
 /// the GPU allocator sample (`submit_blocking`) never contends with an
 /// in-flight generation; observers only ever pay a mutex clone.
-fn update_stats(
-    stats: &Mutex<EngineStatsSnapshot>,
-    result: &Result<GenerationStats>,
-    sessions: &SessionSet,
-    device: &CombsDevice,
-) {
-    let gpu = combs_core::gpu_memory(device);
-    let session_infos: Vec<SessionInfo> = sessions
+fn session_infos(sessions: &SessionSet) -> Vec<SessionInfo> {
+    sessions
         .map
         .iter()
         .map(|(k, s)| SessionInfo {
@@ -1115,7 +1157,17 @@ fn update_stats(
             history_len: s.history.len(),
             pages: s.cache.page_stats(),
         })
-        .collect();
+        .collect()
+}
+
+fn update_stats(
+    stats: &Mutex<EngineStatsSnapshot>,
+    result: &Result<GenerationStats>,
+    sessions: &SessionSet,
+    device: &CombsDevice,
+) {
+    let gpu = combs_core::gpu_memory(device);
+    let session_infos: Vec<SessionInfo> = session_infos(sessions);
 
     let Ok(mut snap) = stats.lock() else { return };
     snap.requests_total += 1;
