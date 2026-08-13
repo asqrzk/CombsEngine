@@ -277,6 +277,11 @@ fn kv_quantize<B: Backend>(x: Tensor<B, 4>) -> (Tensor<B, 4, Int>, Tensor<B, 4>)
     let [b, h, s, d] = x.dims();
     debug_assert_eq!(d % KV_QUANT_GROUP, 0);
     let groups = d / KV_QUANT_GROUP;
+    // Scales are computed in f32 for a stable absmax, but returned in the
+    // input's native dtype: the arena stores them next to native-dtype
+    // tensors, and the unfused f16 backend miscomputes mixed-dtype ops
+    // (an f16 × f32-broadcast mul returns power-of-two-wrong values).
+    let native = x.dtype();
     let g = to_f32(x).reshape([b, h, s, groups, KV_QUANT_GROUP]);
     let scale = g
         .clone()
@@ -295,7 +300,7 @@ fn kv_quantize<B: Backend>(x: Tensor<B, 4>) -> (Tensor<B, 4, Int>, Tensor<B, 4>)
         + lane(1).add_scalar(128).mul_scalar(256)
         + lane(2).add_scalar(128).mul_scalar(65536)
         + lane(3).mul_scalar(16777216);
-    (packed, scale.reshape([b, h, s, groups]))
+    (packed, to_float(scale.reshape([b, h, s, groups]), native))
 }
 
 /// Inverse of [`kv_quantize`]: unpack the four lanes (floor-division
@@ -332,6 +337,9 @@ fn kv_dequantize<B: Backend>(
     )
     .reshape([b, h, s, d]);
     let g = q.float().reshape([b, h, s, groups, KV_QUANT_GROUP]);
+    // Force the scales onto g's dtype before the broadcast multiply — the
+    // unfused f16 backend silently corrupts mixed-dtype ops.
+    let scales = to_float(scales, g.dtype());
     g.mul(
         scales
             .reshape([b, h, s, groups, 1])
@@ -1169,5 +1177,90 @@ mod tests {
         assert_eq!(c.seq_len(), 0);
         assert_eq!(c.pages_used(), Some(0));
         assert_eq!(c.num_free_pages(), 4);
+    }
+
+    // ---- GPU parity (ignored by default; run with `-- --ignored`) ----
+    //
+    // The NdArray<f32> tests above cannot see dtype-mismatch bugs: on the
+    // f16 build the arena tensors are f16 while kv_quantize computes its
+    // scales in f32. These run the same checks on the production
+    // `combs_core::CombsBackend` of the current build.
+
+    /// Deterministic K/V/Q builders for any backend.
+    fn kv_tok_on<B: Backend>(
+        dev: &B::Device,
+        i: usize,
+        n_kv: usize,
+        d: usize,
+    ) -> (Tensor<B, 4>, Tensor<B, 4>) {
+        let mk = |salt: usize| {
+            let data: Vec<f32> = (0..n_kv * d)
+                .map(|j| ((i * 7 + j * 3 + salt) % 13) as f32 / 13.0 - 0.5)
+                .collect();
+            Tensor::<B, 4>::from_data(TensorData::new(data, [1, n_kv, 1, d]), dev)
+        };
+        (mk(0), mk(5))
+    }
+
+    fn q_tok_on<B: Backend>(dev: &B::Device, i: usize, n_q: usize, d: usize) -> Tensor<B, 4> {
+        let data: Vec<f32> = (0..n_q * d)
+            .map(|j| ((i * 11 + j * 5) % 17) as f32 / 17.0 - 0.5)
+            .collect();
+        Tensor::<B, 4>::from_data(TensorData::new(data, [1, n_q, 1, d]), dev)
+    }
+
+    /// Quantize→dequantize on the given backend must return finite values
+    /// near the input — the f16-build corruption shows up as NaN/garbage.
+    fn quant_roundtrip_on<B: Backend>(dev: &B::Device) {
+        let d = 64usize;
+        let data: Vec<f32> = (0..2 * d)
+            .map(|j| ((j * 5) % 251) as f32 / 251.0 - 0.5)
+            .collect();
+        let x = Tensor::<B, 4>::from_data(TensorData::new(data.clone(), [1, 2, 1, d]), dev);
+        let (packed, scales) = kv_quantize(x);
+        let y = kv_dequantize(packed, scales, d);
+        let yv: Vec<f32> = y.into_data().convert::<f32>().to_vec().unwrap();
+        for (i, (orig, got)) in data.iter().zip(yv.iter()).enumerate() {
+            assert!(got.is_finite(), "dequant[{i}] not finite: {got}");
+            assert!(
+                (orig - got).abs() < 0.01,
+                "dequant[{i}]: {orig} vs {got}"
+            );
+        }
+    }
+
+    /// The fp-vs-quantized attend parity check on the given backend.
+    fn quant_parity_on<B: Backend>(dev: &B::Device, tol: f32) {
+        let (n_kv, n_q, d) = (2usize, 4usize, 32usize);
+        let mut cfg_q = CacheConfig::paged(64);
+        cfg_q.quantize_kv = true;
+        let cfg_f = CacheConfig::paged(64);
+        let scale = 1.0 / (d as f64).sqrt() * 0.9;
+        let mut fp = PagedKVCache::<B>::new(1, cfg_f);
+        let mut qn = PagedKVCache::<B>::new(1, cfg_q);
+        for i in 0..24 {
+            let (k, v) = kv_tok_on::<B>(dev, i, n_kv, d);
+            let q = q_tok_on::<B>(dev, i, n_q, d);
+            let a = fp.attention_opts(0, q.clone(), k.clone(), v.clone(), i, scale, None);
+            let b = qn.attention_opts(0, q, k, v, i, scale, None);
+            let av: Vec<f32> = a.into_data().convert::<f32>().to_vec().unwrap();
+            let bv: Vec<f32> = b.into_data().convert::<f32>().to_vec().unwrap();
+            for (j, (x, y)) in av.iter().zip(bv.iter()).enumerate() {
+                assert!(y.is_finite(), "step {i}[{j}] not finite: {y}");
+                assert!((x - y).abs() < tol, "step {i}[{j}]: {x} vs {y}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "gpu"]
+    fn kv_quant_roundtrip_on_production_backend() {
+        quant_roundtrip_on::<combs_core::CombsBackend>(&Default::default());
+    }
+
+    #[test]
+    #[ignore = "gpu"]
+    fn quantized_paged_cache_matches_fp_on_production_backend() {
+        quant_parity_on::<combs_core::CombsBackend>(&Default::default(), 5e-2);
     }
 }
