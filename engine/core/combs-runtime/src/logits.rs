@@ -79,7 +79,17 @@ impl LogitsProcessor for RepetitionPenalty {
         if self.penalty == 1.0 {
             return;
         }
+        // HF reference semantics: a token is penalized at most once no
+        // matter how often it appears (same dedup as PresencePenalty).
+        // Count-based compounding (penalty^n) pushes generations past
+        // their natural stop — measured on qwen2.5-7b: rope 1.1 ran to
+        // the length cap with spaceless run-ons; once-per-unique stays
+        // clean and terminates.
+        let mut seen = std::collections::HashSet::new();
         for &id in history {
+            if !seen.insert(id) {
+                continue;
+            }
             let Some(v) = logits.get_mut(id as usize) else {
                 continue;
             };
@@ -308,6 +318,19 @@ mod tests {
         let mut logits = vec![4.0f32, -4.0];
         p.process(&mut logits, &[0, 1]);
         assert_eq!(logits, vec![4.0, -4.0]);
+    }
+
+    #[test]
+    fn repetition_penalty_applies_once_per_unique_token() {
+        // A token repeated in history is penalized exactly once (HF
+        // reference), never penalty^count.
+        let p = RepetitionPenalty::new(2.0);
+        let mut repeated = vec![4.0f32, -4.0];
+        p.process(&mut repeated, &[0, 0, 0, 1, 1]);
+        let mut once = vec![4.0f32, -4.0];
+        p.process(&mut once, &[0, 1]);
+        assert_eq!(repeated, once);
+        assert_eq!(repeated, vec![2.0, -8.0]);
     }
 
     #[test]

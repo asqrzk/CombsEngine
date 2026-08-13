@@ -463,6 +463,7 @@ const EOG_TOKENS: &[&str] = &[
     "<|im_end|>",
     "<end_of_turn>",
     "<|end_of_text|>",
+    "<|endoftext|>",
     "<EOT>",
 ];
 
