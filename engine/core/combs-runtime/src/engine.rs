@@ -22,7 +22,9 @@ use tokenizers::Tokenizer;
 use crate::constraint::{ConstraintSpec, ConstraintState, TokenByteTable};
 use crate::detok::IncrementalDetokenizer;
 use crate::spec;
-use crate::sampler::{Sampler, SamplingParams, TokenLogprobs, sampler_from_params};
+use crate::sampler::{
+    Sampler, SamplingParams, TokenLogprobs, sampler_from_params_exempting,
+};
 use crate::stop::StopDetector;
 use crate::{EngineError, Result};
 
@@ -1284,8 +1286,13 @@ fn run_generation(
         model.create_kv_cache(cache_config)
     };
 
-    let mut sampler: Box<dyn Sampler> = sampler_from_params(&config.sampling);
     let eos_ids = req_eos_ids(model, config);
+    // Penalties must never touch the stop tokens: `<|im_end|>` appears
+    // once per prior turn in a chat prompt, so an unexempted penalty
+    // suppresses the model's ability to end its turn — and gets worse
+    // the longer the conversation runs.
+    let mut sampler: Box<dyn Sampler> =
+        sampler_from_params_exempting(&config.sampling, &eos_ids);
     let mut stop = StopDetector::new(eos_ids.clone(), config.stop_strings.clone());
     // Structured output: compile the schema at request time and bind the
     // automaton to this model's token table (built lazily, cached on the

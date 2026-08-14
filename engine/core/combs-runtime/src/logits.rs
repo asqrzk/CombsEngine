@@ -60,17 +60,65 @@ impl LogitsProcessor for TemperatureScaler {
     }
 }
 
-/// HuggingFace-style repetition penalty: for every token already present in
-/// the history, positive logits are divided by the penalty and negative
-/// logits are multiplied by it (both reduce the token's probability).
+/// Default penalty window: penalties look at the last N tokens only.
+///
+/// Unbounded penalties are a documented failure mode, not a theory. On
+/// qwen2.5-7b a 5-turn chat (~1.8k tokens) with `frequency_penalty 0.5`
+/// had subtracted enough from every common word — and from the
+/// `<|im_end|>` sitting in the prompt ten times over — that generation
+/// walked into rare vocabulary and never stopped. A window bounds the
+/// pressure to the recent text, which is where repetition actually
+/// lives.
+pub const PENALTY_LAST_N_DEFAULT: usize = 128;
+
+/// What the penalty processors are allowed to touch: how far back they
+/// look, and which ids they must never suppress.
+#[derive(Debug, Clone, Default)]
+pub struct PenaltyScope {
+    /// Consider only the last N history tokens (`Some(0)` = whole
+    /// context, the pre-window behavior; `None` = engine default).
+    pub last_n: Option<usize>,
+    /// Ids no penalty may touch — the request's eos/stop tokens. A
+    /// penalized stop token is a generation that cannot end.
+    pub exempt: std::sync::Arc<std::collections::HashSet<u32>>,
+}
+
+impl PenaltyScope {
+    /// The slice of history this scope penalizes.
+    pub fn recent<'a>(&self, history: &'a [u32]) -> &'a [u32] {
+        let n = self.last_n.unwrap_or(PENALTY_LAST_N_DEFAULT);
+        if n == 0 || history.len() <= n {
+            history
+        } else {
+            &history[history.len() - n..]
+        }
+    }
+
+    /// True when the id must never be penalized.
+    pub fn is_exempt(&self, id: u32) -> bool {
+        self.exempt.contains(&id)
+    }
+}
+
+/// HuggingFace-style repetition penalty: for every token present in the
+/// scoped history window, positive logits are divided by the penalty and
+/// negative logits are multiplied by it (both reduce the token's
+/// probability). Stop tokens are exempt.
 pub struct RepetitionPenalty {
     penalty: f32,
+    scope: PenaltyScope,
 }
 
 impl RepetitionPenalty {
-    /// Creates the processor. `penalty == 1.0` is a no-op.
+    /// Creates the processor with the default scope. `penalty == 1.0` is
+    /// a no-op.
     pub fn new(penalty: f32) -> Self {
-        RepetitionPenalty { penalty }
+        RepetitionPenalty { penalty, scope: PenaltyScope::default() }
+    }
+
+    /// Creates the processor with an explicit window/exempt scope.
+    pub fn with_scope(penalty: f32, scope: PenaltyScope) -> Self {
+        RepetitionPenalty { penalty, scope }
     }
 }
 
@@ -86,8 +134,8 @@ impl LogitsProcessor for RepetitionPenalty {
         // the length cap with spaceless run-ons; once-per-unique stays
         // clean and terminates.
         let mut seen = std::collections::HashSet::new();
-        for &id in history {
-            if !seen.insert(id) {
+        for &id in self.scope.recent(history) {
+            if !seen.insert(id) || self.scope.is_exempt(id) {
                 continue;
             }
             let Some(v) = logits.get_mut(id as usize) else {
@@ -107,12 +155,19 @@ impl LogitsProcessor for RepetitionPenalty {
 /// appears.
 pub struct FrequencyPenalty {
     penalty: f32,
+    scope: PenaltyScope,
 }
 
 impl FrequencyPenalty {
-    /// Creates the processor. `penalty == 0.0` is a no-op.
+    /// Creates the processor with the default scope. `penalty == 0.0` is
+    /// a no-op.
     pub fn new(penalty: f32) -> Self {
-        FrequencyPenalty { penalty }
+        FrequencyPenalty { penalty, scope: PenaltyScope::default() }
+    }
+
+    /// Creates the processor with an explicit window/exempt scope.
+    pub fn with_scope(penalty: f32, scope: PenaltyScope) -> Self {
+        FrequencyPenalty { penalty, scope }
     }
 }
 
@@ -121,7 +176,13 @@ impl LogitsProcessor for FrequencyPenalty {
         if self.penalty == 0.0 {
             return;
         }
-        for &id in history {
+        // Count-based and therefore the sharpest of the three: a word
+        // appearing 40 times in an unwindowed context loses 40×penalty
+        // logits, which is a ban. The window is what keeps it a nudge.
+        for &id in self.scope.recent(history) {
+            if self.scope.is_exempt(id) {
+                continue;
+            }
             if let Some(v) = logits.get_mut(id as usize) {
                 *v -= self.penalty;
             }
@@ -133,12 +194,19 @@ impl LogitsProcessor for FrequencyPenalty {
 /// every token that appears at least once in the history.
 pub struct PresencePenalty {
     penalty: f32,
+    scope: PenaltyScope,
 }
 
 impl PresencePenalty {
-    /// Creates the processor. `penalty == 0.0` is a no-op.
+    /// Creates the processor with the default scope. `penalty == 0.0` is
+    /// a no-op.
     pub fn new(penalty: f32) -> Self {
-        PresencePenalty { penalty }
+        PresencePenalty { penalty, scope: PenaltyScope::default() }
+    }
+
+    /// Creates the processor with an explicit window/exempt scope.
+    pub fn with_scope(penalty: f32, scope: PenaltyScope) -> Self {
+        PresencePenalty { penalty, scope }
     }
 }
 
@@ -148,7 +216,10 @@ impl LogitsProcessor for PresencePenalty {
             return;
         }
         let mut seen = std::collections::HashSet::new();
-        for &id in history {
+        for &id in self.scope.recent(history) {
+            if self.scope.is_exempt(id) {
+                continue;
+            }
             if seen.insert(id) {
                 if let Some(v) = logits.get_mut(id as usize) {
                     *v -= self.penalty;
@@ -430,5 +501,77 @@ mod tests {
         chain.process(&mut logits, &[0]);
         // token 0: 4/2 (penalty) then /2 (temperature) = 1; token 1: 8/2 = 4.
         assert_eq!(logits, vec![1.0, 4.0]);
+    }
+
+    fn scope(last_n: Option<usize>, exempt: &[u32]) -> PenaltyScope {
+        PenaltyScope {
+            last_n,
+            exempt: std::sync::Arc::new(exempt.iter().copied().collect()),
+        }
+    }
+
+    #[test]
+    fn penalty_window_ignores_older_history() {
+        // Token 0 appears only outside the 2-token window; token 1 inside.
+        let p = RepetitionPenalty::with_scope(2.0, scope(Some(2), &[]));
+        let mut logits = vec![4.0f32, 8.0];
+        p.process(&mut logits, &[0, 0, 1, 1]);
+        assert_eq!(logits[0], 4.0, "outside the window: untouched");
+        assert_eq!(logits[1], 4.0, "inside the window: penalized once");
+    }
+
+    #[test]
+    fn penalty_window_zero_means_whole_context() {
+        let p = RepetitionPenalty::with_scope(2.0, scope(Some(0), &[]));
+        let mut logits = vec![4.0f32, 8.0];
+        p.process(&mut logits, &[0, 0, 1, 1]);
+        assert_eq!(logits, vec![2.0, 4.0]);
+    }
+
+    #[test]
+    fn stop_tokens_are_exempt_from_every_penalty() {
+        // Id 7 is the request's eos: present in history, never suppressed.
+        let history = [7u32, 7, 7, 1];
+        let mut logits = vec![0.0f32; 8];
+        logits[7] = 5.0;
+        logits[1] = 5.0;
+        RepetitionPenalty::with_scope(2.0, scope(None, &[7])).process(&mut logits, &history);
+        assert_eq!(logits[7], 5.0, "eos survives the repetition penalty");
+        assert_eq!(logits[1], 2.5);
+
+        let mut logits = vec![0.0f32; 8];
+        logits[7] = 5.0;
+        logits[1] = 5.0;
+        FrequencyPenalty::with_scope(1.0, scope(None, &[7])).process(&mut logits, &history);
+        assert_eq!(logits[7], 5.0, "eos survives the frequency penalty");
+        assert_eq!(logits[1], 4.0);
+
+        let mut logits = vec![0.0f32; 8];
+        logits[7] = 5.0;
+        logits[1] = 5.0;
+        PresencePenalty::with_scope(1.0, scope(None, &[7])).process(&mut logits, &history);
+        assert_eq!(logits[7], 5.0, "eos survives the presence penalty");
+        assert_eq!(logits[1], 4.0);
+    }
+
+    #[test]
+    fn frequency_penalty_counts_only_within_the_window() {
+        // 4 occurrences overall, 2 inside the window → −2, not −4.
+        let p = FrequencyPenalty::with_scope(1.0, scope(Some(2), &[]));
+        let mut logits = vec![10.0f32];
+        p.process(&mut logits, &[0, 0, 0, 0]);
+        assert_eq!(logits[0], 8.0);
+    }
+
+    #[test]
+    fn default_window_bounds_a_long_history() {
+        // The measured failure: a token repeated across a long context.
+        // Unwindowed frequency penalty would subtract 1000; the default
+        // window caps the damage at PENALTY_LAST_N_DEFAULT.
+        let history = vec![0u32; 1000];
+        let p = FrequencyPenalty::new(1.0);
+        let mut logits = vec![0.0f32];
+        p.process(&mut logits, &history);
+        assert_eq!(logits[0], -(PENALTY_LAST_N_DEFAULT as f32));
     }
 }

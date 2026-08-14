@@ -568,6 +568,12 @@ fn apply_sampling_params(req: &Value, config: &mut GenerationConfig) -> Result<(
     if let Some(pp) = req.get("presence_penalty").and_then(Value::as_f64) {
         config.sampling.presence_penalty = Some(pp as f32);
     }
+    // Penalty window (llama.cpp's name for it). Negative or 0 means the
+    // whole context — the unbounded behavior that suppresses common words
+    // and the stop token itself in long chats. Omitted = engine default.
+    if let Some(n) = req.get("repeat_last_n").and_then(Value::as_i64) {
+        config.sampling.penalty_last_n = Some(if n <= 0 { 0 } else { n as usize });
+    }
     if let Some(seed) = req.get("seed").and_then(Value::as_u64) {
         config.sampling.seed = Some(seed);
     }

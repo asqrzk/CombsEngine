@@ -6,8 +6,8 @@
 //! picks the next token. GPU-side sampling kernels are a later phase.
 
 use crate::logits::{
-    FrequencyPenalty, LogitBias, LogitsProcessorChain, MinP, PresencePenalty,
-    RepetitionPenalty, TemperatureScaler, TopK, TopP,
+    FrequencyPenalty, LogitBias, LogitsProcessorChain, MinP, PenaltyScope,
+    PresencePenalty, RepetitionPenalty, TemperatureScaler, TopK, TopP,
 };
 
 /// Picks the next token id from a mutable logits row (vocab-sized).
@@ -78,24 +78,36 @@ pub struct SamplingParams {
     /// Capture per-token log-probabilities: `Some(n)` returns the sampled
     /// token's logprob plus the top-n alternatives (`n` may be 0).
     pub logprobs: Option<usize>,
+    /// Penalty window (llama.cpp's `repeat_last_n`): penalties consider
+    /// only the last N tokens. `None` = `PENALTY_LAST_N_DEFAULT`,
+    /// `Some(0)` = the whole context (legacy, unbounded) behavior.
+    pub penalty_last_n: Option<usize>,
+    /// Ids exempt from every penalty. Engine-supplied (the request's
+    /// eos/stop tokens), not a client knob — see
+    /// [`sampler_from_params_exempting`].
+    pub penalty_exempt: std::sync::Arc<std::collections::HashSet<u32>>,
 }
 
 /// Builds the penalty-only chain shared by both samplers.
 fn penalty_chain(params: &SamplingParams) -> LogitsProcessorChain {
     let mut chain = LogitsProcessorChain::new();
+    let scope = PenaltyScope {
+        last_n: params.penalty_last_n,
+        exempt: params.penalty_exempt.clone(),
+    };
     if let Some(bias) = &params.logit_bias {
         if !bias.is_empty() {
             chain.push(LogitBias::new(bias.clone()));
         }
     }
     if let Some(p) = params.repetition_penalty {
-        chain.push(RepetitionPenalty::new(p));
+        chain.push(RepetitionPenalty::with_scope(p, scope.clone()));
     }
     if let Some(p) = params.frequency_penalty {
-        chain.push(FrequencyPenalty::new(p));
+        chain.push(FrequencyPenalty::with_scope(p, scope.clone()));
     }
     if let Some(p) = params.presence_penalty {
-        chain.push(PresencePenalty::new(p));
+        chain.push(PresencePenalty::with_scope(p, scope));
     }
     chain
 }
@@ -107,6 +119,22 @@ pub fn sampler_from_params(params: &SamplingParams) -> Box<dyn Sampler> {
     } else {
         Box::new(MultinomialSampler::new(params))
     }
+}
+
+/// Picks a sampler whose penalties leave the request's stop tokens
+/// alone. Callers that know the eos set (the engine does) must use this:
+/// a penalized `<|im_end|>` is exactly how a chat loses its ability to
+/// stop, and the effect grows with every turn.
+pub fn sampler_from_params_exempting(
+    params: &SamplingParams,
+    exempt: &[u32],
+) -> Box<dyn Sampler> {
+    if exempt.is_empty() {
+        return sampler_from_params(params);
+    }
+    let mut p = params.clone();
+    p.penalty_exempt = std::sync::Arc::new(exempt.iter().copied().collect());
+    sampler_from_params(&p)
 }
 
 /// Argmax sampler — deterministic. Still applies the penalty processors
