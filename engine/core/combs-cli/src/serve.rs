@@ -155,6 +155,12 @@ fn stats_response(
                     "page_size": p.page_size,
                     "seq_len": p.seq_len,
                     "kv_bytes": p.pages_used as u64 * snap.kv_page_bytes,
+                    // Arenas are allocated lazily, one per layer, so this
+                    // is a measured count of layers actually holding KV —
+                    // not a derivation from the layer total.
+                    "layers_materialized": p.layers_materialized,
+                    "layers_total": p.layers_total,
+                    "layers_sliding": p.layers_sliding,
                 })),
             })
         })
@@ -170,6 +176,7 @@ fn stats_response(
             "totals": {
                 "requests": snap.requests_total,
                 "errors": snap.errors_total,
+                "cancelled": snap.cancelled_total,
                 "prompt_tokens": snap.prompt_tokens_total,
                 "generated_tokens": snap.generated_tokens_total,
                 "cached_tokens": snap.cached_tokens_total,

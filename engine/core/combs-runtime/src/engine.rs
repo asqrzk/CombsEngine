@@ -321,6 +321,10 @@ pub struct EngineStatsSnapshot {
     pub requests_total: u64,
     /// Requests that ended in an engine error.
     pub errors_total: u64,
+    /// Requests the client aborted mid-stream. A normal outcome — kept
+    /// apart from `errors_total` so a stopped turn does not read as a
+    /// fault in the stats.
+    pub cancelled_total: u64,
     /// Sum of prompt tokens across requests.
     pub prompt_tokens_total: u64,
     /// Sum of generated tokens across requests.
@@ -1195,6 +1199,10 @@ fn update_stats(
                 cache_pages_used: st.cache_pages_used,
             });
         }
+        // A client hanging up is a normal outcome, not an engine fault.
+        // Counting cancels as errors made every stopped turn look like a
+        // failure in /v1/stats.
+        Err(EngineError::Cancelled) => snap.cancelled_total += 1,
         Err(_) => snap.errors_total += 1,
     }
     snap.sessions = session_infos;
@@ -1512,6 +1520,14 @@ fn run_generation(
                 c.advance(next);
             }
             trace.sampled();
+        }
+    }
+
+    // Release any character the detokenizer held back (an incomplete
+    // UTF-8 sequence at the very end of generation).
+    if let Ok(tail) = detok.flush(tokenizer) {
+        if !tail.is_empty() {
+            let _ = req.pieces.send((0, tail, None));
         }
     }
 

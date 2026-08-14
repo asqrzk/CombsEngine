@@ -163,6 +163,15 @@ pub struct PageStats {
     pub page_size: usize,
     /// Cached sequence length in tokens.
     pub seq_len: usize,
+    /// Layers whose arena tensor is actually allocated. Arenas are lazy —
+    /// a layer materializes on its first write — so this rises through
+    /// the first prefill and stays below `layers_total` for models whose
+    /// sliding layers never touch the paged arena at all.
+    pub layers_materialized: usize,
+    /// Layers in this cache.
+    pub layers_total: usize,
+    /// Layers holding a rolling sliding-window store instead of pages.
+    pub layers_sliding: usize,
 }
 
 /// Repeats each KV head `n_rep` times consecutively (GQA → MHA expansion):
@@ -530,6 +539,9 @@ impl<B: Backend> PagedKVCache<B> {
             num_pages: self.config.num_pages(),
             page_size: self.config.page_size,
             seq_len: self.seq_len,
+            layers_materialized: self.arenas.iter().filter(|a| a.is_some()).count(),
+            layers_total: self.arenas.len(),
+            layers_sliding: self.sliding.iter().filter(|s| s.is_some()).count(),
         }
     }
 
