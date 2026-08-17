@@ -98,9 +98,13 @@ optional `generation_config.json` / `tokenizer_config.json`.
   paged-decode CubeCL kernel + persistent tune cache is future work.
 - **Sampling**: CPU-side logits-processor chain (repetition/frequency/
   presence penalties → temperature → top-k → top-p) with greedy and seeded
-  multinomial samplers (`--seed` reproducible); model `generation_config.json`
-  defaults are honored (explicit flags win); stop tokens + boundary-safe
-  stop strings; context-length guard against cache capacity.
+  multinomial samplers (`--seed` reproducible); penalties look at a recent
+  window of history (`repeat_last_n`, default 128, `0` = whole context)
+  and never touch the request's stop tokens — unbounded penalties in long
+  chats suppress common words and the stop token itself; model
+  `generation_config.json` defaults are honored (explicit flags win);
+  stop tokens + boundary-safe stop strings; context-length guard against
+  cache capacity.
 - **Quantization**: `combs_core::quant::dequantize_q4` (GGUF q4_0 layout,
   portable `remainder`/`div` nibble extraction — no bitwise ops needed) and
   `combs_models::QuantizedLinear` keep weights packed in VRAM (4x footprint

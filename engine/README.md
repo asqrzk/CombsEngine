@@ -112,9 +112,9 @@ Four layers. Compute lives exclusively in **L0** — every layer above is thin o
 - **Inference engine** — Llama-family architectures on Burn 0.21 + CubeCL/wgpu; validated with SmolLM2 on Apple Silicon (Metal). New architectures = one line in the `ModelRegistry`.
 - **Model formats** — SafeTensors (Hugging Face layout) and **GGUF v3** (Q8_0 / Q4_0 / F16 / F32) through a single `ModelSource` adapter trait. `combs run --model anything.gguf` just works.
 - **Memory** — paged KV cache (page-16 arenas, LIFO free-list, prefix-safe `popn`), chunked prefill, quantized linear layers with weights packed in VRAM.
-- **Sampling** — temperature, top-k, top-p, repetition/frequency/presence penalties, seeded (byte-identical) generation, stop strings & stop tokens.
+- **Sampling** — temperature, top-k, top-p, min-p, repetition/frequency/presence penalties windowed over recent history (`repeat_last_n`, stop tokens exempt), seeded (byte-identical) generation, stop strings & stop tokens, UTF-8-safe incremental detokenization for streaming.
 - **CLI (`combs`)** — `run` · `serve` · `devices` · `chew` · `pull` (HF download → local cache, presets or any repo) · `convert`.
-- **OpenAI-compatible server** — `POST /v1/chat/completions` (SSE streaming + non-streaming), `GET /v1/models`, `GET /health`.
+- **OpenAI-compatible server** — `POST /v1/chat/completions` (SSE streaming + non-streaming), `GET /v1/models`, `GET /v1/sessions` (list/release KV sessions), `GET /v1/stats` (cancelled-vs-error totals, per-layer KV arena state per session), `GET /health`.
 - **`xtask`** — cross-platform build orchestrator: `cargo xtask matrix` shows live toolchain detection; `cargo xtask bundle` produces `dist/<platform>/{lib, combs.h}` for every target.
 
 ### L2 — TypeScript Framework (`Engine/Js`)
