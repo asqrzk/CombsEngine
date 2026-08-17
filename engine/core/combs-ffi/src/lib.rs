@@ -389,6 +389,8 @@ pub unsafe extern "C" fn combs_chat_completion(
                 .clone()
                 .or_else(|| config.sampling.logit_bias.clone()),
             logprobs: request.logprobs.or(config.sampling.logprobs),
+            penalty_last_n: config.sampling.penalty_last_n,
+            penalty_exempt: config.sampling.penalty_exempt.clone(),
         };
         config.sampling = sampling;
         if let Some(mt) = request.max_tokens {
