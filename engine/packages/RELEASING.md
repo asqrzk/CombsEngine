@@ -89,22 +89,26 @@ deno publish        # first run opens a browser to authorize the @combs scope
 (One-time: create the `combs` scope at https://jsr.io/new — then users can
 `deno add @combs/core @combs/graph ...` or `npx jsr add @combs/core`.)
 
-## 6. crates.io (optional, for Rust developers)
+## 6. crates.io (the Rust library channel)
 
-Published crates must be self-contained, so stage the UI template inside
-the CLI crate first (its `build.rs` picks `vendor/ui-template` over the
-repo path automatically):
+Eight crates ship, in dependency order (each waits for the previous to
+be indexed; `cargo publish` handles the wait automatically). The token
+comes from `CARGO_REGISTRY_TOKEN` in the repo-root `.env` — cargo reads
+that variable natively:
 
 ```bash
 cd Engine/Core
-mkdir -p combs-cli/vendor
-cp -R ../Ui/template combs-cli/vendor/ui-template
-cargo publish -p combs-core -p combs-formats -p combs-models -p combs-runtime \
-              -p combs-ffi -p combs-cli --dry-run   # then for real, in dependency order
-rm -rf combs-cli/vendor
+set -a; source ../../.env; set +a
+for c in combs-core combs-formats combs-media combs-models \
+         combs-runtime combs-ffi combs-mesh combs-mesh-ffi; do
+  cargo publish -p $c || break
+done
 ```
 
-Users then: `cargo install combs-cli`.
+`combs-cli` is NOT published: its `build.rs` needs the UI template
+vendored into the crate (`vendor/ui-template`) and the staging tooling
+does not exist yet. Rust users get the binary from the GitHub Release
+or `npm install -g combs-engine` instead.
 
 ## Quick checklist per release
 
@@ -115,3 +119,4 @@ Users then: `cargo install combs-cli`.
 5. ☐ `npm publish` combs-client, then combs-engine, then combs-mesh
 6. ☐ `twine upload` combs-engine
 7. ☐ `deno publish` from Engine/Js
+8. ☐ `cargo publish` the eight crates in dependency order (step 6)
