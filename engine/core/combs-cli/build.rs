@@ -1,4 +1,4 @@
-//! Embeds the Svelte UI template (`Engine/Ui/template`) into the `combs`
+//! Embeds the Svelte UI template (`engine/ui/template`) into the `combs`
 //! binary so `combs chew` works no matter how the CLI was installed
 //! (cargo / npm / pip / prebuilt binary — no repo checkout required).
 //!
@@ -6,7 +6,7 @@
 //!   1. `$CARGO_MANIFEST_DIR/vendor/ui-template` (staged by `cargo xtask
 //!      package` before `cargo publish`, since published crates cannot
 //!      reference files outside their manifest dir)
-//!   2. `../../Ui/template` (normal in-repo build)
+//!   2. `../../ui/template` (normal in-repo build)
 //!
 //! Emits `$OUT_DIR/template_manifest.rs` with
 //! `pub static TEMPLATE_FILES: &[(&str, &[u8])]`.
@@ -22,7 +22,7 @@ const SKIP_FILES: &[&str] = &["master.key", "permissions.json", "manifest.json",
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let vendored = manifest.join("vendor/ui-template");
-    let repo = manifest.join("../../Ui/template");
+    let repo = manifest.join("../../ui/template");
     let root = if vendored.is_dir() { vendored } else { repo };
     assert!(
         root.is_dir(),
