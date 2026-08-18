@@ -9,6 +9,7 @@
 
 pub use burn::backend::wgpu;
 
+pub mod progress;
 pub mod quant;
 
 use burn::backend::wgpu::{RuntimeOptions, WgpuDevice, WgpuSetup, graphics::AutoGraphicsApi};
