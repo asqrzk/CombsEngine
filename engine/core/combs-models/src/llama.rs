@@ -658,6 +658,12 @@ impl<B: Backend> LlamaModel<B> {
                     None
                 },
             });
+            combs_core::progress::load(
+                "weights",
+                Some((i + 1) as u64),
+                Some(m.num_hidden_layers as u64),
+                None,
+            );
         }
 
         let rotary = RotaryEmbedding::new_scaled(

@@ -42,7 +42,7 @@ struct ServeCounters {
 /// Serves `engine` on `addr` (`host:port`) forever.
 /// `default_prefill_chunk` overrides the engine's chunked-prefill size for
 /// every request (from `combs serve --prefill-chunk-size`).
-/// `static_info` is load-time identity for `/v1/stats` — `{weights, device}`,
+/// `static_info` is load-time identity for `/v1/stats` — `{weights, device, load}`,
 /// built once in `cmd_serve` (device caps must be captured before the engine
 /// initializes the cubecl runtime; see `cmd_serve`).
 pub fn serve(
@@ -216,6 +216,7 @@ fn stats_response(
             "attention": attention_json(engine),
             "weights": static_info.get("weights").cloned().unwrap_or(Value::Null),
             "device": static_info.get("device").cloned().unwrap_or(Value::Null),
+            "load": static_info.get("load").cloned().unwrap_or(Value::Null),
             "build": {
                 "dtype": if cfg!(feature = "f16") { "f16" } else { "f32" },
                 "kv_env": std::env::var("COMBS_KV").ok(),

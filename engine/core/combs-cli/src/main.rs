@@ -285,7 +285,10 @@ fn cmd_serve(
     prefill_chunk_size: Option<usize>,
 ) -> Result<()> {
     let model = resolve_model_arg(&model)?;
+    let t_load = std::time::Instant::now();
     let source = open_model_source(&model)?;
+    let open_ms = t_load.elapsed().as_millis() as u64;
+    combs_core::progress::load("open", None, None, Some(open_ms));
     let model_id = model
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -317,9 +320,28 @@ fn cmd_serve(
     } else {
         std::sync::Arc::new(Engine::load(&source, device)?)
     };
+    let weights_ms = t_load.elapsed().as_millis() as u64 - open_ms;
+    combs_core::progress::load("weights_done", None, None, Some(weights_ms));
+    let t_report = std::time::Instant::now();
+    let weights = weights_report(source.as_ref());
+    let report_ms = t_report.elapsed().as_millis() as u64;
+    combs_core::progress::load("report", None, None, Some(report_ms));
+    let load_ms = t_load.elapsed().as_millis() as u64;
+    let ready_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    combs_core::progress::load("bind", None, None, Some(load_ms));
     let static_info = serde_json::json!({
-        "weights": weights_report(source.as_ref()),
+        "weights": weights,
         "device": device_caps,
+        "load": {
+            "ms": load_ms,
+            "ready_at": ready_at,
+            "open_ms": open_ms,
+            "weights_ms": weights_ms,
+            "report_ms": report_ms,
+        },
     });
     serve::serve(
         engine,
