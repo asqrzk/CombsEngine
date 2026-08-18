@@ -162,12 +162,16 @@ fn qwen_bias_loads_by_presence_without_config_flag() {
 }
 
 #[test]
-fn registry_rejects_active_sliding_windows() {
+fn registry_loads_sliding_window_layouts() {
+    // Active sliding windows used to be refused; they now map onto the
+    // per-layer attention layout (ArchSpec: first `max_window_layers`
+    // global, rest sliding — mistral v0.1 all-layer like phi3), so every
+    // configuration here must load.
     let root = std::env::temp_dir().join(format!("combs-sliding-guard-{}", std::process::id()));
     let device = burn::tensor::Device::<B>::default();
     let registry = ModelRegistry::<B>::new();
 
-    // Qwen2 with sliding explicitly enabled: loud error, not wrong output.
+    // Qwen2 with sliding explicitly enabled.
     let qwen_on = root.join("qwen-sliding");
     write_model_dir(
         &qwen_on,
@@ -175,10 +179,9 @@ fn registry_rejects_active_sliding_windows() {
         None,
     );
     let source = SafetensorsSource::load(&qwen_on).unwrap();
-    let err = registry.load(&source, &device).err().expect("must refuse");
-    assert!(err.to_string().contains("sliding"), "unexpected error: {err}");
+    assert!(registry.load(&source, &device).is_ok());
 
-    // Qwen2 with the (usual) disabled window: loads fine.
+    // Qwen2 with the (usual) disabled window.
     let qwen_off = root.join("qwen-nosliding");
     write_model_dir(
         &qwen_off,
@@ -188,7 +191,7 @@ fn registry_rejects_active_sliding_windows() {
     let source = SafetensorsSource::load(&qwen_off).unwrap();
     assert!(registry.load(&source, &device).is_ok());
 
-    // Mistral v0.1 style (window, no use_sliding_window key): refused.
+    // Mistral v0.1 style (window, no use_sliding_window key).
     let mistral = root.join("mistral-sliding");
     write_model_dir(
         &mistral,
@@ -196,10 +199,9 @@ fn registry_rejects_active_sliding_windows() {
         None,
     );
     let source = SafetensorsSource::load(&mistral).unwrap();
-    let err = registry.load(&source, &device).err().expect("must refuse");
-    assert!(err.to_string().contains("sliding"), "unexpected error: {err}");
+    assert!(registry.load(&source, &device).is_ok());
 
-    // Mistral v0.3+/Nemo style (no window): plain llama, loads.
+    // Mistral v0.3+/Nemo style (no window): plain llama.
     let nemo = root.join("mistral-global");
     write_model_dir(&nemo, &qwen_config("").replace("qwen2", "mistral"), None);
     let source = SafetensorsSource::load(&nemo).unwrap();
