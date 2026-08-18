@@ -25,6 +25,8 @@ Combs Engine runs large language models **on-device** with a single Rust core co
 | **JSR** (Deno/TS framework) | `@combs/core`, `@combs/graph`, `@combs/agents`, `@combs/mesh`, … | `deno add @combs/core` |
 | **GitHub Releases** | prebuilt binaries per platform | [releases](https://github.com/asqrzk/CombsEngine/releases) |
 
+Platform-by-platform from-scratch instructions (macOS / Linux / Windows, binaries or source): [INSTALL.md](INSTALL.md).
+
 Or build from source:
 
 ```bash
