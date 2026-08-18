@@ -563,15 +563,25 @@ fn try_download(url: &str, target: &PathBuf) -> Result<bool> {
                 let mb = done / (10 * 1024 * 1024);
                 if mb != last_mb {
                     last_mb = mb;
-                    eprint!(
-                        "\r  {} {:.0}/{:.0} MB",
-                        style(target.file_name().unwrap().to_string_lossy().to_string()).bold(),
-                        done as f64 / 1e6,
-                        total as f64 / 1e6
-                    );
+                    let name = target.file_name().unwrap().to_string_lossy().to_string();
+                    if combs_core::progress::enabled() {
+                        combs_core::progress::pull(&name, done, total);
+                    } else {
+                        eprint!(
+                            "\r  {} {:.0}/{:.0} MB",
+                            style(name).bold(),
+                            done as f64 / 1e6,
+                            total as f64 / 1e6
+                        );
+                    }
                 }
             }
-            eprintln!();
+            if combs_core::progress::enabled() {
+                let name = target.file_name().unwrap().to_string_lossy().to_string();
+                combs_core::progress::pull(&name, done, total.max(done));
+            } else {
+                eprintln!();
+            }
             out.flush()?;
             if total > 0 && done != total {
                 fs::remove_file(&part).ok();
