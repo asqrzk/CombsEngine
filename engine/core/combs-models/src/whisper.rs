@@ -363,6 +363,9 @@ mod tests {
 
     #[test]
     fn causal_mask_shape_and_triangle() {
+        if crate::skip_no_gpu() {
+            return;
+        }
         let device = init_device();
         let model_mask = |n: usize| {
             // Build via the same routine the decoder uses.

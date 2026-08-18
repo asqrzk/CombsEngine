@@ -1730,6 +1730,9 @@ mod tests {
     /// Layout layer: any repack/indexing slip shows up as a hard mismatch.
     #[test]
     fn dequant_kernel_is_bit_exact_vs_cpu_reference() {
+        if crate::skip_no_gpu() {
+            return;
+        }
         let n_blocks = 33; // deliberately not a multiple of the cube dim
         let data = synth_q4_0(n_blocks);
         let n = n_blocks * Q4_0_BLOCK;
@@ -1747,6 +1750,9 @@ mod tests {
     /// shape (m=1) and a prefill shape (m>1), across multiple cubes.
     #[test]
     fn fused_matmul_matches_reference() {
+        if crate::skip_no_gpu() {
+            return;
+        }
         let (n_out, k) = (67, 128); // 67 forces a partial second cube
         let n_blocks = n_out * k / Q4_0_BLOCK;
         let data = synth_q4_0(n_blocks);
@@ -1836,6 +1842,9 @@ mod tests {
     /// the quantization step).
     #[test]
     fn q4_k_dequant_matches_cpu_reference() {
+        if crate::skip_no_gpu() {
+            return;
+        }
         let n_sb = 9;
         let data = synth_q4_k(n_sb);
         let n = n_sb * K_SUPERBLOCK;
@@ -1850,6 +1859,9 @@ mod tests {
     /// Q5_K GPU dequant vs the harmony CPU reference.
     #[test]
     fn q5_k_dequant_matches_cpu_reference() {
+        if crate::skip_no_gpu() {
+            return;
+        }
         let n_sb = 9;
         let data = synth_q5_k(n_sb);
         let n = n_sb * K_SUPERBLOCK;
@@ -1864,6 +1876,9 @@ mod tests {
     /// Q6_K GPU dequant vs the harmony CPU reference.
     #[test]
     fn q6_k_dequant_matches_cpu_reference() {
+        if crate::skip_no_gpu() {
+            return;
+        }
         let n_sb = 9;
         let data = synth_q6_k(n_sb);
         let n = n_sb * K_SUPERBLOCK;
@@ -1879,6 +1894,9 @@ mod tests {
     /// decode (m=1) and prefill (m>1) shapes, multi-superblock rows.
     #[test]
     fn q5_k_fused_matmul_matches_reference() {
+        if crate::skip_no_gpu() {
+            return;
+        }
         let (n_out, k) = (35, 512); // 2 superblocks per row, partial cube
         let n_sb = n_out * k / K_SUPERBLOCK;
         let data = synth_q5_k(n_sb);
@@ -1903,6 +1921,9 @@ mod tests {
     /// decode (m=1) and prefill (m>1) shapes, multi-superblock rows.
     #[test]
     fn q4_k_fused_matmul_matches_reference() {
+        if crate::skip_no_gpu() {
+            return;
+        }
         let (n_out, k) = (35, 512); // 2 superblocks per row, partial cube
         let n_sb = n_out * k / K_SUPERBLOCK;
         let data = synth_q4_k(n_sb);
@@ -1926,6 +1947,9 @@ mod tests {
     /// Fused Q6_K matmul vs a reference matmul over the reference dequant.
     #[test]
     fn q6_k_fused_matmul_matches_reference() {
+        if crate::skip_no_gpu() {
+            return;
+        }
         let (n_out, k) = (35, 512);
         let n_sb = n_out * k / K_SUPERBLOCK;
         let data = synth_q6_k(n_sb);
@@ -1972,6 +1996,9 @@ mod tests {
     /// both are a single f32 multiply per value, same as Q4_0.
     #[test]
     fn q5_0_and_q8_0_dequant_are_bit_exact() {
+        if crate::skip_no_gpu() {
+            return;
+        }
         let device = Default::default();
         let client = WgpuRuntime::client(&device);
 
@@ -1991,6 +2018,9 @@ mod tests {
     /// dequants, decode and prefill shapes.
     #[test]
     fn q5_0_and_q8_0_fused_matmul_match_reference() {
+        if crate::skip_no_gpu() {
+            return;
+        }
         let device = Default::default();
         let client = WgpuRuntime::client(&device);
         let (n_out, k) = (67, 128);
@@ -2020,6 +2050,9 @@ mod tests {
     /// Q5_0/Q8_0 malformed input rejection.
     #[test]
     fn q5_q8_shape_validation() {
+        if crate::skip_no_gpu() {
+            return;
+        }
         let device = Default::default();
         let client = WgpuRuntime::client(&device);
         assert!(repack_q5_0(&[0u8; 21]).is_err());
@@ -2031,6 +2064,9 @@ mod tests {
     /// K-quant shape validation mirrors the Q4_0 rules.
     #[test]
     fn k_quant_shape_validation() {
+        if crate::skip_no_gpu() {
+            return;
+        }
         let device = Default::default();
         let client = WgpuRuntime::client(&device);
         assert!(repack_q4_k(&[0u8; 143]).is_err());
@@ -2069,6 +2105,9 @@ mod tests {
     /// prefill chunk.
     #[test]
     fn tiled_q8_0_matmul_is_bit_identical() {
+        if crate::skip_no_gpu() {
+            return;
+        }
         let (n_out, k) = (300, 320);
         let n_blocks = n_out * k / Q4_0_BLOCK;
         let data = synth_q8_0(n_blocks);
@@ -2092,6 +2131,9 @@ mod tests {
     /// construction; ragged final column block still exercised).
     #[test]
     fn tiled_q4_k_matmul_is_bit_identical() {
+        if crate::skip_no_gpu() {
+            return;
+        }
         let (n_out, k) = (300, 512);
         let n_sb = n_out * k / K_SUPERBLOCK;
         let data = synth_q4_k(n_sb);
@@ -2114,6 +2156,9 @@ mod tests {
     /// Malformed inputs must be rejected, not mis-indexed.
     #[test]
     fn shape_validation() {
+        if crate::skip_no_gpu() {
+            return;
+        }
         let device = Default::default();
         let client = WgpuRuntime::client(&device);
         // Truncated block stream.

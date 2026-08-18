@@ -48,6 +48,9 @@ mod tests {
 
     #[test]
     fn add_one_runs_on_gpu() {
+        if crate::skip_no_gpu() {
+            return;
+        }
         let device = Default::default();
         let client = WgpuRuntime::client(&device);
 
@@ -73,6 +76,9 @@ mod tests {
 
     #[test]
     fn shared_memory_mirror_runs_on_gpu() {
+        if crate::skip_no_gpu() {
+            return;
+        }
         let device = Default::default();
         let client = WgpuRuntime::client(&device);
 

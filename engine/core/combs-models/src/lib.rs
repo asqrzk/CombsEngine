@@ -78,3 +78,16 @@ pub enum ModelError {
 
 /// Convenient result alias for this crate.
 pub type Result<T> = std::result::Result<T, ModelError>;
+
+/// Test-only guard: true (after logging) when the machine has no wgpu
+/// adapter, so GPU-dependent tests can skip instead of panicking inside
+/// cubecl's device worker. Real GPU coverage is unaffected wherever an
+/// adapter exists — CI's macOS runners included.
+#[cfg(test)]
+pub(crate) fn skip_no_gpu() -> bool {
+    if combs_core::gpu_available() {
+        return false;
+    }
+    eprintln!("skipped: no wgpu adapter on this machine");
+    true
+}

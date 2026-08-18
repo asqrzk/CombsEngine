@@ -51,6 +51,22 @@ pub fn init_device() -> CombsDevice {
     WgpuDevice::default()
 }
 
+/// True when wgpu can see at least one adapter. Cached after the first
+/// probe. Initializing a cubecl device on an adapterless machine (e.g. a
+/// CI runner) panics in a worker thread, so GPU-dependent tests check
+/// this first and skip rather than fail.
+pub fn gpu_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // `::wgpu` is the raw crate — the bare name resolves to this
+    // module's `burn::backend::wgpu` re-export.
+    *AVAILABLE.get_or_init(|| {
+        let instance = ::wgpu::Instance::default();
+        let adapters =
+            cubecl::future::block_on(instance.enumerate_adapters(::wgpu::Backends::all()));
+        !adapters.is_empty()
+    })
+}
+
 /// Basic information about a wgpu adapter.
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {

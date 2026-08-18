@@ -413,6 +413,9 @@ mod tests {
     /// inside the fusion stream and must match the dense path, with a bias.
     #[test]
     fn fused_backend_matches_dense() {
+        if crate::skip_no_gpu() {
+            return;
+        }
         pin_device_dtypes();
         let device: Device<FusedF32> = Default::default();
         let (n_out, k) = (48, 64);
@@ -443,6 +446,9 @@ mod tests {
     /// covers the final f16 rounding of the output.
     #[test]
     fn f16_backend_matches_dense() {
+        if crate::skip_no_gpu() {
+            return;
+        }
         pin_device_dtypes();
         let device: Device<UnfusedF16> = Default::default();
         let (n_out, k) = (48, 64);
