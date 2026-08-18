@@ -16,23 +16,23 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/asqrzk/CombsEngine"
 
 [workspace.dependencies]
 burn = { version = "0.21.0", default-features = false, features = ["wgpu", "fusion", "std"] }
-combs-core = { version = "0.2.0", path = "combs-core" }
-combs-formats = { version = "0.2.0", path = "combs-formats" }
-combs-media = { version = "0.2.0", path = "combs-media" }
-combs-models = { version = "0.2.0", path = "combs-models" }
-combs-runtime = { version = "0.2.0", path = "combs-runtime" }
-combs-ffi = { version = "0.2.0", path = "combs-ffi" }
-combs-wasm = { version = "0.2.0", path = "combs-wasm" }
-combs-cli = { version = "0.2.0", path = "combs-cli" }
-combs-mesh = { version = "0.2.0", path = "combs-mesh" }
-combs-mesh-ffi = { version = "0.2.0", path = "combs-mesh-ffi" }
+combs-core = { version = "0.2.2", path = "combs-core" }
+combs-formats = { version = "0.2.2", path = "combs-formats" }
+combs-media = { version = "0.2.2", path = "combs-media" }
+combs-models = { version = "0.2.2", path = "combs-models" }
+combs-runtime = { version = "0.2.2", path = "combs-runtime" }
+combs-ffi = { version = "0.2.2", path = "combs-ffi" }
+combs-wasm = { version = "0.2.2", path = "combs-wasm" }
+combs-cli = { version = "0.2.2", path = "combs-cli" }
+combs-mesh = { version = "0.2.2", path = "combs-mesh" }
+combs-mesh-ffi = { version = "0.2.2", path = "combs-mesh-ffi" }
 safetensors = "0.6"
 memmap2 = "0.9"
 half = "2"

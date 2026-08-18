@@ -1,6 +1,6 @@
 [package]
 name = "combs-ffi"
-version = "0.2.0"
+version = "0.2.2"
 edition.workspace = true
 license.workspace = true
 description = "Combs Engine stable C ABI + JSON FFI boundary (L1)"
@@ -9,9 +9,9 @@ description = "Combs Engine stable C ABI + JSON FFI boundary (L1)"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-combs-core = { path = "../combs-core", version = "0.2.0" }
-combs-formats = { path = "../combs-formats", version = "0.2.0" }
-combs-models = { path = "../combs-models", version = "0.2.0" }
-combs-runtime = { path = "../combs-runtime", version = "0.2.0" }
+combs-core = { path = "../combs-core", version = "0.2.2" }
+combs-formats = { path = "../combs-formats", version = "0.2.2" }
+combs-models = { path = "../combs-models", version = "0.2.2" }
+combs-runtime = { path = "../combs-runtime", version = "0.2.2" }
 serde.workspace = true
 serde_json.workspace = true

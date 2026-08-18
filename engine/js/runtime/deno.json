@@ -1,6 +1,6 @@
 {
   "name": "@combs/runtime",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "exports": "./mod.ts",
   "imports": {
     "@combs/graph": "jsr:@combs/graph@^0.2.0",

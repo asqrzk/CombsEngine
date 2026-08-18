@@ -1,6 +1,6 @@
 [package]
 name = "combs-models"
-version = "0.2.0"
+version = "0.2.2"
 edition.workspace = true
 license.workspace = true
 description = "Combs Engine model architecture registry (Llama family)"
@@ -16,7 +16,7 @@ burn-fusion = { version = "0.21.0" }
 burn-ir = { version = "0.21.0" }
 cubecl = { version = "0.10.0", default-features = false, features = ["wgpu", "std"] }
 combs-core.workspace = true
-combs-formats = { path = "../combs-formats", version = "0.2.0" }
+combs-formats = { path = "../combs-formats", version = "0.2.2" }
 thiserror.workspace = true
 
 [dev-dependencies]

@@ -1,13 +1,13 @@
 [package]
 name = "combs-diffusion"
-version = "0.2.0"
+version = "0.2.2"
 edition.workspace = true
 license.workspace = true
 description = "Diffusion model runtime for Combs Engine (Burn-native)"
 
 [dependencies]
 burn.workspace = true
-combs-formats = { path = "../combs-formats", version = "0.2.0" }
+combs-formats = { path = "../combs-formats", version = "0.2.2" }
 serde_json.workspace = true
 thiserror.workspace = true
 tokenizers.workspace = true

@@ -1,6 +1,6 @@
 {
   "name": "@combs/flows",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "exports": "./mod.ts",
   "imports": {
     "@combs/agents": "jsr:@combs/agents@^0.2.0",
