@@ -222,6 +222,7 @@ fn main() -> Result<()> {
         Command::GenerateImage(args) => generate_image::cmd_generate_image(args),
         Command::GenerateAudio(args) => generate_audio::cmd_generate_audio(args),
         Command::ServeImages { model, port, lora, lora_scale } => {
+            let lora = lora.map(|l| resolve_lora_arg(&l)).transpose()?;
             serve_images::cmd_serve_images(model, port, lora, lora_scale)
         }
         Command::ServeAudio { model, port, transcribe_model, language } => {
@@ -253,6 +254,21 @@ fn not_yet(cmd: &str, phase: &str) -> Result<()> {
 
 /// Resolves a --model argument: direct path, or a preset id in the local
 /// cache (see `combs pull`).
+/// Resolve a `--lora` argument: a literal safetensors file, or a cached
+/// adapter id (a cache dir carrying `adapter.json` from `combs pull`).
+fn resolve_lora_arg(arg: &std::path::Path) -> Result<PathBuf> {
+    if arg.is_file() {
+        return Ok(arg.to_path_buf());
+    }
+    if let Some(file) = pull::cached_adapter_file(&arg.to_string_lossy()) {
+        return Ok(file);
+    }
+    anyhow::bail!(
+        "lora not found: {} is neither a safetensors file nor a cached adapter id",
+        arg.display()
+    )
+}
+
 fn resolve_model_arg(model: &PathBuf) -> Result<PathBuf> {
     if model.exists() {
         return Ok(model.clone());

@@ -62,10 +62,12 @@ pub fn cmd_generate_image(args: GenerateImageArgs) -> Result<()> {
     );
 
     let device = combs_core::init_device();
-    let lora = args.lora.as_ref().map(|path| combs_diffusion::LoraSpec {
-        path: path.clone(),
-        scale: args.lora_scale,
-    });
+    let lora = args
+        .lora
+        .as_ref()
+        .map(|path| super::resolve_lora_arg(path))
+        .transpose()?
+        .map(|path| combs_diffusion::LoraSpec { path, scale: args.lora_scale });
     let mut pipeline = combs_diffusion::loader::load_diffusion_model_with_lora::<
         combs_core::CombsBackendF32,
     >(architecture, &model_dir, &device, lora.as_ref())

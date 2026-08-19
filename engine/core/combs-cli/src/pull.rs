@@ -60,6 +60,8 @@ enum Kind {
     Gguf,
     /// Kokoro-style ONNX TTS: voices/*.bin style vectors + an .onnx model.
     Tts,
+    /// A LoRA/adapter repo: delta weights only, no runnable base model.
+    Adapter,
 }
 
 pub fn resolve_repo(source: &str) -> (String, String) {
@@ -148,9 +150,15 @@ pub fn pull(source: &str) -> Result<PathBuf> {
         Kind::TextVision => pull_text(&repo, &dir, &tree),
         Kind::Gguf => pull_gguf(&repo, &dir, &tree),
         Kind::Tts => pull_tts(&repo, &dir, &tree),
+        Kind::Adapter => pull_adapter(&repo, &dir, &tree),
     }?;
 
-    println!("{}", style("model ready").bold().green());
+    println!(
+        "{}",
+        style(if matches!(kind, Kind::Adapter) { "adapter ready" } else { "model ready" })
+            .bold()
+            .green()
+    );
     Ok(dir)
 }
 
@@ -187,6 +195,19 @@ fn detect_kind(tree: &[TreeEntry]) -> Result<Kind> {
     {
         return Ok(Kind::Tts);
     }
+    // Adapters before TextVision: a PEFT repo has adapter_config.json (and
+    // may or may not carry a config.json copy); a diffusion-style LoRA repo
+    // has bare lora-named safetensors and nothing runnable.
+    if paths.contains("adapter_config.json")
+        && paths.iter().any(|p| p.ends_with("adapter_model.safetensors"))
+    {
+        return Ok(Kind::Adapter);
+    }
+    if !paths.contains("config.json")
+        && adapter_weight_files(tree).next().is_some()
+    {
+        return Ok(Kind::Adapter);
+    }
     if paths.contains("config.json") {
         return Ok(Kind::TextVision);
     }
@@ -194,8 +215,21 @@ fn detect_kind(tree: &[TreeEntry]) -> Result<Kind> {
         return Ok(Kind::Gguf);
     }
     bail!(
-        "cannot detect model kind: no config.json, model_index.json, or .gguf found in the repo"
+        "cannot detect model kind: no config.json, model_index.json, adapter weights, or .gguf found in the repo"
     )
+}
+
+/// Root-level safetensors that look like adapter weights by name.
+fn adapter_weight_files<'a>(
+    tree: &'a [TreeEntry],
+) -> impl Iterator<Item = &'a str> + 'a {
+    tree.iter().map(|e| e.path.as_str()).filter(|p| {
+        !p.contains('/')
+            && p.ends_with(".safetensors")
+            && (p.to_lowercase().contains("lora")
+                || *p == "pytorch_lora_weights.safetensors"
+                || *p == "adapter_model.safetensors")
+    })
 }
 
 fn pull_text(repo: &str, dir: &PathBuf, tree: &[TreeEntry]) -> Result<()> {
@@ -452,6 +486,131 @@ fn pull_diffusion(repo: &str, dir: &PathBuf, tree: &[TreeEntry]) -> Result<()> {
     download_optional(repo, dir, "scheduler/scheduler_config.json")?;
 
     Ok(())
+}
+
+/// Adapter repos: download the delta weights + PEFT config, probe the
+/// real header for the base family, and record it all in `adapter.json`
+/// so listings and serve-time resolution never re-guess.
+fn pull_adapter(repo: &str, dir: &PathBuf, tree: &[TreeEntry]) -> Result<()> {
+    let paths: HashSet<&str> = tree.iter().map(|e| e.path.as_str()).collect();
+    let files: Vec<String> =
+        adapter_weight_files(tree).map(|p| p.to_string()).collect();
+    anyhow::ensure!(!files.is_empty(), "adapter repo has no recognizable weight files");
+    for f in &files {
+        download_required(repo, dir, f)?;
+    }
+    if paths.contains("adapter_config.json") {
+        download_required(repo, dir, "adapter_config.json")?;
+    }
+
+    let primary = dir.join(&files[0]);
+    let (family, format) = probe_adapter_family(&primary)
+        .with_context(|| format!("probing {}", primary.display()))?;
+    let base = fs::read_to_string(dir.join("adapter_config.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| {
+            v.get("base_model_name_or_path")
+                .and_then(|b| b.as_str())
+                .map(|b| b.to_string())
+        });
+
+    let meta = serde_json::json!({
+        "kind": "adapter",
+        "family": family,
+        "format": format,
+        "files": files,
+        "base": base,
+        "source": repo,
+    });
+    fs::write(dir.join("adapter.json"), serde_json::to_string_pretty(&meta)?)?;
+    println!(
+        "  {} {family} adapter ({format}, {} file{})",
+        style("✓ probed").dim(),
+        files.len(),
+        if files.len() == 1 { "" } else { "s" }
+    );
+    Ok(())
+}
+
+/// Classify an adapter's base family from its actual tensor names/shapes
+/// (header only — no tensor data is read). The cross-attention context
+/// width is the fingerprint: SD1.5 conditions on CLIP-L (768), SDXL on
+/// 2048; FLUX uses its own block naming; PEFT text adapters target
+/// `model.layers.*`.
+fn probe_adapter_family(file: &PathBuf) -> Result<(String, String)> {
+    use std::io::Read;
+    let mut f = fs::File::open(file)?;
+    let mut len_bytes = [0u8; 8];
+    f.read_exact(&mut len_bytes)?;
+    let header_len = u64::from_le_bytes(len_bytes) as usize;
+    anyhow::ensure!(header_len < 100 * 1024 * 1024, "safetensors header too large");
+    let mut header = vec![0u8; header_len];
+    f.read_exact(&mut header)?;
+    let json: serde_json::Value = serde_json::from_slice(&header)?;
+    let obj = json.as_object().context("safetensors header is not an object")?;
+
+    let mut format = "diffusers";
+    let mut has_unet = false;
+    let mut has_flux = false;
+    let mut has_text_peft = false;
+    let mut cross_dim: Option<u64> = None;
+    for (key, entry) in obj {
+        if key == "__metadata__" {
+            continue;
+        }
+        if key.starts_with("lora_unet_") {
+            format = "kohya";
+            has_unet = true;
+        } else if key.starts_with("unet.") {
+            has_unet = true;
+        } else if key.starts_with("base_model.model.") {
+            format = "peft";
+            has_text_peft = true;
+        }
+        if key.contains("double_blocks") || key.contains("single_blocks")
+            || key.starts_with("transformer.")
+        {
+            has_flux = true;
+        }
+        // attn2 K/V read the text context: their lora_down in-dim is the
+        // conditioning width.
+        if (key.contains("attn2_to_k") || key.contains("attn2.to_k"))
+            && (key.ends_with("lora_down.weight") || key.ends_with("lora.down.weight")
+                || key.ends_with("lora_A.weight"))
+        {
+            if let Some(shape) = entry.get("shape").and_then(|s| s.as_array()) {
+                cross_dim = shape.last().and_then(|d| d.as_u64());
+            }
+        }
+    }
+
+    let family = if has_flux {
+        "flux"
+    } else if has_text_peft {
+        "text-peft"
+    } else if has_unet {
+        match cross_dim {
+            Some(768) => "sd15-unet",
+            Some(1024) => "sd2-unet",
+            Some(2048) => "sdxl-unet",
+            _ => "sd-unet-unknown",
+        }
+    } else {
+        "unknown"
+    };
+    Ok((family.to_string(), format.to_string()))
+}
+
+/// Resolve a cached adapter id to its primary weights file, if present.
+pub fn cached_adapter_file(source: &str) -> Option<PathBuf> {
+    let (slug, _) = resolve_repo(source);
+    let dir = cache_root().ok()?.join(slug);
+    let meta = fs::read_to_string(dir.join("adapter.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&meta).ok()?;
+    let file = json.get("files")?.as_array()?.first()?.as_str()?;
+    let path = dir.join(file);
+    path.is_file().then_some(path)
 }
 
 /// Download `source_path` from the repo, erroring if it is missing.
