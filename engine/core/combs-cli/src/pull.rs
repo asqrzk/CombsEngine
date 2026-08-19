@@ -204,7 +204,8 @@ fn detect_kind(tree: &[TreeEntry]) -> Result<Kind> {
         return Ok(Kind::Adapter);
     }
     if !paths.contains("config.json")
-        && adapter_weight_files(tree).next().is_some()
+        && !paths.iter().any(|p| p.ends_with(".gguf"))
+        && !adapter_weight_files(tree).is_empty()
     {
         return Ok(Kind::Adapter);
     }
@@ -219,17 +220,25 @@ fn detect_kind(tree: &[TreeEntry]) -> Result<Kind> {
     )
 }
 
-/// Root-level safetensors that look like adapter weights by name.
-fn adapter_weight_files<'a>(
-    tree: &'a [TreeEntry],
-) -> impl Iterator<Item = &'a str> + 'a {
-    tree.iter().map(|e| e.path.as_str()).filter(|p| {
-        !p.contains('/')
-            && p.ends_with(".safetensors")
-            && (p.to_lowercase().contains("lora")
-                || *p == "pytorch_lora_weights.safetensors"
-                || *p == "adapter_model.safetensors")
-    })
+/// Root-level adapter weight candidates. Lora-named files are preferred;
+/// otherwise every root safetensors qualifies — a repo with weights but no
+/// config.json/model_index.json is not a runnable model, and the header
+/// probe after download rejects anything that is not actually an adapter.
+fn adapter_weight_files(tree: &[TreeEntry]) -> Vec<String> {
+    let root_safetensors: Vec<&str> = tree
+        .iter()
+        .map(|e| e.path.as_str())
+        .filter(|p| !p.contains('/') && p.ends_with(".safetensors"))
+        .collect();
+    let lora_named: Vec<&str> = root_safetensors
+        .iter()
+        .copied()
+        .filter(|p| {
+            p.to_lowercase().contains("lora") || *p == "adapter_model.safetensors"
+        })
+        .collect();
+    let picked = if lora_named.is_empty() { root_safetensors } else { lora_named };
+    picked.into_iter().map(|p| p.to_string()).collect()
 }
 
 fn pull_text(repo: &str, dir: &PathBuf, tree: &[TreeEntry]) -> Result<()> {
@@ -493,8 +502,7 @@ fn pull_diffusion(repo: &str, dir: &PathBuf, tree: &[TreeEntry]) -> Result<()> {
 /// so listings and serve-time resolution never re-guess.
 fn pull_adapter(repo: &str, dir: &PathBuf, tree: &[TreeEntry]) -> Result<()> {
     let paths: HashSet<&str> = tree.iter().map(|e| e.path.as_str()).collect();
-    let files: Vec<String> =
-        adapter_weight_files(tree).map(|p| p.to_string()).collect();
+    let files: Vec<String> = adapter_weight_files(tree);
     anyhow::ensure!(!files.is_empty(), "adapter repo has no recognizable weight files");
     for f in &files {
         download_required(repo, dir, f)?;
@@ -506,6 +514,11 @@ fn pull_adapter(repo: &str, dir: &PathBuf, tree: &[TreeEntry]) -> Result<()> {
     let primary = dir.join(&files[0]);
     let (family, format) = probe_adapter_family(&primary)
         .with_context(|| format!("probing {}", primary.display()))?;
+    anyhow::ensure!(
+        family != "unknown",
+        "{} carries no recognizable adapter keys — not a LoRA/PEFT file",
+        primary.display()
+    );
     let base = fs::read_to_string(dir.join("adapter_config.json"))
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
