@@ -1210,6 +1210,7 @@ version = "0.2.2"
 dependencies = [
  "burn",
  "combs-formats",
+ "safetensors 0.6.2",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",

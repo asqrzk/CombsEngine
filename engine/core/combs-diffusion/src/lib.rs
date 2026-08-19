@@ -13,6 +13,7 @@ use combs_formats::{AttentionPattern, ModelMetadata, ModelSource, TokenizerSpec}
 pub mod blocks;
 pub mod clip;
 pub mod loader;
+pub mod lora;
 pub mod noise;
 pub mod scheduler;
 pub mod time;
@@ -22,6 +23,7 @@ pub mod weights;
 
 pub use clip::{input_ids_to_tensor, ClipTextModel};
 pub use loader::{load_diffusion_model, DiffusionArchitecture};
+pub use lora::LoraSpec;
 pub use noise::NoiseSource;
 pub use scheduler::{Scheduler, SchedulerKind};
 pub use unet::UNet2DConditionModel;

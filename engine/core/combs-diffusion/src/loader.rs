@@ -79,11 +79,23 @@ pub fn load_diffusion_model<B: Backend>(
     model_dir: impl AsRef<Path>,
     device: &B::Device,
 ) -> Result<StableDiffusionPipeline<B>> {
+    load_diffusion_model_with_lora(architecture, model_dir, device, None)
+}
+
+/// Like [`load_diffusion_model`], with an optional LoRA fused into the
+/// UNet (and text encoder, when the file carries `lora_te`/`text_encoder`
+/// keys) at load time.
+pub fn load_diffusion_model_with_lora<B: Backend>(
+    architecture: DiffusionArchitecture,
+    model_dir: impl AsRef<Path>,
+    device: &B::Device,
+    lora: Option<&crate::lora::LoraSpec>,
+) -> Result<StableDiffusionPipeline<B>> {
     let model_dir = model_dir.as_ref();
 
     match architecture {
         DiffusionArchitecture::StableDiffusion1_5 => {
-            load_stable_diffusion_1_5(model_dir, device)
+            load_stable_diffusion_1_5(model_dir, device, lora)
         }
     }
 }
@@ -91,6 +103,7 @@ pub fn load_diffusion_model<B: Backend>(
 fn load_stable_diffusion_1_5<B: Backend>(
     model_dir: &Path,
     device: &B::Device,
+    lora: Option<&crate::lora::LoraSpec>,
 ) -> Result<StableDiffusionPipeline<B>> {
     let unet_source = SafetensorsSource::load_weights_only(
         model_dir.join("unet"),
@@ -106,6 +119,43 @@ fn load_stable_diffusion_1_5<B: Backend>(
     )?;
 
     let tokenizer = load_tokenizer_spec(model_dir)?;
+
+    if let Some(spec) = lora {
+        let file = crate::lora::LoraFile::load(&spec.path)?;
+        if !file.unrecognized.is_empty() {
+            eprintln!(
+                "lora: {} keys matched no known naming scheme (first: {})",
+                file.unrecognized.len(),
+                file.unrecognized[0]
+            );
+        }
+        let unet_merged = crate::lora::merge_lora(unet_source, &file.unet, spec.scale)?;
+        let text_merged = crate::lora::merge_lora(text_source, &file.text, spec.scale)?;
+        for (label, applied, skipped) in [
+            ("unet", unet_merged.applied, &unet_merged.skipped),
+            ("text_encoder", text_merged.applied, &text_merged.skipped),
+        ] {
+            if applied > 0 || !skipped.is_empty() {
+                eprintln!(
+                    "lora {label}: fused {applied} tensors, skipped {}{}",
+                    skipped.len(),
+                    skipped.first().map(|s| format!(" (first: {s})")).unwrap_or_default()
+                );
+            }
+        }
+        if unet_merged.applied == 0 && text_merged.applied == 0 {
+            return Err(FormatError::Safetensors(
+                "lora file matched no tensors in this checkpoint".to_string(),
+            ));
+        }
+        return StableDiffusionPipeline::load_from_dirs(
+            &unet_merged,
+            &vae_source,
+            &text_merged,
+            tokenizer,
+            device,
+        );
+    }
 
     StableDiffusionPipeline::load_from_dirs(
         &unet_source,
