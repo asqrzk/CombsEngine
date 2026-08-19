@@ -45,9 +45,12 @@ pub fn cmd_serve_images(
     lora: Option<PathBuf>,
     lora_scale: f32,
 ) -> Result<()> {
+    let t_load = std::time::Instant::now();
     let model_dir = super::resolve_model_arg(&model)?;
     let architecture =
         DiffusionArchitecture::detect(&model_dir).context("detecting diffusion architecture")?;
+    let open_ms = t_load.elapsed().as_millis() as u64;
+    combs_core::progress::load("open", None, None, Some(open_ms));
 
     eprintln!("[serve-images] loading diffusion pipeline...");
     let device = combs_core::init_device();
@@ -59,6 +62,8 @@ pub fn cmd_serve_images(
         combs_core::CombsBackendF32,
     >(architecture, &model_dir, &device, lora_spec.as_ref())
     .context("loading diffusion pipeline")?;
+    let weights_ms = t_load.elapsed().as_millis() as u64 - open_ms;
+    combs_core::progress::load("weights_done", None, None, Some(weights_ms));
     let pipeline: SharedPipeline = Arc::new(Mutex::new(Box::new(pipeline)));
 
     let lora_info = match &lora_spec {
@@ -68,6 +73,8 @@ pub fn cmd_serve_images(
         }),
         None => serde_json::Value::Null,
     };
+    let load_ms = t_load.elapsed().as_millis() as u64;
+    combs_core::progress::load("bind", None, None, Some(load_ms));
     let addr = format!("0.0.0.0:{port}");
     let server =
         tiny_http::Server::http(&addr).map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
@@ -106,6 +113,7 @@ pub fn cmd_serve_images(
                             "last_duration_ms": stats.last_duration_ms.load(Relaxed),
                             "last_bytes": stats.last_bytes.load(Relaxed),
                             "lora": lora_info,
+                            "load": {"ms": load_ms, "open_ms": open_ms, "weights_ms": weights_ms},
                         }),
                     )
                 }
