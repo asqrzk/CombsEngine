@@ -217,6 +217,7 @@ fn stats_response(
             "weights": static_info.get("weights").cloned().unwrap_or(Value::Null),
             "device": static_info.get("device").cloned().unwrap_or(Value::Null),
             "load": static_info.get("load").cloned().unwrap_or(Value::Null),
+            "lora": static_info.get("lora").cloned().unwrap_or(Value::Null),
             "build": {
                 "dtype": if cfg!(feature = "f16") { "f16" } else { "f32" },
                 "kv_env": std::env::var("COMBS_KV").ok(),

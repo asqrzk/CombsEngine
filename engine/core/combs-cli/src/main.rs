@@ -179,6 +179,13 @@ enum Command {
         /// Prompt tokens per prefill call (0 = single-shot; default 512).
         #[arg(long)]
         prefill_chunk_size: Option<usize>,
+        /// LoRA/adapter safetensors file (or cached adapter id) fused into
+        /// the weights at load time.
+        #[arg(long)]
+        lora: Option<PathBuf>,
+        /// LoRA strength multiplier.
+        #[arg(long, default_value_t = 1.0)]
+        lora_scale: f32,
     },
     /// Scaffold a UI app from the embedded template (interactive or via flags).
     Chew(ChewCommand),
@@ -229,8 +236,17 @@ fn main() -> Result<()> {
             serve_audio::cmd_serve_audio(model, port, transcribe_model, language)
         }
         Command::Transcribe { model, file, language } => cmd_transcribe(model, file, language),
-        Command::Serve { model, port, context_size, page_size, prefill_chunk_size } => {
-            cmd_serve(model, port, context_size, page_size, prefill_chunk_size)
+        Command::Serve {
+            model,
+            port,
+            context_size,
+            page_size,
+            prefill_chunk_size,
+            lora,
+            lora_scale,
+        } => {
+            let lora = lora.map(|l| resolve_lora_arg(&l)).transpose()?;
+            cmd_serve(model, port, context_size, page_size, prefill_chunk_size, lora, lora_scale)
         }
         Command::Perplexity { model, file, text, chunk, max_tokens } => {
             cmd_perplexity(model, file, text, chunk, max_tokens)
@@ -307,12 +323,48 @@ fn cmd_serve(
     context_size: Option<usize>,
     page_size: Option<usize>,
     prefill_chunk_size: Option<usize>,
+    lora: Option<PathBuf>,
+    lora_scale: f32,
 ) -> Result<()> {
     let model = resolve_model_arg(&model)?;
     let t_load = std::time::Instant::now();
     let source = open_model_source(&model)?;
     let open_ms = t_load.elapsed().as_millis() as u64;
     combs_core::progress::load("open", None, None, Some(open_ms));
+    let mut lora_ms: Option<u64> = None;
+    let source: Box<dyn combs_formats::ModelSource> = match &lora {
+        Some(path) => {
+            let t_lora = std::time::Instant::now();
+            let file = combs_formats::LoraFile::load(path)?;
+            if !file.unrecognized.is_empty() {
+                eprintln!(
+                    "lora: {} keys matched no known naming scheme (first: {})",
+                    file.unrecognized.len(),
+                    file.unrecognized[0]
+                );
+            }
+            // Text adapters classify under `text`; a diffusion lora fed to
+            // the text engine lands in `unet` and fuses nothing — that is
+            // the family-mismatch error below, not a silent no-op.
+            let merged =
+                combs_formats::merge_lora(source, &file.text, lora_scale, file.file_alpha)?;
+            anyhow::ensure!(
+                merged.applied > 0,
+                "lora {} matched no tensors in this model (family mismatch?)",
+                path.display()
+            );
+            eprintln!(
+                "lora: fused {} tensors, skipped {}",
+                merged.applied,
+                merged.skipped.len()
+            );
+            let ms = t_lora.elapsed().as_millis() as u64;
+            lora_ms = Some(ms);
+            combs_core::progress::load("lora", None, None, Some(ms));
+            Box::new(merged)
+        }
+        None => source,
+    };
     let model_id = model
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -363,8 +415,16 @@ fn cmd_serve(
             "ms": load_ms,
             "ready_at": ready_at,
             "open_ms": open_ms,
+            "lora_ms": lora_ms,
             "weights_ms": weights_ms,
             "report_ms": report_ms,
+        },
+        "lora": match &lora {
+            Some(path) => serde_json::json!({
+                "file": path.file_name().map(|f| f.to_string_lossy().into_owned()),
+                "scale": lora_scale,
+            }),
+            None => serde_json::Value::Null,
         },
     });
     serve::serve(
