@@ -39,21 +39,35 @@ struct ImageStats {
     last_bytes: std::sync::atomic::AtomicU64,
 }
 
-pub fn cmd_serve_images(model: PathBuf, port: u16) -> Result<()> {
+pub fn cmd_serve_images(
+    model: PathBuf,
+    port: u16,
+    lora: Option<PathBuf>,
+    lora_scale: f32,
+) -> Result<()> {
     let model_dir = super::resolve_model_arg(&model)?;
     let architecture =
         DiffusionArchitecture::detect(&model_dir).context("detecting diffusion architecture")?;
 
     eprintln!("[serve-images] loading diffusion pipeline...");
     let device = combs_core::init_device();
-    let pipeline = load_diffusion_model::<combs_core::CombsBackendF32>(
-        architecture,
-        &model_dir,
-        &device,
-    )
+    let lora_spec = lora.as_ref().map(|path| combs_diffusion::LoraSpec {
+        path: path.clone(),
+        scale: lora_scale,
+    });
+    let pipeline = combs_diffusion::loader::load_diffusion_model_with_lora::<
+        combs_core::CombsBackendF32,
+    >(architecture, &model_dir, &device, lora_spec.as_ref())
     .context("loading diffusion pipeline")?;
     let pipeline: SharedPipeline = Arc::new(Mutex::new(Box::new(pipeline)));
 
+    let lora_info = match &lora_spec {
+        Some(spec) => json!({
+            "file": spec.path.file_name().map(|f| f.to_string_lossy().into_owned()),
+            "scale": spec.scale,
+        }),
+        None => serde_json::Value::Null,
+    };
     let addr = format!("0.0.0.0:{port}");
     let server =
         tiny_http::Server::http(&addr).map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
@@ -68,6 +82,7 @@ pub fn cmd_serve_images(model: PathBuf, port: u16) -> Result<()> {
         let pipeline = pipeline.clone();
         let stats = stats.clone();
         let model_id = model_id.clone();
+        let lora_info = lora_info.clone();
         std::thread::spawn(move || {
             let url = request.url().to_string();
             let method = request.method().as_str().to_string();
@@ -90,6 +105,7 @@ pub fn cmd_serve_images(model: PathBuf, port: u16) -> Result<()> {
                             "errors_total": stats.errors_total.load(Relaxed),
                             "last_duration_ms": stats.last_duration_ms.load(Relaxed),
                             "last_bytes": stats.last_bytes.load(Relaxed),
+                            "lora": lora_info,
                         }),
                     )
                 }

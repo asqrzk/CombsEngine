@@ -124,6 +124,12 @@ enum Command {
         /// Port to listen on.
         #[arg(long, default_value_t = 8082)]
         port: u16,
+        /// LoRA safetensors file to fuse in at load time.
+        #[arg(long)]
+        lora: Option<PathBuf>,
+        /// LoRA strength multiplier.
+        #[arg(long, default_value_t = 1.0)]
+        lora_scale: f32,
     },
     /// Start a persistent speech worker (loads the TTS engine once,
     /// serves /v1/audio/speech and /v1/audio/voices).
@@ -215,7 +221,9 @@ fn main() -> Result<()> {
         Command::Convert { .. } => not_yet("convert", "Phase 5 (GGUF/burnpack adapters)"),
         Command::GenerateImage(args) => generate_image::cmd_generate_image(args),
         Command::GenerateAudio(args) => generate_audio::cmd_generate_audio(args),
-        Command::ServeImages { model, port } => serve_images::cmd_serve_images(model, port),
+        Command::ServeImages { model, port, lora, lora_scale } => {
+            serve_images::cmd_serve_images(model, port, lora, lora_scale)
+        }
         Command::ServeAudio { model, port, transcribe_model, language } => {
             serve_audio::cmd_serve_audio(model, port, transcribe_model, language)
         }

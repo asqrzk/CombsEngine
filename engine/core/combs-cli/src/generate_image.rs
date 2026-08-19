@@ -42,6 +42,13 @@ pub struct GenerateImageArgs {
     /// Output PNG path.
     #[arg(long, default_value = "output.png")]
     pub output: PathBuf,
+    /// LoRA safetensors file to fuse into the pipeline at load time
+    /// (diffusers or kohya key format).
+    #[arg(long)]
+    pub lora: Option<PathBuf>,
+    /// LoRA strength multiplier.
+    #[arg(long, default_value_t = 1.0)]
+    pub lora_scale: f32,
 }
 
 pub fn cmd_generate_image(args: GenerateImageArgs) -> Result<()> {
@@ -55,9 +62,14 @@ pub fn cmd_generate_image(args: GenerateImageArgs) -> Result<()> {
     );
 
     let device = combs_core::init_device();
-    let mut pipeline =
-        load_diffusion_model::<combs_core::CombsBackendF32>(architecture, &model_dir, &device)
-            .context("loading diffusion pipeline")?;
+    let lora = args.lora.as_ref().map(|path| combs_diffusion::LoraSpec {
+        path: path.clone(),
+        scale: args.lora_scale,
+    });
+    let mut pipeline = combs_diffusion::loader::load_diffusion_model_with_lora::<
+        combs_core::CombsBackendF32,
+    >(architecture, &model_dir, &device, lora.as_ref())
+    .context("loading diffusion pipeline")?;
 
     let scheduler = SchedulerKind::parse(&args.scheduler)
         .with_context(|| format!("unknown scheduler {:?} (ddpm | ddim | dpm++2m)", args.scheduler))?;
