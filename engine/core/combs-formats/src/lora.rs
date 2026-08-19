@@ -1,20 +1,24 @@
-//! LoRA merge-at-load for the diffusion pipeline.
+//! LoRA merge-at-load, shared by the diffusion and text pipelines.
 //!
-//! Reads a LoRA safetensors file in either wild format — diffusers
-//! (`unet.<path>.lora.down.weight`, incl. the PEFT `lora_A`/`lora_B`
-//! spelling) or kohya (`lora_unet_<flat>.lora_down.weight` + per-module
-//! `.alpha`) — and fuses `W' = W + scale * (alpha/rank) * (up @ down)`
-//! on the host in f32 before the weights reach the device. Base tensors
-//! the file does not touch stay mmap-served. Unmatched or
-//! unsupported-shape modules are skipped loudly, never silently.
+//! Reads a LoRA safetensors file in the three wild formats — diffusers
+//! (`unet.<path>.lora.down.weight`, incl. the `lora_A`/`lora_B`
+//! spelling), kohya (`lora_unet_<flat>.lora_down.weight` + per-module
+//! `.alpha`), and PEFT text adapters
+//! (`base_model.model.<path>.lora_A.weight`, alpha in the sibling
+//! `adapter_config.json`) — and fuses
+//! `W' = W + scale * (alpha/rank) * (up @ down)` on the host in f32
+//! before the weights reach the device. Base tensors the file does not
+//! touch stay mmap-served; merged tensors force the dense path even on
+//! packed-quant sources. Unmatched or unsupported-shape modules are
+//! skipped loudly, never silently.
 
 use std::collections::HashMap;
 use std::path::Path;
 
-use combs_formats::{
-    FormatError, ModelMetadata, ModelSource, Result, SamplerConfig, TensorDtype, TensorReader,
-    TokenizerSpec,
-};
+use crate::metadata::ModelMetadata;
+use crate::source::{SamplerConfig, TensorDtype, TensorReader};
+use crate::tokenizer::TokenizerSpec;
+use crate::{FormatError, ModelSource, Result};
 
 /// A LoRA file to fuse into the pipeline at load time.
 #[derive(Debug, Clone)]
@@ -38,6 +42,9 @@ pub struct LoraFile {
     pub text: HashMap<String, LoraPair>,
     /// File keys that matched no known LoRA naming scheme.
     pub unrecognized: Vec<String>,
+    /// File-level alpha from a sibling `adapter_config.json` (PEFT keeps
+    /// one `lora_alpha` for the whole adapter instead of per-module keys).
+    pub file_alpha: Option<f32>,
 }
 
 fn dtype_of(d: safetensors::Dtype) -> Result<TensorDtype> {
@@ -109,6 +116,17 @@ fn classify(key: &str) -> Option<(bool, String, Part)> {
             return Some((is_unet, format!("{}.weight", kohya_to_dotted(flat)), part));
         }
     }
+    // PEFT text adapters: base_model.model.<path>.(lora_A|lora_B).weight
+    if let Some(rest) = key.strip_prefix("base_model.model.") {
+        let (path, part) = if let Some(p) = rest.strip_suffix(".lora_A.weight") {
+            (p, Part::Down)
+        } else if let Some(p) = rest.strip_suffix(".lora_B.weight") {
+            (p, Part::Up)
+        } else {
+            return None;
+        };
+        return Some((false, format!("{path}.weight"), part));
+    }
     // diffusers: <comp>.<path>.(lora.down|lora.up|lora_A|lora_B).weight
     for (prefix, is_unet) in [("unet.", true), ("text_encoder.", false)] {
         if let Some(rest) = key.strip_prefix(prefix) {
@@ -164,7 +182,15 @@ impl LoraFile {
                 Part::Alpha => pair.alpha = values.first().copied(),
             }
         }
-        Ok(Self { unet, text, unrecognized })
+        let file_alpha = path
+            .parent()
+            .map(|d| d.join("adapter_config.json"))
+            .filter(|p| p.is_file())
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| v.get("lora_alpha").and_then(|a| a.as_f64()))
+            .map(|a| a as f32);
+        Ok(Self { unet, text, unrecognized, file_alpha })
     }
 }
 
@@ -183,6 +209,7 @@ pub fn merge_lora<S: ModelSource>(
     base: S,
     pairs: &HashMap<String, LoraPair>,
     scale: f32,
+    default_alpha: Option<f32>,
 ) -> Result<LoraMergedSource<S>> {
     let names: std::collections::HashSet<String> = base.tensor_names().into_iter().collect();
     let mut merged = HashMap::new();
@@ -222,7 +249,7 @@ pub fn merge_lora<S: ModelSource>(
             .load_data()?
             .to_vec::<f32>()
             .map_err(|e| FormatError::Safetensors(format!("{target}: {e:?}")))?;
-        let alpha = pair.alpha.unwrap_or(rank as f32);
+        let alpha = pair.alpha.or(default_alpha).unwrap_or(rank as f32);
         let factor = scale * alpha / rank as f32;
         // w[o*in + i] += factor * sum_r up[o*rank + r] * down[r*in + i]
         for o in 0..out_dim {
@@ -239,6 +266,18 @@ pub fn merge_lora<S: ModelSource>(
             }
         }
         merged.insert(target.clone(), (w, base_shape));
+    }
+    let mut dense_fallback_bytes: u64 = 0;
+    for (name, (w, _)) in &merged {
+        if matches!(base.open_tensor_quant(name), Ok(Some(_))) {
+            dense_fallback_bytes += (w.len() * 4) as u64;
+        }
+    }
+    if dense_fallback_bytes > 0 {
+        eprintln!(
+            "lora: {} MB of packed-quant base tensors will run dense f32 (merged weights cannot stay packed)",
+            dense_fallback_bytes / (1024 * 1024)
+        );
     }
     Ok(LoraMergedSource { base, applied: merged.len(), merged, skipped })
 }
@@ -271,6 +310,15 @@ impl<S: ModelSource> ModelSource for LoraMergedSource<S> {
 
     fn sampler_defaults(&self) -> Option<SamplerConfig> {
         self.base.sampler_defaults()
+    }
+
+    fn open_tensor_quant(&self, name: &str) -> Result<Option<crate::QuantTensor<'_>>> {
+        // A merged tensor no longer equals the packed bytes on disk — force
+        // the dense path so the delta is never silently dropped.
+        if self.merged.contains_key(name) {
+            return Ok(None);
+        }
+        self.base.open_tensor_quant(name)
     }
 }
 
@@ -321,6 +369,13 @@ mod tests {
                 .unwrap();
         assert!(!u);
         assert_eq!(t, "text_model.encoder.layers.3.self_attn.q_proj.weight");
+
+        let (u, t, p) = classify(
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+        )
+        .unwrap();
+        assert!(!u && matches!(p, Part::Down));
+        assert_eq!(t, "model.layers.0.self_attn.q_proj.weight");
 
         assert!(classify("some_random_tensor").is_none());
     }

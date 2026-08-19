@@ -8,7 +8,6 @@ description = "Diffusion model runtime for Combs Engine (Burn-native)"
 [dependencies]
 burn.workspace = true
 combs-formats = { path = "../combs-formats", version = "0.2.2" }
-safetensors.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokenizers.workspace = true

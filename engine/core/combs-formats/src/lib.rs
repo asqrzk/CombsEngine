@@ -10,6 +10,7 @@
 mod flatbuf;
 mod gguf;
 mod litertlm;
+mod lora;
 mod metadata;
 mod protomin;
 mod safetensors;
@@ -32,6 +33,7 @@ pub mod quants {
 }
 pub use metadata::{Activation, AttentionPattern, ModelMetadata, RopeScaling, VisionConfig};
 pub use safetensors::SafetensorsSource;
+pub use lora::{merge_lora, LoraFile, LoraMergedSource, LoraSpec};
 pub use litertlm::{SectionInfo, read_sections as litertlm_read_sections};
 pub use source::{ModelSource, QuantFormat, QuantTensor, SamplerConfig, TensorDtype, TensorReader};
 pub use spm::{ensure_tokenizer_json_from_spm, spm_added_tokens};

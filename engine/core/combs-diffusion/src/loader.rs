@@ -89,7 +89,7 @@ pub fn load_diffusion_model_with_lora<B: Backend>(
     architecture: DiffusionArchitecture,
     model_dir: impl AsRef<Path>,
     device: &B::Device,
-    lora: Option<&crate::lora::LoraSpec>,
+    lora: Option<&combs_formats::LoraSpec>,
 ) -> Result<StableDiffusionPipeline<B>> {
     let model_dir = model_dir.as_ref();
 
@@ -103,7 +103,7 @@ pub fn load_diffusion_model_with_lora<B: Backend>(
 fn load_stable_diffusion_1_5<B: Backend>(
     model_dir: &Path,
     device: &B::Device,
-    lora: Option<&crate::lora::LoraSpec>,
+    lora: Option<&combs_formats::LoraSpec>,
 ) -> Result<StableDiffusionPipeline<B>> {
     let unet_source = SafetensorsSource::load_weights_only(
         model_dir.join("unet"),
@@ -121,7 +121,7 @@ fn load_stable_diffusion_1_5<B: Backend>(
     let tokenizer = load_tokenizer_spec(model_dir)?;
 
     if let Some(spec) = lora {
-        let file = crate::lora::LoraFile::load(&spec.path)?;
+        let file = combs_formats::LoraFile::load(&spec.path)?;
         if !file.unrecognized.is_empty() {
             eprintln!(
                 "lora: {} keys matched no known naming scheme (first: {})",
@@ -129,8 +129,10 @@ fn load_stable_diffusion_1_5<B: Backend>(
                 file.unrecognized[0]
             );
         }
-        let unet_merged = crate::lora::merge_lora(unet_source, &file.unet, spec.scale)?;
-        let text_merged = crate::lora::merge_lora(text_source, &file.text, spec.scale)?;
+        let unet_merged =
+            combs_formats::merge_lora(unet_source, &file.unet, spec.scale, file.file_alpha)?;
+        let text_merged =
+            combs_formats::merge_lora(text_source, &file.text, spec.scale, file.file_alpha)?;
         for (label, applied, skipped) in [
             ("unet", unet_merged.applied, &unet_merged.skipped),
             ("text_encoder", text_merged.applied, &text_merged.skipped),
