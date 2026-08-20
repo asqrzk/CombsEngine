@@ -95,7 +95,10 @@ pub fn cmd_generate_image(args: GenerateImageArgs) -> Result<()> {
             args.guidance_scale,
             args.seed,
             scheduler,
-            Some(&mut report),
+            combs_diffusion::GenerationHooks {
+                on_step: Some(&mut report),
+                ..Default::default()
+            },
         )
         .context("generating image")?;
 

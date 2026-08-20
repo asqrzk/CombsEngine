@@ -28,6 +28,18 @@ pub fn json_response(status: u16, body: Value) -> HttpResponse {
         .with_header(cors_header())
 }
 
+/// Non-JSON payload (e.g. a preview PNG) with an explicit content type.
+pub fn bytes_response(status: u16, content_type: &str, data: Vec<u8>) -> HttpResponse {
+    let len = data.len();
+    tiny_http::Response::empty(status)
+        .with_data(
+            Box::new(std::io::Cursor::new(data)) as Box<dyn Read + Send>,
+            Some(len),
+        )
+        .with_header(tiny_http::Header::from_bytes("Content-Type", content_type).unwrap())
+        .with_header(cors_header())
+}
+
 /// Respond to a CORS preflight probe (browsers send OPTIONS before POSTs).
 pub fn respond_preflight(request: tiny_http::Request) {
     let _ = request.respond(

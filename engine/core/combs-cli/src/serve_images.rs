@@ -25,9 +25,19 @@ use combs_diffusion::{
 };
 
 use crate::generate_image::tensor_to_rgb_image;
-use crate::http::{HttpResponse, error_json, json_response, respond_preflight};
+use crate::http::{HttpResponse, bytes_response, error_json, json_response, respond_preflight};
 
 type SharedPipeline = Arc<Mutex<Box<dyn DiffusionModel<combs_core::CombsBackendF32>>>>;
+/// Latest mid-run preview: (completed step, PNG bytes). Cleared when a new
+/// generation stamps its counters; survives after completion until then.
+type PreviewStash = Arc<Mutex<Option<(u64, Vec<u8>)>>>;
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Worker observability for `/v1/stats`: rolling counters written during
 /// and after each generation (u64 atomics; durations stored as
@@ -44,6 +54,11 @@ struct ImageStats {
     current_step: std::sync::atomic::AtomicU64,
     total_steps: std::sync::atomic::AtomicU64,
     started_at_ms: std::sync::atomic::AtomicU64,
+    // Completion time of denoise step 1 — the ETA baseline that excludes
+    // prompt-encode and first-step warmup.
+    first_step_at_ms: std::sync::atomic::AtomicU64,
+    // Last preview's step number (0 = none this run).
+    preview_step: std::sync::atomic::AtomicU64,
     phase: std::sync::atomic::AtomicU8,
 }
 
@@ -52,6 +67,7 @@ pub fn cmd_serve_images(
     port: u16,
     lora: Option<PathBuf>,
     lora_scale: f32,
+    preview_every: usize,
 ) -> Result<()> {
     let t_load = std::time::Instant::now();
     let model_dir = super::resolve_model_arg(&model)?;
@@ -93,9 +109,14 @@ pub fn cmd_serve_images(
     eprintln!("[serve-images] listening on http://{addr} (model: {model_id})");
 
     let stats = Arc::new(ImageStats::default());
+    let preview: PreviewStash = Arc::new(Mutex::new(None));
+    if preview_every > 0 {
+        eprintln!("[serve-images] previews on: every {preview_every} steps");
+    }
     for mut request in server.incoming_requests() {
         let pipeline = pipeline.clone();
         let stats = stats.clone();
+        let preview = preview.clone();
         let model_id = model_id.clone();
         let lora_info = lora_info.clone();
         std::thread::spawn(move || {
@@ -113,22 +134,37 @@ pub fn cmd_serve_images(
                     let generation = if gen_total == 0 {
                         Value::Null
                     } else {
-                        let now_ms = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
+                        let now = now_ms();
+                        let step = stats.current_step.load(Relaxed);
+                        let phase = stats.phase.load(Relaxed);
+                        // Measured pace: (t_now - t_step1) / (step - 1),
+                        // so encode + first-step warmup never skew it.
+                        let first = stats.first_step_at_ms.load(Relaxed);
+                        let eta_ms = if phase == 2 && step >= 2 && first > 0 {
+                            let per = now.saturating_sub(first) / (step - 1);
+                            Value::from(per * (gen_total - step))
+                        } else {
+                            Value::Null
+                        };
+                        let preview_step = stats.preview_step.load(Relaxed);
                         json!({
-                            "step": stats.current_step.load(Relaxed),
+                            "step": step,
                             "total": gen_total,
-                            "phase": match stats.phase.load(Relaxed) {
+                            "phase": match phase {
                                 1 => Value::from("encode"),
                                 2 => Value::from("denoise"),
                                 3 => Value::from("decode"),
                                 4 => Value::from("png"),
                                 _ => Value::Null,
                             },
+                            "eta_ms": eta_ms,
+                            "preview_step": if preview_step > 0 {
+                                Value::from(preview_step)
+                            } else {
+                                Value::Null
+                            },
                             "elapsed_ms":
-                                now_ms.saturating_sub(stats.started_at_ms.load(Relaxed)),
+                                now.saturating_sub(stats.started_at_ms.load(Relaxed)),
                         })
                     };
                     json_response(
@@ -143,17 +179,34 @@ pub fn cmd_serve_images(
                             "last_duration_ms": stats.last_duration_ms.load(Relaxed),
                             "last_bytes": stats.last_bytes.load(Relaxed),
                             "generation": generation,
+                            "preview_every": preview_every,
                             "lora": lora_info,
                             "load": {"ms": load_ms, "open_ms": open_ms, "weights_ms": weights_ms},
                         }),
                     )
+                }
+                ("GET", "/v1/preview") => {
+                    match preview.lock().unwrap().clone() {
+                        Some((step, png)) => bytes_response(200, "image/png", png)
+                            .with_header(
+                                tiny_http::Header::from_bytes(
+                                    "X-Combs-Preview-Step",
+                                    step.to_string(),
+                                )
+                                .unwrap(),
+                            ),
+                        None => json_response(
+                            404,
+                            error_json("not_found", "no preview available"),
+                        ),
+                    }
                 }
                 ("POST", "/v1/images/generations") => {
                     let mut body = String::new();
                     if request.as_reader().read_to_string(&mut body).is_err() {
                         json_response(400, error_json("invalid_request", "unreadable body"))
                     } else {
-                        handle_generate(&pipeline, &body, &stats)
+                        handle_generate(&pipeline, &body, &stats, &preview, preview_every)
                     }
                 }
                 _ => json_response(404, error_json("not_found", "unknown endpoint")),
@@ -164,7 +217,13 @@ pub fn cmd_serve_images(
     Ok(())
 }
 
-fn handle_generate(pipeline: &SharedPipeline, body: &str, stats: &ImageStats) -> HttpResponse {
+fn handle_generate(
+    pipeline: &SharedPipeline,
+    body: &str,
+    stats: &ImageStats,
+    preview: &PreviewStash,
+    preview_every: usize,
+) -> HttpResponse {
     let req: Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(e) => {
@@ -264,18 +323,18 @@ fn handle_generate(pipeline: &SharedPipeline, body: &str, stats: &ImageStats) ->
         use std::sync::atomic::Ordering::Relaxed;
         stats.current_step.store(0, Relaxed);
         stats.total_steps.store(steps as u64, Relaxed);
+        stats.first_step_at_ms.store(0, Relaxed);
+        stats.preview_step.store(0, Relaxed);
         stats.phase.store(1, Relaxed);
-        stats.started_at_ms.store(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
-            Relaxed,
-        );
+        stats.started_at_ms.store(now_ms(), Relaxed);
     }
+    *preview.lock().unwrap() = None;
     let mut on_step = |step: usize, total: usize| {
         use std::sync::atomic::Ordering::Relaxed;
         stats.current_step.store(step as u64, Relaxed);
+        if step == 1 {
+            stats.first_step_at_ms.store(now_ms(), Relaxed);
+        }
         if step == total {
             // After the final scheduler step, what's left inside
             // generate() is the VAE decode.
@@ -284,6 +343,25 @@ fn handle_generate(pipeline: &SharedPipeline, body: &str, stats: &ImageStats) ->
                 "[serve-images] denoise done ({total} steps) at {:.1}s",
                 started.elapsed().as_secs_f64()
             );
+        }
+    };
+    let mut on_preview = |step: usize, image| {
+        let png = tensor_to_rgb_image(&image).ok().and_then(|img| {
+            let mut buf: Vec<u8> = Vec::new();
+            img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .ok()?;
+            Some(buf)
+        });
+        if let Some(png) = png {
+            eprintln!(
+                "[serve-images] preview at step {step} ({} bytes, {:.1}s)",
+                png.len(),
+                started.elapsed().as_secs_f64()
+            );
+            *preview.lock().unwrap() = Some((step as u64, png));
+            stats
+                .preview_step
+                .store(step as u64, std::sync::atomic::Ordering::Relaxed);
         }
     };
     let result = (|| -> Result<(Vec<u8>, u64)> {
@@ -301,7 +379,11 @@ fn handle_generate(pipeline: &SharedPipeline, body: &str, stats: &ImageStats) ->
             guidance,
             seed,
             scheduler,
-            Some(&mut on_step),
+            combs_diffusion::GenerationHooks {
+                on_step: Some(&mut on_step),
+                preview_every,
+                on_preview: Some(&mut on_preview),
+            },
         )?;
         stats.phase.store(4, std::sync::atomic::Ordering::Relaxed);
         eprintln!(

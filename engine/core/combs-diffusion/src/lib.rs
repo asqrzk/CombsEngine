@@ -38,6 +38,26 @@ pub struct PromptEmbed<B: Backend> {
     pub negative: Option<Tensor<B, 3>>,
 }
 
+/// Optional callbacks into the denoising loop — the plugin surface for
+/// progress and preview consumers. `Default` is fully inert.
+pub struct GenerationHooks<'a, B: Backend> {
+    /// Fires after each completed denoise step with `(completed, total)`,
+    /// 1-based; `&mut dyn` keeps `DiffusionModel` object-safe.
+    pub on_step: Option<&'a mut dyn FnMut(usize, usize)>,
+    /// Decode the in-progress image every N completed steps (0 = never).
+    /// Each preview is one extra VAE decode INSIDE the denoise loop, so
+    /// the run slows by roughly total/N decode times.
+    pub preview_every: usize,
+    /// Receives `(completed_step, decoded RGB image [b,3,h,w] in 0..=1)`.
+    pub on_preview: Option<&'a mut dyn FnMut(usize, Tensor<B, 4>)>,
+}
+
+impl<B: Backend> Default for GenerationHooks<'_, B> {
+    fn default() -> Self {
+        Self { on_step: None, preview_every: 0, on_preview: None }
+    }
+}
+
 /// Model-agnostic diffusion contract. Analogous to `GenerativeModel` but for
 /// latent denoising instead of autoregressive token generation.
 pub trait DiffusionModel<B: Backend>: Send {
@@ -53,8 +73,8 @@ pub trait DiffusionModel<B: Backend>: Send {
     /// Run the full denoising loop and return the image tensor
     /// `[batch, channels, height, width]` in RGB order plus the effective
     /// seed (caller-provided, or entropy-drawn and echoed for reproduction).
-    /// `on_step` fires after each completed denoise step with
-    /// `(completed, total)`, 1-based; `&mut dyn` keeps the trait object-safe.
+    /// `hooks` carries the optional step/preview callbacks; pass
+    /// `GenerationHooks::default()` for a silent run.
     fn generate(
         &mut self,
         prompt: PromptEmbed<B>,
@@ -64,7 +84,7 @@ pub trait DiffusionModel<B: Backend>: Send {
         guidance_scale: f32,
         seed: Option<u64>,
         scheduler: SchedulerKind,
-        on_step: Option<&mut dyn FnMut(usize, usize)>,
+        hooks: GenerationHooks<'_, B>,
     ) -> Result<(Tensor<B, 4>, u64)>;
 }
 
@@ -181,7 +201,7 @@ impl<B: Backend> DiffusionModel<B> for StableDiffusionPipeline<B> {
         guidance_scale: f32,
         seed: Option<u64>,
         scheduler: SchedulerKind,
-        mut on_step: Option<&mut dyn FnMut(usize, usize)>,
+        mut hooks: GenerationHooks<'_, B>,
     ) -> Result<(Tensor<B, 4>, u64)> {
         let [b, _seq, _hidden] = prompt.positive.dims();
         let latent_h = (height / 8).max(1) as usize;
@@ -226,21 +246,39 @@ impl<B: Backend> DiffusionModel<B> for StableDiffusionPipeline<B> {
                 pred
             };
             latent = sched.step(noise_pred, i, latent, &mut noise);
-            if let Some(cb) = on_step.as_mut() {
-                cb(i + 1, steps.len());
+            let completed = i + 1;
+            if let Some(cb) = hooks.on_step.as_mut() {
+                cb(completed, steps.len());
+            }
+            // Mid-run preview: skip the final step — the tail decode below
+            // delivers that image anyway.
+            if hooks.preview_every > 0
+                && completed % hooks.preview_every == 0
+                && completed < steps.len()
+            {
+                if let Some(cb) = hooks.on_preview.as_mut() {
+                    let img = self.decode_latent(latent.clone());
+                    cb(completed, img);
+                }
             }
         }
 
         // 3. VAE decode latent -> image
-        //    Latents are in scaled space; undo the scaling before decoding.
-        let latent = latent.div_scalar(0.18215f32);
-        let image = self.vae_decoder.forward(latent);
-        let image = image.clamp(-1.0, 1.0).mul_scalar(0.5).add_scalar(0.5);
+        let image = self.decode_latent(latent);
         Ok((image, noise.effective_seed()))
     }
 }
 
 impl<B: Backend> StableDiffusionPipeline<B> {
+    /// Scaled latent -> RGB image in [0, 1]: undo the latent scaling,
+    /// decode through the VAE, clamp. The tail of generate() and every
+    /// mid-run preview share this exact path.
+    fn decode_latent(&self, latent: Tensor<B, 4>) -> Tensor<B, 4> {
+        let latent = latent.div_scalar(0.18215f32);
+        let image = self.vae_decoder.forward(latent);
+        image.clamp(-1.0, 1.0).mul_scalar(0.5).add_scalar(0.5)
+    }
+
     /// Build a pipeline from separate component sources (UNet, VAE, text encoder,
     /// tokenizer). This is the real checkpoint loading path; the `DiffusionModel`
     /// trait loader is kept for scaffold / random-init sources.

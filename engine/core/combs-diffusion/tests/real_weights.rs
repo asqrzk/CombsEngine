@@ -21,7 +21,7 @@ fn sd15_real_checkpoint_generates() {
         .expect("failed to encode prompt");
 
     let (image, _seed) = pipeline
-        .generate(embed, 64, 64, 5, 7.5, Some(42), combs_diffusion::SchedulerKind::default(), None)
+        .generate(embed, 64, 64, 5, 7.5, Some(42), combs_diffusion::SchedulerKind::default(), combs_diffusion::GenerationHooks::default())
         .expect("generation failed");
 
     assert_eq!(image.dims(), [1, 3, 64, 64]);
