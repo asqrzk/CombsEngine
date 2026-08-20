@@ -29,14 +29,19 @@ use crate::http::{HttpResponse, error_json, json_response, respond_preflight};
 
 type SharedPipeline = Arc<Mutex<Box<dyn DiffusionModel<combs_core::CombsBackendF32>>>>;
 
-/// Worker observability for `/v1/stats`: rolling counters written after
-/// each generation (u64 atomics; durations stored as milliseconds).
+/// Worker observability for `/v1/stats`: rolling counters written during
+/// and after each generation (u64 atomics; durations stored as
+/// milliseconds). `total_steps == 0` means no generation in flight —
+/// the stats route reports `generation: null` then.
 #[derive(Default)]
 struct ImageStats {
     requests_total: std::sync::atomic::AtomicU64,
     errors_total: std::sync::atomic::AtomicU64,
     last_duration_ms: std::sync::atomic::AtomicU64,
     last_bytes: std::sync::atomic::AtomicU64,
+    current_step: std::sync::atomic::AtomicU64,
+    total_steps: std::sync::atomic::AtomicU64,
+    started_at_ms: std::sync::atomic::AtomicU64,
 }
 
 pub fn cmd_serve_images(
@@ -101,6 +106,21 @@ pub fn cmd_serve_images(
                 ("GET", "/health") => json_response(200, json!({"status": "ok"})),
                 ("GET", "/v1/stats") => {
                     use std::sync::atomic::Ordering::Relaxed;
+                    let gen_total = stats.total_steps.load(Relaxed);
+                    let generation = if gen_total == 0 {
+                        Value::Null
+                    } else {
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        json!({
+                            "step": stats.current_step.load(Relaxed),
+                            "total": gen_total,
+                            "elapsed_ms":
+                                now_ms.saturating_sub(stats.started_at_ms.load(Relaxed)),
+                        })
+                    };
                     json_response(
                         200,
                         json!({
@@ -112,6 +132,7 @@ pub fn cmd_serve_images(
                             "errors_total": stats.errors_total.load(Relaxed),
                             "last_duration_ms": stats.last_duration_ms.load(Relaxed),
                             "last_bytes": stats.last_bytes.load(Relaxed),
+                            "generation": generation,
                             "lora": lora_info,
                             "load": {"ms": load_ms, "open_ms": open_ms, "weights_ms": weights_ms},
                         }),
@@ -228,10 +249,36 @@ fn handle_generate(pipeline: &SharedPipeline, body: &str, stats: &ImageStats) ->
     // Single in-flight generation: the pipeline holds VRAM-resident state.
     let mut pipeline = pipeline.lock().unwrap();
     let started = std::time::Instant::now();
+    {
+        // Single-flight (mutex above), so these are unambiguous.
+        use std::sync::atomic::Ordering::Relaxed;
+        stats.current_step.store(0, Relaxed);
+        stats.total_steps.store(steps as u64, Relaxed);
+        stats.started_at_ms.store(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            Relaxed,
+        );
+    }
+    let mut on_step = |step: usize, _total: usize| {
+        stats
+            .current_step
+            .store(step as u64, std::sync::atomic::Ordering::Relaxed);
+    };
     let result = (|| -> Result<(Vec<u8>, u64)> {
         let embed = pipeline.encode_prompt(prompt, negative)?;
-        let (image, effective_seed) =
-            pipeline.generate(embed, width, height, steps, guidance, seed, scheduler)?;
+        let (image, effective_seed) = pipeline.generate(
+            embed,
+            width,
+            height,
+            steps,
+            guidance,
+            seed,
+            scheduler,
+            Some(&mut on_step),
+        )?;
         let img = tensor_to_rgb_image(&image)?;
         let mut buf: Vec<u8> = Vec::new();
         img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)?;
@@ -244,6 +291,8 @@ fn handle_generate(pipeline: &SharedPipeline, body: &str, stats: &ImageStats) ->
         stats
             .last_duration_ms
             .store(started.elapsed().as_millis() as u64, Relaxed);
+        stats.total_steps.store(0, Relaxed);
+        stats.current_step.store(0, Relaxed);
         if let Ok((png, _)) = &result {
             stats.last_bytes.store(png.len() as u64, Relaxed);
         } else {

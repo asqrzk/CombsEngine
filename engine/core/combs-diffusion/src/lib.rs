@@ -53,6 +53,8 @@ pub trait DiffusionModel<B: Backend>: Send {
     /// Run the full denoising loop and return the image tensor
     /// `[batch, channels, height, width]` in RGB order plus the effective
     /// seed (caller-provided, or entropy-drawn and echoed for reproduction).
+    /// `on_step` fires after each completed denoise step with
+    /// `(completed, total)`, 1-based; `&mut dyn` keeps the trait object-safe.
     fn generate(
         &mut self,
         prompt: PromptEmbed<B>,
@@ -62,6 +64,7 @@ pub trait DiffusionModel<B: Backend>: Send {
         guidance_scale: f32,
         seed: Option<u64>,
         scheduler: SchedulerKind,
+        on_step: Option<&mut dyn FnMut(usize, usize)>,
     ) -> Result<(Tensor<B, 4>, u64)>;
 }
 
@@ -178,6 +181,7 @@ impl<B: Backend> DiffusionModel<B> for StableDiffusionPipeline<B> {
         guidance_scale: f32,
         seed: Option<u64>,
         scheduler: SchedulerKind,
+        mut on_step: Option<&mut dyn FnMut(usize, usize)>,
     ) -> Result<(Tensor<B, 4>, u64)> {
         let [b, _seq, _hidden] = prompt.positive.dims();
         let latent_h = (height / 8).max(1) as usize;
@@ -222,6 +226,9 @@ impl<B: Backend> DiffusionModel<B> for StableDiffusionPipeline<B> {
                 pred
             };
             latent = sched.step(noise_pred, i, latent, &mut noise);
+            if let Some(cb) = on_step.as_mut() {
+                cb(i + 1, steps.len());
+            }
         }
 
         // 3. VAE decode latent -> image

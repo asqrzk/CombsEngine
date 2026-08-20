@@ -47,7 +47,7 @@ fn diffusion_pipeline_runs() {
     };
 
     let (image, seed) = pipeline
-        .generate(embed, 64, 64, 5, 7.5, Some(42), combs_diffusion::SchedulerKind::default())
+        .generate(embed, 64, 64, 5, 7.5, Some(42), combs_diffusion::SchedulerKind::default(), None)
         .unwrap();
     assert_eq!(seed, 42);
 

@@ -80,6 +80,12 @@ pub fn cmd_generate_image(args: GenerateImageArgs) -> Result<()> {
         .encode_prompt(&args.prompt, args.negative_prompt.as_deref())
         .context("encoding prompt")?;
 
+    let mut report = |step: usize, total: usize| {
+        eprint!("\r  step {step}/{total}");
+        if step == total {
+            eprintln!();
+        }
+    };
     let (image, effective_seed) = pipeline
         .generate(
             embed,
@@ -89,6 +95,7 @@ pub fn cmd_generate_image(args: GenerateImageArgs) -> Result<()> {
             args.guidance_scale,
             args.seed,
             scheduler,
+            Some(&mut report),
         )
         .context("generating image")?;
 

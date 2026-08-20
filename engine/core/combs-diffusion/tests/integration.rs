@@ -47,7 +47,7 @@ fn pipeline_512x512_runs() {
     };
 
     let (image, _seed) = pipeline
-        .generate(embed, 512, 512, 5, 7.5, Some(42), combs_diffusion::SchedulerKind::default())
+        .generate(embed, 512, 512, 5, 7.5, Some(42), combs_diffusion::SchedulerKind::default(), None)
         .unwrap();
     assert_eq!(image.dims(), [1, 3, 512, 512]);
 }
