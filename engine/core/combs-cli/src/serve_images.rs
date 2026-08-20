@@ -32,7 +32,9 @@ type SharedPipeline = Arc<Mutex<Box<dyn DiffusionModel<combs_core::CombsBackendF
 /// Worker observability for `/v1/stats`: rolling counters written during
 /// and after each generation (u64 atomics; durations stored as
 /// milliseconds). `total_steps == 0` means no generation in flight —
-/// the stats route reports `generation: null` then.
+/// the stats route reports `generation: null` then. `phase` maps
+/// 1=encode (CLIP prompt), 2=denoise (UNet loop), 3=decode (VAE),
+/// 4=png (pack + base64); 0 outside a run.
 #[derive(Default)]
 struct ImageStats {
     requests_total: std::sync::atomic::AtomicU64,
@@ -42,6 +44,7 @@ struct ImageStats {
     current_step: std::sync::atomic::AtomicU64,
     total_steps: std::sync::atomic::AtomicU64,
     started_at_ms: std::sync::atomic::AtomicU64,
+    phase: std::sync::atomic::AtomicU8,
 }
 
 pub fn cmd_serve_images(
@@ -117,6 +120,13 @@ pub fn cmd_serve_images(
                         json!({
                             "step": stats.current_step.load(Relaxed),
                             "total": gen_total,
+                            "phase": match stats.phase.load(Relaxed) {
+                                1 => Value::from("encode"),
+                                2 => Value::from("denoise"),
+                                3 => Value::from("decode"),
+                                4 => Value::from("png"),
+                                _ => Value::Null,
+                            },
                             "elapsed_ms":
                                 now_ms.saturating_sub(stats.started_at_ms.load(Relaxed)),
                         })
@@ -254,6 +264,7 @@ fn handle_generate(pipeline: &SharedPipeline, body: &str, stats: &ImageStats) ->
         use std::sync::atomic::Ordering::Relaxed;
         stats.current_step.store(0, Relaxed);
         stats.total_steps.store(steps as u64, Relaxed);
+        stats.phase.store(1, Relaxed);
         stats.started_at_ms.store(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -262,13 +273,26 @@ fn handle_generate(pipeline: &SharedPipeline, body: &str, stats: &ImageStats) ->
             Relaxed,
         );
     }
-    let mut on_step = |step: usize, _total: usize| {
-        stats
-            .current_step
-            .store(step as u64, std::sync::atomic::Ordering::Relaxed);
+    let mut on_step = |step: usize, total: usize| {
+        use std::sync::atomic::Ordering::Relaxed;
+        stats.current_step.store(step as u64, Relaxed);
+        if step == total {
+            // After the final scheduler step, what's left inside
+            // generate() is the VAE decode.
+            stats.phase.store(3, Relaxed);
+            eprintln!(
+                "[serve-images] denoise done ({total} steps) at {:.1}s",
+                started.elapsed().as_secs_f64()
+            );
+        }
     };
     let result = (|| -> Result<(Vec<u8>, u64)> {
         let embed = pipeline.encode_prompt(prompt, negative)?;
+        stats.phase.store(2, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "[serve-images] prompt encoded at {:.1}s",
+            started.elapsed().as_secs_f64()
+        );
         let (image, effective_seed) = pipeline.generate(
             embed,
             width,
@@ -279,6 +303,11 @@ fn handle_generate(pipeline: &SharedPipeline, body: &str, stats: &ImageStats) ->
             scheduler,
             Some(&mut on_step),
         )?;
+        stats.phase.store(4, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "[serve-images] vae decoded at {:.1}s",
+            started.elapsed().as_secs_f64()
+        );
         let img = tensor_to_rgb_image(&image)?;
         let mut buf: Vec<u8> = Vec::new();
         img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)?;
@@ -293,6 +322,7 @@ fn handle_generate(pipeline: &SharedPipeline, body: &str, stats: &ImageStats) ->
             .store(started.elapsed().as_millis() as u64, Relaxed);
         stats.total_steps.store(0, Relaxed);
         stats.current_step.store(0, Relaxed);
+        stats.phase.store(0, Relaxed);
         if let Ok((png, _)) = &result {
             stats.last_bytes.store(png.len() as u64, Relaxed);
         } else {
