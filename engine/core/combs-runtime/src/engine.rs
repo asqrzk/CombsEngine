@@ -714,6 +714,18 @@ impl Engine {
             .is_some_and(|t| t.contains("tools"))
     }
 
+    /// Whether this model was trained to emit `<think>` reasoning blocks —
+    /// the template renders the tag or the vocab carries it as a control
+    /// token (qwen3 both; qwen2.5 neither). Drives the client's reasoning
+    /// affordance: a think-filter for a model that never thinks is noise.
+    pub fn supports_thinking(&self) -> bool {
+        self.spec
+            .chat_template
+            .as_deref()
+            .is_some_and(|t| t.contains("<think>"))
+            || self.spec.special_token_id("<think>").is_some()
+    }
+
     /// The tool-call phrasing this model's template teaches (drives the
     /// streaming parser).
     pub fn tool_call_style(&self) -> crate::ToolCallStyle {
