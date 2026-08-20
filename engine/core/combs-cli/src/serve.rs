@@ -79,7 +79,7 @@ pub fn serve(
                     200,
                     json!({"object": "list", "data": [model_card(&engine, &model_id)]}),
                 ),
-                ("GET", "/v1/model/info") => model_info(&engine, &model_id),
+                ("GET", "/v1/model/info") => model_info(&engine, &model_id, &static_info),
                 ("GET", "/v1/stats") => stats_response(&engine, &model_id, &counters, &static_info),
                 ("GET", "/v1/sessions") => sessions_response(&engine),
                 ("DELETE", p) if p == "/v1/sessions" || p.starts_with("/v1/sessions/") => {
@@ -256,6 +256,7 @@ fn capabilities_json(engine: &Arc<Engine>) -> Value {
         "logprobs": true,
         "min_p": true,
         "completions": true,
+        "thinking": engine.supports_thinking(),
     })
 }
 
@@ -460,10 +461,14 @@ fn attention_json(engine: &Arc<Engine>) -> Value {
 
 /// Rich model descriptor: real context budget (KV arena), architecture,
 /// and generation defaults — everything a client needs to size requests.
-fn model_info(engine: &Arc<Engine>, model_id: &str) -> HttpResponse {
+fn model_info(engine: &Arc<Engine>, model_id: &str, static_info: &Value) -> HttpResponse {
     let meta = engine.metadata();
     let cc = engine.cache_config();
     let dc = engine.default_config();
+    let mut media_input = vec!["text"];
+    if meta.vision.is_some() {
+        media_input.push("image");
+    }
     json_response(
         200,
         json!({
@@ -481,6 +486,9 @@ fn model_info(engine: &Arc<Engine>, model_id: &str) -> HttpResponse {
             "vocab_size": meta.vocab_size,
             "vision": meta.vision.is_some(),
             "tools": engine.supports_tools(),
+            "thinking": engine.supports_thinking(),
+            "media": {"input": media_input, "output": ["text"]},
+            "adapter": static_info.get("lora").cloned().unwrap_or(Value::Null),
             "capabilities": capabilities_json(engine),
             "defaults": {
                 "max_tokens": dc.max_tokens,
