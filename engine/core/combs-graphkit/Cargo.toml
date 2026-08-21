@@ -1,0 +1,19 @@
+[package]
+name = "combs-graphkit"
+version = "0.2.2"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Looped graph algorithms (spreading activation, k-hop) with CPU reference and GPU (Burn/wgpu) paths"
+publish = false
+
+[features]
+default = []
+# GPU path over the estate's own backend (CombsBackendF32 = Burn/wgpu).
+gpu = ["dep:combs-core", "dep:burn"]
+
+[dependencies]
+combs-core = { workspace = true, optional = true }
+burn = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true

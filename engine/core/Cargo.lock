@@ -1245,6 +1245,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "combs-graphkit"
+version = "0.2.2"
+dependencies = [
+ "burn",
+ "combs-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "combs-graphkit-ffi"
+version = "0.2.2"
+dependencies = [
+ "combs-graphkit",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "combs-media"
 version = "0.2.2"
 dependencies = [

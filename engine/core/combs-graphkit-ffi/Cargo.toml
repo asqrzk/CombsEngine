@@ -1,0 +1,22 @@
+[package]
+name = "combs-graphkit-ffi"
+version = "0.2.2"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Graphkit stable C ABI: one combsgraph_op_json escape hatch"
+publish = false
+
+[lib]
+# Artifact name matches the combsgraph_* symbol prefix (libcombsgraph_ffi.*).
+name = "combsgraph_ffi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+default = []
+gpu = ["combs-graphkit/gpu"]
+
+[dependencies]
+combs-graphkit = { path = "../combs-graphkit", version = "0.2.2" }
+serde.workspace = true
+serde_json.workspace = true
