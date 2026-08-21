@@ -25,6 +25,9 @@ import type {
   SearchQuery,
 } from "./types.ts";
 import { DEFAULT_CASTE_DOORS } from "./types.ts";
+import { cleanText } from "./sanitize.ts";
+
+const CASTE_NAMES = new Set(["youngling", "worker", "queen", "drone"]);
 
 const CASTES: Caste[] = ["youngling", "worker", "queen", "drone"];
 
@@ -141,7 +144,16 @@ export class GraphStore {
 
   // ── entities ──────────────────────────────────────────────────────
 
-  async upsertEntities(specs: EntitySpec[]): Promise<Entity[]> {
+  async upsertEntities(rawSpecs: EntitySpec[]): Promise<Entity[]> {
+    // Every write passes the sanitize boundary: names key relations and
+    // observations reach prompts, so poison never lands in either.
+    const specs = rawSpecs.map((s) => ({
+      ...s,
+      name: cleanText(s.name),
+      type: cleanText(s.type),
+      project: s.project == null ? s.project : cleanText(s.project),
+      caste: s.caste && CASTE_NAMES.has(s.caste) ? s.caste : undefined,
+    }));
     const now = Date.now();
     // Crypto seals happen BEFORE the transaction (no awaits inside it).
     const sealed = new Map<number, { content: string; enc: string | null }[]>();
@@ -176,11 +188,13 @@ export class GraphStore {
           spec.project ?? null,
           spec.caste ?? null,
         );
+        // Replace-with-empty must still clear: a refresh where the doc
+        // line vanished would otherwise keep the stale observation.
+        if (spec.replaceObservations && spec.observations) {
+          this.db.prepare("DELETE FROM observations WHERE entity = ?").run(spec.name);
+        }
         const rows = sealed.get(i);
         if (rows) {
-          if (spec.replaceObservations) {
-            this.db.prepare("DELETE FROM observations WHERE entity = ?").run(spec.name);
-          }
           this.insertObservationRows(spec.name, rows, now);
         }
         out.push(
@@ -194,10 +208,11 @@ export class GraphStore {
     });
   }
 
-  async getEntity(name: string): Promise<
+  async getEntity(rawName: string): Promise<
     | { entity: Entity; observations: Observation[]; out: Relation[]; inn: Relation[] }
     | undefined
   > {
+    const name = cleanText(rawName);
     const row = this.db
       .prepare(`SELECT ${ENTITY_COLS} FROM entities WHERE name = ?`)
       .get(name) as EntityRow | undefined;
@@ -212,7 +227,7 @@ export class GraphStore {
 
   deleteEntities(names: string[]): Promise<number> {
     let n = 0;
-    for (const name of names) {
+    for (const name of names.map(cleanText)) {
       n += Number(this.db.prepare("DELETE FROM entities WHERE name = ?").run(name).changes);
     }
     return Promise.resolve(n);
@@ -223,8 +238,9 @@ export class GraphStore {
    * the worker threshold. Queens are never demoted here; drones touched
    * by recall wake back to worker.
    */
-  touchEntities(names: string[]): Promise<void> {
-    if (!names.length) return Promise.resolve();
+  touchEntities(rawNames: string[]): Promise<void> {
+    if (!rawNames.length) return Promise.resolve();
+    const names = rawNames.map(cleanText);
     const now = Date.now();
     for (const name of names) {
       this.db
@@ -266,7 +282,7 @@ export class GraphStore {
     contents: string[],
   ): Promise<{ content: string; enc: string | null }[]> {
     const out: { content: string; enc: string | null }[] = [];
-    for (const content of contents) {
+    for (const content of contents.map(cleanText)) {
       if (this.crypto) {
         const sealed = await this.crypto.seal(new TextEncoder().encode(content));
         out.push({ content: sealed.blob, enc: JSON.stringify(sealed.entry) });
@@ -292,14 +308,19 @@ export class GraphStore {
     return ids;
   }
 
-  async addObservations(entity: string, contents: string[]): Promise<Observation[]> {
+  async addObservations(rawEntity: string, rawContents: string[]): Promise<Observation[]> {
+    const entity = cleanText(rawEntity);
+    // Echo what was stored, not what arrived — a raw echo would hand
+    // the poison right back to the caller's context.
+    const contents = rawContents.map(cleanText);
     const now = Date.now();
     const rows = await this.sealContents(contents);
     const ids = this.insertObservationRows(entity, rows, now);
     return contents.map((content, i) => ({ id: ids[i], entity, content, createdAt: now }));
   }
 
-  async observationsFor(entity: string, limit = 50): Promise<Observation[]> {
+  async observationsFor(rawEntity: string, limit = 50): Promise<Observation[]> {
+    const entity = cleanText(rawEntity);
     const rows = this.db
       .prepare(
         "SELECT id, entity, content, enc, created_at FROM observations WHERE entity = ? ORDER BY created_at DESC, id DESC LIMIT ?",
@@ -345,8 +366,13 @@ export class GraphStore {
 
   // ── relations ─────────────────────────────────────────────────────
 
-  addRelations(rels: RelationSpec[]): Promise<Relation[]> {
+  addRelations(rawRels: RelationSpec[]): Promise<Relation[]> {
     const now = Date.now();
+    const rels = rawRels.map((r) => ({
+      from: cleanText(r.from),
+      to: cleanText(r.to),
+      relType: cleanText(r.relType),
+    }));
     const out: Relation[] = [];
     for (const rel of rels) {
       this.db
@@ -360,7 +386,10 @@ export class GraphStore {
   }
 
   /** Atomically make `from` point at exactly one `to` via `relType`. */
-  repointRelation(from: string, to: string, relType: string): void {
+  repointRelation(rawFrom: string, rawTo: string, rawRelType: string): void {
+    const from = cleanText(rawFrom);
+    const to = cleanText(rawTo);
+    const relType = cleanText(rawRelType);
     this.atomically(() => {
       this.db
         .prepare("DELETE FROM relations WHERE from_entity = ? AND rel_type = ?")
@@ -373,8 +402,13 @@ export class GraphStore {
     });
   }
 
-  deleteRelations(rels: RelationSpec[]): Promise<number> {
+  deleteRelations(rawRels: RelationSpec[]): Promise<number> {
     let n = 0;
+    const rels = rawRels.map((r) => ({
+      from: cleanText(r.from),
+      to: cleanText(r.to),
+      relType: cleanText(r.relType),
+    }));
     for (const rel of rels) {
       n += Number(
         this.db
@@ -385,14 +419,16 @@ export class GraphStore {
     return Promise.resolve(n);
   }
 
-  relationsFrom(name: string): Relation[] {
+  relationsFrom(rawName: string): Relation[] {
+    const name = cleanText(rawName);
     return (this.db
       .prepare("SELECT from_entity, to_entity, rel_type, created_at FROM relations WHERE from_entity = ?")
       .all(name) as { from_entity: string; to_entity: string; rel_type: string; created_at: number }[])
       .map((r) => ({ from: r.from_entity, to: r.to_entity, relType: r.rel_type, createdAt: r.created_at }));
   }
 
-  relationsTo(name: string): Relation[] {
+  relationsTo(rawName: string): Relation[] {
+    const name = cleanText(rawName);
     return (this.db
       .prepare("SELECT from_entity, to_entity, rel_type, created_at FROM relations WHERE to_entity = ?")
       .all(name) as { from_entity: string; to_entity: string; rel_type: string; created_at: number }[])
@@ -407,7 +443,7 @@ export class GraphStore {
     const args: (string | number)[] = [];
     if (q.project) {
       clauses.push("project = ?");
-      args.push(q.project);
+      args.push(cleanText(q.project));
     }
     if (q.type) {
       clauses.push("type = ?");
@@ -429,14 +465,15 @@ export class GraphStore {
   }
 
   neighbors(
-    name: string,
+    rawName: string,
     opts: { depth?: number; relType?: string; direction?: "out" | "in" | "both" } = {},
   ): Promise<NeighborsResult> {
+    const name = cleanText(rawName);
     const depth = Math.min(opts.depth ?? 1, 4);
     const direction = opts.direction ?? "both";
     const seen = new Set<string>([name]);
     const relations: Relation[] = [];
-    const relKey = (r: Relation) => `${r.from} ${r.to} ${r.relType}`;
+    const relKey = (r: Relation) => `${r.from}\u0000${r.to}\u0000${r.relType}`;
     const seenRels = new Set<string>();
     let frontier = [name];
     for (let d = 0; d < depth && frontier.length; d++) {
@@ -474,7 +511,9 @@ export class GraphStore {
    * not in `keep`) — enumerate + delete in ONE transaction so the
    * window cannot race a concurrent writer in the other process.
    */
-  sweepStale(project: string, types: string[], keep: Set<string>): Promise<number> {
+  sweepStale(rawProject: string, types: string[], rawKeep: Set<string>): Promise<number> {
+    const project = cleanText(rawProject);
+    const keep = new Set([...rawKeep].map(cleanText));
     return Promise.resolve(this.atomically(() => {
       let n = 0;
       for (const type of types) {
@@ -521,7 +560,8 @@ export class GraphStore {
 
   // ── embeddings ────────────────────────────────────────────────────
 
-  putEmbedding(entity: string, vec: Float32Array): Promise<void> {
+  putEmbedding(rawEntity: string, vec: Float32Array): Promise<void> {
+    const entity = cleanText(rawEntity);
     this.db
       .prepare("INSERT OR REPLACE INTO embeddings (entity, dim, vec) VALUES (?, ?, ?)")
       .run(

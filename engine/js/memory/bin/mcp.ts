@@ -42,7 +42,7 @@ const ops: GraphOps = {
   },
   setState: (project, lines) => setCurrentState(store, project, lines),
   where: (project) => whereAreWe(store, project),
-  graphify: (path, project) => graphify(store, path, { project }),
+  graphify: (path, project, maxFiles) => graphify(store, path, { project, maxFiles }),
   stats: () => store.stats(),
 };
 

@@ -217,6 +217,67 @@ Deno.test("graphify ingests this workspace with import edges and refreshes idemp
   store.close();
 });
 
+Deno.test("graphify reads python: docstring over license, import edges, maxFiles door", async () => {
+  const store = await tempStore();
+  const dir = await Deno.makeTempDir({ prefix: "graphify-py" });
+  await Deno.mkdir(`${dir}/src/pkg`, { recursive: true });
+  await Deno.writeTextFile(
+    `${dir}/src/pkg/__init__.py`,
+    "# Copyright 2026 The Fixture Authors.\n" +
+      '# Licensed under the Apache License, Version 2.0 (the "License");\n' +
+      "# you may not use this file except in compliance with the License.\n" +
+      '\n"""The fixture package."""\n',
+  );
+  await Deno.writeTextFile(
+    `${dir}/src/pkg/util.py`,
+    '"""Helpers that trim the seam."""\nfrom . import config\n',
+  );
+  await Deno.writeTextFile(
+    `${dir}/src/pkg/asf.py`,
+    "# Licensed to the Apache Software Foundation (ASF) under one\n" +
+      "# or more contributor license agreements.\n\nimport os\n",
+  );
+  await Deno.writeTextFile(`${dir}/notes.md`, "use pkgctl to inspect the arena\n");
+  await Deno.writeTextFile(`${dir}/src/pkg/config.py`, "WIDTH = 3\n");
+  await Deno.writeTextFile(`${dir}/main.py`, "import pkg.util\n");
+  const res = await graphify(store, dir, { project: "pyfix" });
+  assertEquals(res.files, 6);
+  // The docstring, not the license header, is the file's observation.
+  const init = await store.getEntity("pyfix/src/pkg/__init__.py");
+  assertEquals(init!.observations.map((o) => o.content), ["The fixture package."]);
+  // Relative and src-layout absolute imports resolve to in-repo edges.
+  const util = await store.getEntity("pyfix/src/pkg/util.py");
+  assert(
+    util!.out.some((r) => r.relType === "imports" && r.to === "pyfix/src/pkg/config.py"),
+    `util edges: ${util!.out.map((r) => r.to).join(", ")}`,
+  );
+  const main = await store.getEntity("pyfix/main.py");
+  assert(
+    main!.out.some((r) => r.relType === "imports" && r.to === "pyfix/src/pkg/util.py"),
+    `main edges: ${main!.out.map((r) => r.to).join(", ")}`,
+  );
+  // The ASF header ("Licensed to ...") is never the observation, and a
+  // markdown prose line opening with an import-like word survives.
+  assertEquals((await store.getEntity("pyfix/src/pkg/asf.py"))!.observations, []);
+  assertEquals(
+    (await store.getEntity("pyfix/notes.md"))!.observations.map((o) => o.content),
+    ["use pkgctl to inspect the arena"],
+  );
+  // The maxFiles door caps the walk and reports what it skipped.
+  const capped = await graphify(store, dir, { project: "pycap", maxFiles: 2 });
+  assert(capped.skipped >= 1, `skipped: ${capped.skipped}`);
+  // A truncated re-run must NOT sweep what it did not enumerate, and
+  // non-finite junk falls back to the default cap instead of slicing
+  // the listing to nothing.
+  const before = (await store.stats()).entities;
+  await graphify(store, dir, { project: "pyfix", maxFiles: 2 });
+  await graphify(store, dir, { project: "pyfix", maxFiles: Number.NaN });
+  assertEquals((await store.stats()).entities, before);
+  assert(await store.getEntity("pyfix/main.py"), "capped re-run swept main.py");
+  store.close();
+  await Deno.remove(dir, { recursive: true });
+});
+
 // ── MCP server ──────────────────────────────────────────────────────
 
 import { MemoryMcpServer } from "../src/mcp.ts";
@@ -320,5 +381,49 @@ Deno.test("embed client normalizes, backfills, and hybrid recall merges", async 
   } finally {
     globalThis.fetch = realFetch;
   }
+  store.close();
+});
+
+// ── sanitize ─────────────────────────────────────────────────────────
+
+import { cleanText, looksBinary } from "../src/sanitize.ts";
+
+Deno.test("sanitize strips bidi, tag, and zero-width poison at every write door", async () => {
+  // Bidi override, PDF, zero-width space, tag characters, BOM.
+  const poisoned = "run\u202E me\u202C no\u200Bw \u{E0041}\u{E0042}safe\uFEFF";
+  assertEquals(cleanText(poisoned), "run me now safe");
+  assertEquals(cleanText("plain \u00e9tude keeps accents"), "plain \u00e9tude keeps accents");
+  // Escape sequences go as whole sequences — payload included.
+  assertEquals(cleanText("red \x1B[31mtext\x1B[0m done"), "red text done");
+  assertEquals(cleanText("\x1B]0;evil title\x07body"), "body");
+  // Category strip: private use, noncharacters, variation selectors.
+  assertEquals(cleanText("a\u00ADb\uE000c\uFDD0d\uFE0F"), "abcd");
+  assert(looksBinary("\u0000binary"));
+  assert(looksBinary("\uFFFD\uFFFD\uFFFD\uFFFD\uFFFDx"));
+  assert(!looksBinary("one boundary cut \uFFFD at the tail of a long enough line"));
+  // The store applies it at the write boundary, not just in graphify.
+  const store = await tempStore();
+  await store.upsertEntities([{
+    name: "p/cl\u200Bean",
+    type: "file",
+    project: "p",
+    observations: ["fact\u202E with poison\u202C inside"],
+  }]);
+  const got = await store.getEntity("p/clean");
+  assert(got, "poisoned name was not cleaned to p/clean");
+  assertEquals(got!.observations[0].content, "fact with poison inside");
+  // Symmetry: reads, touches, deletes, and the state walk address the
+  // same cleaned key space as writes.
+  assert(await store.getEntity("p/cl\u200Bean"), "raw-name read missed the cleaned entity");
+  const echoed = await store.addObservations("p/cl\u200Bean", ["tail\u202E fact"]);
+  assertEquals(echoed[0].content, "tail fact");
+  await setSt(store, "p\u200Broj", ["mid-walk"]);
+  assert((await whr(store, "proj")).includes("mid-walk"), "state walk broke on poisoned project");
+  // Junk castes never land — the enum is the boundary.
+  await store.upsertEntities([
+    { name: "p/junk", type: "file", project: "p", caste: "evil\u202E" as never },
+  ]);
+  assertEquals((await store.getEntity("p/junk"))!.entity.caste, "youngling");
+  assertEquals(await store.deleteEntities(["p/cl\u200Bean"]), 1);
   store.close();
 });

@@ -58,7 +58,7 @@ export interface GraphOps {
   recall(q: RecallQuery): Promise<{ text: string; hits: RecallHit[] }>;
   setState(project: string, lines: string[]): Promise<void>;
   where(project?: string): Promise<string>;
-  graphify(path: string, project?: string): Promise<GraphifyResult>;
+  graphify(path: string, project?: string, maxFiles?: number): Promise<GraphifyResult>;
   stats(): Promise<unknown>;
 }
 
@@ -221,6 +221,7 @@ const TOOLS = [
       properties: {
         path: { type: "string" },
         project: { type: "string" },
+        maxFiles: { type: "number" },
       },
       required: ["path"],
     },
@@ -357,7 +358,13 @@ export class MemoryMcpServer {
         const path = String(args.path ?? "");
         if (!path) throw new Error("memory_graphify needs `path`");
         return this.toolResult(
-          await this.ops.graphify(path, args.project as string | undefined),
+          await this.ops.graphify(
+            path,
+            args.project as string | undefined,
+            typeof args.maxFiles === "number" && Number.isFinite(args.maxFiles)
+              ? args.maxFiles
+              : undefined,
+          ),
         );
       }
       case "memory_stats":

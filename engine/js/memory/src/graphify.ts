@@ -12,6 +12,7 @@
 
 import type { GraphStore } from "./store.ts";
 import type { EntitySpec, RelationSpec } from "./types.ts";
+import { cleanText, looksBinary } from "./sanitize.ts";
 
 export interface GraphifyResult {
   project: string;
@@ -21,14 +22,18 @@ export interface GraphifyResult {
   skipped: number;
 }
 
-const MAX_FILES = 5000;
+const DEFAULT_MAX_FILES = 5000;
+const MAX_FILES_CEILING = 50000;
 const MAX_FILE_BYTES = 512 * 1024;
 const READ_BYTES = 64 * 1024;
 const STRUCTURAL_TYPES = ["repo", "module", "file", "doc-section"];
-const SOURCE_EXT = /\.(ts|js|tsx|jsx|rs|md)$/;
-const ANCHOR_FILES = new Set(["deno.json", "Cargo.toml", "package.json"]);
+const SOURCE_EXT = /\.(ts|js|tsx|jsx|rs|md|py)$/;
+const ANCHOR_FILES = new Set(["deno.json", "Cargo.toml", "package.json", "pyproject.toml"]);
 
-async function listFiles(repoPath: string): Promise<{ files: string[]; skipped: number }> {
+async function listFiles(
+  repoPath: string,
+  maxFiles: number,
+): Promise<{ files: string[]; skipped: number }> {
   try {
     const out = await new Deno.Command("git", {
       args: ["ls-files"],
@@ -38,18 +43,18 @@ async function listFiles(repoPath: string): Promise<{ files: string[]; skipped: 
     }).output();
     if (out.success) {
       const all = new TextDecoder().decode(out.stdout).split("\n").filter(Boolean);
-      return { files: all.slice(0, MAX_FILES), skipped: Math.max(0, all.length - MAX_FILES) };
+      return { files: all.slice(0, maxFiles), skipped: Math.max(0, all.length - maxFiles) };
     }
   } catch {
     // git absent — fall through to the bounded walk
   }
   const files: string[] = [];
   let skipped = 0;
-  const EXCLUDE = new Set([".git", "node_modules", "target", "dist", ".cache"]);
+  const EXCLUDE = new Set([".git", "node_modules", "target", "dist", ".cache", ".venv", "venv", "__pycache__"]);
   async function walk(dir: string, rel: string): Promise<void> {
-    if (files.length >= MAX_FILES) return;
+    if (files.length >= maxFiles) return;
     for await (const e of Deno.readDir(dir)) {
-      if (files.length >= MAX_FILES) {
+      if (files.length >= maxFiles) {
         skipped++;
         continue;
       }
@@ -84,16 +89,47 @@ async function readHead(path: string): Promise<string | null> {
   }
 }
 
-/** First doc-comment or contentful line — the file's one observation. */
-function firstDocLine(text: string): string | null {
-  for (const raw of text.split("\n").slice(0, 30)) {
+/**
+ * First doc-comment, docstring, or contentful line — the file's one
+ * observation. A docstring beats a leading comment (Python files open
+ * with license headers; the docstring is the document), and a
+ * copyright/license block is never the observation — it says nothing
+ * about the file.
+ */
+function firstDocLine(text: string, skipImports = true): string | null {
+  let comment: string | null = null;
+  let inLicense = false;
+  for (const raw of text.split("\n").slice(0, 40)) {
     const line = raw.trim();
-    if (!line) continue;
+    if (!line) {
+      inLicense = false;
+      continue;
+    }
+    const ds = line.match(/^[rub]{0,2}["']{3}\s*(.*?)\s*(?:["']{3})?\s*$/i);
+    if (ds && ds[1]) return ds[1].slice(0, 200);
     const m = line.match(/^(?:\/\/[/!]?|\/?\*+|#)\s*(.+?)\s*\*?\/?$/);
-    if (m && m[1] && !/^![[]/.test(m[1])) return m[1].slice(0, 200);
-    if (!/^[/*#{}[\]()'"`;,\s-]/.test(line)) return line.slice(0, 200);
+    if (m && m[1] && !/^![[]/.test(m[1])) {
+      if (/copyright\b|licen[cs]ed?\b|all rights reserved/i.test(m[1])) {
+        inLicense = true;
+        continue;
+      }
+      if (!inLicense && comment === null) comment = m[1].slice(0, 200);
+      continue;
+    }
+    if (!/^[/*#{}[\]()'"`;,\s-]/.test(line)) {
+      // An import line is not a document — skip it; honest absence
+      // beats storing `import x` as the file's one fact. Only for code
+      // files: markdown prose legitimately opens with these words.
+      if (
+        skipImports &&
+        /^(?:import\b|from\s+\S+\s+import\b|export\s.*\sfrom\s|(?:pub\s+)?(?:use|mod|extern)\b|require\()/.test(line)
+      ) {
+        continue;
+      }
+      return comment ?? line.slice(0, 200);
+    }
   }
-  return null;
+  return comment;
 }
 
 function slugify(s: string): string {
@@ -158,6 +194,77 @@ function resolveRelative(fromFile: string, spec: string, fileSet: Set<string>): 
   return null;
 }
 
+function pyEdges(fromFile: string, text: string, fileSet: Set<string>): string[] {
+  const out: string[] = [];
+  const dir = fromFile.includes("/") ? fromFile.slice(0, fromFile.lastIndexOf("/")) : "";
+  const tryModule = (base: string, mod: string): string | null => {
+    const rel = mod.replace(/\./g, "/");
+    const joined = base ? `${base}/${rel}` : rel;
+    for (const c of [`${joined}.py`, `${joined}/__init__.py`]) {
+      if (fileSet.has(c)) return c;
+    }
+    return null;
+  };
+  // `from X import a, b as c` — the names may themselves be modules;
+  // resolve each before falling back to the package/module edge.
+  const parseNames = (list: string): string[] =>
+    list.split(",").map((t) => t.trim().split(/\s+as\s+/)[0])
+      .filter((n) => /^\w+$/.test(n)).slice(0, 8);
+  for (const raw of text.split("\n")) {
+    // Relative: `from .sibling import x`, `from ..pkg.mod import x`.
+    const rel = raw.match(/^\s*from\s+(\.+)([\w.]*)\s+import\s+(.+)/);
+    if (rel) {
+      // One dot is the current package; each extra dot pops a level.
+      // Escaping the repo root is not an in-repo edge.
+      let base: string | null = dir;
+      for (let i = 1; i < rel[1].length && base !== null; i++) {
+        base = base === "" ? null : base.includes("/") ? base.slice(0, base.lastIndexOf("/")) : "";
+      }
+      if (base !== null) {
+        const pkg = rel[2]
+          ? [base, rel[2].replace(/\./g, "/")].filter(Boolean).join("/")
+          : base;
+        let found = false;
+        for (const nm of parseNames(rel[3])) {
+          const t = tryModule(pkg, nm);
+          if (t) {
+            out.push(t);
+            found = true;
+          }
+        }
+        if (!found) {
+          const target = rel[2]
+            ? tryModule(base, rel[2])
+            : fileSet.has(pkg ? `${pkg}/__init__.py` : "__init__.py")
+            ? (pkg ? `${pkg}/__init__.py` : "__init__.py")
+            : null;
+          if (target) out.push(target);
+        }
+      }
+      continue;
+    }
+    // Absolute: `import pkg.mod`, `from pkg.mod import x` — resolved
+    // at the repo root and under src/ (the setuptools src layout).
+    const abs = raw.match(/^\s*(?:from\s+([\w.]+)\s+import\s+(.+)|import\s+([\w.]+))/);
+    if (abs) {
+      const mod = abs[1] ?? abs[3];
+      let found = false;
+      for (const nm of abs[2] ? parseNames(abs[2]) : []) {
+        const t = tryModule("", `${mod}.${nm}`) ?? tryModule("src", `${mod}.${nm}`);
+        if (t) {
+          out.push(t);
+          found = true;
+        }
+      }
+      if (!found) {
+        const target = tryModule("", mod) ?? tryModule("src", mod);
+        if (target) out.push(target);
+      }
+    }
+  }
+  return out;
+}
+
 function rustEdges(fromFile: string, text: string, fileSet: Set<string>): string[] {
   const out: string[] = [];
   const dir = fromFile.includes("/") ? fromFile.slice(0, fromFile.lastIndexOf("/")) : "";
@@ -182,11 +289,16 @@ function rustEdges(fromFile: string, text: string, fileSet: Set<string>): string
 export async function graphify(
   store: GraphStore,
   repoPath: string,
-  opts: { project?: string } = {},
+  opts: { project?: string; maxFiles?: number } = {},
 ): Promise<GraphifyResult> {
   const clean = repoPath.replace(/\/+$/, "");
-  const project = opts.project ?? clean.split("/").pop() ?? "project";
-  const { files, skipped } = await listFiles(clean);
+  const project = cleanText(opts.project ?? clean.split("/").pop() ?? "project");
+  // Non-finite junk (NaN from a loose client) must fall to the default:
+  // Math.min/max propagate NaN, and a NaN cap slices the listing to []
+  // — which the sweep would read as "everything vanished".
+  const requested = Number.isFinite(opts.maxFiles) ? opts.maxFiles as number : DEFAULT_MAX_FILES;
+  const maxFiles = Math.max(1, Math.min(MAX_FILES_CEILING, requested));
+  const { files, skipped } = await listFiles(clean, maxFiles);
   const fileSet = new Set(files);
 
   // Specs dedupe by name (twin markdown headings slugify identically),
@@ -200,7 +312,9 @@ export async function graphify(
   };
   const rels: RelationSpec[] = [];
   const seen = new Set<string>();
-  const name = (rel: string) => `${project}/${rel}`;
+  // Cleaned here too so `seen` matches what the store persists —
+  // sweepStale compares the two.
+  const name = (rel: string) => cleanText(`${project}/${rel}`);
 
   const readme = files.find((f) => f.toLowerCase() === "readme.md");
   const readmeHead = readme ? await readHead(`${clean}/${readme}`) : null;
@@ -239,13 +353,13 @@ export async function graphify(
     const base = f.split("/").pop()!;
     if (!SOURCE_EXT.test(f) && !ANCHOR_FILES.has(base)) continue;
     const text = await readHead(`${clean}/${f}`);
-    if (text === null) {
+    if (text === null || looksBinary(text)) {
       skippedFiles++;
       continue;
     }
     fileCount++;
     const n = name(f);
-    const doc = firstDocLine(text);
+    const doc = firstDocLine(text, !f.endsWith(".md"));
     specs.push({ name: n, type: "file", project, observations: doc ? [doc] : [] });
     seen.add(n);
     const parent = f.includes("/") ? name(f.slice(0, f.lastIndexOf("/"))) : project;
@@ -261,6 +375,10 @@ export async function graphify(
       }
     } else if (f.endsWith(".rs")) {
       for (const target of rustEdges(f, text, fileSet)) {
+        rels.push({ from: n, to: name(target), relType: "imports" });
+      }
+    } else if (f.endsWith(".py")) {
+      for (const target of pyEdges(f, text, fileSet)) {
         rels.push({ from: n, to: name(target), relType: "imports" });
       }
     } else if (f.endsWith(".md")) {
@@ -279,6 +397,7 @@ export async function graphify(
   }
 
   await store.upsertEntities([...specByName.values()]);
+
   // Import edges may point at files skipped by caps; keep only edges
   // whose both ends exist as entities.
   const valid = rels.filter((r) => seen.has(r.from) && seen.has(r.to));
@@ -286,7 +405,12 @@ export async function graphify(
 
   // Full-refresh sweep inside one transaction: the enumerate + delete
   // window must not race a concurrent writer in the other process.
-  await store.sweepStale(project, STRUCTURAL_TYPES, seen);
+  // Only when the listing was complete — a truncated enumeration is
+  // not ground truth, and sweeping against it would mass-delete
+  // entities that are merely past the cap.
+  if (skipped === 0) {
+    await store.sweepStale(project, STRUCTURAL_TYPES, seen);
+  }
 
   return {
     project,
