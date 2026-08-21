@@ -14,6 +14,7 @@ use combs_media::ImagePreprocessor;
 use combs_runtime::{Engine, GenerationConfig};
 
 mod chew;
+mod fit;
 mod generate_audio;
 mod generate_image;
 mod http;
@@ -379,8 +380,47 @@ fn cmd_serve(
     // runtime: `device_caps` performs the runtime setup itself, and calling
     // it again after the engine has registered the service panics in
     // cubecl 0.10 ("Service already initialized").
-    let device_caps =
-        serde_json::to_value(combs_core::device_caps(&device)).unwrap_or(serde_json::Value::Null);
+    let caps = combs_core::device_caps(&device);
+    let device_caps = serde_json::to_value(&caps).unwrap_or(serde_json::Value::Null);
+
+    // Refuse before the first enqueue: an oversize buffer can only fail
+    // as a panic on cubecl's own compute threads once load starts.
+    // COMBS_FIT_LIMIT overrides the adapter cap (diagnostics/tests).
+    let fit_limit = std::env::var("COMBS_FIT_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(caps.max_storage_buffer_binding_size);
+    let fit_rows = source.tensor_names().into_iter().filter_map(|name| {
+        if let Ok(Some(qt)) = source.open_tensor_quant(&name) {
+            let elements: u64 = qt.shape.iter().map(|&d| d as u64).product();
+            let rank = qt.shape.len();
+            return Some(fit::FitRow {
+                name,
+                elements,
+                packed: Some((qt.data.len() as u64, rank)),
+            });
+        }
+        let reader = source.open_tensor(&name).ok()?;
+        Some(fit::FitRow {
+            name,
+            elements: reader.num_elements() as u64,
+            packed: None,
+        })
+    });
+    if let Some(report) = fit::fit_report(fit_rows) {
+        if let Err(msg) = fit::check_fit(&report, fit_limit, &caps.name, &caps.device_type) {
+            anyhow::bail!("{msg}");
+        }
+    }
+
+    // While loading, ANY thread's panic must kill the process: a dead
+    // engine is truthful, a half-uploaded one answers /health.
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("fatal: {info}");
+        std::process::abort();
+    }));
+
+    let sync_device = device.clone();
     let engine = if context_size.is_some() || page_size.is_some() {
         let arena = context_size.unwrap_or_else(|| {
             combs_runtime::default_arena_len(source.metadata().max_position_embeddings)
@@ -400,6 +440,11 @@ fn cmd_serve(
     } else {
         std::sync::Arc::new(Engine::load(&source, device)?)
     };
+    // Block until every enqueued upload materializes (gpu_memory is a
+    // submit_blocking probe) — allocation panics land HERE, while the
+    // abort hook is armed, and /v1/stats.gpu is non-null from startup.
+    let _ = combs_core::gpu_memory(&sync_device);
+    let _ = std::panic::take_hook();
     let weights_ms = t_load.elapsed().as_millis() as u64 - open_ms;
     combs_core::progress::load("weights_done", None, None, Some(weights_ms));
     let t_report = std::time::Instant::now();
@@ -487,6 +532,9 @@ fn cmd_devices() -> Result<()> {
     println!("  backend:     {}", info.backend);
     println!("  device type: {}", info.device_type);
     println!("  driver:      {}", info.driver);
+    let caps = combs_core::device_caps(&device);
+    println!("  max storage binding: {} bytes", caps.max_storage_buffer_binding_size);
+    println!("  max buffer:          {} bytes", caps.max_buffer_size);
     Ok(())
 }
 
