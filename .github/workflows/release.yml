@@ -31,7 +31,7 @@ jobs:
         include:
           - { os: macos-14, platform: macos, arch: arm64 }   # Apple Silicon
           - { os: macos-15-intel, platform: macos, arch: x86_64 }  # Intel Mac (macos-13 retired)
-          - { os: ubuntu-latest, platform: linux, arch: x86_64 }
+          - { os: ubuntu-22.04, platform: linux, arch: x86_64 } # oldest runner = glibc floor 2.35; binaries must run on 22.04 hosts
           - { os: windows-latest, platform: windows, arch: x86_64 }
     runs-on: ${{ matrix.os }}
     defaults:

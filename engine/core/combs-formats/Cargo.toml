@@ -1,6 +1,6 @@
 [package]
 name = "combs-formats"
-version = "0.2.2"
+version = "0.2.3"
 edition.workspace = true
 license.workspace = true
 description = "Combs Engine file-format adapters (ModelSource trait + safetensors)"
