@@ -1,7 +1,18 @@
 {
-  "workspace": ["./core", "./telemetry", "./graph", "./agents", "./runtime", "./flows", "./zerotrust", "./observe", "./mesh"],
+  "workspace": [
+    "./core",
+    "./telemetry",
+    "./graph",
+    "./agents",
+    "./runtime",
+    "./flows",
+    "./zerotrust",
+    "./observe",
+    "./mesh",
+    "./memory"
+  ],
   "tasks": {
-    "check": "deno check core/mod.ts telemetry/mod.ts graph/mod.ts agents/mod.ts runtime/mod.ts flows/mod.ts mesh/mod.ts core/test/*.ts graph/test/*.ts agents/test/*.ts runtime/test/*.ts flows/test/*.ts zerotrust/test/*.ts observe/test/*.ts mesh/test/*.ts",
-    "test": "deno test --allow-ffi --allow-read --allow-write --allow-env --allow-net --allow-run --unstable-kv core/test/ graph/test/ agents/test/ runtime/test/ flows/test/ zerotrust/test/ observe/test/ mesh/test/"
+    "check": "deno check core/mod.ts telemetry/mod.ts graph/mod.ts agents/mod.ts runtime/mod.ts flows/mod.ts mesh/mod.ts memory/mod.ts memory/bin/mcp.ts core/test/*.ts graph/test/*.ts agents/test/*.ts runtime/test/*.ts flows/test/*.ts zerotrust/test/*.ts observe/test/*.ts mesh/test/*.ts memory/test/*.ts",
+    "test": "deno test --allow-ffi --allow-read --allow-write --allow-env --allow-net --allow-run --unstable-kv core/test/ graph/test/ agents/test/ runtime/test/ flows/test/ zerotrust/test/ observe/test/ mesh/test/ memory/test/"
   }
 }
