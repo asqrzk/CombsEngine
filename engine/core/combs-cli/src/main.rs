@@ -392,8 +392,8 @@ fn cmd_serve(
         .unwrap_or(caps.max_storage_buffer_binding_size);
     // Packed size counts ONLY where the quant-kernel path truly takes
     // it: linears. Embeddings ALWAYS dequantize dense (load_weight, not
-    // try_quant_linear) — the pod-breaking case is precisely a packed
-    // rank-2 embed that materializes at elements×4. Unsure → dense.
+    // try_quant_linear) — the worst case is a packed rank-2 embed that
+    // materializes at elements×4. Unsure → dense.
     let no_quant_kernels =
         matches!(std::env::var("COMBS_NO_QUANT_KERNELS").as_deref(), Ok(v) if v != "0");
     let fit_rows = source.tensor_names().into_iter().filter_map(|name| {

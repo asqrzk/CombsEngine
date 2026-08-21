@@ -39,9 +39,9 @@ fn run_op(input: &str) -> Result<String, String> {
     let t0 = Instant::now();
     match req.op.as_str() {
         "activate" => {
-            // Defaults come from the library's own Default — a divergent
-            // literal here once shipped a cap the crate documents as
-            // unable to converge.
+            // Defaults come from the library's own Default — a
+            // diverging literal here risks a step cap the algorithm
+            // cannot converge within (see ActivateParams).
             let defaults = ActivateParams::default();
             let params = ActivateParams {
                 damping: req.damping.unwrap_or(defaults.damping),

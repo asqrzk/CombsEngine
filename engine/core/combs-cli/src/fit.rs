@@ -97,7 +97,7 @@ mod tests {
 
     #[test]
     fn dense_is_elements_times_four() {
-        // The qwen embed that broke the pod: 152064 × 3584 f32.
+        // A large vocab embed: 152064 × 3584 f32.
         let r = row("token_embd.weight", 152_064 * 3_584, None);
         assert_eq!(r.device_bytes(), 2_179_989_504);
     }
@@ -121,9 +121,9 @@ mod tests {
 
     #[test]
     fn packed_embed_counts_dense_and_refuses() {
-        // The pod case exactly: a Q6_K token_embd is packed rank-2 but
-        // LOADS dense — the walk passes packed: None for embeds, so the
-        // dense size drives the refusal.
+        // A Q6_K token_embd is packed rank-2 but LOADS dense — the
+        // walk passes packed: None for embeds, so the dense size
+        // drives the refusal.
         let report = fit_report(vec![row("model.embed_tokens.weight", 152_064 * 3_584, None)])
             .unwrap();
         assert!(check_fit(&report, 2_147_483_647, "llvmpipe", "Cpu").is_err());
