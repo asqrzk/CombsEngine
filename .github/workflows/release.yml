@@ -31,7 +31,7 @@ jobs:
         include:
           - { os: macos-14, platform: macos, arch: arm64 }   # Apple Silicon
           - { os: macos-15-intel, platform: macos, arch: x86_64 }  # Intel Mac (macos-13 retired)
-          - { os: ubuntu-latest, platform: linux, arch: x86_64 }
+          - { os: ubuntu-22.04, platform: linux, arch: x86_64 } # oldest runner = glibc floor 2.35; binaries must run on 22.04 hosts
           - { os: windows-latest, platform: windows, arch: x86_64 }
     runs-on: ${{ matrix.os }}
     defaults:
@@ -80,6 +80,18 @@ jobs:
           cp combs-ffi/include/combs.h "$STAGE/" 2>/dev/null || true
           cp target/release/libcombsmesh_ffi.* "$STAGE/" 2>/dev/null || true
           cp combs-mesh-ffi/include/combsmesh.h "$STAGE/" 2>/dev/null || true
+          # linux links ort dynamically (glibc floor) — bundle the
+          # runtime so TTS/transcription work out of the box with
+          # ORT_DYLIB_PATH pointed at the install dir. ORT_V must stay
+          # inside the ort crate's supported range (2.0.0-rc.10 →
+          # onnxruntime 1.20.x); bump BOTH together. Checksum pinning
+          # deferred: pin the sha256 at the first tagged run.
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            ORT_V=1.20.1
+            curl -fsSL --retry 5 --retry-delay 3 "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_V}/onnxruntime-linux-x64-${ORT_V}.tgz" -o /tmp/ort.tgz
+            tar -xzf /tmp/ort.tgz -C /tmp
+            cp "/tmp/onnxruntime-linux-x64-${ORT_V}/lib/libonnxruntime.so.${ORT_V}" "$STAGE/libonnxruntime.so"
+          fi
           tar -czf "${NAME}.tar.gz" -C stage "$NAME"
           mkdir -p ../artifacts && mv "${NAME}.tar.gz" ../artifacts/
 
