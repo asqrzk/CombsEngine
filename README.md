@@ -88,6 +88,16 @@ Four layers. Compute lives exclusively in **L0** — every layer above is thin o
 - **Inference engine** — one universal decoder on Burn 0.21 + CubeCL/wgpu serving Llama/SmolLM2, Qwen2.5, Qwen3, Phi-3, and Gemma-3 (sliding-window + dual-RoPE variants included), plus SmolVLM vision input, Stable Diffusion 1.5 image generation, Kokoro TTS, and **Whisper speech-to-text** (WAV → 16 kHz log-mel → encoder-decoder transcription). New architectures = a registry line + an `ArchSpec` preset.
 - **Model formats** — SafeTensors (Hugging Face layout, causal-LM or bare base exports) and **GGUF v3** (F32 / F16 / Q4_0 / Q5_0 / Q8_0 / Q4_K / Q5_K / Q6_K) through a single `ModelSource` adapter trait. `combs run --model anything.gguf` just works.
 - **LoRA adapters** — `combs pull` detects adapter repos structurally (diffusers / kohya / PEFT layouts probed from the safetensors header, base family fingerprinted) and caches them beside models; `--lora <file|cache-id> --lora-scale s` on `serve`, `serve-images`, and `generate-image` fuses the adapter into dense or quantized bases at load — zero added latency after the merge, and `/v1/stats` echoes exactly what was fused.
+- **Honest loading** — a pre-flight fit check refuses models whose
+  largest allocation exceeds the adapter's binding cap (naming the
+  tensor, the need, and the limit) instead of serving corrupt weights;
+  load-phase panics abort the process; uploads are synced at load so
+  `/v1/stats.gpu` is truthful from startup. `combs devices` prints the
+  allocation ceilings that decide fit.
+- **Graph compute (`combs-graphkit`)** — looped, convergent graph
+  algorithms (spreading activation, decayed k-hop) with a CPU
+  reference and a Burn/wgpu GPU path, exposed through a single
+  JSON-op C ABI (`combsgraph_op_json`).
 - **Generation observability** — spawning with `COMBS_PROGRESS=json` emits structured load stages (open / per-layer weights / bind) on stderr for any supervisor to parse; the image worker's `/v1/stats` reports a live `generation` object during a run — step k/N, phase (encode / denoise / decode / png), measured `eta_ms` — and with `--preview-every N` it serves the emerging image at `/v1/preview`. Generations are single-flight; the pipeline mutex serializes concurrent requests.
 - **Memory** — paged KV cache (page-16 arenas, LIFO free-list, prefix-safe `popn`), chunked prefill, quantized linear layers with weights packed in VRAM.
 - **Sampling** — temperature, top-k, top-p, min-p, repetition/frequency/presence penalties **bounded to a recent window** (`repeat_last_n`, default 128; `0` restores whole-context) with stop tokens always exempt — so long chats can't penalize their own ability to stop — plus logit_bias, per-token logprobs, seeded (byte-identical) generation, stop strings & stop tokens; opt-in prompt-lookup speculative decoding for greedy runs (`COMBS_SPEC=1`).
@@ -109,6 +119,7 @@ Four layers. Compute lives exclusively in **L0** — every layer above is thin o
 | `@combs/telemetry` | Scoped logging, OpenTelemetry-shaped spans, metrics |
 | `@combs/observe` | Realtime observability bus (isomorphic core) — EventBus, instrument middleware (`wrapEngine`/`instrumentFetch`/`span`), sinks (memory/NDJSON/WebSocket), redaction; powers the Control Tower |
 | `@combs/mesh` | CombsMesh emoji client — FFI `Mesh` wrapper, pure-TS Unicode PUA codec (byte-parity with Rust), MCP server mode, `MeshPeer` WS connector with sha256-verified fetch |
+| `@combs/memory` | Knowledge-graph memory — SQLite entities/relations with a usage-driven lifecycle, ranked recall, repository ingestion (`graphify`), at-rest crypto door, embeddings-hybrid retrieval, and an MCP stdio server exposing the graph as tools |
 
 ### L3 — UI & Shells
 
