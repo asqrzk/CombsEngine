@@ -49,7 +49,8 @@ Deno.test({
       const done = events.find((e) => e.type === "done");
       assert(done, "expected a done event");
       assert(text.length > 0, "expected generated text");
-      assertEquals(done.stats.prompt_tokens, 5);
+      // 5 text tokens + the BOS the engine prepends before prefill.
+      assertEquals(done.stats.prompt_tokens, 6);
       assert(done.stats.generated_tokens > 0);
 
       // Chat mode applies ChatML.
