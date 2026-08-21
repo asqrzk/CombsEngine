@@ -420,7 +420,6 @@ fn cmd_serve(
         std::process::abort();
     }));
 
-    let sync_device = device.clone();
     let engine = if context_size.is_some() || page_size.is_some() {
         let arena = context_size.unwrap_or_else(|| {
             combs_runtime::default_arena_len(source.metadata().max_position_embeddings)
@@ -440,10 +439,9 @@ fn cmd_serve(
     } else {
         std::sync::Arc::new(Engine::load(&source, device)?)
     };
-    // Block until every enqueued upload materializes (gpu_memory is a
-    // submit_blocking probe) — allocation panics land HERE, while the
-    // abort hook is armed, and /v1/stats.gpu is non-null from startup.
-    let _ = combs_core::gpu_memory(&sync_device);
+    // Engine::load's tail primes the GPU sample (a blocking probe), so
+    // every upload materialized under the armed hook; back to default
+    // panic behavior for the serving threads.
     let _ = std::panic::take_hook();
     let weights_ms = t_load.elapsed().as_millis() as u64 - open_ms;
     combs_core::progress::load("weights_done", None, None, Some(weights_ms));
