@@ -34,12 +34,14 @@ ureq.workspace = true
 # TTS (`generate-audio`): Kokoro ONNX runs via onnxruntime — an external
 # runtime by design; the burn-native port is tracked as follow-up work.
 # onnxruntime backs `generate-audio` (Kokoro TTS). Upstream ships no
-# prebuilt libraries for Intel macOS, so that one target loads the
-# runtime dynamically at startup instead of linking it — the CLI builds
-# and runs everywhere, and TTS on Intel Macs needs a locally installed
-# onnxruntime.
-[target.'cfg(not(all(target_os = "macos", target_arch = "x86_64")))'.dependencies]
+# prebuilt libraries for Intel macOS, and the Linux prebuilt static libs
+# require glibc 2.38+ (they would raise the binary's floor above the
+# ubuntu-22.04 release baseline) — so both targets load the runtime
+# dynamically at startup instead of linking it. The CLI builds and runs
+# everywhere; TTS on those targets needs a locally installed
+# onnxruntime (ORT_DYLIB_PATH).
+[target.'cfg(not(any(all(target_os = "macos", target_arch = "x86_64"), target_os = "linux")))'.dependencies]
 ort = "2.0.0-rc.10"
 
-[target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
+[target.'cfg(any(all(target_os = "macos", target_arch = "x86_64"), target_os = "linux"))'.dependencies]
 ort = { version = "2.0.0-rc.10", features = ["load-dynamic"] }
