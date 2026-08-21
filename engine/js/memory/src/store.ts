@@ -571,13 +571,20 @@ export class GraphStore {
       const r of this.db.prepare("SELECT caste, COUNT(*) AS n FROM entities GROUP BY caste")
         .all() as { caste: string; n: number }[]
     ) castes[r.caste] = r.n;
+    const perProject: Record<string, number> = {};
+    for (
+      const r of this.db
+        .prepare(
+          "SELECT project, COUNT(*) AS n FROM entities WHERE project != '' GROUP BY project ORDER BY n DESC",
+        )
+        .all() as unknown as { project: string; n: number }[]
+    ) perProject[r.project] = r.n;
     return Promise.resolve({
       entities: count("SELECT COUNT(*) AS n FROM entities"),
       observations: count("SELECT COUNT(*) AS n FROM observations"),
       relations: count("SELECT COUNT(*) AS n FROM relations"),
-      projects: (this.db
-        .prepare("SELECT DISTINCT project FROM entities WHERE project != '' ORDER BY project")
-        .all() as { project: string }[]).map((r) => r.project),
+      projects: Object.keys(perProject),
+      perProject,
       castes,
     });
   }

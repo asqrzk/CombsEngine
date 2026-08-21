@@ -74,6 +74,7 @@ export interface GraphStats {
   observations: number;
   relations: number;
   projects: string[];
+  perProject: Record<string, number>;
   castes: Record<string, number>;
 }
 
