@@ -390,14 +390,30 @@ fn cmd_serve(
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(caps.max_storage_buffer_binding_size);
+    // Packed size counts ONLY where the quant-kernel path truly takes
+    // it: linears. Embeddings ALWAYS dequantize dense (load_weight, not
+    // try_quant_linear) — the pod-breaking case is precisely a packed
+    // rank-2 embed that materializes at elements×4. Unsure → dense.
+    let no_quant_kernels =
+        matches!(std::env::var("COMBS_NO_QUANT_KERNELS").as_deref(), Ok(v) if v != "0");
     let fit_rows = source.tensor_names().into_iter().filter_map(|name| {
         if let Ok(Some(qt)) = source.open_tensor_quant(&name) {
             let elements: u64 = qt.shape.iter().map(|&d| d as u64).product();
-            let rank = qt.shape.len();
+            let block = match qt.format {
+                combs_formats::QuantFormat::Q4_0
+                | combs_formats::QuantFormat::Q5_0
+                | combs_formats::QuantFormat::Q8_0 => 32,
+                _ => 256,
+            };
+            let k = qt.shape.last().copied().unwrap_or(0);
+            let eligible = !no_quant_kernels
+                && qt.shape.len() == 2
+                && k % block == 0
+                && !name.contains("embed");
             return Some(fit::FitRow {
                 name,
                 elements,
-                packed: Some((qt.data.len() as u64, rank)),
+                packed: eligible.then(|| (qt.data.len() as u64, 2)),
             });
         }
         let reader = source.open_tensor(&name).ok()?;

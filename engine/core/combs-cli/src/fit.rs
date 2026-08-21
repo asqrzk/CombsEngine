@@ -11,10 +11,11 @@ pub struct FitRow {
     /// Logical element count (dense materialization is `elements × 4`,
     /// the f32 widening every non-packed tensor goes through on load).
     pub elements: u64,
-    /// Packed byte length + rank when the source stores a kernel-format
-    /// quant tensor. The quant path uploads the packed bytes verbatim
-    /// only for rank-2 tensors (the quant-linear eligibility); anything
-    /// else dequantizes dense.
+    /// Packed byte length + rank, set by the caller ONLY when the
+    /// quant-linear path truly applies (rank-2 linear, block-aligned k,
+    /// kernels enabled, not an embedding — embeddings always dequantize
+    /// dense). Known limit: GGUF fused projections (phi3 attn_qkv) are
+    /// measured per stored tensor, not per served slice.
     pub packed: Option<(u64, usize)>,
 }
 
@@ -116,6 +117,16 @@ mod tests {
         assert!(err.contains("token_embd.weight"));
         assert!(err.contains("2179989504"));
         assert!(check_fit(&report, u64::MAX, "M3", "IntegratedGpu").is_ok());
+    }
+
+    #[test]
+    fn packed_embed_counts_dense_and_refuses() {
+        // The pod case exactly: a Q6_K token_embd is packed rank-2 but
+        // LOADS dense — the walk passes packed: None for embeds, so the
+        // dense size drives the refusal.
+        let report = fit_report(vec![row("model.embed_tokens.weight", 152_064 * 3_584, None)])
+            .unwrap();
+        assert!(check_fit(&report, 2_147_483_647, "llvmpipe", "Cpu").is_err());
     }
 
     #[test]

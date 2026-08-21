@@ -165,6 +165,9 @@ pub fn gpu_memory(device: &CombsDevice) -> Option<GpuMemory> {
 /// Note: this performs the cubecl runtime setup for the device (the same setup
 /// burn performs lazily on first tensor use), so it is safe to use the device
 /// for compute afterwards.
+/// NOTE: like [`device_caps`], this primes the cubecl runtime — only
+/// ONE such probe may run per process (a second `init_setup` panics in
+/// cubecl 0.10). Prefer `device_caps`, which carries a superset.
 pub fn device_info(device: &CombsDevice) -> DeviceInfo {
     let setup: WgpuSetup =
         burn::backend::wgpu::init_setup::<AutoGraphicsApi>(device, RuntimeOptions::default());
