@@ -92,6 +92,8 @@ pub struct DeviceCaps {
     pub backend: String,
     /// Device type ("IntegratedGpu", "DiscreteGpu", ...).
     pub device_type: String,
+    /// Driver name + info string.
+    pub driver: String,
     /// `max_storage_buffer_binding_size`: the hard cap on a single GPU
     /// buffer — the sharding limit on mobile devices.
     pub max_storage_buffer_binding_size: u64,
@@ -118,9 +120,10 @@ pub fn device_caps(device: &CombsDevice) -> DeviceCaps {
     let limits = setup.adapter.limits();
     let features = setup.adapter.features();
     DeviceCaps {
-        name: info.name,
+        name: info.name.clone(),
         backend: format!("{:?}", info.backend),
         device_type: format!("{:?}", info.device_type),
+        driver: format!("{} ({})", info.driver, info.driver_info),
         max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size as u64,
         max_buffer_size: limits.max_buffer_size,
         max_compute_workgroup_size_x: limits.max_compute_workgroup_size_x,

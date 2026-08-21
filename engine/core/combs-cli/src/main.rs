@@ -526,13 +526,14 @@ fn weights_report(source: &dyn combs_formats::ModelSource) -> serde_json::Value 
 
 fn cmd_devices() -> Result<()> {
     let device = combs_core::init_device();
-    let info = combs_core::device_info(&device);
-    println!("wgpu device:");
-    println!("  name:        {}", info.name);
-    println!("  backend:     {}", info.backend);
-    println!("  device type: {}", info.device_type);
-    println!("  driver:      {}", info.driver);
+    // ONE runtime-priming probe per process: a second init_setup call
+    // panics in cubecl 0.10 ("Service already initialized").
     let caps = combs_core::device_caps(&device);
+    println!("wgpu device:");
+    println!("  name:        {}", caps.name);
+    println!("  backend:     {}", caps.backend);
+    println!("  device type: {}", caps.device_type);
+    println!("  driver:      {}", caps.driver);
     println!("  max storage binding: {} bytes", caps.max_storage_buffer_binding_size);
     println!("  max buffer:          {} bytes", caps.max_buffer_size);
     Ok(())
