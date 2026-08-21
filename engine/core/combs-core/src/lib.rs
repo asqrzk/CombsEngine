@@ -92,6 +92,8 @@ pub struct DeviceCaps {
     pub backend: String,
     /// Device type ("IntegratedGpu", "DiscreteGpu", ...).
     pub device_type: String,
+    /// Driver name + info string.
+    pub driver: String,
     /// `max_storage_buffer_binding_size`: the hard cap on a single GPU
     /// buffer — the sharding limit on mobile devices.
     pub max_storage_buffer_binding_size: u64,
@@ -118,9 +120,10 @@ pub fn device_caps(device: &CombsDevice) -> DeviceCaps {
     let limits = setup.adapter.limits();
     let features = setup.adapter.features();
     DeviceCaps {
-        name: info.name,
+        name: info.name.clone(),
         backend: format!("{:?}", info.backend),
         device_type: format!("{:?}", info.device_type),
+        driver: format!("{} ({})", info.driver, info.driver_info),
         max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size as u64,
         max_buffer_size: limits.max_buffer_size,
         max_compute_workgroup_size_x: limits.max_compute_workgroup_size_x,
@@ -162,6 +165,9 @@ pub fn gpu_memory(device: &CombsDevice) -> Option<GpuMemory> {
 /// Note: this performs the cubecl runtime setup for the device (the same setup
 /// burn performs lazily on first tensor use), so it is safe to use the device
 /// for compute afterwards.
+/// NOTE: like [`device_caps`], this primes the cubecl runtime — only
+/// ONE such probe may run per process (a second `init_setup` panics in
+/// cubecl 0.10). Prefer `device_caps`, which carries a superset.
 pub fn device_info(device: &CombsDevice) -> DeviceInfo {
     let setup: WgpuSetup =
         burn::backend::wgpu::init_setup::<AutoGraphicsApi>(device, RuntimeOptions::default());

@@ -281,6 +281,10 @@ impl<'a> TensorReader<'a> {
                 self.shape.len()
             )));
         }
+        // from_data only ENQUEUES the upload — cubecl materializes the
+        // buffer later on its own compute threads, where an allocation
+        // failure can only panic, never return. Callers that need the
+        // truth must sync (e.g. a blocking allocator probe) afterwards.
         Ok(Tensor::from_data(data, device))
     }
 

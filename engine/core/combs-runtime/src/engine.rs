@@ -495,6 +495,11 @@ impl Engine {
                 / 8
                 * 2 // K and V
                 * global_layers as u64,
+            // Priming the GPU sample here is ALSO the load-time sync:
+            // gpu_memory blocks on the compute stream, so every enqueued
+            // weight upload materializes before load() returns — an
+            // allocation panic lands during load, not behind /health.
+            gpu: combs_core::gpu_memory(&device),
             ..EngineStatsSnapshot::default()
         }));
 

@@ -14,6 +14,7 @@ use combs_media::ImagePreprocessor;
 use combs_runtime::{Engine, GenerationConfig};
 
 mod chew;
+mod fit;
 mod generate_audio;
 mod generate_image;
 mod http;
@@ -379,8 +380,62 @@ fn cmd_serve(
     // runtime: `device_caps` performs the runtime setup itself, and calling
     // it again after the engine has registered the service panics in
     // cubecl 0.10 ("Service already initialized").
-    let device_caps =
-        serde_json::to_value(combs_core::device_caps(&device)).unwrap_or(serde_json::Value::Null);
+    let caps = combs_core::device_caps(&device);
+    let device_caps = serde_json::to_value(&caps).unwrap_or(serde_json::Value::Null);
+
+    // Refuse before the first enqueue: an oversize buffer can only fail
+    // as a panic on cubecl's own compute threads once load starts.
+    // COMBS_FIT_LIMIT overrides the adapter cap (diagnostics/tests).
+    let fit_limit = std::env::var("COMBS_FIT_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(caps.max_storage_buffer_binding_size);
+    // Packed size counts ONLY where the quant-kernel path truly takes
+    // it: linears. Embeddings ALWAYS dequantize dense (load_weight, not
+    // try_quant_linear) — the pod-breaking case is precisely a packed
+    // rank-2 embed that materializes at elements×4. Unsure → dense.
+    let no_quant_kernels =
+        matches!(std::env::var("COMBS_NO_QUANT_KERNELS").as_deref(), Ok(v) if v != "0");
+    let fit_rows = source.tensor_names().into_iter().filter_map(|name| {
+        if let Ok(Some(qt)) = source.open_tensor_quant(&name) {
+            let elements: u64 = qt.shape.iter().map(|&d| d as u64).product();
+            let block = match qt.format {
+                combs_formats::QuantFormat::Q4_0
+                | combs_formats::QuantFormat::Q5_0
+                | combs_formats::QuantFormat::Q8_0 => 32,
+                _ => 256,
+            };
+            let k = qt.shape.last().copied().unwrap_or(0);
+            let eligible = !no_quant_kernels
+                && qt.shape.len() == 2
+                && k % block == 0
+                && !name.contains("embed");
+            return Some(fit::FitRow {
+                name,
+                elements,
+                packed: eligible.then(|| (qt.data.len() as u64, 2)),
+            });
+        }
+        let reader = source.open_tensor(&name).ok()?;
+        Some(fit::FitRow {
+            name,
+            elements: reader.num_elements() as u64,
+            packed: None,
+        })
+    });
+    if let Some(report) = fit::fit_report(fit_rows) {
+        if let Err(msg) = fit::check_fit(&report, fit_limit, &caps.name, &caps.device_type) {
+            anyhow::bail!("{msg}");
+        }
+    }
+
+    // While loading, ANY thread's panic must kill the process: a dead
+    // engine is truthful, a half-uploaded one answers /health.
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("fatal: {info}");
+        std::process::abort();
+    }));
+
     let engine = if context_size.is_some() || page_size.is_some() {
         let arena = context_size.unwrap_or_else(|| {
             combs_runtime::default_arena_len(source.metadata().max_position_embeddings)
@@ -400,6 +455,10 @@ fn cmd_serve(
     } else {
         std::sync::Arc::new(Engine::load(&source, device)?)
     };
+    // Engine::load's tail primes the GPU sample (a blocking probe), so
+    // every upload materialized under the armed hook; back to default
+    // panic behavior for the serving threads.
+    let _ = std::panic::take_hook();
     let weights_ms = t_load.elapsed().as_millis() as u64 - open_ms;
     combs_core::progress::load("weights_done", None, None, Some(weights_ms));
     let t_report = std::time::Instant::now();
@@ -481,12 +540,16 @@ fn weights_report(source: &dyn combs_formats::ModelSource) -> serde_json::Value 
 
 fn cmd_devices() -> Result<()> {
     let device = combs_core::init_device();
-    let info = combs_core::device_info(&device);
+    // ONE runtime-priming probe per process: a second init_setup call
+    // panics in cubecl 0.10 ("Service already initialized").
+    let caps = combs_core::device_caps(&device);
     println!("wgpu device:");
-    println!("  name:        {}", info.name);
-    println!("  backend:     {}", info.backend);
-    println!("  device type: {}", info.device_type);
-    println!("  driver:      {}", info.driver);
+    println!("  name:        {}", caps.name);
+    println!("  backend:     {}", caps.backend);
+    println!("  device type: {}", caps.device_type);
+    println!("  driver:      {}", caps.driver);
+    println!("  max storage binding: {} bytes", caps.max_storage_buffer_binding_size);
+    println!("  max buffer:          {} bytes", caps.max_buffer_size);
     Ok(())
 }
 
