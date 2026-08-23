@@ -125,9 +125,8 @@ fn gguf_round_trip() {
 
     // tokenizer.json synthesized from GGUF metadata
     let spec = source.tokenizer().expect("tokenizer");
-    assert!(spec.tokenizer_json.exists());
     let json: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&spec.tokenizer_json).unwrap()).unwrap();
+        serde_json::from_slice(&spec.json_bytes().unwrap()).unwrap();
     assert_eq!(json["model"]["vocab"]["a"], 1);
     // No add_bos_token key in this file -> unspecified.
     assert_eq!(spec.add_bos, None);
@@ -252,7 +251,8 @@ fn qwen_gguf_add_bos_and_single_digit_pretokenizer() {
     // The qwen2 pre family splits digit runs into single digits, so "123"
     // must encode as three tokens even though the "1 2"/"12 3" merges could
     // fuse it under the default split regex.
-    let tok = tokenizers::Tokenizer::from_file(&spec.tokenizer_json).expect("load tokenizer");
+    let tok = tokenizers::Tokenizer::from_bytes(spec.json_bytes().unwrap())
+        .expect("load tokenizer");
     let enc = tok.encode("123", false).expect("encode");
     assert_eq!(enc.get_ids(), &[1, 2, 3], "digit run must stay split");
 
@@ -537,6 +537,84 @@ fn split_shard_gguf_is_rejected() {
     let err = GgufSource::load(&path).err().expect("must refuse a split shard");
     let msg = err.to_string();
     assert!(msg.contains("shard 1 of 2"), "unexpected error: {msg}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The in-memory door and the mapped door must open onto the same model.
+///
+/// Not "both load": every observable — metadata, the tensor name set, the
+/// dequantized bytes of each tensor, the packed quant bytes, and the
+/// tokenizer JSON — must agree. A browser that gets a *slightly* different
+/// model than the CLI is worse than one that gets none, because the
+/// difference shows up as bad output rather than as an error.
+#[test]
+fn from_bytes_matches_load() {
+    let dir = std::env::temp_dir().join(format!("combs-gguf-bytes-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("tiny.gguf");
+    write_test_gguf(&path);
+
+    let mapped = GgufSource::load(&path).expect("mapped parse");
+    let bytes = GgufSource::from_bytes(std::fs::read(&path).unwrap()).expect("bytes parse");
+
+    assert_eq!(
+        format!("{:?}", mapped.metadata()),
+        format!("{:?}", bytes.metadata()),
+        "metadata must not depend on how the bytes arrived"
+    );
+
+    let mut a = mapped.tensor_names();
+    let mut b = bytes.tensor_names();
+    a.sort();
+    b.sort();
+    assert_eq!(a, b, "tensor name sets differ");
+
+    for name in &a {
+        let ra = mapped.open_tensor(name).expect("mapped tensor");
+        let rb = bytes.open_tensor(name).expect("bytes tensor");
+        assert_eq!(ra.shape(), rb.shape(), "{name}: shape");
+        assert_eq!(ra.dtype(), rb.dtype(), "{name}: dtype");
+        assert_eq!(ra.raw_bytes(), rb.raw_bytes(), "{name}: bytes");
+
+        let qa = mapped.open_tensor_quant(name).expect("mapped quant");
+        let qb = bytes.open_tensor_quant(name).expect("bytes quant");
+        match (qa, qb) {
+            (Some(qa), Some(qb)) => {
+                assert_eq!(qa.format, qb.format, "{name}: quant format");
+                assert_eq!(qa.shape, qb.shape, "{name}: quant shape");
+                assert_eq!(qa.data.as_ref(), qb.data.as_ref(), "{name}: packed bytes");
+            }
+            (None, None) => {}
+            _ => panic!("{name}: one source offered packed bytes and the other did not"),
+        }
+    }
+
+    let sa = mapped.tokenizer().expect("mapped tokenizer");
+    let sb = bytes.tokenizer().expect("bytes tokenizer");
+    assert_eq!(
+        sa.json_bytes().unwrap(),
+        sb.json_bytes().unwrap(),
+        "synthesized tokenizer JSON differs between the cached file and memory"
+    );
+    assert_eq!(sa.added_tokens, sb.added_tokens);
+    assert_eq!(sa.add_bos, sb.add_bos);
+    // The mapped source cached its synthesis next to the model; the
+    // in-memory one has no file, and says so rather than inventing a path.
+    assert!(sa.json_path().is_some(), "mapped tokenizer should be path-backed");
+    assert!(sb.json_path().is_none(), "in-memory tokenizer has no path");
+
+    // Truncation is a wrong model, not a smaller one: GGUF offsets are
+    // absolute, so a partial buffer must be refused, not half-read.
+    let whole = std::fs::read(&path).unwrap();
+    let truncated = whole[..whole.len() / 2].to_vec();
+    let short = GgufSource::from_bytes(truncated);
+    if let Ok(src) = short {
+        assert!(
+            src.open_tensor("model.embed_tokens.weight").is_err(),
+            "a truncated image must not serve tensor bytes"
+        );
+    }
 
     std::fs::remove_dir_all(&dir).ok();
 }

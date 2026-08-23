@@ -382,7 +382,7 @@ impl ModelSource for TfliteSource {
 
     fn tokenizer(&self) -> Result<TokenizerSpec> {
         Ok(TokenizerSpec {
-            tokenizer_json: self.tokenizer_json.clone(),
+            tokenizer: crate::tokenizer::TokenizerSource::Path(self.tokenizer_json.clone()),
             added_tokens: self.added_tokens.clone(),
             chat_template: None,
             add_bos: None,

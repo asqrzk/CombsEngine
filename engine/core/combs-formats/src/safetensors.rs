@@ -132,7 +132,7 @@ impl SafetensorsSource {
             add_bos = tc.get("add_bos_token").and_then(|v| v.as_bool());
         }
         let tokenizer = TokenizerSpec {
-            tokenizer_json,
+            tokenizer: crate::tokenizer::TokenizerSource::Path(tokenizer_json),
             added_tokens,
             chat_template,
             add_bos,
@@ -286,7 +286,7 @@ impl ModelSource for SafetensorsSource {
     }
 
     fn tokenizer(&self) -> Result<TokenizerSpec> {
-        if self.tokenizer.tokenizer_json.as_os_str().is_empty() {
+        if self.tokenizer.is_placeholder() {
             return Err(FormatError::MissingFile(
                 "tokenizer.json (weights-only source has no tokenizer)".to_string(),
             ));

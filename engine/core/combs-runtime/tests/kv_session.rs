@@ -100,7 +100,14 @@ fn divergent_prompt_gets_no_reuse() {
 
     let b = engine.encode("Completely different words altogether").unwrap();
     let stats = engine.generate(&b, &greedy(4), |_, _, _| {}).expect("gen b");
-    assert_eq!(stats.cached_tokens, 0, "unrelated prompt must cold-start");
+    // Every prompt is prefixed with the model's BOS when it declares one,
+    // so two unrelated prompts genuinely share their first token. What
+    // must not happen is reuse of the stale *text* prefix.
+    assert!(
+        stats.cached_tokens <= 1,
+        "unrelated prompt reused {} tokens; only a shared BOS is legitimate",
+        stats.cached_tokens
+    );
 }
 
 fn agent_turn(

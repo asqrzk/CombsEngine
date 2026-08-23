@@ -210,7 +210,7 @@ fn load_tokenizer_spec(model_dir: &Path) -> Result<TokenizerSpec> {
     }
 
     Ok(TokenizerSpec {
-        tokenizer_json,
+        tokenizer: combs_formats::TokenizerSource::Path(tokenizer_json),
         added_tokens,
         chat_template,
         add_bos: None,

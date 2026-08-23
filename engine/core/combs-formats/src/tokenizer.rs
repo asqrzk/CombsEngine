@@ -1,13 +1,33 @@
 //! Tokenizer specification returned by [`crate::ModelSource::tokenizer`].
 
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Where a tokenizer's `tokenizer.json` comes from.
+///
+/// A door rather than a flag: an adapter names the one origin its
+/// tokenizer has, and consumers read it through
+/// [`TokenizerSpec::json_bytes`] without caring which. A model delivered
+/// as bytes over a wire — the browser case — has no path to hand out, and
+/// a model on disk should not be forced to copy itself into memory to be
+/// read. A third origin later (an OPFS handle, a ranged fetch) is a
+/// variant here and a change nowhere else.
+#[derive(Debug, Clone)]
+pub enum TokenizerSource {
+    /// A file on disk. Its directory is also where sibling artifacts are
+    /// looked up (`1_Pooling/config.json`, tokenizer companions).
+    Path(PathBuf),
+    /// The JSON itself, held in memory: synthesized from container
+    /// metadata, or received without a filesystem behind it.
+    Bytes(Vec<u8>),
+}
 
 /// Where to find the tokenizer and which special tokens it defines.
 #[derive(Debug, Clone)]
 pub struct TokenizerSpec {
-    /// Path to the HuggingFace `tokenizer.json`.
-    pub tokenizer_json: PathBuf,
+    /// Origin of the HuggingFace `tokenizer.json`.
+    pub tokenizer: TokenizerSource,
     /// Added special tokens parsed from `tokenizer_config.json`
     /// (`added_tokens_decoder`): token id → token string (e.g. `<|im_end|>`).
     pub added_tokens: HashMap<u32, String>,
@@ -27,11 +47,57 @@ impl TokenizerSpec {
     /// tokenizer. `tokenizer()` on those sources errors before this is used.
     pub(crate) fn placeholder() -> Self {
         Self {
-            tokenizer_json: PathBuf::new(),
+            tokenizer: TokenizerSource::Bytes(Vec::new()),
             added_tokens: HashMap::new(),
             chat_template: None,
             add_bos: None,
         }
+    }
+
+    /// Builds a spec around a `tokenizer.json` on disk.
+    pub fn from_path(path: impl Into<PathBuf>) -> Self {
+        Self {
+            tokenizer: TokenizerSource::Path(path.into()),
+            added_tokens: HashMap::new(),
+            chat_template: None,
+            add_bos: None,
+        }
+    }
+
+    /// True for the weights-only placeholder — a source that carries no
+    /// tokenizer at all, as distinct from one whose tokenizer failed to
+    /// load.
+    pub fn is_placeholder(&self) -> bool {
+        match &self.tokenizer {
+            TokenizerSource::Path(p) => p.as_os_str().is_empty(),
+            TokenizerSource::Bytes(b) => b.is_empty(),
+        }
+    }
+
+    /// The `tokenizer.json` bytes, read from disk on demand or borrowed
+    /// from memory. This is what every consumer should call:
+    /// `Tokenizer::from_bytes(spec.json_bytes()?)` works on every target,
+    /// where `from_file` needs a filesystem that a browser does not have.
+    pub fn json_bytes(&self) -> crate::Result<Cow<'_, [u8]>> {
+        match &self.tokenizer {
+            TokenizerSource::Path(p) => Ok(Cow::Owned(std::fs::read(p)?)),
+            TokenizerSource::Bytes(b) => Ok(Cow::Borrowed(b)),
+        }
+    }
+
+    /// The `tokenizer.json` path, when the tokenizer has one. `None` for
+    /// an in-memory tokenizer — callers that need a real file (an external
+    /// tool, a cache) must handle its absence rather than fabricate a path.
+    pub fn json_path(&self) -> Option<&Path> {
+        match &self.tokenizer {
+            TokenizerSource::Path(p) => Some(p),
+            TokenizerSource::Bytes(_) => None,
+        }
+    }
+
+    /// The directory sibling artifacts live in, when there is one.
+    pub fn json_dir(&self) -> Option<&Path> {
+        self.json_path().and_then(Path::parent)
     }
 
     /// Looks up the id of an added special token by its string, e.g.

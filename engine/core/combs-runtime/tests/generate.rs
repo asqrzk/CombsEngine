@@ -42,32 +42,69 @@ fn load_engine() -> Engine {
 
 #[test]
 #[ignore = "requires a local model directory (COMBS_TEST_MODEL)"]
-fn cancel_flag_stops_generation_between_tokens() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+fn cancel_before_first_token_returns_cancelled() {
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
+    // The flag is already set when the worker picks the request up, so the
+    // first loop iteration sees it. Nothing here depends on how fast the
+    // machine decodes or on what the model would have said.
     let engine = load_engine();
-    let tokens = engine.encode("Tell me a long story about the sea.").unwrap();
-    let cancel = Arc::new(AtomicBool::new(false));
-    let flag = cancel.clone();
-    std::thread::spawn(move || {
-        // Fire after prefill + a few decode steps (TTFT ~250 ms here).
-        std::thread::sleep(std::time::Duration::from_millis(600));
-        flag.store(true, Ordering::Relaxed);
-    });
-
+    let tokens = engine.encode("The capital of France is").unwrap();
     let mut pieces = 0;
     let result = engine.generate_cancellable(
         &tokens,
         &GenerationConfig {
-            max_tokens: 512,
+            max_tokens: 64,
+            ..Default::default()
+        },
+        Arc::new(AtomicBool::new(true)),
+        |_id, _piece, _lp| pieces += 1,
+    );
+    assert!(
+        matches!(result, Err(combs_runtime::EngineError::Cancelled)),
+        "expected Cancelled, got {result:?}"
+    );
+    assert_eq!(pieces, 0, "a request cancelled before decoding emits nothing");
+}
+
+#[test]
+#[ignore = "requires a local model directory (COMBS_TEST_MODEL)"]
+fn cancel_flag_stops_generation_between_tokens() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let engine = load_engine();
+    // A continuation prompt, not an instruction: the test model is a base
+    // model and answers an instruction by stopping immediately, which would
+    // leave nothing to cancel and the test passing vacuously. This prompt
+    // runs to the budget when left alone.
+    let tokens = engine.encode("The capital of France is").unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flag = cancel.clone();
+
+    // Raised from the stream itself rather than from a timer: racing a
+    // sleep against decode speed measures the machine, not the engine.
+    let mut pieces = 0;
+    let result = engine.generate_cancellable(
+        &tokens,
+        &GenerationConfig {
+            max_tokens: 256,
             ..Default::default()
         },
         cancel,
-        |_id, _piece, _lp| pieces += 1,
+        |_id, _piece, _lp| {
+            pieces += 1;
+            if pieces == 1 {
+                flag.store(true, Ordering::Relaxed);
+            }
+        },
     );
-    assert!(matches!(result, Err(combs_runtime::EngineError::Cancelled)));
-    assert!(pieces > 0 && pieces < 512, "partial stream: {pieces} pieces");
+    assert!(
+        matches!(result, Err(combs_runtime::EngineError::Cancelled)),
+        "expected Cancelled after {pieces} pieces, got {result:?}"
+    );
+    assert!(pieces > 0 && pieces < 256, "partial stream: {pieces} pieces");
 }
 
 #[test]
@@ -101,3 +138,4 @@ fn concurrent_generates_queue_single_flight() {
         assert!(!h.join().unwrap().is_empty());
     }
 }
+

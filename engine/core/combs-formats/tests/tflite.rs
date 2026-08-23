@@ -44,8 +44,8 @@ fn parses_task_structure() {
     assert!(names.iter().any(|n| n.ends_with("mlp.down_proj.weight")));
     // Tokenizer extraction + conversion must have run.
     let spec = source.tokenizer().expect("tokenizer");
-    assert!(spec.tokenizer_json.exists());
-    println!("tokenizer: {}", spec.tokenizer_json.display());
+    assert!(!spec.json_bytes().unwrap().is_empty());
+    println!("tokenizer: {}", spec.json_path().expect("path-backed").display());
 }
 
 #[test]

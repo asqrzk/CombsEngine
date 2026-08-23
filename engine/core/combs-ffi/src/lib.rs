@@ -145,7 +145,11 @@ pub unsafe extern "C" fn combs_engine_create(config_json: *const c_char) -> *mut
         let config: EngineConfigJson =
             serde_json::from_str(json).map_err(|e| format!("invalid engine config JSON: {e}"))?;
 
-        let source = open_model_source(&config.model_dir)
+        let model_dir = config
+            .model_dir
+            .as_deref()
+            .ok_or("engine config needs `model_dir`")?;
+        let source = open_model_source(model_dir)
             .map_err(|e| format!("loading model source: {e}"))?;
 
         let mut cache_config = CacheConfig::paged(
@@ -335,93 +339,16 @@ pub unsafe extern "C" fn combs_chat_completion(
                 .map_err(|e| format!("invalid request JSON: {e}"))?;
         let req_id = unsafe { read_str(request_id, "request_id") }?.to_string();
 
-        let prompt = match (&request.messages, &request.prompt) {
-            (Some(messages), _) => {
-                let msgs: Vec<combs_runtime::ChatMessage> = messages
-                    .iter()
-                    .map(|m| combs_runtime::ChatMessage {
-                        role: m.role.clone(),
-                        content: m.content.clone(),
-                        tool_calls: m
-                            .tool_calls
-                            .iter()
-                            .filter_map(|c| serde_json::from_value(c.clone()).ok())
-                            .collect(),
-                        tool_call_id: m.tool_call_id.clone(),
-                        name: m.name.clone(),
-                    })
-                    .collect();
-                engine
-                    .engine
-                    .wrap_chat_with_tools(&msgs, request.tools.as_ref())
-            }
-            (None, Some(p)) => p.clone(),
-            (None, None) => return Err("request needs `prompt` or `messages`".into()),
-        };
-        // Parse tool calls out of the stream only when tools were supplied.
-        let parser_style = if request.tools.is_some() {
-            engine.engine.tool_call_style()
-        } else {
-            combs_runtime::ToolCallStyle::None
-        };
-        let prompt_tokens = engine
-            .engine
-            .encode(&prompt)
-            .map_err(|e| format!("tokenization failed: {e}"))?;
-
-        // Defaults from the engine; explicit request fields win.
-        let mut config = engine.engine.default_config();
-        let sampling = SamplingParams {
-            temperature: request.temperature.unwrap_or(config.sampling.temperature),
-            top_k: request.top_k.or(config.sampling.top_k),
-            top_p: request.top_p.or(config.sampling.top_p),
-            repetition_penalty: request
-                .repetition_penalty
-                .or(config.sampling.repetition_penalty),
-            frequency_penalty: request
-                .frequency_penalty
-                .or(config.sampling.frequency_penalty),
-            presence_penalty: request.presence_penalty.or(config.sampling.presence_penalty),
-            seed: request.seed.or(config.sampling.seed),
-            min_p: request.min_p.or(config.sampling.min_p),
-            logit_bias: request
-                .logit_bias
-                .clone()
-                .or_else(|| config.sampling.logit_bias.clone()),
-            logprobs: request.logprobs.or(config.sampling.logprobs),
-            penalty_last_n: config.sampling.penalty_last_n,
-            penalty_exempt: config.sampling.penalty_exempt.clone(),
-        };
-        config.sampling = sampling;
-        if let Some(mt) = request.max_tokens {
-            config.max_tokens = mt;
-        }
-        if let Some(stop) = request.stop {
-            config.stop_strings = stop;
-        }
-        if let Some(ids) = request.stop_token_ids {
-            config.stop_token_ids = ids;
-        } else if request.messages.is_some() {
-            // Chat mode: stop at <|im_end|> when the tokenizer defines it.
-            if let Some(im_end) = engine.engine.im_end_id() {
-                config.stop_token_ids.push(im_end);
-            }
-        }
-        if let Some(chunk) = request.prefill_chunk_size.or(engine.prefill_chunk_size) {
-            config.prefill_chunk_size = chunk;
-        }
-        if let Some(rf) = request.response_format.as_ref() {
-            config.constraint = combs_runtime::ConstraintSpec::from_response_format(rf)
-                .and_then(|spec| {
-                    if let Some(s) = &spec {
-                        // Compile now so schema errors surface as request
-                        // errors, not generation failures.
-                        s.compile()?;
-                    }
-                    Ok(spec)
-                })
-                .map_err(|e| format!("response_format: {e}"))?;
-        }
+        let resolved = combs_runtime::resolve_chat_request(
+            &engine.engine,
+            &request,
+            engine.prefill_chunk_size,
+        )?;
+        let combs_runtime::ResolvedChat {
+            prompt_tokens,
+            config,
+            parser_style,
+        } = resolved;
 
         let cancel = Arc::new(AtomicBool::new(false));
         cancel_registry()
@@ -476,27 +403,15 @@ pub unsafe extern "C" fn combs_chat_completion(
 
         match outcome {
             Ok(stats) => {
-                let finish_reason = if stats.generated_tokens >= config.max_tokens {
-                    "length"
-                } else if !tool_calls.is_empty() {
-                    "tool_calls"
-                } else {
-                    "stop"
-                };
+                let reason =
+                    combs_runtime::finish_reason(&stats, config.max_tokens, tool_calls.len());
                 emit(
                     cb,
                     user_data,
                     &StreamEvent::Done {
-                        finish_reason: finish_reason.into(),
+                        finish_reason: reason.into(),
                         tool_calls,
-                        stats: StatsJson {
-                            prompt_tokens: stats.prompt_tokens,
-                            generated_tokens: stats.generated_tokens,
-                            ttft_ms: stats.ttft.as_secs_f64() * 1000.0,
-                            decode_tokens_per_second: stats.decode_tokens_per_second(),
-                            prefill_tokens_per_second: stats.prefill_tokens_per_second(),
-                            cache_pages_used: stats.cache_pages_used,
-                        },
+                        stats: StatsJson::from(&stats),
                     },
                 );
                 Ok(())
@@ -511,14 +426,7 @@ pub unsafe extern "C" fn combs_chat_completion(
                         &StreamEvent::Done {
                             finish_reason: "cancelled".into(),
                             tool_calls: Vec::new(),
-                            stats: StatsJson {
-                                prompt_tokens: 0,
-                                generated_tokens: 0,
-                                ttft_ms: 0.0,
-                                decode_tokens_per_second: 0.0,
-                                prefill_tokens_per_second: 0.0,
-                                cache_pages_used: 0,
-                            },
+                            stats: StatsJson::default(),
                         },
                     );
                     Ok(())

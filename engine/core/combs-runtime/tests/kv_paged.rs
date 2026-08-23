@@ -50,7 +50,11 @@ fn paged_matches_contiguous_greedy() {
 #[test]
 #[ignore = "requires a local model directory (COMBS_TEST_MODEL)"]
 fn chunked_prefill_matches_single_shot() {
-    let prompt = "Explain what a hash map is in one paragraph.";
+    // A continuation, not an instruction: the test model is a base model
+    // and answers an instruction by emitting its stop token first, which
+    // makes both sides trivially equal and the comparison meaningless.
+    // Long enough that a chunk size of 4 really does prefill in pieces.
+    let prompt = "The history of the printing press begins in the fifteenth century, when";
     let single = greedy_tokens(CacheKind::Paged, prompt, 32, 0);
     let chunked = greedy_tokens(CacheKind::Paged, prompt, 32, 4);
     assert!(

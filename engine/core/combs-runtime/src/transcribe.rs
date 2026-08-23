@@ -39,7 +39,7 @@ impl SpeechEngine {
         let device = init_device();
         let model = load_speech_model::<CombsBackend>(&source, &device)?;
         let spec = source.tokenizer()?;
-        let tokenizer = Tokenizer::from_file(&spec.tokenizer_json)
+        let tokenizer = Tokenizer::from_bytes(spec.json_bytes()?)
             .map_err(|e| EngineError::Tokenizer(e.to_string()))?;
 
         let id = |s: &str| -> Result<u32> {

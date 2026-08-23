@@ -38,13 +38,20 @@ pub use litertlm::{SectionInfo, read_sections as litertlm_read_sections};
 pub use source::{ModelSource, QuantFormat, QuantTensor, SamplerConfig, TensorDtype, TensorReader};
 pub use spm::{ensure_tokenizer_json_from_spm, spm_added_tokens};
 pub use tflite::TfliteSource;
-pub use tokenizer::TokenizerSpec;
+pub use tokenizer::{TokenizerSource, TokenizerSpec};
 
+#[cfg(not(target_family = "wasm"))]
 use std::path::Path;
 
 /// Opens any supported model path: a `.gguf` file, or a directory in the
 /// HuggingFace safetensors layout. This is the single entry point the CLI,
 /// FFI and server use — format detection lives here.
+///
+/// Native only, and deliberately: every arm below asks the filesystem a
+/// question. A browser answers none of them — it comes in through
+/// [`open_model_source_bytes`] instead, which is a different question, not
+/// a degraded version of this one.
+#[cfg(not(target_family = "wasm"))]
 pub fn open_model_source(path: impl AsRef<Path>) -> Result<Box<dyn ModelSource>> {
     let path = path.as_ref();
     if path.is_file() && path.extension().is_some_and(|e| e == "gguf") {
@@ -60,6 +67,24 @@ pub fn open_model_source(path: impl AsRef<Path>) -> Result<Box<dyn ModelSource>>
         return Ok(Box::new(SafetensorsSource::load(path)?));
     }
     Err(FormatError::MissingFile(path.display().to_string()))
+}
+
+/// Opens a model whose bytes are already in memory, sniffing the
+/// container from its magic. The counterpart to [`open_model_source`] for
+/// callers with no filesystem to point at — a browser tab holding a
+/// downloaded file, a test fixture built in memory.
+///
+/// Single-file GGUF only: the directory formats are directories, and a
+/// directory is not a byte string. Extending this is a new arm here.
+pub fn open_model_source_bytes(bytes: Vec<u8>) -> Result<Box<dyn ModelSource>> {
+    const GGUF_MAGIC: &[u8; 4] = b"GGUF";
+    if bytes.starts_with(GGUF_MAGIC) {
+        return Ok(Box::new(GgufSource::from_bytes(bytes)?));
+    }
+    Err(FormatError::Safetensors(format!(
+        "unrecognized model bytes: expected a GGUF magic, found {:02x?}",
+        &bytes[..bytes.len().min(4)]
+    )))
 }
 
 /// Errors produced by format adapters.

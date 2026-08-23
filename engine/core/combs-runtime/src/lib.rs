@@ -10,19 +10,38 @@
 mod constraint;
 mod detok;
 mod engine;
+mod local;
 mod logits;
+mod request;
 mod sampler;
+// Prompt-lookup drafting feeds the speculative decode path, which is
+// native-only (it verifies with a blocking readback).
+#[cfg(not(target_family = "wasm"))]
 mod spec;
+mod step;
 mod stop;
+mod time;
 mod template;
 mod toolcall;
+// Speech transcription reads checkpoints off disk and syncs the device on
+// every window; neither exists in a browser, so it stays native-only until
+// it has an async readback of its own.
+#[cfg(not(target_family = "wasm"))]
 mod transcribe;
 
 pub use combs_models::{CacheConfig, CacheKind};
 pub use constraint::{CompiledSchema, ConstraintSpec, ConstraintState, TokenByteTable};
 pub use engine::{
-    EmbedOptions, EmbedOutput, Engine, EngineStatsSnapshot, GenerationConfig, GenerationStats,
+    EmbedOptions, EmbedOutput, EngineStatsSnapshot, GenerationConfig, GenerationStats,
     LastGeneration, PerplexityOutput, Pooling, SessionInfo, check_context_len, default_arena_len,
+};
+#[cfg(not(target_family = "wasm"))]
+pub use engine::Engine;
+
+pub use local::{LocalEngine, StepEvent};
+pub use request::{
+    ChatHost, ChatMessageJson, ChatRequestJson, EngineConfigJson, EngineMetadataJson,
+    ResolvedChat, StatsJson, StreamEvent, finish_reason, resolve_chat_request,
 };
 
 pub use logits::{
@@ -38,6 +57,7 @@ pub use template::ChatTemplate;
 pub use toolcall::{
     ChatMessage, ToolCall, ToolCallParser, ToolCallStyle, ToolEvent, ToolFunction,
 };
+#[cfg(not(target_family = "wasm"))]
 pub use transcribe::SpeechEngine;
 
 /// Errors produced by the runtime.

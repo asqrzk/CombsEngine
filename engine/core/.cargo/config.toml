@@ -1,2 +1,10 @@
 [alias]
 xtask = "run --package xtask --"
+
+# getrandom 0.3 (reached through ahash) refuses wasm32-unknown-unknown
+# unless the browser backend is named BOTH as a feature and as a cfg flag —
+# the feature alone is explicitly insufficient. Scoped to the wasm target,
+# so native builds are untouched. getrandom 0.4 (through rand) needs only
+# its `wasm_js` feature, declared in combs-core's Cargo.toml.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

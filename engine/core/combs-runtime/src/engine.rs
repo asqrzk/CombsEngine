@@ -7,26 +7,36 @@
 //! executed strictly serially — this is the seam Phase 3's threaded engine
 //! and scheduler will hang off.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use burn::tensor::{Tensor, TensorData};
-use combs_core::{BufferPool, CombsBackend, CombsDevice};
-use combs_formats::{ModelMetadata, ModelSource, SamplerConfig};
-use combs_media::PixelBatch;
-use combs_models::{CacheConfig, CacheKind, GenerativeModel, KVCache, ModelRegistry, pixels_to_tensor};
-use tokenizers::Tokenizer;
+use combs_formats::SamplerConfig;
 
-use crate::constraint::{ConstraintSpec, ConstraintState, TokenByteTable};
-use crate::detok::IncrementalDetokenizer;
-use crate::spec;
-use crate::sampler::{
-    Sampler, SamplingParams, TokenLogprobs, sampler_from_params_exempting,
-};
-use crate::stop::StopDetector;
+use crate::constraint::ConstraintSpec;
+use crate::sampler::SamplingParams;
 use crate::{EngineError, Result};
+
+// The threaded driver's own imports. Kept apart from the shared ones above
+// so that cfg-ing the driver out does not leave a dozen unused names
+// behind — the boundary is visible here rather than repeated per line.
+#[cfg(not(target_family = "wasm"))]
+use native_driver_imports::*;
+#[cfg(not(target_family = "wasm"))]
+mod native_driver_imports {
+    pub(super) use std::sync::atomic::AtomicBool;
+    pub(super) use std::sync::{Arc, Mutex, mpsc};
+    pub(super) use std::thread::JoinHandle;
+
+    pub(super) use burn::tensor::{Tensor, TensorData};
+    pub(super) use combs_core::{BufferPool, CombsBackend, CombsDevice};
+    pub(super) use combs_formats::{ModelMetadata, ModelSource};
+    pub(super) use combs_media::PixelBatch;
+    pub(super) use combs_models::{CacheConfig, CacheKind, GenerativeModel, ModelRegistry};
+    pub(super) use tokenizers::Tokenizer;
+
+    pub(super) use crate::constraint::TokenByteTable;
+    pub(super) use crate::sampler::TokenLogprobs;
+    pub(super) use crate::step::{self, MAX_SESSIONS, SessionSet, Submitted, begin_generation};
+}
 
 /// Parameters for one generation call.
 #[derive(Debug, Clone)]
@@ -191,6 +201,15 @@ pub fn check_context_len(
     Ok(())
 }
 
+// --- the threaded driver ------------------------------------------------
+//
+// Everything from here to `run_generation` is one engine shape: a worker
+// thread that owns the model and blocks on each readback, fed over an mpsc
+// queue. A browser has no thread to give it and no blocking readback to
+// give it either, so rather than ship an API that compiles there and fails
+// there, the whole driver is native. The browser's engine is
+// `crate::LocalEngine`, and both are drivers over the same `crate::step`.
+#[cfg(not(target_family = "wasm"))]
 /// One queued generation request.
 struct GenerateRequest {
     prompt_tokens: Vec<u32>,
@@ -205,6 +224,7 @@ struct GenerateRequest {
     reply: mpsc::Sender<Result<GenerationStats>>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Instruction for the engine worker thread.
 enum Command {
     Generate(Box<GenerateRequest>),
@@ -228,20 +248,6 @@ enum Command {
     Shutdown,
 }
 
-/// The worker's rolling session: the previous request's full token history
-/// (prompt + decoded tokens — exactly what the KV cache contains) and its
-/// cache. The next request rolls the cache back to the longest common
-/// prefix with its own prompt and prefills only the suffix.
-struct SessionState {
-    history: Vec<u32>,
-    cache: Box<dyn KVCache<CombsBackend>>,
-    last_used: u64,
-}
-
-/// Maximum named sessions kept alive at once (LRU-evicted beyond this).
-/// Each session owns its KV arena, so this also bounds cache VRAM.
-const MAX_SESSIONS: usize = 4;
-
 /// Default cap for the KV arena when the model advertises a larger
 /// positional maximum. 32k tokens covers long coding sessions while keeping
 /// the arena allocation bounded on 16–18 GB machines; `--context-size`
@@ -261,56 +267,6 @@ const DEFAULT_KV_ARENA_CAP: usize = 65536;
 /// `--context-size`).
 pub fn default_arena_len(max_position_embeddings: usize) -> usize {
     max_position_embeddings.min(DEFAULT_KV_ARENA_CAP)
-}
-
-/// The worker's session table: named rolling sessions with LRU eviction.
-/// The anonymous session (empty key) serves requests without a session id.
-struct SessionSet {
-    map: std::collections::HashMap<String, SessionState>,
-    tick: u64,
-    evictions: u64,
-}
-
-impl SessionSet {
-    fn new() -> Self {
-        SessionSet {
-            map: std::collections::HashMap::new(),
-            tick: 0,
-            evictions: 0,
-        }
-    }
-
-    /// Removes and returns the session for `key` (caller re-inserts it
-    /// after generation, or drops it to free its pages).
-    fn take(&mut self, key: &str) -> Option<SessionState> {
-        self.map.remove(key)
-    }
-
-    /// Drops every session, returning how many were removed.
-    fn clear_all(&mut self) -> usize {
-        let n = self.map.len();
-        self.map.clear();
-        n
-    }
-
-    /// Inserts a session, evicting the least-recently-used one past
-    /// [`MAX_SESSIONS`].
-    fn put(&mut self, key: String, mut session: SessionState) {
-        self.tick += 1;
-        session.last_used = self.tick;
-        self.map.insert(key, session);
-        if self.map.len() > MAX_SESSIONS {
-            if let Some(oldest) = self
-                .map
-                .iter()
-                .min_by_key(|(_, s)| s.last_used)
-                .map(|(k, _)| k.clone())
-            {
-                self.map.remove(&oldest);
-                self.evictions += 1;
-            }
-        }
-    }
 }
 
 /// Point-in-time engine statistics, written by the worker thread after
@@ -382,11 +338,7 @@ pub struct SessionInfo {
     pub pages: Option<combs_models::PageStats>,
 }
 
-/// Length of the longest common prefix of two token slices.
-fn common_prefix(a: &[u32], b: &[u32]) -> usize {
-    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
-}
-
+#[cfg(not(target_family = "wasm"))]
 /// Single-flight generation engine over the default wgpu backend.
 ///
 /// The model lives on an internal worker thread; all public methods are
@@ -416,6 +368,7 @@ pub struct Engine {
     pool: BufferPool,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl Engine {
     /// Loads a model from any [`ModelSource`] via the default registry.
     ///
@@ -464,8 +417,8 @@ impl Engine {
         let supports_embeddings = model.supports_hidden_states();
 
         let spec = source.tokenizer()?;
-        let default_pooling = detect_pooling(&spec.tokenizer_json);
-        let tokenizer = Tokenizer::from_file(&spec.tokenizer_json)
+        let default_pooling = detect_pooling(spec.json_dir());
+        let tokenizer = Tokenizer::from_bytes(spec.json_bytes()?)
             .map_err(|e| EngineError::Tokenizer(e.to_string()))?;
 
         // Observability snapshot: seeded with the static KV geometry so
@@ -854,6 +807,36 @@ impl Engine {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
+/// The threaded engine answers chat requests the same way every engine
+/// does — see [`crate::request`], where that meaning lives.
+impl crate::request::ChatHost for Engine {
+    fn wrap_chat_with_tools(
+        &self,
+        messages: &[crate::ChatMessage],
+        tools: Option<&serde_json::Value>,
+    ) -> String {
+        Engine::wrap_chat_with_tools(self, messages, tools)
+    }
+
+    fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        Engine::encode(self, text)
+    }
+
+    fn default_config(&self) -> GenerationConfig {
+        Engine::default_config(self)
+    }
+
+    fn im_end_id(&self) -> Option<u32> {
+        Engine::im_end_id(self)
+    }
+
+    fn tool_call_style(&self) -> crate::ToolCallStyle {
+        Engine::tool_call_style(self)
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
 impl Drop for Engine {
     fn drop(&mut self) {
         let _ = self.tx.send(Command::Shutdown);
@@ -868,6 +851,7 @@ impl Drop for Engine {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Worker-thread loop: executes queued requests serially until shutdown.
 fn worker_loop(
     mut model: Box<dyn GenerativeModel<CombsBackend>>,
@@ -884,7 +868,7 @@ fn worker_loop(
     // Token→bytes table for constrained decoding: derived from the
     // tokenizer on the first constrained request, then reused for the
     // worker's lifetime (vocab-sized, so built once, never per request).
-    let mut token_table: Option<TokenByteTable> = None;
+    let mut token_table: Option<Arc<TokenByteTable>> = None;
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Command::Shutdown => break,
@@ -946,10 +930,12 @@ fn worker_loop(
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Prompt tokens per `prefill_hidden` call on the embeddings path — the
 /// same attention-memory bound chunked generation prefill uses.
 const EMBED_CHUNK: usize = 512;
 
+#[cfg(not(target_family = "wasm"))]
 /// Executes one embeddings request on the worker thread.
 ///
 /// Each text runs on a fresh contiguous cache (dropped afterwards — no
@@ -1047,6 +1033,7 @@ fn run_embed(
     })
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Evaluates perplexity of a token sequence on the worker thread.
 ///
 /// Chunked prefill through the model's all-positions logits head; the
@@ -1091,7 +1078,7 @@ fn run_perplexity(
         let input = embedded.clone().narrow(1, offset, len);
         let start = offset as u32;
         let logits = model.prefill_all_logits(input, cache.as_mut(), start..start + len as u32)?;
-        let [_, l, vocab] = logits.dims();
+        let [_, _l, vocab] = logits.dims();
 
         // Targets for positions offset..offset+len are tokens shifted by
         // one; the sequence-final position has none.
@@ -1134,6 +1121,7 @@ fn run_perplexity(
     })
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// In-place L2 normalization (no-op on a zero vector).
 fn l2_normalize(v: &mut [f32]) {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1144,14 +1132,17 @@ fn l2_normalize(v: &mut [f32]) {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Detects the checkpoint's pooling convention: sentence-transformers
 /// layouts ship `1_Pooling/config.json` next to the weights; absent (or
 /// unrecognized), decoder embedding models pool the last token.
-fn detect_pooling(tokenizer_json: &std::path::Path) -> Pooling {
-    let path = match tokenizer_json.parent() {
-        Some(dir) => dir.join("1_Pooling").join("config.json"),
-        None => return Pooling::Last,
-    };
+///
+/// `None` means the tokenizer has no directory to look beside — an
+/// in-memory checkpoint carries no sibling files, so there is nothing to
+/// detect and the decoder default stands.
+fn detect_pooling(dir: Option<&std::path::Path>) -> Pooling {
+    let Some(dir) = dir else { return Pooling::Last };
+    let path = dir.join("1_Pooling").join("config.json");
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Pooling::Last;
     };
@@ -1164,12 +1155,12 @@ fn detect_pooling(tokenizer_json: &std::path::Path) -> Pooling {
     Pooling::Last
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Refreshes the shared snapshot after a generation. Runs on the worker so
 /// the GPU allocator sample (`submit_blocking`) never contends with an
 /// in-flight generation; observers only ever pay a mutex clone.
 fn session_infos(sessions: &SessionSet) -> Vec<SessionInfo> {
     sessions
-        .map
         .iter()
         .map(|(k, s)| SessionInfo {
             id: if k.is_empty() {
@@ -1183,6 +1174,7 @@ fn session_infos(sessions: &SessionSet) -> Vec<SessionInfo> {
         .collect()
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn update_stats(
     stats: &Mutex<EngineStatsSnapshot>,
     result: &Result<GenerationStats>,
@@ -1229,14 +1221,13 @@ fn update_stats(
     snap.gpu = gpu;
 }
 
+#[cfg(not(target_family = "wasm"))]
 /// Executes one generation request on the worker thread.
 ///
-/// Rolling-session prefix reuse: when the request allows it (paged cache,
-/// `session_reuse`), the previous request's KV cache is rolled back to the
-/// longest common token prefix with the new prompt and only the suffix is
-/// prefilled. The session is saved on every exit path after prefill, so a
-/// cancelled request still leaves a consistent cache behind.
-#[allow(clippy::too_many_arguments)]
+/// The decode loop itself lives in [`crate::step`]; what belongs here is
+/// only the part that is specific to *this* driver — a dedicated thread
+/// that can afford to block on each logits readback, and an mpsc channel
+/// that can refuse a piece when the caller has hung up.
 fn run_generation(
     model: &mut dyn GenerativeModel<CombsBackend>,
     tokenizer: &Tokenizer,
@@ -1245,481 +1236,64 @@ fn run_generation(
     max_position_embeddings: usize,
     req: &GenerateRequest,
     sessions: &mut SessionSet,
-    token_table: &mut Option<TokenByteTable>,
+    token_table: &mut Option<Arc<TokenByteTable>>,
 ) -> Result<GenerationStats> {
-    let prompt_tokens = &req.prompt_tokens;
-    let config = &req.config;
-    if prompt_tokens.is_empty() {
-        return Err(EngineError::Tokenizer("empty prompt".to_string()));
-    }
-    // Context budget: enforced against the cache capacity, which is itself
-    // capped by the model's positional limit.
-    check_context_len(
-        prompt_tokens.len(),
-        config.max_tokens,
-        cache_config.max_seq_len.min(max_position_embeddings),
+    let (mut active, logits) = begin_generation(
+        model,
+        tokenizer,
+        device,
+        cache_config,
+        max_position_embeddings,
+        &req.prompt_tokens,
+        &req.images,
+        &req.config,
+        req.cancel.clone(),
+        sessions,
+        token_table,
     )?;
 
-    // Image turns never join the KV session cache: token prefixes would
-    // collide with different image contents, so media requests run on a
-    // fresh cache and are not saved back.
-    let has_media = !req.images.is_empty();
-    let reuse = config.session_reuse && cache_config.kind == CacheKind::Paged && !has_media;
-    let key = config.session_id.clone().unwrap_or_default();
+    // A send failure is the caller hanging up mid-stream, which the loop
+    // treats as a cancel.
+    let mut emit = |id: u32, piece: String, lp: Option<TokenLogprobs>| {
+        req.pieces.send((id, piece, lp)).is_ok()
+    };
 
-    // Longest common prefix with this session's previous request. Capped at
-    // prompt.len() - 1 so at least one token is always prefilled (the last
-    // position's logits are needed to start decoding, even for an
-    // identical repeated prompt).
-    let mut lcp = 0usize;
-    let mut cache = if reuse {
-        match sessions.take(&key) {
-            Some(mut s) => {
-                let shared = common_prefix(&s.history, prompt_tokens)
-                    .min(prompt_tokens.len().saturating_sub(1));
-                if shared > 0 {
-                    let need = s.history.len() - shared;
-                    let popped = s.cache.popn(need);
-                    if popped == need {
-                        // Invariant: lcp == cache seq_len == history len.
-                        s.history.truncate(shared);
-                        lcp = shared;
-                        s.cache
-                    } else {
-                        // The cache cannot roll back to the shared prefix
-                        // (sliding-window layers past eviction): a partial
-                        // rollback would leave divergent tokens cached, so
-                        // rebuild fresh. Pure extensions (need == 0) never
-                        // hit this arm.
-                        model.create_kv_cache(cache_config)
+    // Errors before the first token are request-level rejections: nothing
+    // was produced and no session is written.
+    let row = step::readback_logits(logits)?;
+    active.sample_row(row)?;
+
+    loop {
+        active.advance(tokenizer, &mut emit);
+        if active.is_done() {
+            break;
+        }
+        match active.submit(model, device) {
+            Submitted::Logits(t) => match step::readback_logits(t) {
+                Ok(row) => {
+                    if active.sample_row(row).is_err() {
+                        // Unreachable: past the first token, sample_row
+                        // records its failure instead of returning it.
+                        break;
                     }
-                } else {
-                    model.create_kv_cache(cache_config)
                 }
-            }
-            None => model.create_kv_cache(cache_config),
-        }
-    } else {
-        model.create_kv_cache(cache_config)
-    };
-
-    let eos_ids = req_eos_ids(model, config);
-    // Penalties must never touch the stop tokens: `<|im_end|>` appears
-    // once per prior turn in a chat prompt, so an unexempted penalty
-    // suppresses the model's ability to end its turn — and gets worse
-    // the longer the conversation runs.
-    let mut sampler: Box<dyn Sampler> =
-        sampler_from_params_exempting(&config.sampling, &eos_ids);
-    let mut stop = StopDetector::new(eos_ids.clone(), config.stop_strings.clone());
-    // Structured output: compile the schema at request time and bind the
-    // automaton to this model's token table (built lazily, cached on the
-    // worker). The mask runs engine-side, not in the sampler's processor
-    // chain — the greedy sampler skips that chain, and a constraint must
-    // hold under every sampler.
-    let mut constraint = match &config.constraint {
-        Some(spec) => {
-            let schema = spec.compile().map_err(EngineError::Constraint)?;
-            let table = token_table.get_or_insert_with(|| TokenByteTable::build(tokenizer));
-            Some(ConstraintState::new(schema, table, eos_ids))
-        }
-        None => None,
-    };
-    let mut detok = IncrementalDetokenizer::new();
-    let mut history: Vec<u32> = prompt_tokens.to_vec();
-
-    let t_start = Instant::now();
-
-    // --- chunked prefill of the suffix (prompt[lcp..]) ---------------------
-    let chunk = if config.prefill_chunk_size == 0 {
-        usize::MAX
-    } else {
-        config.prefill_chunk_size
-    };
-    let suffix = &prompt_tokens[lcp..];
-    let data: Vec<i32> = suffix.iter().map(|&t| t as i32).collect();
-    let tokens = Tensor::from_data(TensorData::new(data, [1, suffix.len()]), device);
-    let embedded = if has_media {
-        let pixels: Vec<Tensor<CombsBackend, 4>> = req
-            .images
-            .iter()
-            .map(|pb| pixels_to_tensor(pb.data.clone(), pb.shape(), device))
-            .collect();
-        model.embed_multimodal(tokens, &pixels)?
-    } else {
-        model.embed(tokens)
-    };
-
-    let mut offset = 0;
-    let mut logits = None;
-    while offset < suffix.len() {
-        let len = chunk.min(suffix.len() - offset);
-        let input = embedded.clone().narrow(1, offset, len);
-        let start = (lcp + offset) as u32;
-        logits = Some(model.prefill(input, cache.as_mut(), start..start + len as u32));
-        offset += len;
-    }
-    let logits = logits.expect("nonempty suffix runs at least one chunk");
-
-    let mut row = readback_logits(logits)?;
-    if let Some(c) = constraint.as_mut() {
-        if c.mask(&mut row) == 0 {
-            return Err(EngineError::Constraint(DEAD_END.to_string()));
-        }
-    }
-    let outcome = sampler.sample(&mut row, &history);
-    let mut next = outcome.token;
-    let mut next_logprobs = outcome.logprobs;
-    if let Some(c) = constraint.as_mut() {
-        c.advance(next);
-    }
-    let ttft = t_start.elapsed();
-    let t_decode = Instant::now();
-    let mut trace = DecodeTrace::from_env();
-
-    // Speculative decoding (prompt-lookup drafts + multi-token verify):
-    // greedy-only and only where raw argmax IS the sampler (no penalties,
-    // bias, or logprob capture), never under constraints, and only on
-    // non-sliding models with a paged cache — there `popn` rollback is
-    // always total. Every other request takes the normal path untouched.
-    let spec_active = spec_enabled()
-        && constraint.is_none()
-        && config.sampling.temperature <= 0.0
-        && config.sampling.repetition_penalty.map_or(true, |v| v == 1.0)
-        && config.sampling.frequency_penalty.map_or(true, |v| v == 0.0)
-        && config.sampling.presence_penalty.map_or(true, |v| v == 0.0)
-        && config.sampling.logit_bias.is_none()
-        && config.sampling.logprobs.is_none()
-        && model.supports_decode_all_logits()
-        && model.metadata().attention_pattern.sliding_window.is_none()
-        && cache.pages_used().is_some();
-    // Pre-verified tokens waiting to be emitted, and how many cache rows
-    // sit beyond `decoded` (drained back to zero as pending empties).
-    let mut pending: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
-    let mut cache_ahead = 0usize;
-    let mut spec_cooldown = 0usize;
-
-    // Tokens actually fed through `decode` (i.e. present in the KV cache).
-    // The final sampled token and stop tokens never enter the cache.
-    let mut decoded: Vec<u32> = Vec::new();
-    let mut generated = 0usize;
-    let mut loop_error: Option<EngineError> = None;
-
-    for _ in 0..config.max_tokens {
-        if req.cancel.load(Ordering::Relaxed) {
-            loop_error = Some(EngineError::Cancelled);
-            break;
-        }
-        if stop.is_stop_token(next) {
-            break;
-        }
-        history.push(next);
-        let piece = match detok.push(tokenizer, next) {
-            Ok(p) => p,
-            Err(e) => {
-                loop_error = Some(e);
-                break;
-            }
-        };
-        // Emit the piece, truncating at a stop string if one completes.
-        match stop.push_text(&piece) {
-            Some(cut) => {
-                if cut > 0
-                    && req
-                        .pieces
-                        .send((next, piece[..cut].to_string(), next_logprobs.take()))
-                        .is_err()
-                {
-                    loop_error = Some(EngineError::Cancelled); // caller hung up
-                }
-                generated += 1;
-                break;
-            }
-            None => {
-                if req.pieces.send((next, piece, next_logprobs.take())).is_err() {
-                    loop_error = Some(EngineError::Cancelled); // caller hung up
-                    break;
-                }
-            }
-        }
-        generated += 1;
-
-        if generated >= config.max_tokens {
-            break;
-        }
-        if let Some(t) = pending.pop_front() {
-            // Pre-verified by the last speculative round: `next` is already
-            // in the cache and `t` was proven to follow it.
-            decoded.push(next);
-            cache_ahead -= 1;
-            next = t;
-            next_logprobs = None;
-        } else if let Some(draft) = (spec_active && spec_cooldown == 0)
-            .then(|| spec::propose(&history, SPEC_DRAFT, SPEC_MIN_NGRAM, SPEC_MAX_NGRAM))
-            .flatten()
-        {
-            // Feed [next, draft…] in one pass; row i's argmax is the
-            // model's true next token after position i, so the longest
-            // matching prefix of the draft is exactly what greedy decoding
-            // would have produced one at a time.
-            let k = draft.len();
-            let mut ids: Vec<i32> = Vec::with_capacity(k + 1);
-            ids.push(next as i32);
-            ids.extend(draft.iter().map(|&t| t as i32));
-            let input =
-                model.embed(Tensor::from_data(TensorData::new(ids, [1, k + 1]), device));
-            let all = match model.decode_all_logits(input, cache.as_mut()) {
-                Ok(t) => t,
                 Err(e) => {
-                    loop_error = Some(e.into());
+                    active.fail(e);
                     break;
                 }
-            };
-            let rows: Vec<f32> = match all.into_data().convert::<f32>().to_vec::<f32>() {
-                Ok(v) => v,
-                Err(e) => {
-                    loop_error = Some(EngineError::Readback(format!("spec logits: {e:?}")));
-                    break;
-                }
-            };
-            let vocab = rows.len() / (k + 1);
-            let argmax = |r: usize| -> u32 {
-                rows[r * vocab..(r + 1) * vocab]
-                    .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.total_cmp(b.1))
-                    .map(|(i, _)| i as u32)
-                    .unwrap_or(0)
-            };
-            let mut accepted = 0usize;
-            while accepted < k && argmax(accepted) == draft[accepted] {
-                accepted += 1;
-            }
-            let correction = argmax(accepted.min(k));
-            // Roll the rejected tail out of the cache. The static guards
-            // make a partial rollback impossible; treat one as fatal
-            // rather than continuing on divergent state.
-            let unwanted = k - accepted;
-            if unwanted > 0 {
-                let popped = cache.popn(unwanted);
-                if popped != unwanted {
-                    loop_error = Some(EngineError::Readback(format!(
-                        "speculative rollback popped {popped} of {unwanted} rows"
-                    )));
-                    break;
-                }
-            }
-            decoded.push(next);
-            cache_ahead += accepted;
-            spec_cooldown = if accepted == 0 { SPEC_BACKOFF } else { 0 };
-            pending.extend(draft[..accepted].iter().copied());
-            pending.push_back(correction);
-            next = pending.pop_front().expect("correction token is always queued");
-            next_logprobs = None;
-        } else {
-            spec_cooldown = spec_cooldown.saturating_sub(1);
-            trace.step_start();
-            let data = vec![next as i32];
-            let input = model.embed(Tensor::from_data(TensorData::new(data, [1, 1]), device));
-            let logits = model.decode(input, cache.as_mut());
-            trace.submitted();
-            decoded.push(next); // `next` is now in the KV cache
-            let mut row = match readback_logits(logits) {
-                Ok(r) => r,
-                Err(e) => {
-                    loop_error = Some(e);
-                    break;
-                }
-            };
-            trace.read_back();
-            if let Some(c) = constraint.as_mut() {
-                if c.mask(&mut row) == 0 {
-                    loop_error = Some(EngineError::Constraint(DEAD_END.to_string()));
-                    break;
-                }
-            }
-            let outcome = sampler.sample(&mut row, &history);
-            next = outcome.token;
-            next_logprobs = outcome.logprobs;
-            if let Some(c) = constraint.as_mut() {
-                c.advance(next);
-            }
-            trace.sampled();
-        }
-    }
-
-    // Release any character the detokenizer held back (an incomplete
-    // UTF-8 sequence at the very end of generation).
-    if let Ok(tail) = detok.flush(tokenizer) {
-        if !tail.is_empty() {
-            let _ = req.pieces.send((0, tail, None));
-        }
-    }
-
-    // Pre-verified rows that never got emitted must leave the cache before
-    // the session snapshot (history must mirror KV contents exactly).
-    if cache_ahead > 0 {
-        let popped = cache.popn(cache_ahead);
-        debug_assert_eq!(popped, cache_ahead, "speculative exit rollback");
-    }
-
-    // Save the rolling session: history must mirror KV contents exactly
-    // (prompt + decoded tokens — nothing else).
-    let cache_pages_used = cache.pages_used().unwrap_or(0);
-    if reuse {
-        let mut hist = prompt_tokens.clone();
-        hist.extend_from_slice(&decoded);
-        sessions.put(
-            key,
-            SessionState {
-                history: hist,
-                cache,
-                last_used: 0,
             },
-        );
-    }
-
-    trace.report();
-    let decode_time = t_decode.elapsed();
-    let stats = GenerationStats {
-        prompt_tokens: prompt_tokens.len(),
-        generated_tokens: generated,
-        ttft,
-        decode_time,
-        total_time: t_start.elapsed(),
-        cache_pages_used,
-        cached_tokens: lcp,
-    };
-    match loop_error {
-        Some(e) => Err(e),
-        None => Ok(stats),
-    }
-}
-
-/// Draft length proposed per speculative round.
-const SPEC_DRAFT: usize = 6;
-/// Shortest history suffix n-gram accepted as a draft trigger — bigrams
-/// recur incidentally in all text and produce failed rounds that cost more
-/// than they save.
-const SPEC_MIN_NGRAM: usize = 3;
-/// Longest history suffix n-gram searched for a recurrence.
-const SPEC_MAX_NGRAM: usize = 8;
-/// Tokens decoded normally after a fully-rejected round before drafting
-/// again (a miss usually means this region of text is not repetitive).
-const SPEC_BACKOFF: usize = 16;
-
-/// Speculative decoding ships opt-in behind `COMBS_SPEC=1` until its
-/// measured speedup clears the bar for default-on; checked once.
-fn spec_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| matches!(std::env::var("COMBS_SPEC").as_deref(), Ok("1")))
-}
-
-/// Error text for a constraint dead end (no token can legally continue).
-const DEAD_END: &str =
-    "no vocabulary token can continue the constrained JSON output (schema dead end)";
-
-/// Collects the eos ids that apply to a request.
-fn req_eos_ids(
-    model: &dyn GenerativeModel<CombsBackend>,
-    config: &GenerationConfig,
-) -> Vec<u32> {
-    model
-        .metadata()
-        .eos_token_ids
-        .iter()
-        .chain(config.stop_token_ids.iter())
-        .copied()
-        .collect()
-}
-
-/// Reads a `[1, vocab]` logits row back to the host (one copy per step).
-fn readback_logits(logits: Tensor<CombsBackend, 2>) -> Result<Vec<f32>> {
-    logits
-        .into_data()
-        .convert::<f32>()
-        .to_vec::<f32>()
-        .map_err(|e| EngineError::Readback(format!("logits must be f32: {e:?}")))
-}
-
-/// Per-step decode timing behind `COMBS_TRACE_DECODE=1`: accumulates the
-/// wall split of kernel submission (embed + decode enqueue), logits
-/// readback (the host sync that absorbs GPU execution time), and host-side
-/// mask + sample, then prints one stderr summary line per generation.
-/// Inert when the env var is unset.
-struct DecodeTrace {
-    enabled: bool,
-    t: Instant,
-    submit: Duration,
-    readback: Duration,
-    sample: Duration,
-    steps: u32,
-}
-
-impl DecodeTrace {
-    fn from_env() -> Self {
-        DecodeTrace {
-            enabled: matches!(std::env::var("COMBS_TRACE_DECODE").as_deref(), Ok("1")),
-            t: Instant::now(),
-            submit: Duration::ZERO,
-            readback: Duration::ZERO,
-            sample: Duration::ZERO,
-            steps: 0,
+            Submitted::Ready => continue,
+            Submitted::Done => break,
         }
     }
 
-    fn step_start(&mut self) {
-        if self.enabled {
-            self.t = Instant::now();
-        }
-    }
-
-    fn submitted(&mut self) {
-        if self.enabled {
-            let now = Instant::now();
-            self.submit += now - self.t;
-            self.t = now;
-        }
-    }
-
-    fn read_back(&mut self) {
-        if self.enabled {
-            let now = Instant::now();
-            self.readback += now - self.t;
-            self.t = now;
-        }
-    }
-
-    fn sampled(&mut self) {
-        if self.enabled {
-            self.sample += self.t.elapsed();
-            self.steps += 1;
-        }
-    }
-
-    fn report(&self) {
-        if !self.enabled || self.steps == 0 {
-            return;
-        }
-        let total = self.submit + self.readback + self.sample;
-        let per = |d: Duration| d.as_secs_f64() * 1e3 / self.steps as f64;
-        let pct = |d: Duration| 100.0 * d.as_secs_f64() / total.as_secs_f64().max(f64::EPSILON);
-        eprintln!(
-            "[trace] decode: {} steps, {:.2} ms/step — submit {:.2} ms ({:.0}%), readback {:.2} ms ({:.0}%), sample {:.3} ms ({:.0}%)",
-            self.steps,
-            per(total),
-            per(self.submit),
-            pct(self.submit),
-            per(self.readback),
-            pct(self.readback),
-            per(self.sample),
-            pct(self.sample),
-        );
-    }
+    active.finish(tokenizer, sessions, &mut emit)
 }
+
 
 /// Merges `generation_config.json` sampler defaults over the built-in
 /// defaults. `None` fields keep the built-in default (greedy, no filters).
-fn default_config_from(sampler: Option<&SamplerConfig>) -> GenerationConfig {
+pub(crate) fn default_config_from(sampler: Option<&SamplerConfig>) -> GenerationConfig {
     let mut config = GenerationConfig::default();
     if let Some(sd) = sampler {
         if let Some(t) = sd.temperature {
@@ -1794,19 +1368,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_family = "wasm"))]
     fn engine_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Engine>();
-    }
-
-    #[test]
-    fn common_prefix_cases() {
-        assert_eq!(common_prefix(&[1, 2, 3], &[1, 2, 3]), 3);
-        assert_eq!(common_prefix(&[1, 2, 3], &[1, 2, 4]), 2);
-        assert_eq!(common_prefix(&[1, 2], &[1, 2, 3, 4]), 2);
-        assert_eq!(common_prefix(&[1, 2, 3, 4], &[1, 2]), 2);
-        assert_eq!(common_prefix(&[1], &[2]), 0);
-        assert_eq!(common_prefix(&[], &[1]), 0);
-        assert_eq!(common_prefix(&[1], &[]), 0);
     }
 }

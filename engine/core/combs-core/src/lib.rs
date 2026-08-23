@@ -14,6 +14,15 @@ pub mod quant;
 
 use burn::backend::wgpu::{RuntimeOptions, WgpuDevice, WgpuSetup, graphics::AutoGraphicsApi};
 
+// `AutoGraphicsApi` already resolves to `BrowserWebGpu` under
+// `target_family = "wasm"`, so the graphics API needs no cfg of ours —
+// only the *initialization* differs: cubecl's sync `init_setup` panics on
+// wasm by construction ("Creating a wgpu setup synchronously is
+// unsupported"), and `init_setup_async` is the form that works on every
+// target. Every probe below therefore exists twice: the sync original,
+// native-only and unchanged for the CLI/FFI/serve callers, and an `_async`
+// twin compiled everywhere, which is what the browser bindings call.
+
 /// The default inference backend: autotuned, fusing wgpu/CubeCL backend
 /// (`Fusion<CubeBackend<WgpuRuntime, f32, i32, u32>>`).
 ///
@@ -56,6 +65,9 @@ pub fn init_device() -> CombsDevice {
 /// probe. Initializing a cubecl device on an adapterless machine (e.g. a
 /// CI runner) panics in a worker thread, so GPU-dependent tests check
 /// this first and skip rather than fail.
+///
+/// Native only — see [`gpu_available_async`] for the browser.
+#[cfg(not(target_family = "wasm"))]
 pub fn gpu_available() -> bool {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // `::wgpu` is the raw crate — the bare name resolves to this
@@ -66,6 +78,18 @@ pub fn gpu_available() -> bool {
             cubecl::future::block_on(instance.enumerate_adapters(::wgpu::Backends::all()));
         !adapters.is_empty()
     })
+}
+
+/// True when wgpu can reach an adapter, asked the way every platform can
+/// answer it: `request_adapter`. The browser reports no adapters through
+/// `enumerate_adapters` by construction, so the sync probe above is not
+/// merely blocked there, it is wrong there; this one is correct on both.
+pub async fn gpu_available_async() -> bool {
+    let instance = ::wgpu::Instance::default();
+    instance
+        .request_adapter(&::wgpu::RequestAdapterOptions::default())
+        .await
+        .is_ok()
 }
 
 /// Basic information about a wgpu adapter.
@@ -113,9 +137,29 @@ pub struct DeviceCaps {
 ///
 /// Like [`device_info`], this performs the cubecl runtime setup for the
 /// device, so it is safe (and cheap) to use the device afterwards.
+#[cfg(not(target_family = "wasm"))]
 pub fn device_caps(device: &CombsDevice) -> DeviceCaps {
-    let setup: WgpuSetup =
-        burn::backend::wgpu::init_setup::<AutoGraphicsApi>(device, RuntimeOptions::default());
+    caps_from_setup(&burn::backend::wgpu::init_setup::<AutoGraphicsApi>(
+        device,
+        RuntimeOptions::default(),
+    ))
+}
+
+/// [`device_caps`] for callers that can await — the only form available in
+/// a browser, and identical in result natively.
+pub async fn device_caps_async(device: &CombsDevice) -> DeviceCaps {
+    caps_from_setup(
+        &burn::backend::wgpu::init_setup_async::<AutoGraphicsApi>(
+            device,
+            RuntimeOptions::default(),
+        )
+        .await,
+    )
+}
+
+/// Reads the capability set off an already-initialized setup. Both
+/// `device_caps` forms share this so the two can never drift.
+fn caps_from_setup(setup: &WgpuSetup) -> DeviceCaps {
     let info = setup.adapter.get_info();
     let limits = setup.adapter.limits();
     let features = setup.adapter.features();
@@ -149,6 +193,7 @@ pub struct GpuMemory {
 /// Samples the GPU allocator. `memory_usage()` is `submit_blocking` on the
 /// compute stream — call from the engine worker between generations (or
 /// rate-limited), not from request threads during a long prefill.
+#[cfg(not(target_family = "wasm"))]
 pub fn gpu_memory(device: &CombsDevice) -> Option<GpuMemory> {
     let client =
         <burn::backend::wgpu::WgpuRuntime as cubecl::prelude::Runtime>::client(device);
@@ -160,6 +205,16 @@ pub fn gpu_memory(device: &CombsDevice) -> Option<GpuMemory> {
     })
 }
 
+/// Browser build: `memory_usage()` is a blocking submit on the compute
+/// stream, which a single-threaded wasm page cannot perform. Reporting
+/// `None` — "not measured" — keeps every call site source-identical and
+/// keeps the number honest; when the platform grows a non-blocking
+/// allocator query, only this arm changes.
+#[cfg(target_family = "wasm")]
+pub fn gpu_memory(_device: &CombsDevice) -> Option<GpuMemory> {
+    None
+}
+
 /// Initializes the wgpu runtime for `device` and returns adapter information.
 ///
 /// Note: this performs the cubecl runtime setup for the device (the same setup
@@ -168,12 +223,30 @@ pub fn gpu_memory(device: &CombsDevice) -> Option<GpuMemory> {
 /// NOTE: like [`device_caps`], this primes the cubecl runtime — only
 /// ONE such probe may run per process (a second `init_setup` panics in
 /// cubecl 0.10). Prefer `device_caps`, which carries a superset.
+#[cfg(not(target_family = "wasm"))]
 pub fn device_info(device: &CombsDevice) -> DeviceInfo {
-    let setup: WgpuSetup =
-        burn::backend::wgpu::init_setup::<AutoGraphicsApi>(device, RuntimeOptions::default());
+    info_from_setup(&burn::backend::wgpu::init_setup::<AutoGraphicsApi>(
+        device,
+        RuntimeOptions::default(),
+    ))
+}
+
+/// [`device_info`] for callers that can await.
+pub async fn device_info_async(device: &CombsDevice) -> DeviceInfo {
+    info_from_setup(
+        &burn::backend::wgpu::init_setup_async::<AutoGraphicsApi>(
+            device,
+            RuntimeOptions::default(),
+        )
+        .await,
+    )
+}
+
+/// Reads adapter identity off an already-initialized setup.
+fn info_from_setup(setup: &WgpuSetup) -> DeviceInfo {
     let info = setup.adapter.get_info();
     DeviceInfo {
-        name: info.name,
+        name: info.name.clone(),
         backend: format!("{:?}", info.backend),
         device_type: format!("{:?}", info.device_type),
         driver: format!("{} ({})", info.driver, info.driver_info),

@@ -53,10 +53,9 @@ fn cpu_chunked_matches_cpu_single_shot() {
     prompt.push_str("In one sentence, summarize the above:");
 
     let source = SafetensorsSource::load(model_dir()).expect("load source");
-    let tokenizer = tokenizers::Tokenizer::from_file(
-        source.tokenizer().unwrap().tokenizer_json,
-    )
-    .unwrap();
+    let tokenizer =
+        tokenizers::Tokenizer::from_bytes(source.tokenizer().unwrap().json_bytes().unwrap())
+            .unwrap();
     let tokens: Vec<u32> = tokenizer.encode(prompt, false).unwrap().get_ids().to_vec();
     assert!(tokens.len() >= 500);
 

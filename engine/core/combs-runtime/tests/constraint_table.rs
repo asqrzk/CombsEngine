@@ -39,7 +39,7 @@ fn table_matches_decoder_on_cached_vocabs() {
         }
         let tok = Tokenizer::from_file(&path).expect("tokenizer loads");
         let t0 = std::time::Instant::now();
-        let table = TokenByteTable::build(&tok);
+        let table = std::sync::Arc::new(TokenByteTable::build(&tok));
         let build_ms = t0.elapsed().as_millis();
 
         let anchor = *tok.get_vocab(true).get("a").expect("'a' in vocab");
@@ -76,7 +76,7 @@ fn mask_allows_legal_json_and_reports_overhead() {
         return;
     }
     let tok = Tokenizer::from_file(&path).expect("tokenizer loads");
-    let table = TokenByteTable::build(&tok);
+    let table = std::sync::Arc::new(TokenByteTable::build(&tok));
     let n = tok.get_vocab_size(true);
 
     let doc = r#"{"name": "combs", "age": 3, "tags": ["fast", "local"], "score": -2.5e-1, "ok": true, "extra": null}"#;
@@ -87,7 +87,7 @@ fn mask_allows_legal_json_and_reports_overhead() {
         .to_vec();
 
     let schema = ConstraintSpec::JsonObject.compile().expect("compiles");
-    let mut state = ConstraintState::new(schema, &table, vec![]);
+    let mut state = ConstraintState::new(schema, table.clone(), vec![]);
     let mut logits = vec![0.0f32; n];
     let mut total = std::time::Duration::ZERO;
     for &id in &ids {

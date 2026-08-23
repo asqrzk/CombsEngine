@@ -18,3 +18,10 @@ wgpu = "29"
 
 [dev-dependencies]
 burn = { version = "0.21.0", default-features = false, features = ["ndarray", "std"] }
+
+# getrandom 0.4 reaches us transitively (burn-backend -> rand) and refuses
+# to build for wasm32-unknown-unknown unless the browser backend feature is
+# selected. Declared target-gated (inert on native) so a wasm check of this
+# crate alone resolves without a workspace-wide rustflag.
+[target.'cfg(target_family = "wasm")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }

@@ -120,7 +120,9 @@ pub struct StableDiffusionPipeline<B: Backend> {
     unet: UNet2DConditionModel<B>,
     vae_decoder: VAEDecoder<B>,
     text_encoder: Option<ClipTextModel<B>>,
-    tokenizer_json: Option<std::path::PathBuf>,
+    /// CLIP tokenizer JSON, held as bytes so the pipeline does not depend
+    /// on the checkpoint still being on disk when a prompt is encoded.
+    tokenizer_json: Option<Vec<u8>>,
 }
 
 impl<B: Backend> DiffusionModel<B> for StableDiffusionPipeline<B> {
@@ -151,7 +153,7 @@ impl<B: Backend> DiffusionModel<B> for StableDiffusionPipeline<B> {
         let tokenizer_json = source
             .tokenizer()
             .ok()
-            .map(|spec| spec.tokenizer_json.clone());
+            .and_then(|spec| spec.json_bytes().ok().map(|b| b.into_owned()));
 
         Ok(Self {
             metadata,
@@ -177,12 +179,12 @@ impl<B: Backend> DiffusionModel<B> for StableDiffusionPipeline<B> {
             });
         };
 
-        let positive_ids = tokenize_clip(&tokenizer_json, prompt)?;
+        let positive_ids = tokenize_clip(tokenizer_json, prompt)?;
         let positive_ids = crate::clip::input_ids_to_tensor::<B>(&positive_ids, &self.device);
         let positive = text_encoder.forward(positive_ids);
 
         let negative_text = negative_prompt.unwrap_or("");
-        let negative_ids = tokenize_clip(&tokenizer_json, negative_text)?;
+        let negative_ids = tokenize_clip(tokenizer_json, negative_text)?;
         let negative_ids = crate::clip::input_ids_to_tensor::<B>(&negative_ids, &self.device);
         let negative = text_encoder.forward(negative_ids);
 
@@ -300,20 +302,17 @@ impl<B: Backend> StableDiffusionPipeline<B> {
             unet,
             vae_decoder,
             text_encoder: Some(text_encoder),
-            tokenizer_json: Some(tokenizer.tokenizer_json),
+            tokenizer_json: Some(tokenizer.json_bytes()?.into_owned()),
         })
     }
 }
 
 /// Tokenize a prompt for CLIP (SD 1.5): add bos/eos, truncate to 77, and pad
 /// with the end-of-text token.
-fn tokenize_clip(tokenizer_json: &std::path::Path, text: &str) -> Result<Vec<u32>> {
+fn tokenize_clip(tokenizer_json: &[u8], text: &str) -> Result<Vec<u32>> {
     const MAX_LEN: usize = 77;
-    let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_json).map_err(|e| {
-        combs_formats::FormatError::Safetensors(format!(
-            "failed to load tokenizer {}: {e}",
-            tokenizer_json.display()
-        ))
+    let tokenizer = tokenizers::Tokenizer::from_bytes(tokenizer_json).map_err(|e| {
+        combs_formats::FormatError::Safetensors(format!("failed to load CLIP tokenizer: {e}"))
     })?;
     let encoding = tokenizer.encode(text, true).map_err(|e| {
         combs_formats::FormatError::Safetensors(format!("tokenize failed: {e}"))

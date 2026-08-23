@@ -17,15 +17,23 @@
 //! Tokenizer: a sibling `tokenizer.json` is used when present; otherwise a
 //! BPE `tokenizer.json` is synthesized from the GGUF tokenizer metadata
 //! (tokens/scores/types/merges) and cached next to the model.
+//!
+//! Two ways in. [`GgufSource::load`] maps a file — the native path, and
+//! the reason GGUF exists: weights are read where they lie.
+//! [`GgufSource::from_bytes`] takes the file image already in memory, for
+//! callers that have no filesystem to map (a browser tab holding a
+//! downloaded model). Parsing, name mapping and every reader are shared;
+//! only the byte custody and the tokenizer's origin differ.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+#[cfg(not(target_family = "wasm"))]
 use memmap2::Mmap;
 
 use crate::metadata::ModelMetadata;
 use crate::source::{ModelSource, SamplerConfig, TensorDtype, TensorReader};
-use crate::tokenizer::TokenizerSpec;
+use crate::tokenizer::{TokenizerSource, TokenizerSpec};
 use crate::{FormatError, Result};
 
 const GGUF_MAGIC: u32 = 0x4655_4747; // "GGUF"
@@ -51,15 +59,39 @@ struct TensorInfo {
     offset: usize, // relative to data section
 }
 
+/// The GGUF byte image and who holds it.
+///
+/// Mapped from disk natively; owned outright when the bytes arrived
+/// without a file behind them. Both deref to the same slice, so every
+/// reader below is written once and neither origin is a special case.
+enum GgufData {
+    #[cfg(not(target_family = "wasm"))]
+    Mmap(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl std::ops::Deref for GgufData {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            #[cfg(not(target_family = "wasm"))]
+            GgufData::Mmap(m) => m,
+            GgufData::Owned(v) => v,
+        }
+    }
+}
+
 /// A parsed GGUF file.
 pub struct GgufSource {
-    path: PathBuf,
-    mmap: Mmap,
+    /// The file this was read from, when it came from one.
+    path: Option<PathBuf>,
+    data: GgufData,
     metadata: ModelMetadata,
     kv: HashMap<String, MetaValue>,
     tensors: HashMap<String, TensorInfo>,
     data_start: usize,
-    tokenizer_json: PathBuf,
+    tokenizer: TokenizerSource,
     added_tokens: HashMap<u32, String>,
     eos_ids: Vec<u32>,
     bos_id: Option<u32>,
@@ -209,12 +241,27 @@ const GGML_Q6_K: u32 = 14;
 const GGML_BF16: u32 = 30;
 
 impl GgufSource {
-    /// Opens and parses a `.gguf` file.
+    /// Opens and parses a `.gguf` file, mapping it into memory.
+    #[cfg(not(target_family = "wasm"))]
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = std::fs::File::open(&path)?;
         let mmap = unsafe { Mmap::map(&file)? };
-        let mut c = Cursor::new(&mmap);
+        Self::parse(GgufData::Mmap(mmap), Some(path))
+    }
+
+    /// Parses a `.gguf` file image already held in memory.
+    ///
+    /// The whole file must be present — GGUF's tensor offsets are absolute
+    /// within it, so a partial buffer is not a smaller model, it is a
+    /// wrong one. With no file to sit beside, the tokenizer is synthesized
+    /// into memory rather than cached to disk.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+        Self::parse(GgufData::Owned(bytes), None)
+    }
+
+    fn parse(data: GgufData, path: Option<PathBuf>) -> Result<Self> {
+        let mut c = Cursor::new(&data);
 
         if c.u32()? != GGUF_MAGIC {
             return Err(FormatError::Safetensors("gguf: bad magic".into()));
@@ -276,16 +323,23 @@ impl GgufSource {
 
         let metadata = build_model_metadata(&kv)?;
         let (eos_ids, bos_id, added_tokens) = tokenizer_ids(&kv);
-        let tokenizer_json = ensure_tokenizer_json(&path, &kv)?;
+        // A file on disk gets the sibling-or-cached tokenizer.json (written
+        // once, reused by every later run); bytes in memory get the same
+        // JSON synthesized in memory. Same text either way.
+        let tokenizer = match &path {
+            #[cfg(not(target_family = "wasm"))]
+            Some(p) => TokenizerSource::Path(ensure_tokenizer_json(p, &kv)?),
+            _ => TokenizerSource::Bytes(synthesize_tokenizer_json(&kv)?.into_bytes()),
+        };
 
         let mut source = GgufSource {
             path,
-            mmap,
+            data,
             metadata,
             kv,
             tensors,
             data_start,
-            tokenizer_json,
+            tokenizer,
             added_tokens,
             eos_ids,
             bos_id,
@@ -523,6 +577,7 @@ fn pretokenizer_regex(kv: &HashMap<String, MetaValue>) -> &'static str {
 /// whenever its added_tokens count disagrees with the GGUF metadata. (No
 /// in-file version marker: the tokenizers crate rejects unknown top-level
 /// keys.)
+#[cfg(not(target_family = "wasm"))]
 fn ensure_tokenizer_json(path: &Path, kv: &HashMap<String, MetaValue>) -> Result<PathBuf> {
     let sibling = path.with_file_name("tokenizer.json");
     if sibling.exists() {
@@ -555,6 +610,17 @@ fn ensure_tokenizer_json(path: &Path, kv: &HashMap<String, MetaValue>) -> Result
         // Stale synthesis — regenerate below.
     }
 
+    let serialized = synthesize_tokenizer_json(kv)?;
+    std::fs::write(&cached, serialized)?;
+    Ok(cached)
+}
+
+/// Builds the HF BPE `tokenizer.json` text from GGUF tokenizer metadata.
+///
+/// Pure: no filesystem, no caching, no decisions about where the result
+/// should live — those belong to the caller, and only the caller knows
+/// whether there is a disk to put it on.
+fn synthesize_tokenizer_json(kv: &HashMap<String, MetaValue>) -> Result<String> {
     let tokens = match kv.get("tokenizer.ggml.tokens") {
         Some(MetaValue::Strings(t)) => t,
         _ => {
@@ -632,9 +698,8 @@ fn ensure_tokenizer_json(path: &Path, kv: &HashMap<String, MetaValue>) -> Result
             "merges": merges,
         }
     });
-    let serialized = serde_json::to_string(&json).map_err(|e| FormatError::Safetensors(format!("tokenizer json: {e}")))?;
-    std::fs::write(&cached, serialized)?;
-    Ok(cached)
+    serde_json::to_string(&json)
+        .map_err(|e| FormatError::Safetensors(format!("tokenizer json: {e}")))
 }
 
 /// Maps a ggml tensor name to its HF equivalent (`None` = skip tensor).
@@ -1116,7 +1181,7 @@ impl ModelSource for GgufSource {
         let size = tensor_byte_size(info)?;
         let start = self.data_start + info.offset;
         let data = self
-            .mmap
+            .data
             .get(start..start + size)
             .ok_or_else(|| FormatError::Safetensors(format!("gguf tensor {} out of bounds", info.name)))?;
 
@@ -1223,7 +1288,7 @@ impl ModelSource for GgufSource {
             _ => None,
         };
         Ok(TokenizerSpec {
-            tokenizer_json: self.tokenizer_json.clone(),
+            tokenizer: self.tokenizer.clone(),
             added_tokens: self.added_tokens.clone(),
             chat_template,
             add_bos,
@@ -1245,7 +1310,7 @@ impl ModelSource for GgufSource {
         };
         let size = tensor_byte_size(info)?;
         let start = self.data_start + info.offset;
-        let data = self.mmap.get(start..start + size).ok_or_else(|| {
+        let data = self.data.get(start..start + size).ok_or_else(|| {
             FormatError::Safetensors(format!("gguf tensor {} out of bounds", info.name))
         })?;
         let mut shape: Vec<usize> = info.dims.iter().rev().copied().collect();
@@ -1299,9 +1364,9 @@ impl GgufSource {
         &self.eos_ids
     }
 
-    /// Model file path.
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// Model file path, when this source was read from a file.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 }
 

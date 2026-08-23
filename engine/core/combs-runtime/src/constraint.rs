@@ -1347,9 +1347,14 @@ fn num_step(integer: bool, stage: NumStage, b: u8) -> NumOutcome {
 
 /// Live constraint for one generation: masks the logits row before each
 /// sample and advances on the sampled token.
-pub struct ConstraintState<'t> {
+pub struct ConstraintState {
     schema: CompiledSchema,
-    table: &'t TokenByteTable,
+    /// The vocabulary's byte table. Shared rather than borrowed: the table
+    /// is built once per engine and outlives many requests, and a borrow
+    /// would force every driver to keep the engine and the in-flight
+    /// generation in one stack frame — which the single-threaded browser
+    /// driver cannot do.
+    table: std::sync::Arc<TokenByteTable>,
     eos: Vec<u32>,
     machine: Machine,
     scratch: Machine,
@@ -1375,10 +1380,14 @@ struct CachedMask {
 /// Cache reset threshold — bounds memory at ~vocab/8 bytes × entries.
 const MASK_CACHE_MAX: usize = 512;
 
-impl<'t> ConstraintState<'t> {
+impl ConstraintState {
     /// Builds the live state from a compiled schema, the model's token
     /// table, and the request's eos ids (allowed only in accept states).
-    pub fn new(schema: CompiledSchema, table: &'t TokenByteTable, eos: Vec<u32>) -> Self {
+    pub fn new(
+        schema: CompiledSchema,
+        table: std::sync::Arc<TokenByteTable>,
+        eos: Vec<u32>,
+    ) -> Self {
         let machine = Machine::new(schema.root);
         let scratch = machine.clone();
         ConstraintState {
@@ -1707,7 +1716,7 @@ mod tests {
         ])
     }
 
-    fn masked_ids(state: &mut ConstraintState<'_>) -> Vec<u32> {
+    fn masked_ids(state: &mut ConstraintState) -> Vec<u32> {
         let mut logits = vec![0.0f32; state.table.len()];
         state.mask(&mut logits);
         logits
@@ -1720,9 +1729,9 @@ mod tests {
 
     #[test]
     fn mask_walks_json_object_mode() {
-        let table = toy_table();
+        let table = std::sync::Arc::new(toy_table());
         let schema = ConstraintSpec::JsonObject.compile().unwrap();
-        let mut state = ConstraintState::new(schema, &table, vec![5]);
+        let mut state = ConstraintState::new(schema, table.clone(), vec![5]);
 
         // Start: `{` opens the object (leading whitespace is legal JSON).
         assert_eq!(masked_ids(&mut state), vec![0, 8]);
@@ -1745,7 +1754,7 @@ mod tests {
     #[test]
     fn mask_dead_end_returns_zero() {
         // Schema requires a key "q" that no token in the vocabulary spells.
-        let table = toy_table();
+        let table = std::sync::Arc::new(toy_table());
         let schema = ConstraintSpec::JsonSchema(json!({
             "type":"object",
             "properties":{"q":{"type":"integer"}},
@@ -1754,18 +1763,18 @@ mod tests {
         }))
         .compile()
         .unwrap();
-        let mut state = ConstraintState::new(schema, &table, vec![5]);
+        let mut state = ConstraintState::new(schema, table.clone(), vec![5]);
         state.advance(0); // {
         let mut logits = vec![0.0f32; state.table.len()];
         // `}` is illegal (required key missing), `"a"` doesn't match "q",
         // `"z` matches nothing: only whitespace remains…
         assert_eq!(masked_ids(&mut state), vec![8]);
         // …and a vocabulary without whitespace would be a hard dead end.
-        let bare = TokenByteTable::from_raw(vec![
+        let bare = std::sync::Arc::new(TokenByteTable::from_raw(vec![
             Some(b"{".to_vec()),
             Some(b"}".to_vec()),
             Some(b"\"a\"".to_vec()),
-        ]);
+        ]));
         let schema = ConstraintSpec::JsonSchema(json!({
             "type":"object",
             "properties":{"q":{"type":"integer"}},
@@ -1774,7 +1783,7 @@ mod tests {
         }))
         .compile()
         .unwrap();
-        let mut state = ConstraintState::new(schema, &bare, vec![]);
+        let mut state = ConstraintState::new(schema, bare.clone(), vec![]);
         state.advance(0);
         logits.truncate(3);
         assert_eq!(state.mask(&mut logits), 0);
@@ -1807,7 +1816,7 @@ mod tests {
     fn free_string_fast_path_utf8_splices() {
         // 0 `{`, 1 `"k"`, 2 `:`, 3 `"`, 4 `x` (plain ascii), 5 lead C3,
         // 6 continuation A9, 7 `é` complete, 8 `x"` (closes the string).
-        let table = TokenByteTable::from_raw(vec![
+        let table = std::sync::Arc::new(TokenByteTable::from_raw(vec![
             Some(b"{".to_vec()),
             Some(b"\"k\"".to_vec()),
             Some(b":".to_vec()),
@@ -1817,9 +1826,9 @@ mod tests {
             Some(vec![0xA9]),
             Some(vec![0xC3, 0xA9]),
             Some(b"x\"".to_vec()),
-        ]);
+        ]));
         let schema = ConstraintSpec::JsonObject.compile().unwrap();
-        let mut state = ConstraintState::new(schema, &table, vec![]);
+        let mut state = ConstraintState::new(schema, table.clone(), vec![]);
         for id in [0u32, 1, 2, 3] {
             state.advance(id); // {"k":"
         }
