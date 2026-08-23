@@ -11,6 +11,8 @@
 const PIECES = ["Par", "is", " is", " the", " capital"];
 
 let cancelled = new Set();
+/** What `load` was configured with — metadata must report it afterwards. */
+let configured = null;
 
 const post = (kind, id, payload) => self.postMessage({ kind, id, payload });
 
@@ -57,9 +59,21 @@ self.onmessage = async (event) => {
   switch (kind) {
     case "load":
       if (payload?.fail) return post("error", id, "load refused by the test");
-      return post("ready", id, METADATA);
+      // The real worker accepts the model two ways and refuses neither
+      // silently; the test worker holds it to the same rule.
+      if (!payload?.modelBytes && !payload?.modelUrl) {
+        return post("error", id, "load needs `modelBytes` or `modelUrl`");
+      }
+      configured = {
+        ...METADATA,
+        max_seq_len: payload.max_seq_len ?? METADATA.max_seq_len,
+      };
+      return post("ready", id, configured);
     case "metadata":
-      return post("metadata", id, METADATA);
+      // The same answer `load` gave: an engine that reported one context
+      // window at load and another when asked would be lying about which
+      // one it allocated.
+      return post("metadata", id, configured ?? METADATA);
     case "chat":
       return await chat(id);
     case "cancel":

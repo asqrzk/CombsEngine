@@ -14,15 +14,44 @@ import { WorkerEngine } from "../src/worker.ts";
 const WORKER = new URL("./fake.worker.js", import.meta.url);
 
 Deno.test("worker: load resolves with the engine's metadata", async () => {
-  const engine = await WorkerEngine.load(WORKER, { max_seq_len: 4096 });
+  const engine = await WorkerEngine.load(WORKER, {
+    max_seq_len: 4096,
+    modelUrl: "https://example.invalid/model.gguf",
+  });
   const md = await engine.metadata();
   assertEquals(md.architecture, "llama");
   assertEquals(md.max_seq_len, 4096);
   engine.close();
 });
 
+Deno.test("worker: model bytes are accepted in place of a URL", async () => {
+  // The path a page takes when it already holds the weights: hand over the
+  // buffer rather than a URL the worker would have to resolve itself. (The
+  // platform's own backend posts this directly so the buffer can be
+  // transferred; through `WorkerEngine.load` it is structure-cloned, which
+  // costs a copy but is the same contract.)
+  const bytes = new Uint8Array([0x47, 0x47, 0x55, 0x46]).buffer;
+  const engine = await WorkerEngine.load(WORKER, {
+    max_seq_len: 2048,
+    modelBytes: bytes,
+  });
+  assertEquals((await engine.metadata()).max_seq_len, 2048);
+  engine.close();
+});
+
+Deno.test("worker: a load with no model at all is refused", async () => {
+  let failed = false;
+  try {
+    await WorkerEngine.load(WORKER, { max_seq_len: 2048 });
+  } catch (e) {
+    failed = true;
+    assertEquals(String(e).includes("modelBytes"), true);
+  }
+  assertEquals(failed, true, "a load without a model must not silently succeed");
+});
+
 Deno.test("worker: stream yields every delta then the terminal event", async () => {
-  const engine = await WorkerEngine.load(WORKER, {});
+  const engine = await WorkerEngine.load(WORKER, { modelUrl: "https://example.invalid/m.gguf" });
   const kinds: string[] = [];
   let text = "";
   for await (const event of engine.stream({ prompt: "The capital of France is" })) {
@@ -36,7 +65,7 @@ Deno.test("worker: stream yields every delta then the terminal event", async () 
 });
 
 Deno.test("worker: complete concatenates the stream", async () => {
-  const engine = await WorkerEngine.load(WORKER, {});
+  const engine = await WorkerEngine.load(WORKER, { modelUrl: "https://example.invalid/m.gguf" });
   const { text, finishReason, stats } = await engine.complete({ prompt: "x" });
   assertEquals(text, "Paris is the capital");
   assertEquals(finishReason, "stop");
@@ -45,7 +74,7 @@ Deno.test("worker: complete concatenates the stream", async () => {
 });
 
 Deno.test("worker: a cancel mid-stream keeps what arrived", async () => {
-  const engine = await WorkerEngine.load(WORKER, {});
+  const engine = await WorkerEngine.load(WORKER, { modelUrl: "https://example.invalid/m.gguf" });
   const id = crypto.randomUUID();
   let text = "";
   let reason = "";
