@@ -160,6 +160,48 @@ pub fn combs_engine_metadata(engine_id: u32) -> Result<String, JsValue> {
     })
 }
 
+/// The engine's live KV state as JSON: cache geometry and every rolling
+/// session with its history length and page usage.
+///
+/// The native engine publishes a snapshot its host polls over HTTP; a
+/// browser engine has no port and no thread to publish from, so its host
+/// asks it directly. Without this, a page can watch its own model answer
+/// and still have no idea what its cache is doing — which is precisely
+/// the state a KV bug is invisible in.
+#[wasm_bindgen]
+pub fn combs_engine_stats(engine_id: u32) -> Result<String, JsValue> {
+    ENGINES.with(|m| {
+        let map = m.borrow();
+        let engine = map
+            .get(&engine_id)
+            .ok_or_else(|| js_err("no such engine, or a request is running on it"))?;
+        let cc = engine.cache_config();
+        let sessions: Vec<serde_json::Value> = engine
+            .sessions()
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "history_tokens": s.history_len,
+                    "pages_used": s.pages.map(|p| p.pages_used),
+                })
+            })
+            .collect();
+        serde_json::to_string(&serde_json::json!({
+            "kind": match cc.kind {
+                combs_runtime::CacheKind::Paged => "paged",
+                combs_runtime::CacheKind::Contiguous => "contiguous",
+            },
+            "quantized": cc.quantize_kv,
+            "max_seq_len": cc.max_seq_len,
+            "page_size": cc.page_size,
+            "page_bytes": engine.kv_page_bytes(),
+            "sessions": sessions,
+        }))
+        .map_err(js_err)
+    })
+}
+
 /// Frees an engine and everything it holds (weights, KV arenas).
 #[wasm_bindgen]
 pub fn combs_engine_destroy(engine_id: u32) {

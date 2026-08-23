@@ -69,6 +69,15 @@ self.onmessage = async (event) => {
         max_seq_len: payload.max_seq_len ?? METADATA.max_seq_len,
       };
       return post("ready", id, configured);
+    case "stats":
+      return post("metadata", id, {
+        kind: "paged",
+        quantized: false,
+        max_seq_len: configured?.max_seq_len ?? METADATA.max_seq_len,
+        page_size: 16,
+        page_bytes: 368640,
+        sessions: [{ id: "(anonymous)", history_tokens: 42, pages_used: 3 }],
+      });
     case "metadata":
       // The same answer `load` gave: an engine that reported one context
       // window at load and another when asked would be lying about which

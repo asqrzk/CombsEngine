@@ -96,9 +96,9 @@ impl SessionSet {
         n
     }
 
-    /// Live sessions, for observability. Only the threaded engine
-    /// publishes a stats snapshot today.
-    #[cfg(not(target_family = "wasm"))]
+    /// Live sessions, for observability. Both engines publish a snapshot:
+    /// a KV cache nobody can see is a KV cache nobody can debug, and the
+    /// browser needs that more than the desktop does, not less.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &SessionState)> {
         self.map.iter()
     }

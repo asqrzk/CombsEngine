@@ -92,6 +92,23 @@ Deno.test("worker: a cancel mid-stream keeps what arrived", async () => {
   engine.close();
 });
 
+Deno.test("worker: the engine's KV state is reachable", async () => {
+  // A browser engine has no port to poll, so its cache is only visible if
+  // the host can ask for it. Nothing else in the app can see it.
+  const engine = await WorkerEngine.load(WORKER, {
+    modelUrl: "https://example.invalid/m.gguf",
+  });
+  const stats = await (engine as unknown as {
+    rpc: (r: { kind: string; id: string }) => Promise<unknown>;
+  }).rpc({ kind: "stats", id: crypto.randomUUID() }) as {
+    kind: string;
+    sessions: { history_tokens: number }[];
+  };
+  assertEquals(stats.kind, "paged");
+  assertEquals(stats.sessions[0].history_tokens, 42);
+  engine.close();
+});
+
 Deno.test("worker: a refused load rejects rather than hanging", async () => {
   let failed = false;
   try {

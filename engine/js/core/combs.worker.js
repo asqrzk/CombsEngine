@@ -22,6 +22,7 @@ import init, {
   combs_engine_create,
   combs_engine_destroy,
   combs_engine_metadata,
+  combs_engine_stats,
 } from "./pkg/combs_wasm.js";
 
 /** The one engine this worker hosts. One worker, one model, one flight. */
@@ -97,6 +98,10 @@ self.onmessage = async (event) => {
         // Nothing to reply to: the running request reports its own
         // cancellation through its event stream.
         combs_cancel(id);
+        break;
+      case "stats":
+        if (engineId === null) throw new Error("no engine loaded");
+        post("metadata", id, JSON.parse(combs_engine_stats(engineId)));
         break;
       case "caps":
         post("metadata", id, JSON.parse(await combs_device_caps()));

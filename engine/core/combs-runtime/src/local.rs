@@ -323,6 +323,50 @@ impl LocalEngine {
         }
     }
 
+    /// The live KV sessions this engine holds.
+    ///
+    /// The threaded engine publishes a stats snapshot its host can poll;
+    /// this one has no thread to publish from, so its host asks instead.
+    /// Same information, pulled rather than pushed.
+    pub fn sessions(&self) -> Vec<crate::SessionInfo> {
+        self.sessions
+            .iter()
+            .map(|(k, s)| crate::SessionInfo {
+                id: if k.is_empty() {
+                    "(anonymous)".to_string()
+                } else {
+                    k.clone()
+                },
+                history_len: s.history.len(),
+                pages: s.cache.page_stats(),
+            })
+            .collect()
+    }
+
+    /// Bytes one KV page costs across all layers (both K and V), so a
+    /// caller can turn page counts into memory the way the native stats
+    /// endpoint does.
+    pub fn kv_page_bytes(&self) -> u64 {
+        let meta = &self.metadata;
+        let elem_bytes: u64 = if cfg!(feature = "f16") { 2 } else { 4 };
+        let global_layers = (0..meta.num_hidden_layers)
+            .filter(|&i| meta.attention_pattern.is_global_layer(i))
+            .count()
+            .max(1);
+        let bytes_per_value_x8 = if self.cache_config.quantize_kv {
+            9 // (1 + 4/32) * 8
+        } else {
+            elem_bytes * 8
+        };
+        self.cache_config.page_size as u64
+            * meta.num_key_value_heads as u64
+            * meta.head_dim as u64
+            * bytes_per_value_x8
+            / 8
+            * 2 // K and V
+            * global_layers as u64
+    }
+
     /// Discards an in-flight generation, freeing its cache and leaving the
     /// engine ready for the next `begin`. Returns whether there was one.
     ///

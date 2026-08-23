@@ -23,7 +23,7 @@ import type {
 } from "./types.ts";
 
 interface WorkerRequest {
-  kind: "load" | "chat" | "cancel" | "metadata" | "caps" | "close";
+  kind: "load" | "chat" | "cancel" | "metadata" | "stats" | "caps" | "close";
   id: string;
   payload?: unknown;
 }
@@ -82,7 +82,9 @@ export class WorkerEngine implements EngineClient {
     return engine;
   }
 
-  private rpc(req: WorkerRequest): Promise<unknown> {
+  /** One pending RPC per id. Exposed to tests so protocol kinds without a
+   * typed wrapper (stats, caps) can still be exercised. */
+  rpc(req: WorkerRequest): Promise<unknown> {
     return new Promise((resolve, reject) => {
       this.pending.set(req.id, { resolve, reject, events: [] });
       this.worker.postMessage(req);
