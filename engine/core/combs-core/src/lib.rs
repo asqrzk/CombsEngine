@@ -131,6 +131,18 @@ pub struct DeviceCaps {
     /// exposes WebGPU extension features like `SHADER_F16` through the
     /// public adapter API, so we surface the raw list for the planner).
     pub features: String,
+    /// Smallest subgroup ("plane") width the adapter reports.
+    ///
+    /// Reported, not assumed, because it is a place the browser and the
+    /// desktop genuinely disagree: WebGPU exposes no subgroup information
+    /// today, so an adapter there reports zero — and cubecl substitutes a
+    /// nominal 8/128 range, which some reduction kernels then size
+    /// themselves against. A model whose reductions are correct on Metal
+    /// and wrong in a tab is a model to check this number for first.
+    pub subgroup_min_size: u32,
+    /// Largest subgroup width the adapter reports. See
+    /// [`DeviceCaps::subgroup_min_size`].
+    pub subgroup_max_size: u32,
 }
 
 /// Queries the adapter for its limits/features and returns [`DeviceCaps`].
@@ -173,6 +185,8 @@ fn caps_from_setup(setup: &WgpuSetup) -> DeviceCaps {
         max_compute_workgroup_size_x: limits.max_compute_workgroup_size_x,
         max_compute_invocations_per_workgroup: limits.max_compute_invocations_per_workgroup,
         features: format!("{:?}", features),
+        subgroup_min_size: info.subgroup_min_size,
+        subgroup_max_size: info.subgroup_max_size,
     }
 }
 

@@ -439,3 +439,12 @@ fn native_throughput_baseline() {
         stats.prefill_tokens_per_second(),
     );
 }
+
+/// Prints the device's own report of itself, native, for comparison with
+/// what the same code reports inside a browser.
+#[test]
+#[ignore = "prints the native device caps; asserts nothing"]
+fn native_device_caps() {
+    let caps = combs_core::device_caps(&combs_core::init_device());
+    println!("[caps] {}", serde_json::to_string(&caps).unwrap());
+}
