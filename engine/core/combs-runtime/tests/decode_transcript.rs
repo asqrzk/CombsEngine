@@ -388,3 +388,54 @@ fn unseeded_sampled_generation_runs() {
         assert!(n > 0, "an unseeded sampled request generated nothing");
     });
 }
+
+/// Native decode throughput on the same model the browser runs, so the
+/// browser number has something honest to be compared against.
+///
+/// Same file, same quantization, same sampling as the console's defaults.
+/// Printed, not asserted: a throughput assertion would be a machine
+/// benchmark masquerading as a correctness test.
+#[test]
+#[ignore = "requires COMBS_TEST_GGUF and a GPU; prints, asserts nothing"]
+fn native_throughput_baseline() {
+    let Ok(path) = std::env::var("COMBS_TEST_GGUF") else {
+        eprintln!("skipping: set COMBS_TEST_GGUF");
+        return;
+    };
+    let source = combs_formats::open_model_source(&path).expect("open model");
+    let engine = Engine::load(&source, combs_core::init_device()).expect("engine");
+
+    let config = GenerationConfig {
+        max_tokens: 128,
+        sampling: SamplingParams {
+            temperature: 0.7,
+            top_p: Some(0.9),
+            repetition_penalty: Some(1.1),
+            seed: Some(1),
+            ..SamplingParams::default()
+        },
+        ..GenerationConfig::default()
+    };
+    let prompt = engine.wrap_chat(&[combs_runtime::ChatMessage {
+        role: "user".to_string(),
+        content: "What are some good software engineering practices?".to_string(),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        name: None,
+    }]);
+    let tokens = engine.encode(&prompt).expect("encode");
+
+    // Warm the kernels first; the first run of any shape pays for its
+    // compilation and would otherwise be reported as decode time.
+    let _ = engine.generate(&tokens, &config, |_, _, _| {});
+    let stats = engine.generate(&tokens, &config, |_, _, _| {}).expect("generate");
+
+    println!(
+        "[native] prompt={} generated={} ttft={:.0}ms decode={:.1} tok/s prefill={:.0} tok/s",
+        stats.prompt_tokens,
+        stats.generated_tokens,
+        stats.ttft.as_secs_f64() * 1000.0,
+        stats.decode_tokens_per_second(),
+        stats.prefill_tokens_per_second(),
+    );
+}
