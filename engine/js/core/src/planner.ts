@@ -63,7 +63,9 @@ export function planEngineConfig(input: PlannerInput): EngineConfig {
 }
 
 /** Checks whether the model's largest single weight fits one GPU buffer;
- * if not, weight sharding (Phase 5 ring buffer) is required and we warn. */
+ * if not, weight sharding (a ring buffer, not yet built) is required and we
+ * warn — in a browser this is the difference between a refusal at selection
+ * time and a crash mid-load. */
 export function needsWeightSharding(caps: DeviceCaps, weightBytes: number): boolean {
   return weightBytes > caps.max_storage_buffer_binding_size;
 }

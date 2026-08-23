@@ -1,14 +1,17 @@
 /**
- * WorkerEngine: browser Web Worker transport (EXPERIMENTAL).
+ * WorkerEngine: the browser transport.
  *
- * web-llm pattern: the engine (combs-wasm module) lives in a Web Worker;
- * the main thread talks to it with a `{kind, id, payload}` envelope —
- * pull-based streaming, one pending RPC per id. The worker script
- * (`combs.worker.js`) hosts the wasm module and implements the same
- * event shapes as the FFI engine, so app code is transport-agnostic.
+ * The engine (the `combs-wasm` module) lives in a Web Worker; the main
+ * thread talks to it with a `{kind, id, payload}` envelope. The worker
+ * script (`combs.worker.js`) hosts the module and emits the same event
+ * shapes as the native FFI engine, so application code cannot tell which
+ * transport it is holding — which is the point of `EngineClient`.
  *
- * Status: the protocol side is complete; the worker-side wasm engine is
- * the Phase 5+ follow-up (see Engine/Core/combs-wasm).
+ * Streaming is push: the worker sends every token as it is decoded. An
+ * earlier design had the main thread pull one token at a time, to keep
+ * cancellation responsive; that turned out to be unnecessary, because the
+ * engine already yields between tokens inside the worker, and it would have
+ * cost a postMessage round-trip per token.
  */
 
 import type {
@@ -20,13 +23,17 @@ import type {
 } from "./types.ts";
 
 interface WorkerRequest {
-  kind: "load" | "chat" | "cancel" | "metadata" | "next";
+  kind: "load" | "chat" | "cancel" | "metadata" | "caps" | "close";
   id: string;
   payload?: unknown;
 }
 
+/** Every streaming event arrives as `event`; `done` closes a non-streaming
+ * call. There is deliberately no separate `delta` kind — one shape for all
+ * events means a client never has to know which of two ways a token might
+ * arrive. */
 interface WorkerReply {
-  kind: "ready" | "metadata" | "delta" | "done" | "error" | "event";
+  kind: "ready" | "metadata" | "done" | "error" | "event";
   id: string;
   payload?: unknown;
 }

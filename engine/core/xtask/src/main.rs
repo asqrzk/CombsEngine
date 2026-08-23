@@ -12,11 +12,16 @@
 //! | android-arm64   | aarch64-linux-android     | libcombs_ffi.so       | full (needs NDK) |
 //! | windows-x86_64  | x86_64-pc-windows-msvc    | combs_ffi.dll         | check (needs MSVC to link) |
 //! | linux-x86_64    | x86_64-unknown-linux-gnu  | libcombs_ffi.so       | check (needs a cross linker) |
-//! | web-wasm32      | wasm32-unknown-unknown    | combs_wasm.wasm       | Phase 5 (combs-wasm crate) |
 //!
 //! `xtask target <name>` runs a full build when the toolchain is available,
 //! otherwise a `cargo check` (type/borrow verification without linking).
 //! `xtask bundle` assembles `dist/<target>/` with the library + combs.h.
+//!
+//! The browser is its own command rather than a row above, because it does
+//! not produce a C library and cannot be bundled like one: `xtask web`
+//! builds `combs-wasm` for `wasm32-unknown-unknown` and, when
+//! `wasm-bindgen` is installed, emits the loadable ES module beside the
+//! worker script in `js/core/pkg/`.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -53,6 +58,17 @@ enum XCommand {
         /// Force cargo check even when a full build is possible.
         #[arg(long)]
         check: bool,
+    },
+    /// Build the browser engine: combs-wasm for wasm32-unknown-unknown,
+    /// plus the wasm-bindgen ES module in js/core/pkg/.
+    Web {
+        /// Build without optimizations (much faster, much larger).
+        #[arg(long)]
+        debug: bool,
+        /// Also copy the worker script and pkg/ into this directory, for a
+        /// host application that serves them (e.g. the platform's engine/).
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Show the platform matrix and detected toolchains.
     Matrix,
@@ -232,6 +248,83 @@ fn build_target(ctx: &Ctx, target: &Target, force_check: bool) -> Result<PathBuf
         .join(target.artifact))
 }
 
+/// Builds the browser engine and its JS glue.
+///
+/// The wasm module is useless to a page on its own — it needs the
+/// wasm-bindgen shim that knows how to pass strings and closures across
+/// the boundary. When `wasm-bindgen` is missing this says so and stops,
+/// rather than leaving a `pkg/` that looks built and imports nothing.
+fn cmd_web(ctx: &Ctx, release: bool, out_dir: Option<PathBuf>) -> Result<()> {
+    const TRIPLE: &str = "wasm32-unknown-unknown";
+
+    let mut cmd = Command::new(cargo());
+    cmd.current_dir(&ctx.root)
+        .args(["build", "-p", "combs-wasm", "--target", TRIPLE]);
+    if release {
+        cmd.arg("--release");
+    }
+    eprintln!("== web-wasm32 ({TRIPLE}): {} ==", if release { "release" } else { "debug" });
+    run(cmd)?;
+
+    let wasm = ctx
+        .root
+        .join("target")
+        .join(TRIPLE)
+        .join(if release { "release" } else { "debug" })
+        .join("combs_wasm.wasm");
+    if !wasm.exists() {
+        bail!("expected artifact missing: {}", wasm.display());
+    }
+    let bytes = std::fs::metadata(&wasm).map(|m| m.len()).unwrap_or(0);
+    eprintln!("built {} ({:.1} MB)", wasm.display(), bytes as f64 / 1e6);
+
+    let out = ctx.root.join("../js/core/pkg");
+    let bindgen = Command::new("wasm-bindgen")
+        .args(["--target", "web", "--out-name", "combs_wasm", "--out-dir"])
+        .arg(&out)
+        .arg(&wasm)
+        .current_dir(&ctx.root)
+        .status();
+    match bindgen {
+        Ok(status) if status.success() => {
+            eprintln!("bindings -> {}", out.display());
+            if let Some(dest) = out_dir {
+                copy_web_bundle(ctx, &out, &dest)?;
+                eprintln!("bundle -> {}", dest.display());
+            } else {
+                eprintln!(
+                    "serve js/core/combs.worker.js and js/core/pkg/ from the same directory, \
+                     or re-run with --out <dir> to copy both somewhere that already is"
+                );
+            }
+            Ok(())
+        }
+        Ok(status) => bail!("wasm-bindgen failed: {status}"),
+        Err(e) => bail!(
+            "wasm-bindgen not found ({e}). Install the version matching the \
+             wasm-bindgen crate in Cargo.lock:\n  \
+             cargo install wasm-bindgen-cli --version <locked> --locked"
+        ),
+    }
+}
+
+/// Copies the worker script and the generated package into a host
+/// application's static directory. Both must land together and stay
+/// together: the worker imports `./pkg/combs_wasm.js` by relative path.
+fn copy_web_bundle(ctx: &Ctx, pkg: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    let worker = ctx.root.join("../js/core/combs.worker.js");
+    std::fs::create_dir_all(dest.join("pkg"))?;
+    std::fs::copy(&worker, dest.join("combs.worker.js"))
+        .with_context(|| format!("copying {}", worker.display()))?;
+    for entry in std::fs::read_dir(pkg)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            std::fs::copy(entry.path(), dest.join("pkg").join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
 fn cmd_matrix() {
     let ctx = Ctx {
         root: workspace_root(),
@@ -245,7 +338,10 @@ fn cmd_matrix() {
         };
         println!("  {:<15} {:<26} -> {:<20} [{}]", t.name, t.triple, t.artifact, mode);
     }
-    println!("  {:<15} {:<26} -> {:<20} [{}]", "web-wasm32", "wasm32-unknown-unknown", "combs_wasm.wasm", "Phase 5 (combs-wasm crate)");
+    println!(
+        "  {:<15} {:<26} -> {:<20} [{}]",
+        "web-wasm32", "wasm32-unknown-unknown", "combs_wasm.wasm", "cargo xtask web"
+    );
     match android_linker() {
         Some(l) => println!("android NDK linker: {l}"),
         None => println!("android NDK linker: NOT FOUND (android-arm64 will be check-only)"),
@@ -350,6 +446,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        XCommand::Web { debug, out } => cmd_web(&ctx, !debug, out),
         XCommand::Matrix => {
             cmd_matrix();
             Ok(())

@@ -25,6 +25,10 @@ serde_json.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 burn = { version = "0.21.0", default-features = false, features = ["ndarray", "std"] }
+# Drives LocalEngine's async steps from a test. A browser supplies its own
+# executor; natively there is none, and a tiny block_on is cheaper than an
+# async runtime the engine itself never wants.
+pollster = "0.4"
 
 # See .cargo/config.toml: the wasm browser backend for getrandom 0.3 is
 # named here as a feature and there as a cfg flag; both are required.

@@ -120,3 +120,215 @@ fn speculative_transcript_matches_plain() {
     let prompt = "Repeat after me: alpha beta gamma. alpha beta gamma. alpha beta";
     transcript(&engine, "spec", prompt, &greedy(32));
 }
+
+/// The bytes door and the file door must produce the same generation.
+///
+/// This is the browser's whole claim in one test: a model handed over as
+/// bytes — no filesystem, no mmap, no cached tokenizer next to it — decodes
+/// to the same tokens as the same file opened the ordinary way. If these
+/// ever diverge, the browser is quietly running a different model.
+#[test]
+#[ignore = "requires COMBS_TEST_GGUF and a GPU"]
+fn bytes_loaded_model_matches_file_loaded() {
+    let Ok(path) = std::env::var("COMBS_TEST_GGUF") else {
+        eprintln!("skipping: set COMBS_TEST_GGUF");
+        return;
+    };
+    let prompt = "The capital of France is";
+    let config = greedy(24);
+
+    let from_file = {
+        let source = combs_formats::open_model_source(&path).expect("open file");
+        let engine = Engine::load(&source, combs_core::init_device()).expect("engine");
+        let tokens = engine.encode(prompt).expect("encode");
+        let mut ids = Vec::new();
+        engine
+            .generate(&tokens, &config, |id, _, _| ids.push(id))
+            .expect("generate");
+        ids
+    };
+
+    let from_bytes = {
+        let bytes = std::fs::read(&path).expect("read model");
+        let source = combs_formats::open_model_source_bytes(bytes).expect("open bytes");
+        let engine = Engine::load(&source, combs_core::init_device()).expect("engine");
+        let tokens = engine.encode(prompt).expect("encode");
+        let mut ids = Vec::new();
+        engine
+            .generate(&tokens, &config, |id, _, _| ids.push(id))
+            .expect("generate");
+        ids
+    };
+
+    println!("[bytes-parity] file={from_file:?}");
+    println!("[bytes-parity] bytes={from_bytes:?}");
+    assert!(!from_file.is_empty(), "the file path generated nothing");
+    assert_eq!(
+        from_file, from_bytes,
+        "a model delivered as bytes decoded differently from the same file"
+    );
+}
+
+/// The browser's engine, driven natively, must decode like the desktop's.
+///
+/// `LocalEngine` is what runs in a tab: no worker thread, no channel, one
+/// awaited token at a time. Its decode logic is shared with `Engine`, but
+/// "shared" is a claim about the code, and this is the claim about the
+/// output. Run natively because that is where a GPU and a model are.
+#[test]
+#[ignore = "requires COMBS_TEST_GGUF and a GPU"]
+fn local_engine_matches_threaded_engine() {
+    use combs_runtime::{LocalEngine, StepEvent};
+
+    let Ok(path) = std::env::var("COMBS_TEST_GGUF") else {
+        eprintln!("skipping: set COMBS_TEST_GGUF");
+        return;
+    };
+    let prompt = "The capital of France is";
+    let config = greedy(24);
+
+    let source = combs_formats::open_model_source(&path).expect("open model");
+
+    let threaded = {
+        let engine = Engine::load(&source, combs_core::init_device()).expect("engine");
+        let tokens = engine.encode(prompt).expect("encode");
+        let mut ids = Vec::new();
+        let mut text = String::new();
+        engine
+            .generate(&tokens, &config, |id, piece, _| {
+                ids.push(id);
+                text.push_str(piece);
+            })
+            .expect("generate");
+        (ids, text)
+    };
+
+    let local = pollster::block_on(async {
+        let mut engine =
+            LocalEngine::load(&source, combs_core::init_device()).expect("local engine");
+        let tokens = engine.encode(prompt).expect("encode");
+        engine.begin(&tokens, &config).expect("begin");
+        let mut ids = Vec::new();
+        let mut text = String::new();
+        loop {
+            match engine.step().await.expect("step") {
+                StepEvent::Token { id, text: piece, .. } => {
+                    ids.push(id);
+                    text.push_str(&piece);
+                }
+                StepEvent::Done { tail, stats } => {
+                    text.push_str(&tail);
+                    assert_eq!(
+                        stats.generated_tokens,
+                        ids.len(),
+                        "stats disagree with the tokens actually delivered"
+                    );
+                    break;
+                }
+            }
+        }
+        (ids, text)
+    });
+
+    println!("[local] threaded={:?}", threaded.0);
+    println!("[local] local   ={:?}", local.0);
+    println!("[local] text={:?}", local.1);
+    assert!(!threaded.0.is_empty(), "the threaded engine generated nothing");
+    assert_eq!(threaded.0, local.0, "token ids differ between the two drivers");
+    assert_eq!(threaded.1, local.1, "text differs between the two drivers");
+}
+
+/// A Stop between tokens keeps what already arrived.
+#[test]
+#[ignore = "requires COMBS_TEST_GGUF and a GPU"]
+fn local_engine_cancels_between_tokens() {
+    use combs_runtime::{EngineError, LocalEngine, StepEvent};
+
+    let Ok(path) = std::env::var("COMBS_TEST_GGUF") else {
+        eprintln!("skipping: set COMBS_TEST_GGUF");
+        return;
+    };
+    let source = combs_formats::open_model_source(&path).expect("open model");
+
+    pollster::block_on(async {
+        let mut engine =
+            LocalEngine::load(&source, combs_core::init_device()).expect("local engine");
+        let tokens = engine.encode("The capital of France is").expect("encode");
+        engine.begin(&tokens, &greedy(256)).expect("begin");
+
+        let mut delivered = 0usize;
+        let outcome = loop {
+            match engine.step().await {
+                Ok(StepEvent::Token { .. }) => {
+                    delivered += 1;
+                    // Exactly what a Stop button does: set the flag between
+                    // two awaited tokens.
+                    if delivered == 4 {
+                        engine.cancel();
+                    }
+                }
+                Ok(StepEvent::Done { .. }) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+        };
+        println!("[local-cancel] delivered={delivered} outcome={outcome:?}");
+        assert!(
+            matches!(outcome, Err(EngineError::Cancelled)),
+            "expected a cancelled run, got {outcome:?}"
+        );
+        assert!(
+            (4..256).contains(&delivered),
+            "a cancelled run kept {delivered} tokens"
+        );
+    });
+}
+
+/// An abandoned generation must not wedge the engine.
+///
+/// A browser tab that navigates away mid-answer drops the future without
+/// ever reaching a terminal step. If that left the single-flight slot
+/// taken, every later request would be refused for a turn nobody is
+/// waiting for.
+#[test]
+#[ignore = "requires COMBS_TEST_GGUF and a GPU"]
+fn abandoned_generation_frees_the_engine() {
+    use combs_runtime::{LocalEngine, StepEvent};
+
+    let Ok(path) = std::env::var("COMBS_TEST_GGUF") else {
+        eprintln!("skipping: set COMBS_TEST_GGUF");
+        return;
+    };
+    let source = combs_formats::open_model_source(&path).expect("open model");
+
+    pollster::block_on(async {
+        let mut engine =
+            LocalEngine::load(&source, combs_core::init_device()).expect("local engine");
+        let tokens = engine.encode("The capital of France is").expect("encode");
+
+        engine.begin(&tokens, &greedy(64)).expect("first begin");
+        let _ = engine.step().await.expect("one token");
+        // Starting another turn while one runs is refused, not queued.
+        assert!(
+            engine.begin(&tokens, &greedy(8)).is_err(),
+            "a second generation should be refused while one is in flight"
+        );
+
+        assert!(engine.abandon(), "there was a generation to abandon");
+        assert!(!engine.abandon(), "abandoning twice reports nothing left");
+
+        // The engine is usable again, and the abandoned turn left no trace.
+        engine.begin(&tokens, &greedy(4)).expect("begin after abandon");
+        let mut delivered = 0;
+        loop {
+            match engine.step().await.expect("step") {
+                StepEvent::Token { .. } => delivered += 1,
+                StepEvent::Done { stats, .. } => {
+                    assert_eq!(stats.generated_tokens, delivered);
+                    break;
+                }
+            }
+        }
+        assert!(delivered > 0, "the recovered engine generated nothing");
+        println!("[abandon] recovered and generated {delivered} tokens");
+    });
+}

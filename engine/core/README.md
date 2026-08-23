@@ -109,7 +109,9 @@ optional `generation_config.json` / `tokenizer_config.json`.
   portable `remainder`/`div` nibble extraction — no bitwise ops needed) and
   `combs_models::QuantizedLinear` keep weights packed in VRAM (4x footprint
   cut) and dequantize on-device before the matmul; a fused dequant-matmul
-  kernel is future work. The GGUF `ModelSource` adapter lands in Phase 5.
+  kernel is future work. The GGUF `ModelSource` adapter is implemented
+  (`combs-formats::GgufSource`), and reads either a mapped file or a byte
+  image already in memory — the latter is how a browser loads a model.
 - **f32 compute everywhere** (BF16/F16 weights are widened on load).
 - **Memory**: cubecl's pooled allocator is used as-is; `combs_core::BufferPool`
   is a documented no-op facade reserved for arena management.

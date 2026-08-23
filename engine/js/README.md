@@ -71,5 +71,9 @@ Note: Deno KV APIs (checkpoints, memory, queues) require `--unstable-kv`.
 The same code runs anywhere Deno runs; the native library is resolved per
 platform from `Engine/Core/dist/<platform>/` (see `cargo xtask matrix`):
 macOS arm64/x86_64, iOS, Android (Linux/Windows check-only until a linker is
-available). The browser transport (Web Worker + WASM/WebGPU) lands in Phase 5
-behind the same `EngineClient` contract.
+available).
+
+The browser is the fourth transport, behind the same `EngineClient`
+contract: `WorkerEngine` talks to `combs.worker.js`, which hosts the engine
+compiled to WebAssembly on WebGPU. Build it with `cargo xtask web` — the
+module and its glue are generated, never committed.

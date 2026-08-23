@@ -107,7 +107,7 @@ enum Command {
         /// Preset id (smollm2-135m) or HuggingFace repo (org/name).
         source: String,
     },
-    /// Convert/repackage a model (Phase 5).
+    /// Convert/repackage a model (not implemented).
     Convert {
         /// Input model path.
         input: PathBuf,
@@ -230,7 +230,7 @@ fn main() -> Result<()> {
             println!("cached at: {}", dir.display());
             Ok(())
         }
-        Command::Convert { .. } => not_yet("convert", "Phase 5 (GGUF/burnpack adapters)"),
+        Command::Convert { .. } => not_yet("convert", "model repackaging"),
         Command::GenerateImage(args) => generate_image::cmd_generate_image(args),
         Command::GenerateAudio(args) => generate_audio::cmd_generate_audio(args),
         Command::ServeImages { model, port, lora, lora_scale, preview_every } => {

@@ -62,3 +62,7 @@ target-lora/
 /QUANTIZATION_PLAN.md
 /docs/
 /documentations/
+
+# Browser engine build output (rebuilt via `cargo xtask web`): a wasm
+# module tens of MB large, plus its generated wasm-bindgen shim.
+engine/js/core/pkg/

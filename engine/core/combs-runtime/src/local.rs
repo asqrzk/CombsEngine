@@ -323,6 +323,29 @@ impl LocalEngine {
         }
     }
 
+    /// Discards an in-flight generation, freeing its cache and leaving the
+    /// engine ready for the next `begin`. Returns whether there was one.
+    ///
+    /// This is for a caller whose request ended without reaching a terminal
+    /// step — a browser tab navigating away mid-stream, a dropped future.
+    /// Without it, the abandoned generation would still hold the
+    /// single-flight slot and every later request would be refused for a
+    /// turn that nobody is waiting for any more.
+    pub fn abandon(&mut self) -> bool {
+        self.pending = None;
+        self.terminal = None;
+        self.active.take().is_some()
+    }
+
+    /// The current generation's cancel flag.
+    ///
+    /// Handed out so a caller can hold the ability to stop a run without
+    /// holding the engine — which matters when the engine is borrowed for
+    /// the duration of the request and a Stop must still land.
+    pub fn cancel_handle(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
+    }
+
     /// Requests cancellation of the running generation. The next step
     /// stops between tokens and reports `Cancelled`.
     pub fn cancel(&self) {

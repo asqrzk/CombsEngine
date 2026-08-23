@@ -1336,6 +1336,7 @@ dependencies = [
  "combs-models",
  "getrandom 0.3.4",
  "minijinja",
+ "pollster",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
@@ -1349,7 +1350,13 @@ name = "combs-wasm"
 version = "0.2.3"
 dependencies = [
  "combs-core",
+ "combs-formats",
+ "combs-runtime",
+ "console_error_panic_hook",
+ "js-sys",
+ "serde_json",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]
@@ -1401,6 +1408,16 @@ dependencies = [
  "once_cell",
  "unicode-width",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if",
+ "wasm-bindgen",
 ]
 
 [[package]]

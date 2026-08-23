@@ -4,7 +4,8 @@
  * One `EngineClient` contract, three transports:
  * - `FfiEngine` — in-process native engine via Deno FFI (desktop/server)
  * - `RemoteEngine` — OpenAI-compatible HTTP/SSE (`combs serve`)
- * - (Phase 5) `WorkerEngine` — browser Web Worker + WASM/WebGPU
+ * - `WorkerEngine` — browser Web Worker hosting the engine as WASM on
+ *   WebGPU (`combs.worker.js`; build with `cargo xtask web`)
  *
  * High-level entry: {@link Combs} (presets + cache + planner + engine).
  */

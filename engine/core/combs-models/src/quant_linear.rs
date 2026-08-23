@@ -5,7 +5,7 @@
 //! passes (a 4x footprint reduction vs f32 for the weight); the current
 //! implementation dequantizes to f32 and runs the standard matmul (see
 //! `combs_core::quant` docs — a fused dequant-matmul kernel is future
-//! work). Format adapters (GGUF in Phase 5) construct these layers via
+//! work). The GGUF adapter constructs these layers via
 //! [`QuantizedLinear::new`].
 
 use burn::tensor::{Int, Tensor, backend::Backend};

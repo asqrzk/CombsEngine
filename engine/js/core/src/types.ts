@@ -75,7 +75,7 @@ export interface GenerationStats {
 }
 
 /** The transport-agnostic engine contract (FfiEngine, RemoteEngine, and
- * the Phase-5 WorkerEngine all implement this). */
+ * WorkerEngine all implement this). */
 export interface EngineClient {
   readonly kind: "ffi" | "remote" | "worker";
   metadata(): Promise<EngineMetadata>;
