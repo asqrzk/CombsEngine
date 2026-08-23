@@ -332,3 +332,59 @@ fn abandoned_generation_frees_the_engine() {
         println!("[abandon] recovered and generated {delivered} tokens");
     });
 }
+
+/// A sampled turn with no seed — the path every default chat request takes.
+///
+/// Every other test here is greedy, which never asks the sampler for
+/// randomness and so never touches the clock the RNG seeds from. That gap
+/// is exactly where the browser build failed: it loaded, reported its
+/// metadata, and aborted on the first sampled token. Greedy proves the
+/// decode loop; this proves the request shape a user actually sends.
+#[test]
+#[ignore = "requires COMBS_TEST_GGUF and a GPU"]
+fn unseeded_sampled_generation_runs() {
+    use combs_runtime::{LocalEngine, StepEvent};
+
+    let Ok(path) = std::env::var("COMBS_TEST_GGUF") else {
+        eprintln!("skipping: set COMBS_TEST_GGUF");
+        return;
+    };
+    let source = combs_formats::open_model_source(&path).expect("open model");
+
+    // The console's defaults, verbatim: temperature and penalties on, and
+    // no seed — so the sampler must invent one.
+    let config = GenerationConfig {
+        max_tokens: 16,
+        sampling: SamplingParams {
+            temperature: 0.7,
+            top_p: Some(0.9),
+            repetition_penalty: Some(1.1),
+            seed: None,
+            ..SamplingParams::default()
+        },
+        ..GenerationConfig::default()
+    };
+
+    pollster::block_on(async {
+        let mut engine =
+            LocalEngine::load(&source, combs_core::init_device()).expect("local engine");
+        let tokens = engine.encode("The capital of France is").expect("encode");
+        engine.begin(&tokens, &config).expect("begin");
+        let mut text = String::new();
+        let mut n = 0;
+        loop {
+            match engine.step().await.expect("step") {
+                StepEvent::Token { text: piece, .. } => {
+                    text.push_str(&piece);
+                    n += 1;
+                }
+                StepEvent::Done { tail, .. } => {
+                    text.push_str(&tail);
+                    break;
+                }
+            }
+        }
+        println!("[sampled] {n} tokens: {text:?}");
+        assert!(n > 0, "an unseeded sampled request generated nothing");
+    });
+}

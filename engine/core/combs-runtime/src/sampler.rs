@@ -293,8 +293,12 @@ impl MultinomialSampler {
 /// splitmix64 finalize, used to scramble a user seed into the RNG state.
 fn seed_or_time(seed: Option<u64>) -> u64 {
     let raw = seed.unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        // Through crate::time, not std: in a browser this is `Date.now()`,
+        // where std's clock does not exist and asking for it aborts the
+        // module. An unseeded sampled request is the common case, so this
+        // one line decides whether the engine can answer at all there.
+        crate::time::SystemTime::now()
+            .duration_since(crate::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x9E3779B97F4A7C15)
     });

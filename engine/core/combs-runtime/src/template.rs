@@ -75,8 +75,8 @@ fn strftime_now(fmt: &str) -> String {
     if let Ok(pinned) = std::env::var("COMBS_CHAT_DATE") {
         return pinned;
     }
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let secs = crate::time::SystemTime::now()
+        .duration_since(crate::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let (y, m, d) = civil_from_days((secs / 86400) as i64);
