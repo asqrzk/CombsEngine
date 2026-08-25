@@ -11,12 +11,21 @@
 //! Requires a real model and a GPU, so it is ignored by default:
 //!
 //! ```text
-//! COMBS_TEST_GGUF=$HOME/.cache/combs/models/qwen3-0.6b-gguf/model.gguf \
+//! COMBS_TEST_GGUF=$HOME/.cache/combs/models/smollm2-360m-instruct-gguf/model.gguf \
 //!   cargo test -p combs-runtime --test decode_transcript -- --ignored --nocapture
 //! ```
 //!
 //! Capture the output before a change and diff it against the output after.
 //! Every line is deterministic; nothing timing-dependent is printed.
+//!
+//! RUN ONE TEST PER PROCESS on large-vocabulary models. Each test loads
+//! its own engine, the GPU pool never returns memory until the process
+//! exits, and autotune's working set scales super-linearly with the
+//! vocabulary: one qwen3-0.6b test peaks at 20.5 GB of footprint against
+//! 3.2 GB for smollm2-360m. A wholesale ignored run against a large-vocab
+//! model stacks eleven such spikes in one address space and has taken the
+//! whole machine down. Use `--exact <name>` per run and let the process
+//! exit in between; keep suite-wide sweeps on a smollm2-family model.
 
 use combs_runtime::{Engine, GenerationConfig, SamplingParams};
 
@@ -442,9 +451,158 @@ fn native_throughput_baseline() {
 
 /// Prints the device's own report of itself, native, for comparison with
 /// what the same code reports inside a browser.
+///
+/// Must run in a process of its own: `device_caps` performs the cubecl
+/// runtime setup, and cubecl 0.10 panics on a second one — any test that
+/// has already touched the GPU poisons it. Hence the env gate on top of
+/// `#[ignore]`, so a blanket `-- --ignored` does not sweep it up:
+///
+/// ```text
+/// COMBS_CAPS_ONLY=1 cargo test --release -p combs-runtime \
+///   --test decode_transcript native_device_caps -- --ignored --nocapture
+/// ```
 #[test]
-#[ignore = "prints the native device caps; asserts nothing"]
+#[ignore = "prints the native device caps; must run alone (COMBS_CAPS_ONLY=1)"]
 fn native_device_caps() {
+    if std::env::var("COMBS_CAPS_ONLY").as_deref() != Ok("1") {
+        eprintln!("skipping: set COMBS_CAPS_ONLY=1 and run this test alone");
+        return;
+    }
     let caps = combs_core::device_caps(&combs_core::init_device());
     println!("[caps] {}", serde_json::to_string(&caps).unwrap());
+}
+
+/// A new generation must not inherit the previous one's ending.
+///
+/// A run that finishes on the same step it emits its last token parks the
+/// terminal for one more step. A caller who takes that token and starts a
+/// new turn without draining would otherwise be handed the old run's Done
+/// — stats and all — as the first result of the new one.
+#[test]
+#[ignore = "requires COMBS_TEST_GGUF and a GPU"]
+fn a_new_generation_does_not_inherit_the_previous_terminal() {
+    use combs_runtime::{LocalEngine, StepEvent};
+
+    let Ok(path) = std::env::var("COMBS_TEST_GGUF") else {
+        eprintln!("skipping: set COMBS_TEST_GGUF");
+        return;
+    };
+    let source = combs_formats::open_model_source(&path).expect("open model");
+
+    pollster::block_on(async {
+        let mut engine =
+            LocalEngine::load(&source, combs_core::init_device()).expect("local engine");
+        let tokens = engine.encode("The capital of France is").expect("encode");
+
+        // Stop mid-run, then start again without draining the terminal.
+        engine.begin(&tokens, &greedy(8)).expect("first begin");
+        let _ = engine.step().await.expect("a token");
+        engine.abandon();
+
+        // The same shape via the outbox: run to the last token but not past
+        // it, then begin again.
+        engine.begin(&tokens, &greedy(2)).expect("second begin");
+        let mut seen = 0;
+        while seen < 2 {
+            match engine.step().await.expect("step") {
+                StepEvent::Token { .. } => seen += 1,
+                StepEvent::Done { .. } => break,
+            }
+        }
+        engine.begin(&tokens, &greedy(4)).expect("third begin");
+
+        // The first result of the new run must be a token, not the
+        // previous run's completion.
+        match engine.step().await.expect("step") {
+            StepEvent::Token { .. } => {}
+            StepEvent::Done { stats, .. } => panic!(
+                "a fresh generation returned the previous run's terminal \
+                 (generated={})",
+                stats.generated_tokens
+            ),
+        }
+        let mut delivered = 1;
+        loop {
+            match engine.step().await.expect("step") {
+                StepEvent::Token { .. } => delivered += 1,
+                StepEvent::Done { stats, .. } => {
+                    assert_eq!(stats.generated_tokens, delivered, "stats belong to this run");
+                    break;
+                }
+            }
+        }
+        println!("[outbox] fresh run delivered {delivered} tokens of its own");
+    });
+}
+
+/// A step dropped mid-readback must refuse, not silently repeat a token.
+///
+/// The logits that future was carrying are gone while `next` has already
+/// been emitted, so resuming would emit it twice and feed the cache a
+/// duplicate row — wrong output, no error. It is worse than that: the
+/// abandoned readback is still outstanding in the GPU runtime, which
+/// aborts on the next command instead of returning an error. So the
+/// engine must retire itself, and this test holds it to that rather than
+/// to a recovery it cannot perform.
+#[test]
+#[ignore = "requires COMBS_TEST_GGUF and a GPU"]
+fn a_dropped_step_refuses_to_resume() {
+    use combs_runtime::{EngineError, LocalEngine, StepEvent};
+    use std::future::Future;
+
+    let Ok(path) = std::env::var("COMBS_TEST_GGUF") else {
+        eprintln!("skipping: set COMBS_TEST_GGUF");
+        return;
+    };
+    let source = combs_formats::open_model_source(&path).expect("open model");
+
+    pollster::block_on(async {
+        let mut engine =
+            LocalEngine::load(&source, combs_core::init_device()).expect("local engine");
+        let tokens = engine.encode("The capital of France is").expect("encode");
+        engine.begin(&tokens, &greedy(16)).expect("begin");
+
+        // One completed step, so a token has been emitted and a readback
+        // is outstanding.
+        let first = match engine.step().await.expect("step") {
+            StepEvent::Token { id, .. } => id,
+            StepEvent::Done { .. } => panic!("expected a token"),
+        };
+
+        // Drive the next step as far as its readback, then drop it. An
+        // *unpolled* future would prove nothing — an `async fn` body does
+        // not run until polled — so it has to be polled once to reach the
+        // await that takes the pending logits.
+        let reached_await = {
+            let mut fut = std::pin::pin!(engine.step());
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            matches!(fut.as_mut().poll(&mut cx), std::task::Poll::Pending)
+        };
+        if !reached_await {
+            eprintln!("skipping: the readback completed before the future could be dropped");
+            return;
+        }
+
+        match engine.step().await {
+            Err(EngineError::WorkerGone(msg)) => {
+                assert!(msg.contains("dropped"), "unhelpful message: {msg}");
+                println!("[dropped] {msg}");
+            }
+            Ok(StepEvent::Token { id, .. }) => panic!(
+                "resumed after a dropped step and re-emitted token {id} (first was {first})"
+            ),
+            Ok(StepEvent::Done { .. }) => panic!("expected a refusal, got a completion"),
+            Err(e) => panic!("expected a WorkerGone refusal, got {e}"),
+        }
+
+        // And it stays retired: a second attempt gets the same answer
+        // rather than an abort from somewhere unrelated.
+        let again = engine.begin(&tokens, &greedy(2));
+        match again {
+            Err(EngineError::WorkerGone(msg)) => {
+                assert!(msg.contains("no longer be used"), "unhelpful: {msg}");
+            }
+            _ => panic!("a retired engine accepted a new generation"),
+        }
+    });
 }

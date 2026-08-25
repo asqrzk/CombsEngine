@@ -618,3 +618,46 @@ fn from_bytes_matches_load() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Footprint probe for the CPU side of a real model load.
+///
+/// Parses a real GGUF and pulls every tensor through `load_data` — the
+/// full CPU cost of our format path (mmap, dequantization, byte copies,
+/// tokenizer synthesis) with the GPU never touched. Exists to attribute
+/// memory: when a full engine load spikes far beyond what this reports,
+/// the difference lives in the GPU stack, not in this crate.
+///
+/// ```text
+/// COMBS_TEST_GGUF=... cargo test -p combs-formats --release --test gguf \
+///   footprint_of_the_cpu_load_path -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires COMBS_TEST_GGUF; prints, asserts little"]
+fn footprint_of_the_cpu_load_path() {
+    let Ok(path) = std::env::var("COMBS_TEST_GGUF") else {
+        eprintln!("skipping: set COMBS_TEST_GGUF");
+        return;
+    };
+    let source = GgufSource::load(&path).expect("parse");
+    let spec = source.tokenizer().expect("tokenizer");
+    let tok_bytes = spec.json_bytes().expect("tokenizer bytes").len();
+
+    let mut total = 0usize;
+    let mut peak_single = 0usize;
+    for name in source.tensor_names() {
+        let reader = source.open_tensor(&name).expect("tensor");
+        let data = reader.load_data().expect("load");
+        let bytes = data.as_bytes().len();
+        total += bytes;
+        peak_single = peak_single.max(bytes);
+        // Dropped here — the transient working set is what /usr/bin/time
+        // sees, and per-tensor drop is exactly what the engine load does.
+    }
+    println!(
+        "[cpu-load] tensors={} total_f32_bytes={:.2}GB largest_single={:.0}MB tokenizer_json={:.1}MB",
+        source.tensor_names().len(),
+        total as f64 / 1e9,
+        peak_single as f64 / 1e6,
+        tok_bytes as f64 / 1e6,
+    );
+}

@@ -109,6 +109,26 @@ Deno.test("worker: the engine's KV state is reachable", async () => {
   engine.close();
 });
 
+Deno.test("worker: loading twice frees the engine it replaces", async () => {
+  // A worker hosts one engine. Loading a second model into the same worker
+  // must free the first, or hundreds of megabytes of weights stay
+  // reachable only through an id nobody holds.
+  const engine = await WorkerEngine.load(WORKER, {
+    modelUrl: "https://example.invalid/first.gguf",
+  });
+  const rpc = (engine as unknown as {
+    rpc: (r: { kind: string; id: string; payload?: unknown }) => Promise<unknown>;
+  }).rpc.bind(engine);
+  await rpc({
+    kind: "load",
+    id: crypto.randomUUID(),
+    payload: { modelUrl: "https://example.invalid/second.gguf" },
+  });
+  const { live } = await rpc({ kind: "live", id: crypto.randomUUID() }) as { live: number };
+  assertEquals(live, 1, "a second load left the first engine alive");
+  engine.close();
+});
+
 Deno.test("worker: a refused load rejects rather than hanging", async () => {
   let failed = false;
   try {

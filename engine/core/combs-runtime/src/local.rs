@@ -81,6 +81,16 @@ pub struct LocalEngine {
     /// A terminal held back one step, because the step that produced it
     /// also produced a token and a step reports one thing.
     terminal: Option<Result<StepEvent>>,
+    /// Set while a readback is awaited. If a later step finds it still set
+    /// with no pending work, the future carrying that readback was
+    /// dropped — the logits are gone, and the run cannot be resumed.
+    readback_in_flight: bool,
+    /// Set once this engine has been abandoned mid-readback. Not a
+    /// generation-level flag: a dropped readback strands work inside the
+    /// GPU runtime as well as inside this machine, and cubecl panics on
+    /// the next command rather than returning an error. The engine can
+    /// still be *dropped* safely; it cannot be used again.
+    unusable: Option<String>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -130,6 +140,8 @@ impl LocalEngine {
             active: None,
             pending: None,
             terminal: None,
+            readback_in_flight: false,
+            unusable: None,
             cancel: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -192,11 +204,25 @@ impl LocalEngine {
     /// is single-flight by construction, and silently queueing would hide
     /// that from a caller who could have opened a second worker instead.
     pub fn begin(&mut self, prompt_tokens: &[u32], config: &GenerationConfig) -> Result<()> {
+        if let Some(why) = &self.unusable {
+            return Err(EngineError::WorkerGone(why.clone()));
+        }
         if self.active.is_some() {
             return Err(EngineError::WorkerGone(
                 "a generation is already running on this engine".to_string(),
             ));
         }
+        // `active` going empty is not the same as the run being collected:
+        // a run that ends on the same step it emits its last token parks
+        // its terminal here for one more step. A caller who takes that
+        // last token and starts a new turn without draining would
+        // otherwise receive the previous run's Done — stats and all — as
+        // the first result of this one.
+        if self.terminal.take().is_some() {
+            tracing::debug!("discarding an undelivered terminal from the previous generation");
+        }
+        self.pending = None;
+        self.readback_in_flight = false;
         // HF `add_special_tokens` semantics, matching the threaded engine:
         // prompts start with BOS when the model declares one, unless the
         // tokenizer says otherwise or the prompt already opens with it.
@@ -248,11 +274,37 @@ impl LocalEngine {
             ));
         }
 
+        if let Some(why) = &self.unusable {
+            return Err(EngineError::WorkerGone(why.clone()));
+        }
+
+        // A dropped future is the one interruption neither this machine nor
+        // the layer under it can absorb. The logits it carried are gone and
+        // `next` was already emitted, so resuming would emit that token
+        // twice and feed the cache a duplicate row. Worse, the readback it
+        // abandoned is still outstanding inside the GPU runtime, which
+        // panics on the next command rather than reporting an error — so
+        // this engine is finished, not merely this generation. Say so
+        // once, plainly, instead of letting an abort surface later from
+        // somewhere unrelated.
+        if self.readback_in_flight && self.pending.is_none() {
+            self.abandon();
+            let why = "a step future was dropped while its logits were in \
+                       flight; this engine can no longer be used — create a \
+                       new one (to interrupt a turn, call cancel() and keep \
+                       stepping, or abandon() before dropping)"
+                .to_string();
+            self.unusable = Some(why.clone());
+            return Err(EngineError::WorkerGone(why));
+        }
+
         // 1. Turn the outstanding GPU work into a sampled `next`. The
         //    readback is awaited outside any borrow of the generation.
         match self.pending.take() {
             Some(Pending::Logits(t)) => {
+                self.readback_in_flight = true;
                 let row = step::readback_logits_async(t).await;
+                self.readback_in_flight = false;
                 let active = self.active.as_mut().expect("checked above");
                 match row {
                     Ok(row) => {
@@ -378,6 +430,7 @@ impl LocalEngine {
     pub fn abandon(&mut self) -> bool {
         self.pending = None;
         self.terminal = None;
+        self.readback_in_flight = false;
         self.active.take().is_some()
     }
 

@@ -57,8 +57,17 @@ async function load(id, payload = {}) {
     throw new Error("load needs `modelBytes` or `modelUrl`");
   }
 
-  engineId = await combs_engine_create(JSON.stringify(config), bytes);
-  post("ready", id, JSON.parse(combs_engine_metadata(engineId)));
+  // A worker hosts one engine. Creating a second without freeing the
+  // first would leave hundreds of megabytes of weights and KV arenas
+  // reachable only by an id nobody holds any more — the engine table is
+  // keyed by id, so an overwritten id is a leak, not a replacement.
+  const previous = engineId;
+  engineId = null;
+  if (previous !== null) combs_engine_destroy(previous);
+
+  const created = await combs_engine_create(JSON.stringify(config), bytes);
+  engineId = created;
+  post("ready", id, JSON.parse(combs_engine_metadata(created)));
 }
 
 /**

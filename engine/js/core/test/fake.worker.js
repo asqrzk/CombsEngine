@@ -13,6 +13,8 @@ const PIECES = ["Par", "is", " is", " the", " capital"];
 let cancelled = new Set();
 /** What `load` was configured with — metadata must report it afterwards. */
 let configured = null;
+/** How many engines this worker has created and never freed. */
+let live = 0;
 
 const post = (kind, id, payload) => self.postMessage({ kind, id, payload });
 
@@ -64,11 +66,15 @@ self.onmessage = async (event) => {
       if (!payload?.modelBytes && !payload?.modelUrl) {
         return post("error", id, "load needs `modelBytes` or `modelUrl`");
       }
+      if (live > 0) live -= 1; // the reload frees what it replaces
+      live += 1;
       configured = {
         ...METADATA,
         max_seq_len: payload.max_seq_len ?? METADATA.max_seq_len,
       };
       return post("ready", id, configured);
+    case "live":
+      return post("metadata", id, { live });
     case "stats":
       return post("metadata", id, {
         kind: "paged",

@@ -164,6 +164,12 @@ pub(crate) struct ActiveGeneration {
     /// Set once a row has been sampled: before that, a failure is a
     /// request-level rejection rather than a generation that stopped.
     started: bool,
+    /// Set when the cache holds rows this machine can no longer account
+    /// for. The session invariant is that `history` mirrors the cache
+    /// exactly; once that is in doubt the session is dropped rather than
+    /// written, because a wrong cache is served silently forever while a
+    /// missing one costs one re-prefill.
+    poisoned: bool,
 
     prompt_tokens: Vec<u32>,
     lcp: usize,
@@ -222,6 +228,22 @@ pub(crate) fn begin_generation(
         cache_config.max_seq_len.min(max_position_embeddings),
     )?;
 
+    // Structured output compiles first, before anything is taken from the
+    // session table. An unsatisfiable schema is a request error that
+    // produced nothing, and it must not cost a conversation the KV cache
+    // it had accumulated — taking the session and then failing would
+    // silently drop it on the floor.
+    let eos_for_constraint = req_eos_ids(model, config);
+    let constraint = match &config.constraint {
+        Some(spec) => {
+            let schema = spec.compile().map_err(EngineError::Constraint)?;
+            let table = token_table
+                .get_or_insert_with(|| Arc::new(TokenByteTable::build(tokenizer)));
+            Some(ConstraintState::new(schema, table.clone(), eos_for_constraint))
+        }
+        None => None,
+    };
+
     // Image turns never join the KV session cache: token prefixes would
     // collide with different image contents, so media requests run on a
     // fresh cache and are not saved back.
@@ -271,21 +293,7 @@ pub(crate) fn begin_generation(
     // suppresses the model's ability to end its turn — and gets worse
     // the longer the conversation runs.
     let sampler: Box<dyn Sampler> = sampler_from_params_exempting(&config.sampling, &eos_ids);
-    let stop = StopDetector::new(eos_ids.clone(), config.stop_strings.clone());
-    // Structured output: compile the schema at request time and bind the
-    // automaton to this model's token table (built lazily, cached on the
-    // engine). The mask runs engine-side, not in the sampler's processor
-    // chain — the greedy sampler skips that chain, and a constraint must
-    // hold under every sampler.
-    let constraint = match &config.constraint {
-        Some(spec) => {
-            let schema = spec.compile().map_err(EngineError::Constraint)?;
-            let table = token_table
-                .get_or_insert_with(|| Arc::new(TokenByteTable::build(tokenizer)));
-            Some(ConstraintState::new(schema, table.clone(), eos_ids))
-        }
-        None => None,
-    };
+    let stop = StopDetector::new(eos_ids, config.stop_strings.clone());
 
     let t_start = Instant::now();
 
@@ -360,6 +368,7 @@ pub(crate) fn begin_generation(
         loop_error: None,
         done: false,
         started: false,
+        poisoned: false,
         prompt_tokens: prompt_tokens.to_vec(),
         lcp,
         reuse,
@@ -527,17 +536,25 @@ impl ActiveGeneration {
         ids.push(self.next as i32);
         ids.extend(draft.iter().map(|&t| t as i32));
         let input = model.embed(Tensor::from_data(TensorData::new(ids, [1, k + 1]), device));
+        // Past this call the cache holds k+1 rows that nothing has
+        // accounted for yet: `decoded` gains `next` and `cache_ahead`
+        // gains `accepted` only after the verification below succeeds.
+        // Every failure in between therefore leaves the cache longer than
+        // `history` describes, and the session must be dropped rather than
+        // saved — see `poisoned`.
         let all = match model.decode_all_logits(input, self.cache.as_mut()) {
             Ok(t) => t,
             Err(e) => {
-                self.fail(e.into());
+                self.fail_with_unaccounted_cache(e.into());
                 return Some(Submitted::Done);
             }
         };
         let rows: Vec<f32> = match all.into_data().convert::<f32>().to_vec::<f32>() {
             Ok(v) => v,
             Err(e) => {
-                self.fail(EngineError::Readback(format!("spec logits: {e:?}")));
+                self.fail_with_unaccounted_cache(EngineError::Readback(format!(
+                    "spec logits: {e:?}"
+                )));
                 return Some(Submitted::Done);
             }
         };
@@ -562,7 +579,7 @@ impl ActiveGeneration {
         if unwanted > 0 {
             let popped = self.cache.popn(unwanted);
             if popped != unwanted {
-                self.fail(EngineError::Readback(format!(
+                self.fail_with_unaccounted_cache(EngineError::Readback(format!(
                     "speculative rollback popped {popped} of {unwanted} rows"
                 )));
                 return Some(Submitted::Done);
@@ -585,6 +602,15 @@ impl ActiveGeneration {
     /// Whether the loop should stop.
     pub(crate) fn is_done(&self) -> bool {
         self.done
+    }
+
+    /// Records a terminal error, stops the loop, and abandons the session:
+    /// the cache holds rows beyond what `decoded` describes and no
+    /// accounting can recover which.
+    #[cfg(not(target_family = "wasm"))]
+    fn fail_with_unaccounted_cache(&mut self, err: EngineError) {
+        self.poisoned = true;
+        self.fail(err);
     }
 
     /// Records a terminal error and stops the loop.
@@ -622,7 +648,7 @@ impl ActiveGeneration {
         }
 
         let cache_pages_used = self.cache.pages_used().unwrap_or(0);
-        if self.reuse {
+        if self.reuse && !self.poisoned {
             let mut hist = self.prompt_tokens.clone();
             hist.extend_from_slice(&self.decoded);
             sessions.put(
