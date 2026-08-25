@@ -435,6 +435,33 @@ fn q8_0_dequant_kernel(qs: &Array<u32>, d: &Array<f32>, out: &mut Array<f32>, n:
     }
 }
 
+/// Q8_0 dequant-gather: `out[t*k + c]` is column `c` of row `ids[t]`,
+/// dequantized. The block arithmetic is byte-identical to
+/// [`q8_0_dequant_kernel`] with a row indirection in front — which is
+/// what keeps it bit-exact against the CPU reference. This is the
+/// embedding lookup for a table kept packed in VRAM.
+#[cube(launch_unchecked)]
+fn q8_0_gather_kernel(
+    ids: &Array<u32>,
+    qs: &Array<u32>,
+    d: &Array<f32>,
+    out: &mut Array<f32>,
+    total: usize,
+    k: usize,
+) {
+    if ABSOLUTE_POS < total {
+        let t = ABSOLUTE_POS / k;
+        let c = ABSOLUTE_POS % k;
+        let row = usize::cast_from(ids[t]);
+        let block = row * (k / 32) + c / 32;
+        let j = c % 32;
+        let word = qs[block * 8 + j / 4];
+        let byte = (word >> (u32::cast_from(j % 4) * 8)) & 0xFF;
+        let q = (i32::cast_from(byte) << 24) >> 24;
+        out[ABSOLUTE_POS] = f32::cast_from(q) * d[block];
+    }
+}
+
 /// Fused Q8_0 dequant-matmul.
 #[cube(launch_unchecked)]
 fn q8_0_matmul_kernel(
@@ -743,6 +770,35 @@ impl<R: Runtime> Q80Weight<R> {
                     self.n_out,
                 );
             }
+        }
+        out_h
+    }
+
+    /// Dequantizes the rows named by `ids` (u32 device handle, `n_tokens`
+    /// entries) into a dense `[n_tokens, k]` f32 buffer — the embedding
+    /// lookup for a packed table. Row-for-row bit-exact with the dequant
+    /// kernel, and therefore with the CPU reference.
+    pub fn gather_rows_device(
+        &self,
+        client: &ComputeClient<R>,
+        ids: Handle,
+        n_tokens: usize,
+    ) -> Handle {
+        let total = n_tokens * self.k;
+        let n_blocks = self.n_out * self.k / Q4_0_BLOCK;
+        let out_h = client.empty(total * core::mem::size_of::<f32>());
+        unsafe {
+            q8_0_gather_kernel::launch_unchecked::<R>(
+                client,
+                cube_count_capped(total as u32),
+                CubeDim::new_1d(CUBE_DIM),
+                ArrayArg::from_raw_parts(ids, n_tokens),
+                ArrayArg::from_raw_parts(self.qs.clone(), n_blocks * 8),
+                ArrayArg::from_raw_parts(self.d.clone(), n_blocks),
+                ArrayArg::from_raw_parts(out_h.clone(), total),
+                total,
+                self.k,
+            );
         }
         out_h
     }
@@ -1670,6 +1726,27 @@ impl QuantWeight {
         }
     }
 
+    /// Row gather (embedding lookup) off the packed table, when this
+    /// format has a gather kernel. Q8_0 only in the first landing — other
+    /// formats return `None` and the caller keeps its dense table, per
+    /// the fallback discipline.
+    pub fn gather_rows_device(
+        &self,
+        client: &ComputeClient<cubecl::wgpu::WgpuRuntime>,
+        ids: Handle,
+        n_tokens: usize,
+    ) -> Option<Handle> {
+        match self {
+            QuantWeight::Q80(w) => Some(w.gather_rows_device(client, ids, n_tokens)),
+            _ => None,
+        }
+    }
+
+    /// Whether [`Self::gather_rows_device`] is implemented for this format.
+    pub fn supports_gather(&self) -> bool {
+        matches!(self, QuantWeight::Q80(_))
+    }
+
     /// Fused dequant-matmul, device handles in and out.
     pub fn matmul_device(
         &self,
@@ -1990,6 +2067,42 @@ mod tests {
             out.extend_from_slice(&lcg_bytes(32, 0x80C0 ^ b as u32));
         }
         out
+    }
+
+    /// The embedding gather must be bit-exact against the CPU reference
+    /// row slices: it is the dequant kernel with a row indirection, and
+    /// any drift would make a packed table a subtly different model.
+    /// Ragged k-multiple vocab, out-of-order and repeated ids, and a
+    /// single-token gather all covered.
+    #[test]
+    fn q8_0_gather_is_bit_exact_vs_cpu_reference_rows() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let device = Default::default();
+        let client = WgpuRuntime::client(&device);
+
+        // vocab=67 rows (ragged vs every launch granularity), k=64.
+        let (vocab, k) = (67usize, 64usize);
+        let data = synth_q8_0(vocab * k / 32);
+        let w = Q80Weight::<WgpuRuntime>::from_gguf_bytes(&client, &data, vocab, k)
+            .expect("packed table");
+        let dense = combs_formats::quants::dequantize_q8_0(&data, vocab * k).unwrap();
+
+        for ids in [vec![3u32], vec![3, 0, 66, 3, 41]] {
+            let ids_h = client.create_from_slice(u32::as_bytes(&ids));
+            let out_h = w.gather_rows_device(&client, ids_h, ids.len());
+            let bytes = client.read_one_unchecked(out_h);
+            let got = f32::from_bytes(&bytes);
+            for (t, &row) in ids.iter().enumerate() {
+                let want = &dense[row as usize * k..(row as usize + 1) * k];
+                assert_eq!(
+                    &got[t * k..(t + 1) * k],
+                    want,
+                    "row {row} at slot {t} must be bit-exact vs gguf.rs"
+                );
+            }
+        }
     }
 
     /// Q5_0/Q8_0 GPU dequant must be **bit-exact** vs the CPU references —

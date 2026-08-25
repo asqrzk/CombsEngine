@@ -64,10 +64,11 @@ struct LlamaLayer<B: Backend> {
 pub struct LlamaModel<B: Backend> {
     metadata: ModelMetadata,
     spec: ArchSpec,
-    /// `[vocab, hidden]`. Stays dense: embedding lookup needs `select`, and
-    /// the tied-head case reuses it as a dense matmul weight.
-    embed: Tensor<B, 2>,
-    lm_head: Option<Linear<B>>, // None => tied to `embed`
+    /// `[vocab, hidden]`, dense or packed. When packed, lookup runs the
+    /// dequant-gather kernel and a tied head shares the packed table
+    /// through `lm_head` — so `lm_head: None` implies the dense arm.
+    embed: crate::embed::Embedding<B>,
+    lm_head: Option<Linear<B>>, // None => tied to the DENSE `embed`
     final_norm: Tensor<B, 1>,
     layers: Vec<LlamaLayer<B>>,
     rotary: RotaryEmbedding<B>,
@@ -317,9 +318,15 @@ impl<B: Backend> LlamaModel<B> {
         let logits: Tensor<B, 3> = match &self.lm_head {
             Some(head) => head.forward(hidden, None),
             None => {
-                // Tied head: dense matmul against the embedding table.
+                // Tied head over the dense table. A packed embedding
+                // always installs a packed tied head, so this arm is
+                // dense by construction.
+                let table = self
+                    .embed
+                    .dense()
+                    .expect("lm_head: None implies a dense embedding");
                 let flat = hidden.reshape([seq, hidden_size]);
-                let out = safe_matmul(flat, self.embed.clone().transpose());
+                let out = safe_matmul(flat, table.clone().transpose());
                 let [_, vocab] = out.dims();
                 out.reshape([1, seq, vocab])
             }
@@ -341,9 +348,13 @@ impl<B: Backend> LlamaModel<B> {
                 logits.reshape([1, vocab])
             }
             None => {
-                // Tied head: dense matmul against the embedding table.
+                // Dense by construction — see `all_logits`.
+                let table = self
+                    .embed
+                    .dense()
+                    .expect("lm_head: None implies a dense embedding");
                 let last = last.reshape([1, hidden_size]);
-                safe_matmul(last, self.embed.clone().transpose())
+                safe_matmul(last, table.clone().transpose())
             }
         };
         match self.spec.final_logit_softcap {
@@ -390,13 +401,7 @@ impl<B: Backend> GenerativeModel<B> for LlamaModel<B> {
     }
 
     fn embed(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        let [batch, seq] = tokens.dims();
-        let flat = tokens.reshape([batch * seq]);
-        let embedded = self
-            .embed
-            .clone()
-            .select(0, flat)
-            .reshape([batch, seq, self.metadata.hidden_size]);
+        let embedded = self.embed.gather(tokens);
         if self.spec.embed_scale_sqrt_hidden {
             // Gemma scales embeddings by sqrt(hidden); computed in f32 —
             // the half-precision product was the f16 garbage-output bug.
@@ -493,16 +498,32 @@ impl<B: Backend> LlamaModel<B> {
         };
         let prefix = prefix.as_str();
 
-        let embed: Tensor<B, 2> =
-            load_weight(source, device, &format!("{prefix}embed_tokens.weight"))?;
+        // Packed first: keep the largest tensor of the model in its GGUF
+        // packing, with lookup as a gather kernel — and hold onto the
+        // packed tied-head op it comes paired with. Any refusal falls
+        // back to the dense load, byte-for-byte today's behavior.
+        let embed_name = format!("{prefix}embed_tokens.weight");
+        let (embed, packed_head) =
+            match crate::embed::try_quant_embedding::<B>(source, &embed_name, device)? {
+                Some((e, head)) => (e, Some(head)),
+                None => {
+                    let t: Tensor<B, 2> = load_weight(source, device, &embed_name)?;
+                    (crate::embed::Embedding::Dense(t), None)
+                }
+            };
         Self::expect_shape(
             "embed_tokens.weight",
             &embed.dims(),
             &[m.vocab_size, m.hidden_size],
         )?;
 
+        // A tied head with a packed embedding uses the SAME packed table
+        // through the quant-linear op — one copy in VRAM, and the decode
+        // head's dense-vs-embed matmul becomes a packed gemv. With a
+        // dense embedding, `None` keeps today's tied fallback matmul.
+        let tied_head = || packed_head.map(Linear::Quant);
         let lm_head = if m.tie_word_embeddings {
-            None
+            tied_head()
         } else {
             match load_linear(source, device, "lm_head.weight") {
                 Ok(w) => {
@@ -521,7 +542,7 @@ impl<B: Backend> LlamaModel<B> {
                     eprintln!(
                         "[load] lm_head.weight absent; falling back to tied embeddings"
                     );
-                    None
+                    tied_head()
                 }
                 Err(e) => return Err(e),
             }

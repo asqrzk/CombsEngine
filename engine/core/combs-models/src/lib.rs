@@ -7,6 +7,7 @@
 
 mod act;
 mod archspec;
+mod embed;
 mod kv;
 mod llama;
 mod matmul;

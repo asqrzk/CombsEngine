@@ -412,7 +412,16 @@ fn native_throughput_baseline() {
         return;
     };
     let source = combs_formats::open_model_source(&path).expect("open model");
-    let engine = Engine::load(&source, combs_core::init_device()).expect("engine");
+    let device = combs_core::init_device();
+    let engine = Engine::load(&source, device.clone()).expect("engine");
+    if let Some(m) = combs_core::gpu_memory(&device) {
+        println!(
+            "[native] after load: in_use={:.1}MB reserved={:.1}MB allocs={}",
+            m.bytes_in_use as f64 / 1e6,
+            m.bytes_reserved as f64 / 1e6,
+            m.number_allocs,
+        );
+    }
 
     let config = GenerationConfig {
         max_tokens: 128,

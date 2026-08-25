@@ -43,13 +43,13 @@ use crate::qmatmul::QuantWeight;
 use crate::{ModelError, Result};
 
 /// The default engine backend (fused f32 wgpu).
-type FusedF32 = Fusion<CubeBackend<WgpuRuntime, f32, i32, u32>>;
+pub(crate) type FusedF32 = Fusion<CubeBackend<WgpuRuntime, f32, i32, u32>>;
 /// Unfused f32 wgpu (used when the fusion feature is off).
-type UnfusedF32 = CubeBackend<WgpuRuntime, f32, i32, u32>;
+pub(crate) type UnfusedF32 = CubeBackend<WgpuRuntime, f32, i32, u32>;
 /// The `--features f16` backend.
-type UnfusedF16 = CubeBackend<WgpuRuntime, burn::tensor::f16, i32, u32>;
+pub(crate) type UnfusedF16 = CubeBackend<WgpuRuntime, burn::tensor::f16, i32, u32>;
 /// The inner (non-fusion) backend the custom op executes on.
-type InnerF32 = CubeBackend<WgpuRuntime, f32, i32, u32>;
+pub(crate) type InnerF32 = CubeBackend<WgpuRuntime, f32, i32, u32>;
 
 /// A backend-specific quantized-linear forward. Boxed into [`Linear::Quant`]
 /// at load time by [`try_quant_linear`].
@@ -279,6 +279,25 @@ fn debug_quant(name: &str, outcome: &str) {
     if std::env::var_os("COMBS_DEBUG_QUANT").is_some() {
         eprintln!("quant-linear {name}: {outcome}");
     }
+}
+
+/// Wraps an already-packed weight as a [`QuantLinearOp`] for `B` — the
+/// bridge that lets a tied lm_head share the embedding's packed table
+/// (one `Arc`, one copy in VRAM) instead of loading a second one.
+pub(crate) fn quant_linear_from_weight<B: Backend>(
+    w: Arc<QuantWeight>,
+) -> Option<Box<dyn QuantLinearOp<B>>> {
+    let lin = CubeQuantLinear { w };
+    if TypeId::of::<B>() == TypeId::of::<FusedF32>() {
+        return cast_op::<B, FusedF32>(Box::new(lin));
+    }
+    if TypeId::of::<B>() == TypeId::of::<UnfusedF32>() {
+        return cast_op::<B, UnfusedF32>(Box::new(lin));
+    }
+    if TypeId::of::<B>() == TypeId::of::<UnfusedF16>() {
+        return cast_op::<B, UnfusedF16>(Box::new(lin));
+    }
+    None
 }
 
 pub fn try_quant_linear<B: Backend>(
