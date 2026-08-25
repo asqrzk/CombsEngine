@@ -67,3 +67,16 @@ codegen-units = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+# Vendored copies of two upstream crates, patched for the browser. wgpu's
+# WebGPU backend advertises subgroup support it never requests from the
+# device (hardcoded plane sizes, an unmapped feature bit), and the plane
+# gemv matmul kernels emit `enable subgroups;` without checking feature
+# support — the shader then fails WGSL validation, the invalid pipeline
+# dispatches as a silent no-op, and autotune crowns it the fastest
+# candidate. Every model whose k dimensions divide by the fictional plane
+# size decodes zeros in a browser. The patches (one cfg gate each, marked
+# `WASM PATCH`) keep plane kernels out of wasm builds; native builds are
+# bit-identical. Drop when the upstream feature mapping is real.
+[patch.crates-io]
+burn-cubecl = { path = "vendor/burn-cubecl" }
+cubecl-wgpu = { path = "vendor/cubecl-wgpu" }

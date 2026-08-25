@@ -29,6 +29,46 @@ import init, {
 let engineId = null;
 let ready = null;
 
+/**
+ * What WebGPU swallows, surfaced. A shader that fails validation in a
+ * browser does not error the call that dispatches it — the pipeline is
+ * invalid, every dispatch through it is a silent no-op, and the output
+ * buffer stays zero-initialized. From the outside that is a model that
+ * "runs" and emits garbage. These interceptors catch the compile errors
+ * and device errors as they happen, log them loudly, and expose them on
+ * the `stats` reply so a page can tell a broken kernel from a bad model.
+ */
+const gpuErrors = [];
+const noteGpuError = (kind, detail) => {
+  const entry = { kind, detail: String(detail).slice(0, 500), at: Date.now() };
+  gpuErrors.push(entry);
+  if (gpuErrors.length > 20) gpuErrors.shift();
+  console.error(`[combs.worker] ${kind}: ${entry.detail}`);
+};
+if (globalThis.GPUDevice) {
+  const origCSM = GPUDevice.prototype.createShaderModule;
+  GPUDevice.prototype.createShaderModule = function (desc) {
+    const mod = origCSM.call(this, desc);
+    mod.getCompilationInfo?.().then((info) => {
+      const errs = info.messages.filter((m) => m.type === 'error');
+      if (errs.length) {
+        noteGpuError('shader-compile-error', `${desc.label ?? '(unlabeled)'}: ${errs[0].message}`);
+      }
+    });
+    return mod;
+  };
+}
+if (globalThis.GPUAdapter) {
+  const origRD = GPUAdapter.prototype.requestDevice;
+  GPUAdapter.prototype.requestDevice = async function (...args) {
+    const device = await origRD.apply(this, args);
+    device.addEventListener?.('uncapturederror', (ev) => {
+      noteGpuError('uncaptured-error', ev.error?.message ?? ev.error);
+    });
+    return device;
+  };
+}
+
 const post = (kind, id, payload) => self.postMessage({ kind, id, payload });
 const fail = (id, error) => post("error", id, String(error?.message ?? error));
 
@@ -108,10 +148,13 @@ self.onmessage = async (event) => {
         // cancellation through its event stream.
         combs_cancel(id);
         break;
-      case "stats":
+      case "stats": {
         if (engineId === null) throw new Error("no engine loaded");
-        post("metadata", id, JSON.parse(combs_engine_stats(engineId)));
+        const stats = JSON.parse(combs_engine_stats(engineId));
+        stats.gpu_errors = gpuErrors;
+        post("metadata", id, stats);
         break;
+      }
       case "caps":
         post("metadata", id, JSON.parse(await combs_device_caps()));
         break;

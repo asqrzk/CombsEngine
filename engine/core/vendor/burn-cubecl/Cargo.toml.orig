@@ -1,0 +1,97 @@
+[package]
+authors = ["nathanielsimard <nathaniel.simard.42@gmail.com>"]
+categories = ["science"]
+description = "Generic backend that can be compiled just-in-time to any shader language target"
+documentation = "https://docs.rs/burn-cubecl"
+edition.workspace = true
+keywords = ["deep-learning", "machine-learning", "gpu"]
+license.workspace = true
+name = "burn-cubecl"
+readme.workspace = true
+repository = "https://github.com/tracel-ai/burn/tree/main/crates/burn-cubecl"
+version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = [
+    "autotune",
+    "std",
+    "fusion",
+    "cubecl/default",
+    "burn-backend/default",
+    "burn-fusion?/default",
+    "burn-cubecl-fusion?/default",
+]
+std = [
+    "cubecl/std",
+    "burn-backend/std",
+    "burn-fusion?/std",
+    "burn-cubecl-fusion?/std",
+]
+doc = ["default"]
+memory-checks = ["burn-fusion?/memory-checks"]
+tracing = [
+    "dep:tracing",
+    "cubecl/tracing",
+    "burn-std/tracing",
+    "burn-backend/tracing",
+    "burn-fusion?/tracing",
+    "burn-cubecl-fusion?/tracing",
+]
+
+autotune = ["burn-cubecl-fusion?/autotune"]
+autotune-checks = [
+    "autotune",
+    "cubecl/autotune-checks",
+    "burn-cubecl-fusion?/autotune-checks",
+]
+
+fusion = ["burn-fusion", "burn-cubecl-fusion"]
+fusion-experimental = ["fusion"]
+
+template = []
+
+distributed = [
+    "std",
+    "burn-backend/distributed",
+    "burn-fusion?/distributed",
+]
+
+[dependencies]
+burn-cubecl-fusion = { workspace = true, optional = true }
+burn-fusion = { workspace = true, optional = true }
+burn-ir = { workspace = true }
+burn-std = { workspace = true, features = [
+    "cubecl",
+] }
+burn-backend = { workspace = true, features = [
+    "cubecl",
+] }
+cubecl = { workspace = true, features = ["stdlib"] }
+cubek = { workspace = true, features = [
+    "attention",
+    "matmul",
+    "convolution",
+    "reduce",
+    "random",
+    "quantization",
+    "stdlib",
+    "fft",
+] }
+tracing = { workspace = true, features = ["attributes"], optional = true }
+
+derive-new = { workspace = true }
+log = { workspace = true }
+
+# Async
+futures-lite = { workspace = true, features = ["std"] }
+
+# Template
+serde = { workspace = true }
+text_placeholder = { workspace = true, features = ["struct_context"] }
+
+[package.metadata.docs.rs]
+features = ["doc"]
+rustdoc-args = ["--cfg", "docsrs"]
