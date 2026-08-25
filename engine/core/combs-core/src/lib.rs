@@ -12,7 +12,9 @@ pub use burn::backend::wgpu;
 pub mod progress;
 pub mod quant;
 
-use burn::backend::wgpu::{RuntimeOptions, WgpuDevice, WgpuSetup, graphics::AutoGraphicsApi};
+use burn::backend::wgpu::{
+    MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuSetup, graphics::AutoGraphicsApi,
+};
 
 // `AutoGraphicsApi` already resolves to `BrowserWebGpu` under
 // `target_family = "wasm"`, so the graphics API needs no cfg of ours —
@@ -55,10 +57,94 @@ pub type CombsBackend = burn::backend::wgpu::CubeBackend<
 /// The default device handle type.
 pub type CombsDevice = WgpuDevice;
 
-/// Returns the default wgpu device (best available GPU; on macOS this is the
-/// Metal device). Honors cubecl's `CUBECL_WGPU_DEFAULT_DEVICE` override.
+/// The one device context this process holds: the device handle, the
+/// retained [`WgpuSetup`] (adapter, device, queue — the doorway for any
+/// pass that must speak wgpu directly), and the capabilities read at
+/// initialization. cubecl permits exactly one setup per device; retaining
+/// it here is what lets `device_caps`/`device_info` be called freely
+/// where a second `init_setup` used to panic.
+struct DeviceContext {
+    device: CombsDevice,
+    setup: WgpuSetup,
+    caps: DeviceCaps,
+}
+
+static CONTEXT: std::sync::OnceLock<DeviceContext> = std::sync::OnceLock::new();
+
+/// Runtime options for the engine's device: the seam where memory-pool
+/// policy is chosen. Native defaults to cubecl's sub-slice pools;
+/// `COMBS_MEM_POOLS=exclusive` switches to one-buffer-per-allocation
+/// pools (offset 0 everywhere, aged out on a dealloc period). The wasm
+/// build has no environment and takes cubecl's wasm default, which is
+/// already exclusive pages.
+fn combs_runtime_options() -> RuntimeOptions {
+    #[cfg(not(target_family = "wasm"))]
+    if matches!(
+        std::env::var("COMBS_MEM_POOLS").as_deref(),
+        Ok("exclusive")
+    ) {
+        return RuntimeOptions {
+            memory_config: MemoryConfiguration::ExclusivePages,
+            ..RuntimeOptions::default()
+        };
+    }
+    RuntimeOptions::default()
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn context() -> &'static DeviceContext {
+    CONTEXT.get_or_init(|| {
+        let device = WgpuDevice::default();
+        let setup = burn::backend::wgpu::init_setup::<AutoGraphicsApi>(
+            &device,
+            combs_runtime_options(),
+        );
+        let caps = caps_from_setup(&setup);
+        DeviceContext {
+            device,
+            setup,
+            caps,
+        }
+    })
+}
+
+/// [`context`] for callers that can await — the only form a browser has.
+async fn context_async() -> &'static DeviceContext {
+    if let Some(ctx) = CONTEXT.get() {
+        return ctx;
+    }
+    let device = WgpuDevice::default();
+    let setup = burn::backend::wgpu::init_setup_async::<AutoGraphicsApi>(
+        &device,
+        combs_runtime_options(),
+    )
+    .await;
+    let caps = caps_from_setup(&setup);
+    // A racing initializer on native would mean two setups were built;
+    // only the first is kept, and cubecl treats the duplicate as the same
+    // registered device. On wasm there is one thread and no race.
+    let _ = CONTEXT.set(DeviceContext {
+        device,
+        setup,
+        caps,
+    });
+    CONTEXT.get().expect("just set")
+}
+
+/// Returns the default wgpu device (best available GPU; on macOS this is
+/// the Metal device). Honors cubecl's `CUBECL_WGPU_DEFAULT_DEVICE`
+/// override. Natively this also performs the one-time runtime setup and
+/// retains it — see [`DeviceContext`]. The wasm build defers setup to the
+/// first async capability query, because setup cannot block there.
 pub fn init_device() -> CombsDevice {
-    WgpuDevice::default()
+    #[cfg(not(target_family = "wasm"))]
+    {
+        context().device.clone()
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        WgpuDevice::default()
+    }
 }
 
 /// True when wgpu can see at least one adapter. Cached after the first
@@ -145,28 +231,20 @@ pub struct DeviceCaps {
     pub subgroup_max_size: u32,
 }
 
-/// Queries the adapter for its limits/features and returns [`DeviceCaps`].
-///
-/// Like [`device_info`], this performs the cubecl runtime setup for the
-/// device, so it is safe (and cheap) to use the device afterwards.
+/// The adapter's limits and features, read once at setup and answered
+/// from the retained context thereafter — callable as often as anyone
+/// likes, where it used to panic on the second call.
 #[cfg(not(target_family = "wasm"))]
 pub fn device_caps(device: &CombsDevice) -> DeviceCaps {
-    caps_from_setup(&burn::backend::wgpu::init_setup::<AutoGraphicsApi>(
-        device,
-        RuntimeOptions::default(),
-    ))
+    let _ = device; // one device per process; the context holds it
+    context().caps.clone()
 }
 
 /// [`device_caps`] for callers that can await — the only form available in
 /// a browser, and identical in result natively.
 pub async fn device_caps_async(device: &CombsDevice) -> DeviceCaps {
-    caps_from_setup(
-        &burn::backend::wgpu::init_setup_async::<AutoGraphicsApi>(
-            device,
-            RuntimeOptions::default(),
-        )
-        .await,
-    )
+    let _ = device;
+    context_async().await.caps.clone()
 }
 
 /// Reads the capability set off an already-initialized setup. Both
@@ -229,31 +307,17 @@ pub fn gpu_memory(_device: &CombsDevice) -> Option<GpuMemory> {
     None
 }
 
-/// Initializes the wgpu runtime for `device` and returns adapter information.
-///
-/// Note: this performs the cubecl runtime setup for the device (the same setup
-/// burn performs lazily on first tensor use), so it is safe to use the device
-/// for compute afterwards.
-/// NOTE: like [`device_caps`], this primes the cubecl runtime — only
-/// ONE such probe may run per process (a second `init_setup` panics in
-/// cubecl 0.10). Prefer `device_caps`, which carries a superset.
+/// Adapter identity, answered from the retained context.
 #[cfg(not(target_family = "wasm"))]
 pub fn device_info(device: &CombsDevice) -> DeviceInfo {
-    info_from_setup(&burn::backend::wgpu::init_setup::<AutoGraphicsApi>(
-        device,
-        RuntimeOptions::default(),
-    ))
+    let _ = device;
+    info_from_setup(&context().setup)
 }
 
 /// [`device_info`] for callers that can await.
 pub async fn device_info_async(device: &CombsDevice) -> DeviceInfo {
-    info_from_setup(
-        &burn::backend::wgpu::init_setup_async::<AutoGraphicsApi>(
-            device,
-            RuntimeOptions::default(),
-        )
-        .await,
-    )
+    let _ = device;
+    info_from_setup(&context_async().await.setup)
 }
 
 /// Reads adapter identity off an already-initialized setup.

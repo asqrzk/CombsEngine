@@ -492,6 +492,16 @@ pub struct PagedKVCache<B: Backend> {
     /// the attention mask is re-based when old tokens are evicted.
     sliding: Vec<Option<(Tensor<B, 4>, Tensor<B, 4>)>>,
     device: Option<Device<B>>,
+    /// Device-resident mirror of `table`, rebuilt only when the table
+    /// changes. Without it every attention call re-uploaded the table —
+    /// twice per layer per token, ~56 host->device round trips per decode
+    /// step on a 28-layer model, for a table that changes once every
+    /// `page_size` tokens.
+    table_device: Option<Tensor<B, 1, Int>>,
+    /// Set by every mutation of `table`; cleared on rebuild. The host
+    /// `table` stays the single source of truth — the device tensor is
+    /// derived state and must never be read while this is set.
+    table_dirty: bool,
 }
 
 impl<B: Backend> PagedKVCache<B> {
@@ -523,6 +533,8 @@ impl<B: Backend> PagedKVCache<B> {
             layer_windows: windows,
             sliding: (0..num_layers).map(|_| None).collect(),
             device: None,
+            table_device: None,
+            table_dirty: true,
         }
     }
 
@@ -554,6 +566,7 @@ impl<B: Backend> PagedKVCache<B> {
                 .alloc()
                 .expect("page allocator exhausted (max_seq_len exceeded)");
             self.table.push(page);
+            self.table_dirty = true;
         }
         pages_needed
     }
@@ -609,20 +622,36 @@ impl<B: Backend> PagedKVCache<B> {
     }
 
     /// Page-table indices for the first `pages` logical pages, on-device.
-    fn page_indices(&self, pages: usize) -> Tensor<B, 1, Int> {
-        let ids: Vec<i32> = self.table[..pages].iter().map(|&p| p as i32).collect();
-        let device = self
-            .device
+    ///
+    /// The full table is uploaded once per mutation and narrowed per call;
+    /// steady-state decode reads a resident tensor instead of paying a
+    /// host->device trip per layer.
+    fn page_indices(&mut self, pages: usize) -> Tensor<B, 1, Int> {
+        if self.table_dirty || self.table_device.is_none() {
+            let ids: Vec<i32> = self.table.iter().map(|&p| p as i32).collect();
+            let len = ids.len();
+            let device = self
+                .device
+                .as_ref()
+                .expect("device set on first attention call");
+            self.table_device = Some(Tensor::<B, 1, Int>::from_data(
+                TensorData::new(ids, [len]),
+                device,
+            ));
+            self.table_dirty = false;
+        }
+        self.table_device
             .as_ref()
-            .expect("device set on first attention call");
-        Tensor::<B, 1, Int>::from_data(TensorData::new(ids, [pages]), device)
+            .expect("rebuilt above")
+            .clone()
+            .narrow(0, 0, pages)
     }
 
     /// Gathers the first `pages` page-table entries of `arena`
     /// (`[num_pages, n_kv, page_size, last]`) into a contiguous
     /// `[1, n_kv, total, last]` window.
     fn gather_window(
-        &self,
+        &mut self,
         arena: Tensor<B, 4>,
         pages: usize,
         total: usize,
@@ -637,7 +666,7 @@ impl<B: Backend> PagedKVCache<B> {
 
     /// [`Self::gather_window`] for the packed int arenas.
     fn gather_window_int(
-        &self,
+        &mut self,
         arena: Tensor<B, 4, Int>,
         pages: usize,
         total: usize,
@@ -830,12 +859,15 @@ impl<B: Backend> KVCache<B> for PagedKVCache<B> {
         while self.table.len() > keep {
             let page = self.table.pop().expect("table nonempty");
             self.allocator.free_page(page);
+            self.table_dirty = true;
         }
         n
     }
 
     fn reset(&mut self) {
         self.table.clear();
+        self.table_device = None;
+        self.table_dirty = true;
         self.allocator.reset(self.config.num_pages());
         self.seq_len = 0;
         for slot in &mut self.sliding {
