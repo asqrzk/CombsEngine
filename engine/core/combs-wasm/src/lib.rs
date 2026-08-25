@@ -91,6 +91,23 @@ pub async fn combs_device_caps() -> Result<String, JsValue> {
     ensure_device().await.map_err(js_err)
 }
 
+/// Validates the hand-written kernel contract on THIS browser's WebGPU
+/// stack: the scalar uniform layout and workgroup-memory barriers, judged
+/// by output values rather than by the absence of errors — a shader that
+/// fails Tint validation dispatches as a silent no-op here, so silence
+/// proves nothing. Returns "ok" or throws with the first violation.
+///
+/// Run and record this green before enabling any COMBS_WGSL door in a
+/// browser build; naga passing natively says nothing about Tint.
+#[wasm_bindgen]
+pub async fn combs_wgsl_probe() -> Result<String, JsValue> {
+    ensure_device().await.map_err(js_err)?;
+    combs_models::wgsl_probe_report()
+        .await
+        .map(|()| "ok".to_string())
+        .map_err(js_err)
+}
+
 /// Creates an engine from a config JSON and the model's bytes.
 ///
 /// `model_bytes` must be the complete GGUF image: its tensor offsets are

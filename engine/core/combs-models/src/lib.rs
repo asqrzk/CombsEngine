@@ -17,6 +17,7 @@ mod qlinear;
 mod qmatmul;
 mod quant_linear;
 mod registry;
+mod wgsl;
 mod rope;
 mod smolvlm;
 mod traits;
@@ -35,6 +36,7 @@ pub use qmatmul::{
 };
 pub use quant_linear::QuantizedLinear;
 pub use registry::ModelRegistry;
+pub use wgsl::probe_report as wgsl_probe_report;
 pub use rope::RotaryEmbedding;
 pub use smolvlm::{SmolVlmModel, image_prompt_expansion, pixels_to_tensor};
 pub use whisper::{WhisperModel, load_speech_model};

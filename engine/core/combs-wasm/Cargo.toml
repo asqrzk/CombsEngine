@@ -15,5 +15,6 @@ js-sys = "0.3"
 console_error_panic_hook = "0.1"
 combs-core.workspace = true
 combs-formats.workspace = true
+combs-models.workspace = true
 combs-runtime.workspace = true
 serde_json.workspace = true
