@@ -301,6 +301,13 @@ pub struct StatsJson {
     pub prefill_tokens_per_second: f64,
     /// KV pages in use at end of generation (paged cache).
     pub cache_pages_used: usize,
+    /// Prompt tokens served from a rolling session's KV cache instead of
+    /// being re-prefilled. The number that says whether prefix reuse
+    /// happened — a consumer shown only `prompt_tokens` cannot tell a
+    /// warm turn from a cold one.
+    pub cached_tokens: usize,
+    /// Wall time of the whole request, milliseconds.
+    pub total_ms: f64,
 }
 
 impl From<&GenerationStats> for StatsJson {
@@ -312,6 +319,8 @@ impl From<&GenerationStats> for StatsJson {
             decode_tokens_per_second: s.decode_tokens_per_second(),
             prefill_tokens_per_second: s.prefill_tokens_per_second(),
             cache_pages_used: s.cache_pages_used,
+            cached_tokens: s.cached_tokens,
+            total_ms: s.total_time.as_secs_f64() * 1000.0,
         }
     }
 }
