@@ -37,10 +37,6 @@
 //! existing burn path, and every door reads its environment once per
 //! process.
 
-// The probes are exercised from tests until the first production kernel
-// (Stage 2) takes `launch` into the forward path.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use burn_cubecl::template::{KernelSource, SourceKernel, SourceTemplate};
 use cubecl::prelude::{CubeCount, CubeDim, KernelId, Runtime};
 use cubecl::server::{Binding, KernelArguments, MetadataBindingInfo};
@@ -81,6 +77,11 @@ macro_rules! wgsl_kernel {
 
 wgsl_kernel!(ProbeEcho, "probe_echo.wgsl");
 wgsl_kernel!(ProbeSmem, "probe_smem.wgsl");
+wgsl_kernel!(RmsNorm, "rmsnorm.wgsl");
+
+mod rmsnorm;
+
+pub(crate) use rmsnorm::try_rms_norm;
 
 /// Launches one WGSL kernel on the runtime's stream.
 ///
@@ -172,6 +173,49 @@ pub async fn probe_report() -> Result<(), String> {
                 got[i],
                 staged + 1.0
             ));
+        }
+    }
+
+    // --- rmsnorm canary (K1) ----------------------------------------------
+    // Two ragged rows through the production kernel, gemma flavor to
+    // exercise every scalar slot, checked against a host reduction.
+    let (rows, n) = (2usize, 300usize);
+    let xs: Vec<f32> = (0..rows * n).map(|i| (i as f32 * 0.37).sin() * 2.0).collect();
+    let ws: Vec<f32> = (0..n).map(|i| 0.5 + (i as f32 * 0.11).cos()).collect();
+    let (eps, flavor) = (1e-6f32, 1.0f32);
+    let x_h = client.create_from_slice(f32::as_bytes(&xs));
+    let w_h = client.create_from_slice(f32::as_bytes(&ws));
+    let y_h = client.empty(rows * n * core::mem::size_of::<f32>());
+    launch(
+        &client,
+        RmsNorm,
+        CubeCount::Static(rows as u32, 1, 1),
+        vec![x_h.binding(), w_h.binding(), y_h.clone().binding()],
+        vec![
+            rows as u64,
+            n as u64,
+            f32::to_bits(eps) as u64,
+            f32::to_bits(flavor) as u64,
+        ],
+    );
+    let bytes = client
+        .read_async(vec![y_h])
+        .await
+        .map_err(|e| format!("rmsnorm readback failed: {e:?}"))?;
+    let got = f32::from_bytes(&bytes[0]);
+    for r in 0..rows {
+        let row = &xs[r * n..(r + 1) * n];
+        let mean_sq = row.iter().map(|v| v * v).sum::<f32>() / n as f32;
+        let inv_rms = 1.0 / (mean_sq + eps).sqrt();
+        for c in 0..n {
+            let expect = row[c] * inv_rms * (ws[c] + flavor);
+            let g = got[r * n + c];
+            if (g - expect).abs() > 1e-4 * expect.abs().max(1.0) {
+                return Err(format!(
+                    "rmsnorm canary wrong at [{r},{c}]: got {g}, expected \
+                     {expect} — the K1 kernel must stay doored off here"
+                ));
+            }
         }
     }
     Ok(())

@@ -8,11 +8,17 @@ use crate::precision::{to_f32, to_float};
 /// `eps` is added inside the square root.
 ///
 /// The reduction runs in f32 for f16 stability (no-op in f32 builds).
+/// On the wgpu f32 backends this dispatches the K1 WGSL kernel — one
+/// workgroup per row instead of burn's mean/sqrt/mul chain; every
+/// refusal (doors, other backends) falls through to that chain.
 pub fn rms_norm<B: Backend, const D: usize>(
     x: Tensor<B, D>,
     weight: Tensor<B, 1>,
     eps: f64,
 ) -> Tensor<B, D> {
+    if let Some(y) = crate::wgsl::try_rms_norm(x.clone(), weight.clone(), eps, 0.0) {
+        return y;
+    }
     let out_dtype = x.dtype();
     let dims = x.dims();
     let hidden = dims[D - 1];
@@ -35,6 +41,11 @@ pub fn gemma_rms_norm<B: Backend, const D: usize>(
     weight: Tensor<B, 1>,
     eps: f64,
 ) -> Tensor<B, D> {
+    // The kernel takes the raw weight and adds the 1 in-register; the
+    // fallback materializes the shifted weight as before.
+    if let Some(y) = crate::wgsl::try_rms_norm(x.clone(), weight.clone(), eps, 1.0) {
+        return y;
+    }
     rms_norm(x, weight.add_scalar(1.0), eps)
 }
 

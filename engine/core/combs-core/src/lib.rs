@@ -64,7 +64,6 @@ pub type CombsDevice = WgpuDevice;
 /// it here is what lets `device_caps`/`device_info` be called freely
 /// where a second `init_setup` used to panic.
 struct DeviceContext {
-    device: CombsDevice,
     /// The retained setup — `Some` when this context performed the cubecl
     /// initialization itself (the doorway to the raw device/queue for any
     /// future foreign pass). `None` when something else initialized the
@@ -116,7 +115,6 @@ fn context() -> &'static DeviceContext {
             Ok(setup) => {
                 let caps = caps_from_setup(&setup);
                 DeviceContext {
-                    device,
                     setup: Some(setup),
                     caps,
                 }
@@ -124,7 +122,6 @@ fn context() -> &'static DeviceContext {
             Err(_) => {
                 let caps = cubecl::future::block_on(caps_from_fresh_adapter());
                 DeviceContext {
-                    device,
                     setup: None,
                     caps,
                 }
@@ -179,7 +176,6 @@ async fn context_async() -> &'static DeviceContext {
     // only the first is kept, and cubecl treats the duplicate as the same
     // registered device. On wasm there is one thread and no race.
     let _ = CONTEXT.set(DeviceContext {
-        device,
         setup: Some(setup),
         caps,
     });
