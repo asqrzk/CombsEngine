@@ -65,7 +65,13 @@ pub type CombsDevice = WgpuDevice;
 /// where a second `init_setup` used to panic.
 struct DeviceContext {
     device: CombsDevice,
-    setup: WgpuSetup,
+    /// The retained setup — `Some` when this context performed the cubecl
+    /// initialization itself (the doorway to the raw device/queue for any
+    /// future foreign pass). `None` when something else initialized the
+    /// runtime lazily first; capabilities are then read from a fresh
+    /// adapter query, which answers everything the planner asks without
+    /// touching cubecl's registration.
+    setup: Option<WgpuSetup>,
     caps: DeviceCaps,
 }
 
@@ -95,17 +101,66 @@ fn combs_runtime_options() -> RuntimeOptions {
 fn context() -> &'static DeviceContext {
     CONTEXT.get_or_init(|| {
         let device = WgpuDevice::default();
-        let setup = burn::backend::wgpu::init_setup::<AutoGraphicsApi>(
-            &device,
-            combs_runtime_options(),
-        );
-        let caps = caps_from_setup(&setup);
-        DeviceContext {
-            device,
-            setup,
-            caps,
+        // cubecl accepts exactly one initialization per device and offers
+        // no way to ask whether one happened; a process that touched a
+        // tensor before asking for capabilities has already initialized
+        // lazily, and a second setup panics. Catch that one case and
+        // answer from a plain adapter query instead — same numbers, no
+        // retained setup.
+        match std::panic::catch_unwind(|| {
+            burn::backend::wgpu::init_setup::<AutoGraphicsApi>(
+                &device,
+                combs_runtime_options(),
+            )
+        }) {
+            Ok(setup) => {
+                let caps = caps_from_setup(&setup);
+                DeviceContext {
+                    device,
+                    setup: Some(setup),
+                    caps,
+                }
+            }
+            Err(_) => {
+                let caps = cubecl::future::block_on(caps_from_fresh_adapter());
+                DeviceContext {
+                    device,
+                    setup: None,
+                    caps,
+                }
+            }
         }
     })
+}
+
+/// Capability query with no cubecl involvement: a fresh instance and
+/// adapter answer the planner's questions identically — limits, features
+/// and subgroup sizes are adapter properties, not runtime state.
+async fn caps_from_fresh_adapter() -> DeviceCaps {
+    let instance = ::wgpu::Instance::default();
+    let adapter = instance
+        .request_adapter(&::wgpu::RequestAdapterOptions {
+            power_preference: ::wgpu::PowerPreference::HighPerformance,
+            ..Default::default()
+        })
+        .await
+        .expect("an adapter exists: the runtime already initialized on one");
+    let info = adapter.get_info();
+    let limits = adapter.limits();
+    let features = adapter.features();
+    DeviceCaps {
+        name: info.name.clone(),
+        backend: format!("{:?}", info.backend),
+        device_type: format!("{:?}", info.device_type),
+        driver: format!("{} ({})", info.driver, info.driver_info),
+        max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size as u64,
+        max_buffer_size: limits.max_buffer_size,
+        max_compute_workgroup_size_x: limits.max_compute_workgroup_size_x,
+        max_compute_invocations_per_workgroup: limits.max_compute_invocations_per_workgroup,
+        features: format!("{:?}", features),
+        subgroup_min_size: info.subgroup_min_size,
+        subgroup_max_size: info.subgroup_max_size,
+    }
 }
 
 /// [`context`] for callers that can await — the only form a browser has.
@@ -125,7 +180,7 @@ async fn context_async() -> &'static DeviceContext {
     // registered device. On wasm there is one thread and no race.
     let _ = CONTEXT.set(DeviceContext {
         device,
-        setup,
+        setup: Some(setup),
         caps,
     });
     CONTEXT.get().expect("just set")
@@ -133,18 +188,11 @@ async fn context_async() -> &'static DeviceContext {
 
 /// Returns the default wgpu device (best available GPU; on macOS this is
 /// the Metal device). Honors cubecl's `CUBECL_WGPU_DEFAULT_DEVICE`
-/// override. Natively this also performs the one-time runtime setup and
-/// retains it — see [`DeviceContext`]. The wasm build defers setup to the
-/// first async capability query, because setup cannot block there.
+/// override. Deliberately lazy: the runtime initializes on first use (or
+/// on the first capability query, which retains the setup — see
+/// [`DeviceContext`]), so call order never becomes a correctness rule.
 pub fn init_device() -> CombsDevice {
-    #[cfg(not(target_family = "wasm"))]
-    {
-        context().device.clone()
-    }
-    #[cfg(target_family = "wasm")]
-    {
-        WgpuDevice::default()
-    }
+    WgpuDevice::default()
 }
 
 /// True when wgpu can see at least one adapter. Cached after the first
@@ -311,13 +359,31 @@ pub fn gpu_memory(_device: &CombsDevice) -> Option<GpuMemory> {
 #[cfg(not(target_family = "wasm"))]
 pub fn device_info(device: &CombsDevice) -> DeviceInfo {
     let _ = device;
-    info_from_setup(&context().setup)
+    let ctx = context();
+    match &ctx.setup {
+        Some(setup) => info_from_setup(setup),
+        None => DeviceInfo {
+            name: ctx.caps.name.clone(),
+            backend: ctx.caps.backend.clone(),
+            device_type: ctx.caps.device_type.clone(),
+            driver: ctx.caps.driver.clone(),
+        },
+    }
 }
 
 /// [`device_info`] for callers that can await.
 pub async fn device_info_async(device: &CombsDevice) -> DeviceInfo {
     let _ = device;
-    info_from_setup(&context_async().await.setup)
+    let ctx = context_async().await;
+    match &ctx.setup {
+        Some(setup) => info_from_setup(setup),
+        None => DeviceInfo {
+            name: ctx.caps.name.clone(),
+            backend: ctx.caps.backend.clone(),
+            device_type: ctx.caps.device_type.clone(),
+            driver: ctx.caps.driver.clone(),
+        },
+    }
 }
 
 /// Reads adapter identity off an already-initialized setup.
