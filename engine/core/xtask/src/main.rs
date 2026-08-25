@@ -279,8 +279,17 @@ fn cmd_web(ctx: &Ctx, release: bool, out_dir: Option<PathBuf>) -> Result<()> {
     eprintln!("built {} ({:.1} MB)", wasm.display(), bytes as f64 / 1e6);
 
     let out = ctx.root.join("../js/core/pkg");
+    let mut bindgen_args =
+        vec!["--target", "web", "--out-name", "combs_wasm"];
+    if release {
+        // The name section is 7.7 MB of function names a release visitor
+        // never sees; debug builds keep it so stack traces stay readable.
+        bindgen_args.push("--remove-name-section");
+        bindgen_args.push("--remove-producers-section");
+    }
+    bindgen_args.push("--out-dir");
     let bindgen = Command::new("wasm-bindgen")
-        .args(["--target", "web", "--out-name", "combs_wasm", "--out-dir"])
+        .args(&bindgen_args)
         .arg(&out)
         .arg(&wasm)
         .current_dir(&ctx.root)
@@ -288,6 +297,30 @@ fn cmd_web(ctx: &Ctx, release: bool, out_dir: Option<PathBuf>) -> Result<()> {
     match bindgen {
         Ok(status) if status.success() => {
             eprintln!("bindings -> {}", out.display());
+            if release {
+                // wasm-opt -Oz takes ~30s and buys ~12% on this module.
+                // Optional on purpose: a missing binaryen must not fail
+                // the build, and debug builds keep the unoptimized module.
+                let module = out.join("combs_wasm_bg.wasm");
+                let opt = Command::new("wasm-opt")
+                    .args([
+                        "-Oz",
+                        "--enable-bulk-memory",
+                        "--enable-nontrapping-float-to-int",
+                    ])
+                    .arg(&module)
+                    .arg("-o")
+                    .arg(&module)
+                    .status();
+                match opt {
+                    Ok(s) if s.success() => {
+                        let bytes = std::fs::metadata(&module).map(|m| m.len()).unwrap_or(0);
+                        eprintln!("wasm-opt -Oz -> {:.1} MB", bytes as f64 / 1e6);
+                    }
+                    Ok(s) => eprintln!("wasm-opt failed ({s}); shipping unoptimized"),
+                    Err(_) => eprintln!("wasm-opt not found; shipping unoptimized (brew install binaryen)"),
+                }
+            }
             if let Some(dest) = out_dir {
                 copy_web_bundle(ctx, &out, &dest)?;
                 eprintln!("bundle -> {}", dest.display());
