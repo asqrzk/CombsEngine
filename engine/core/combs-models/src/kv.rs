@@ -761,6 +761,26 @@ impl<B: Backend> KVCache<B> for PagedKVCache<B> {
                     arena_v = arena_v.slice_assign(range, v.clone().narrow(2, written, run));
                     written += run;
                 }
+                // K3a: the single-token step attends in place — one
+                // dispatch reading K/V through the page table; no gather,
+                // no repeat_kv, no materialized scores. The slice_assign
+                // above is already enqueued on the same stream, so the
+                // kernel sees this token's K/V.
+                if seq == 1 && window.is_none() {
+                    let table = self.page_indices(pages);
+                    if let Some(out) = crate::wgsl::try_decode_attention(
+                        q.clone(),
+                        arena_k.clone(),
+                        arena_v.clone(),
+                        table,
+                        total,
+                        0,
+                        scale,
+                    ) {
+                        self.arenas[layer] = Some(Arena::Fp { k: arena_k, v: arena_v });
+                        return out;
+                    }
+                }
                 let k_full = self.gather_window(arena_k.clone(), pages, total);
                 let v_full = self.gather_window(arena_v.clone(), pages, total);
                 self.arenas[layer] = Some(Arena::Fp { k: arena_k, v: arena_v });
@@ -1306,5 +1326,72 @@ mod tests {
     #[ignore = "gpu"]
     fn quantized_paged_cache_matches_fp_on_production_backend() {
         quant_parity_on::<combs_core::CombsBackend>(&Default::default(), 5e-2);
+    }
+
+    /// The K3a interleave proof: paged decode (the in-place kernel on the
+    /// production backend) against the contiguous baseline through
+    /// prefill → decode → popn → regrow. The popn leg replays a fresh
+    /// contiguous cache, since the baseline cannot roll back. Also the
+    /// stress test for the fused custom op's read-only arena inputs: the
+    /// same arenas are registered step after step and must survive every
+    /// registration intact.
+    fn paged_decode_parity_on<B: Backend>(dev: &B::Device, tol: f32) {
+        let (n_kv, n_q, d) = (2usize, 4usize, 64usize);
+        let scale = 1.0 / (d as f64).sqrt();
+        let cmp = |a: Tensor<B, 4>, b: Tensor<B, 4>, what: &str| {
+            let av: Vec<f32> = a.into_data().convert::<f32>().to_vec().unwrap();
+            let bv: Vec<f32> = b.into_data().convert::<f32>().to_vec().unwrap();
+            for (j, (x, y)) in av.iter().zip(bv.iter()).enumerate() {
+                assert!(x.is_finite(), "{what}[{j}] not finite: {x}");
+                assert!((x - y).abs() < tol, "{what}[{j}]: {x} vs {y}");
+            }
+        };
+        let feed = |cache: &mut dyn KVCache<B>, from: usize, to: usize| {
+            // One chunk covering [from, to) — the prefill shape.
+            let (ks, vs): (Vec<_>, Vec<_>) =
+                (from..to).map(|i| kv_tok_on::<B>(dev, i, n_kv, d)).unzip();
+            let k = Tensor::cat(ks, 2);
+            let v = Tensor::cat(vs, 2);
+            let (qs, _): (Vec<_>, Vec<_>) =
+                (from..to).map(|i| (q_tok_on::<B>(dev, i, n_q, d), ())).unzip();
+            let q = Tensor::cat(qs, 2);
+            cache.attention_opts(0, q, k, v, from, scale, None)
+        };
+
+        let mut paged = PagedKVCache::<B>::new(1, CacheConfig::paged(64));
+        let mut cont = ContiguousKVCache::<B>::new(1);
+
+        // Prefill 21 (mid-page), then decode to 28 — every decode step on
+        // the paged side is one kernel dispatch.
+        cmp(
+            feed(&mut paged, 0, 21),
+            feed(&mut cont, 0, 21),
+            "prefill",
+        );
+        for i in 21..28 {
+            let (k, v) = kv_tok_on::<B>(dev, i, n_kv, d);
+            let q = q_tok_on::<B>(dev, i, n_q, d);
+            let a = paged.attention_opts(0, q.clone(), k.clone(), v.clone(), i, scale, None);
+            let b = cont.attention_opts(0, q, k, v, i, scale, None);
+            cmp(a, b, &format!("decode {i}"));
+        }
+
+        // Roll back 3, then regrow over fresh replay.
+        assert_eq!(paged.popn(3), 3, "paged cache rolls back");
+        let mut replay = ContiguousKVCache::<B>::new(1);
+        let _ = feed(&mut replay, 0, 25);
+        for i in 25..28 {
+            let (k, v) = kv_tok_on::<B>(dev, i, n_kv, d);
+            let q = q_tok_on::<B>(dev, i, n_q, d);
+            let a = paged.attention_opts(0, q.clone(), k.clone(), v.clone(), i, scale, None);
+            let b = replay.attention_opts(0, q, k, v, i, scale, None);
+            cmp(a, b, &format!("regrow {i}"));
+        }
+    }
+
+    #[test]
+    #[ignore = "gpu"]
+    fn paged_decode_matches_contiguous_on_production_backend() {
+        paged_decode_parity_on::<combs_core::CombsBackend>(&Default::default(), 1e-3);
     }
 }

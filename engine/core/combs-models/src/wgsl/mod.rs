@@ -78,9 +78,12 @@ macro_rules! wgsl_kernel {
 wgsl_kernel!(ProbeEcho, "probe_echo.wgsl");
 wgsl_kernel!(ProbeSmem, "probe_smem.wgsl");
 wgsl_kernel!(RmsNorm, "rmsnorm.wgsl");
+wgsl_kernel!(DecodeAttn, "decode_attn.wgsl");
 
+mod decode_attn;
 mod rmsnorm;
 
+pub(crate) use decode_attn::try_decode_attention;
 pub(crate) use rmsnorm::try_rms_norm;
 
 /// Launches one WGSL kernel on the runtime's stream.
@@ -214,6 +217,88 @@ pub async fn probe_report() -> Result<(), String> {
                 return Err(format!(
                     "rmsnorm canary wrong at [{r},{c}]: got {g}, expected \
                      {expect} — the K1 kernel must stay doored off here"
+                ));
+            }
+        }
+    }
+
+    // --- decode-attention canary (K3a) ------------------------------------
+    // A small paged fixture with a shuffled table, GQA 2:1, ragged total,
+    // checked against a host softmax — the same reference the harmony
+    // matrix uses natively.
+    let (n_q, n_kv, d, page_size, total) = (4usize, 2usize, 64usize, 16usize, 21usize);
+    let pages = total.div_ceil(page_size);
+    let num_pages = pages + 2;
+    let table: Vec<i32> = (0..pages).map(|p| ((p * 3 + 1) % num_pages) as i32).collect();
+    let val = |i: usize, salt: f32| ((i as f32 * 0.437 + salt).sin() * 1.5) as f32;
+    let qv: Vec<f32> = (0..n_q * d).map(|i| val(i, 42.5)).collect();
+    let mut ak = vec![0.0f32; num_pages * n_kv * page_size * d];
+    let mut av = vec![0.0f32; num_pages * n_kv * page_size * d];
+    let key = |g: usize, j: usize, c: usize| val(c + (g * total + j) * d, 0.71);
+    let value = |g: usize, j: usize, c: usize| val(c + (g * total + j) * d, 90.0);
+    for j in 0..total {
+        let phys = table[j / page_size] as usize;
+        for g in 0..n_kv {
+            let base = ((phys * n_kv + g) * page_size + j % page_size) * d;
+            for c in 0..d {
+                ak[base + c] = key(g, j, c);
+                av[base + c] = value(g, j, c);
+            }
+        }
+    }
+    let scale = 0.125f32;
+    let q_h = client.create_from_slice(f32::as_bytes(&qv));
+    let k_h = client.create_from_slice(f32::as_bytes(&ak));
+    let v_h = client.create_from_slice(f32::as_bytes(&av));
+    let t_h = client.create_from_slice(i32::as_bytes(&table));
+    let o_h = client.empty(n_q * d * core::mem::size_of::<f32>());
+    launch(
+        &client,
+        DecodeAttn,
+        CubeCount::Static(n_q as u32, 1, 1),
+        vec![
+            q_h.binding(),
+            k_h.binding(),
+            v_h.binding(),
+            t_h.binding(),
+            o_h.clone().binding(),
+        ],
+        vec![
+            n_q as u64,
+            n_kv as u64,
+            d as u64,
+            page_size as u64,
+            total as u64,
+            0,
+            0,
+            f32::to_bits(scale) as u64,
+        ],
+    );
+    let bytes = client
+        .read_async(vec![o_h])
+        .await
+        .map_err(|e| format!("decode-attn readback failed: {e:?}"))?;
+    let got = f32::from_bytes(&bytes[0]);
+    for h in 0..n_q {
+        let g = h / (n_q / n_kv);
+        let qi = &qv[h * d..(h + 1) * d];
+        let scores: Vec<f32> = (0..total)
+            .map(|j| {
+                (0..d).map(|c| qi[c] * key(g, j, c)).sum::<f32>() * scale
+            })
+            .collect();
+        let m = scores.iter().cloned().fold(f32::MIN, f32::max);
+        let ps: Vec<f32> = scores.iter().map(|s| (s - m).exp()).collect();
+        let sum: f32 = ps.iter().sum();
+        for c in 0..d {
+            let expect: f32 =
+                (0..total).map(|j| ps[j] / sum * value(g, j, c)).sum();
+            let gv = got[h * d + c];
+            if (gv - expect).abs() > 1e-3 * expect.abs().max(1.0) {
+                return Err(format!(
+                    "decode-attn canary wrong at [{h},{c}]: got {gv}, \
+                     expected {expect} — the K3 kernel must stay doored \
+                     off here"
                 ));
             }
         }

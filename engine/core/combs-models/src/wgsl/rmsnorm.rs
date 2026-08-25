@@ -39,7 +39,7 @@ fn rmsnorm_enabled() -> bool {
 
 /// Runtime type-equality bridge, tensor edition: `From` and `To` are the
 /// same type exactly when the backends match, and the downcast proves it.
-fn cast_any<From: 'static, To: 'static>(v: From) -> Option<To> {
+pub(super) fn cast_any<From: 'static, To: 'static>(v: From) -> Option<To> {
     let any: Box<dyn Any> = Box::new(v);
     any.downcast::<To>().ok().map(|b| *b)
 }
