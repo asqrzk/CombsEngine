@@ -7,9 +7,9 @@ pub enum Extension {
     PowfScalar(Item),
     PowfPrimitive(Elem),
     Powf(Item),
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_family = "wasm"))]
     SafeTanh(Item),
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_family = "wasm"))]
     SafeTanhPrimitive(Elem),
     IsNanPrimitive(Elem),
     IsNan(Item, Item),
@@ -53,9 +53,9 @@ impl Display for Extension {
                 ],
                 *item,
             ),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_family = "wasm"))]
             Extension::SafeTanhPrimitive(elem) => format_safe_tanh_primitive(f, elem),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_family = "wasm"))]
             Extension::SafeTanh(item) => construct_vector(
                 f,
                 SAFE_TANH,
@@ -96,9 +96,9 @@ const POWF_PRIMITIVE: &str = "powf_primitive";
 const POWF: &str = "powf";
 const POWF_SCALAR: &str = "powf_scalar";
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_family = "wasm"))]
 const SAFE_TANH_PRIMITIVE: &str = "safe_tanh_primitive";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_family = "wasm"))]
 const SAFE_TANH: &str = "safe_tanh";
 
 const IS_NAN_PRIMITIVE: &str = "is_nan_primitive";
@@ -138,7 +138,7 @@ pub fn call_powf(
     write!(f, "{out} = {function_name}({lhs}, {rhs});")
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_family = "wasm"))]
 pub fn call_safe_tanh(
     f: &mut core::fmt::Formatter,
     input: &Variable,
@@ -267,7 +267,7 @@ fn {function_name}(lhs: {elem}, rhs: {elem}) -> {elem} {{
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_family = "wasm"))]
 fn format_safe_tanh_primitive(
     f: &mut std::fmt::Formatter<'_>,
     elem: &Elem,

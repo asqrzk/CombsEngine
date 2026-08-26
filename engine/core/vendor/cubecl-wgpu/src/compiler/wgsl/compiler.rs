@@ -1264,7 +1264,7 @@ fn register_extensions(instructions: &[wgsl::Instruction]) -> Vec<wgsl::Extensio
                 register_extension(wgsl::Extension::PowfPrimitive(out.elem()));
                 register_extension(wgsl::powf_extension(rhs, out));
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_family = "wasm"))]
             wgsl::Instruction::Tanh { input, out: _ } => {
                 register_extension(wgsl::Extension::SafeTanhPrimitive(input.elem()));
                 register_extension(wgsl::Extension::SafeTanh(input.item()));

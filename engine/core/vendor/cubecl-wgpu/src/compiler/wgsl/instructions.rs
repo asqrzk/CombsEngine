@@ -688,9 +688,13 @@ impl Display for Instruction {
                 writeln!(f, "{out} = tan({input});")
             }
             Instruction::Tanh { input, out } => {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_family = "wasm"))]
                 let result = super::call_safe_tanh(f, input, out);
-                #[cfg(not(target_os = "macos"))]
+                // WASM PATCH: the browser module cannot know the host OS, and Dawn on
+                // a Mac lowers WGSL tanh onto the same broken Metal tanh this
+                // workaround exists for. The clamp is free everywhere (f32 tanh
+                // saturates to 1.0 far below 43), so wasm always takes safe_tanh.
+                #[cfg(not(any(target_os = "macos", target_family = "wasm")))]
                 let result = {
                     let out = out.fmt_left();
                     writeln!(f, "{out} = tanh({input});")

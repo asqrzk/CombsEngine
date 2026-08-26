@@ -231,8 +231,51 @@ pub async fn probe_report() -> Result<(), String> {
     // matrix uses natively. d = 256 is gemma3's head dim and exercises
     // the full-workgroup column path; the contiguous case adds mode 1
     // with a window.
-    for (mode, d, window) in [(0usize, 64usize, 0usize), (0, 256, 0), (1, 256, 5)] {
-        decode_attn_canary(&client, mode, d, window).await?;
+    // The totals straddle the 256-key tile boundary on purpose: the
+    // multi-tile online-softmax correction is exactly the code a
+    // single-tile canary would leave unproven, and gemma3's second turn
+    // (context > 256) is where an unproven tile shows up as garbage.
+    for (mode, d, window, n_kv, total) in [
+        (0usize, 64usize, 0usize, 2usize, 21usize),
+        (0, 256, 0, 2, 21),
+        (1, 256, 5, 2, 21),
+        (0, 256, 0, 2, 500),
+        (1, 256, 512, 1, 500),
+        (0, 128, 0, 1, 300),
+    ] {
+        decode_attn_canary(&client, mode, d, window, n_kv, total).await?;
+    }
+
+    // --- tiled quant-matmul canaries --------------------------------------
+    // Prefill (m > 1) takes the shared-memory TILED kernels while decode
+    // takes the untiled gemv — a browser model can therefore decode
+    // perfectly while its prefill lies. Natively tiled and untiled are
+    // bit-identical; hold Tint to the same bar, per format, and check
+    // untiled against the CPU dequant reference so a both-wrong tie
+    // cannot slip through.
+    for format in ["q8_0", "q4_k", "q6_k"] {
+        tiled_matmul_canary(&client, format).await?;
+    }
+
+    // --- compiled-tanh canary ---------------------------------------------
+    // Goes through cubecl's WGSL compiler (not this module's hand-written
+    // kernels) on purpose: it proves the safe-tanh workaround is active
+    // on THIS target. Metal returns NaN for tanh past 43.0, and a build
+    // that misses the clamp turns every GeluTanh model into token-0 soup.
+    let xs = [-88.0f32, -50.0, -10.0, 0.5, 10.0, 43.5, 50.0, 88.0];
+    let out_h = crate::qmatmul::tanh_canary_device(&client, &xs);
+    let bytes = client
+        .read_async(vec![out_h])
+        .await
+        .map_err(|e| format!("tanh readback failed: {e:?}"))?;
+    let got = f32::from_bytes(&bytes[0]);
+    for (i, (&x, &g)) in xs.iter().zip(got.iter()).enumerate() {
+        let expect = x.tanh();
+        if !g.is_finite() || (g - expect).abs() > 1e-6 {
+            return Err(format!(
+                "tanh canary wrong at [{i}] (x = {x}): got {g}, expected                  {expect} — the safe-tanh workaround is not active on this                  target and GeluTanh models will decode garbage"
+            ));
+        }
     }
 
     // --- rope canary (K2) -------------------------------------------------
@@ -296,6 +339,117 @@ pub async fn probe_report() -> Result<(), String> {
     Ok(())
 }
 
+/// One tiled-vs-untiled quant matmul canary: synthetic packed weights,
+/// a prefill-shaped input (m = 32), both kernel variants read back and
+/// the untiled one checked against the CPU dequant reference.
+async fn tiled_matmul_canary(
+    client: &cubecl::prelude::ComputeClient<WgpuRuntime>,
+    format: &str,
+) -> Result<(), String> {
+    use cubecl::prelude::*;
+
+    let (n_out, k, m) = (48usize, 256usize, 32usize);
+    // Deterministic packed bytes with sane f16 scales patched in at each
+    // block's scale offsets (0x3C00 = 1.0, 0x3400 = 0.25).
+    let synth = |block_bytes: usize, scale_offsets: &[usize]| -> Vec<u8> {
+        let blocks = match format {
+            "q8_0" => n_out * k / 32,
+            _ => n_out * k / 256,
+        };
+        let mut data: Vec<u8> = (0..blocks * block_bytes)
+            .map(|i| ((i * 37 + 11) % 251) as u8)
+            .collect();
+        for b in 0..blocks {
+            for (which, &off) in scale_offsets.iter().enumerate() {
+                let bits: u16 = if which == 0 { 0x3C00 } else { 0x3400 };
+                data[b * block_bytes + off..b * block_bytes + off + 2]
+                    .copy_from_slice(&bits.to_le_bytes());
+            }
+        }
+        data
+    };
+    let (x_host, dense, tiled_h, untiled_h) = match format {
+        "q8_0" => {
+            let data = synth(34, &[0]);
+            let w = crate::qmatmul::Q80Weight::<WgpuRuntime>::from_gguf_bytes(
+                client, &data, n_out, k,
+            )
+            .map_err(|e| format!("q8_0 pack failed: {e}"))?;
+            let dense = combs_formats::quants::dequantize_q8_0(&data, n_out * k)
+                .map_err(|e| format!("q8_0 reference failed: {e}"))?;
+            let x: Vec<f32> = (0..m * k)
+                .map(|i| ((i as f32 * 0.377).sin() * 1.3) - 0.2)
+                .collect();
+            let x_h = client.create_from_slice(f32::as_bytes(&x));
+            let t = w.matmul_device_with(client, x_h.clone(), m, true);
+            let u = w.matmul_device_with(client, x_h, m, false);
+            (x, dense, t, u)
+        }
+        "q4_k" => {
+            let data = synth(144, &[0, 2]);
+            let w = crate::qmatmul::Q4KWeight::<WgpuRuntime>::from_gguf_bytes(
+                client, &data, n_out, k,
+            )
+            .map_err(|e| format!("q4_k pack failed: {e}"))?;
+            let dense = combs_formats::quants::dequantize_q4_k(&data, n_out * k)
+                .map_err(|e| format!("q4_k reference failed: {e}"))?;
+            let x: Vec<f32> = (0..m * k)
+                .map(|i| ((i as f32 * 0.377).sin() * 1.3) - 0.2)
+                .collect();
+            let x_h = client.create_from_slice(f32::as_bytes(&x));
+            let t = w.matmul_device_with(client, x_h.clone(), m, true);
+            let u = w.matmul_device_with(client, x_h, m, false);
+            (x, dense, t, u)
+        }
+        _ => {
+            // Q6_K has no tiled variant — prefill and decode share the
+            // one kernel, so the reference check alone covers it.
+            let data = synth(210, &[208]);
+            let w = crate::qmatmul::Q6KWeight::<WgpuRuntime>::from_gguf_bytes(
+                client, &data, n_out, k,
+            )
+            .map_err(|e| format!("q6_k pack failed: {e}"))?;
+            let dense = combs_formats::quants::dequantize_q6_k(&data, n_out * k)
+                .map_err(|e| format!("q6_k reference failed: {e}"))?;
+            let x: Vec<f32> = (0..m * k)
+                .map(|i| ((i as f32 * 0.377).sin() * 1.3) - 0.2)
+                .collect();
+            let x_h = client.create_from_slice(f32::as_bytes(&x));
+            let t = w.matmul_device(client, x_h.clone(), m);
+            let u = w.matmul_device(client, x_h, m);
+            (x, dense, t, u)
+        }
+    };
+    let bytes = client
+        .read_async(vec![tiled_h, untiled_h])
+        .await
+        .map_err(|e| format!("{format} tiled canary readback failed: {e:?}"))?;
+    let tiled = f32::from_bytes(&bytes[0]);
+    let untiled = f32::from_bytes(&bytes[1]);
+    for i in 0..m * n_out {
+        if tiled[i].to_bits() != untiled[i].to_bits() {
+            return Err(format!(
+                "{format} tiled canary: tiled[{i}] = {} differs from                  untiled {} — the tiled prefill kernel computes different                  values on this target",
+                tiled[i], untiled[i]
+            ));
+        }
+    }
+    for r in 0..m {
+        for c in 0..n_out {
+            let expect: f32 = (0..k)
+                .map(|j| x_host[r * k + j] * dense[c * k + j])
+                .sum();
+            let g = untiled[r * n_out + c];
+            if !g.is_finite() || (g - expect).abs() > 1e-3 * expect.abs().max(1.0) {
+                return Err(format!(
+                    "{format} tiled canary: untiled[{r},{c}] = {g}, host                      reference {expect} — the quant matmul itself is wrong                      on this target"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// One decode-attention canary case: build the fixture, launch, check
 /// every output element against a host softmax.
 async fn decode_attn_canary(
@@ -303,13 +457,17 @@ async fn decode_attn_canary(
     mode: usize,
     d: usize,
     window: usize,
+    n_kv: usize,
+    total: usize,
 ) -> Result<(), String> {
     use cubecl::prelude::*;
 
-    let (n_q, n_kv, page_size, total) = (4usize, 2usize, 16usize, 21usize);
+    let (n_q, page_size) = (4usize, 16usize);
     let pages = total.div_ceil(page_size);
     let num_pages = pages + 2;
-    let table: Vec<i32> = (0..pages).map(|p| ((p * 3 + 1) % num_pages) as i32).collect();
+    // A rotation is collision-free for every page count — the stride-3
+    // shuffle this used to be collides whenever gcd(3, num_pages) > 1.
+    let table: Vec<i32> = (0..pages).map(|p| ((p + 2) % num_pages) as i32).collect();
     let val = |i: usize, salt: f32| ((i as f32 * 0.437 + salt).sin() * 1.5) as f32;
     let qv: Vec<f32> = (0..n_q * d).map(|i| val(i, 42.5)).collect();
     let mut ak = vec![0.0f32; num_pages * n_kv * page_size * d];

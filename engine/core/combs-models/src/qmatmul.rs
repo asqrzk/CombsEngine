@@ -930,6 +930,39 @@ fn q4_k_dequant_kernel(
     }
 }
 
+/// Canary for the cubecl-compiled `tanh`: Metal misbehaves above 43.0
+/// (NaN), and the compiler's safe-tanh workaround must be active on
+/// every target that can end up lowering to Metal — including wasm via
+/// Dawn, where a missing gate cost gemma3 its browser output (all-NaN
+/// logits, endless token 0). The probe checks the VALUES.
+#[cube(launch_unchecked)]
+fn tanh_canary_kernel(x: &Array<f32>, out: &mut Array<f32>, n: usize) {
+    if ABSOLUTE_POS < n {
+        out[ABSOLUTE_POS] = f32::tanh(x[ABSOLUTE_POS]);
+    }
+}
+
+/// Launches the tanh canary over `xs`; the caller reads the handle back.
+pub(crate) fn tanh_canary_device<R: Runtime>(
+    client: &ComputeClient<R>,
+    xs: &[f32],
+) -> cubecl::server::Handle {
+    let n = xs.len();
+    let x_h = client.create_from_slice(f32::as_bytes(xs));
+    let out_h = client.empty(n * core::mem::size_of::<f32>());
+    unsafe {
+        tanh_canary_kernel::launch_unchecked::<R>(
+            client,
+            cube_count_1d(n as u32),
+            CubeDim::new_1d(CUBE_DIM),
+            ArrayArg::from_raw_parts(x_h, n),
+            ArrayArg::from_raw_parts(out_h.clone(), n),
+            n,
+        );
+    }
+    out_h
+}
+
 /// Q4_K dequant-gather: `out[t·k + c]` is column `c` of row `ids[t]`,
 /// dequantized — [`q4_k_dequant_kernel`]'s arithmetic with a row
 /// indirection in front, which keeps it bit-exact vs the CPU reference.
