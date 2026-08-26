@@ -930,6 +930,43 @@ fn q4_k_dequant_kernel(
     }
 }
 
+/// Q4_K dequant-gather: `out[t·k + c]` is column `c` of row `ids[t]`,
+/// dequantized — [`q4_k_dequant_kernel`]'s arithmetic with a row
+/// indirection in front, which keeps it bit-exact vs the CPU reference.
+#[cube(launch_unchecked)]
+fn q4_k_gather_kernel(
+    ids: &Array<u32>,
+    qs: &Array<u32>,
+    dd: &Array<f32>,
+    scales: &Array<u32>,
+    out: &mut Array<f32>,
+    total: usize,
+    k: usize,
+) {
+    if ABSOLUTE_POS < total {
+        let t = ABSOLUTE_POS / k;
+        let c = ABSOLUTE_POS % k;
+        let row = usize::cast_from(ids[t]);
+        let src = row * k + c;
+        let sb = src / 256;
+        let r = src % 256;
+        let j = r / 64;
+        let tt = (r % 64) / 32;
+        let l = r % 32;
+        let byte = byte_at(qs, sb * 128 + j * 32 + l);
+        let mut q = byte & 0xF;
+        if tt == 1 {
+            q = byte >> 4;
+        }
+        let sidx = 2 * j + tt;
+        let sc = k4_scale(scales, sb * 12, sidx);
+        let mn = k4_min(scales, sb * 12, sidx);
+        let d1 = dd[sb * 2] * f32::cast_from(sc);
+        let fmin = dd[sb * 2 + 1] * f32::cast_from(mn);
+        out[ABSOLUTE_POS] = d1 * f32::cast_from(q) - fmin;
+    }
+}
+
 /// Fused Q4_K dequant-matmul. Uses the ggml sum-split: within a sub-block,
 /// `Σ (d·sc·q − dmin·m)·x = d·sc·Σ q·x − dmin·m·Σ x`, so the packed bytes
 /// are touched once and the scales applied once per 32 values.
@@ -1234,6 +1271,41 @@ fn q6_k_dequant_kernel(
     }
 }
 
+/// Q6_K dequant-gather: [`q6_k_dequant_kernel`]'s arithmetic with a row
+/// indirection in front — bit-exact vs the CPU reference, per row.
+#[cube(launch_unchecked)]
+fn q6_k_gather_kernel(
+    ids: &Array<u32>,
+    ql: &Array<u32>,
+    qh: &Array<u32>,
+    sc: &Array<u32>,
+    d: &Array<f32>,
+    out: &mut Array<f32>,
+    total: usize,
+    k: usize,
+) {
+    if ABSOLUTE_POS < total {
+        let t = ABSOLUTE_POS / k;
+        let c = ABSOLUTE_POS % k;
+        let row = usize::cast_from(ids[t]);
+        let src = row * k + c;
+        let sb = src / 256;
+        let r = src % 256;
+        let half = r / 128;
+        let tt = (r % 128) / 32;
+        let l = r % 32;
+        let ql_byte = byte_at(ql, sb * 128 + half * 64 + (tt % 2) * 32 + l);
+        let mut nib = ql_byte & 0xF;
+        if tt >= 2 {
+            nib = ql_byte >> 4;
+        }
+        let hi = (byte_at(qh, sb * 64 + half * 32 + l) >> (u32::cast_from(tt) * 2)) & 3;
+        let q = i32::cast_from(nib | (hi << 4)) - 32;
+        let scale = i8_at(sc, sb * 16 + half * 8 + l / 16 + 2 * tt);
+        out[ABSOLUTE_POS] = d[sb] * f32::cast_from(scale) * f32::cast_from(q);
+    }
+}
+
 /// Fused Q6_K dequant-matmul: per 16-value scale group,
 /// `acc += d · sc · Σ (q − 32) · x`.
 #[cube(launch_unchecked)]
@@ -1403,6 +1475,35 @@ impl<R: Runtime> Q4KWeight<R> {
     /// Bytes in VRAM: 148 per 256 weights (4.63 bits/weight).
     pub fn vram_bytes(&self) -> usize {
         (self.n_out * self.k / K_SUPERBLOCK) * (128 + 12 + 8)
+    }
+
+    /// Dequantizes the rows named by `ids` into `[n_tokens, k]` f32 —
+    /// the embedding lookup for a packed Q4_K table, row-for-row
+    /// bit-exact with the dequant kernel.
+    pub fn gather_rows_device(
+        &self,
+        client: &ComputeClient<R>,
+        ids: Handle,
+        n_tokens: usize,
+    ) -> Handle {
+        let total = n_tokens * self.k;
+        let n_sb = self.n_out * self.k / K_SUPERBLOCK;
+        let out_h = client.empty(total * core::mem::size_of::<f32>());
+        unsafe {
+            q4_k_gather_kernel::launch_unchecked::<R>(
+                client,
+                cube_count_capped(total as u32),
+                CubeDim::new_1d(CUBE_DIM),
+                ArrayArg::from_raw_parts(ids, n_tokens),
+                ArrayArg::from_raw_parts(self.qs.clone(), n_sb * 32),
+                ArrayArg::from_raw_parts(self.dd.clone(), n_sb * 2),
+                ArrayArg::from_raw_parts(self.scales.clone(), n_sb * 3),
+                ArrayArg::from_raw_parts(out_h.clone(), total),
+                total,
+                self.k,
+            );
+        }
+        out_h
     }
 
     /// Device path: launch only, output handle returned. Decode (`m == 1`)
@@ -1610,6 +1711,36 @@ impl<R: Runtime> Q6KWeight<R> {
         (self.n_out * self.k / K_SUPERBLOCK) * (128 + 64 + 16 + 4)
     }
 
+    /// Dequantizes the rows named by `ids` into `[n_tokens, k]` f32 —
+    /// the embedding lookup for a packed Q6_K table, row-for-row
+    /// bit-exact with the dequant kernel.
+    pub fn gather_rows_device(
+        &self,
+        client: &ComputeClient<R>,
+        ids: Handle,
+        n_tokens: usize,
+    ) -> Handle {
+        let total = n_tokens * self.k;
+        let n_sb = self.n_out * self.k / K_SUPERBLOCK;
+        let out_h = client.empty(total * core::mem::size_of::<f32>());
+        unsafe {
+            q6_k_gather_kernel::launch_unchecked::<R>(
+                client,
+                cube_count_capped(total as u32),
+                CubeDim::new_1d(CUBE_DIM),
+                ArrayArg::from_raw_parts(ids, n_tokens),
+                ArrayArg::from_raw_parts(self.ql.clone(), n_sb * 32),
+                ArrayArg::from_raw_parts(self.qh.clone(), n_sb * 16),
+                ArrayArg::from_raw_parts(self.sc.clone(), n_sb * 4),
+                ArrayArg::from_raw_parts(self.d.clone(), n_sb),
+                ArrayArg::from_raw_parts(out_h.clone(), total),
+                total,
+                self.k,
+            );
+        }
+        out_h
+    }
+
     /// Device path: launch only, output handle returned (see
     /// [`Q40Weight::matmul_device`]).
     pub fn matmul_device(&self, client: &ComputeClient<R>, x: Handle, m: usize) -> Handle {
@@ -1738,13 +1869,18 @@ impl QuantWeight {
     ) -> Option<Handle> {
         match self {
             QuantWeight::Q80(w) => Some(w.gather_rows_device(client, ids, n_tokens)),
+            QuantWeight::Q4K(w) => Some(w.gather_rows_device(client, ids, n_tokens)),
+            QuantWeight::Q6K(w) => Some(w.gather_rows_device(client, ids, n_tokens)),
             _ => None,
         }
     }
 
     /// Whether [`Self::gather_rows_device`] is implemented for this format.
     pub fn supports_gather(&self) -> bool {
-        matches!(self, QuantWeight::Q80(_))
+        matches!(
+            self,
+            QuantWeight::Q80(_) | QuantWeight::Q4K(_) | QuantWeight::Q6K(_)
+        )
     }
 
     /// Fused dequant-matmul, device handles in and out.
@@ -2100,6 +2236,57 @@ mod tests {
                     &got[t * k..(t + 1) * k],
                     want,
                     "row {row} at slot {t} must be bit-exact vs gguf.rs"
+                );
+            }
+        }
+    }
+
+    /// The K-quant gathers under the same bar as Q8_0's: bit-exact
+    /// against the CPU reference row slices, with out-of-order and
+    /// repeated ids. k = 256 = one superblock per row keeps the fixture
+    /// small while touching every sub-block/quadrant lane.
+    #[test]
+    fn q4_k_and_q6_k_gather_are_bit_exact_vs_cpu_reference_rows() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let device = Default::default();
+        let client = WgpuRuntime::client(&device);
+        let (vocab, k) = (13usize, 256usize);
+        let ids_sets: [&[u32]; 2] = [&[5], &[5, 0, 12, 5, 7]];
+
+        let data = synth_q4_k(vocab);
+        let w = Q4KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, vocab, k)
+            .expect("packed q4_k table");
+        let dense = combs_formats::quants::dequantize_q4_k(&data, vocab * k).unwrap();
+        for ids in ids_sets {
+            let ids_h = client.create_from_slice(u32::as_bytes(ids));
+            let out_h = w.gather_rows_device(&client, ids_h, ids.len());
+            let bytes = client.read_one_unchecked(out_h);
+            let got = f32::from_bytes(&bytes);
+            for (t, &row) in ids.iter().enumerate() {
+                assert_eq!(
+                    &got[t * k..(t + 1) * k],
+                    &dense[row as usize * k..(row as usize + 1) * k],
+                    "q4_k row {row} at slot {t} must be bit-exact"
+                );
+            }
+        }
+
+        let data = synth_q6_k(vocab);
+        let w = Q6KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, vocab, k)
+            .expect("packed q6_k table");
+        let dense = combs_formats::quants::dequantize_q6_k(&data, vocab * k).unwrap();
+        for ids in ids_sets {
+            let ids_h = client.create_from_slice(u32::as_bytes(ids));
+            let out_h = w.gather_rows_device(&client, ids_h, ids.len());
+            let bytes = client.read_one_unchecked(out_h);
+            let got = f32::from_bytes(&bytes);
+            for (t, &row) in ids.iter().enumerate() {
+                assert_eq!(
+                    &got[t * k..(t + 1) * k],
+                    &dense[row as usize * k..(row as usize + 1) * k],
+                    "q6_k row {row} at slot {t} must be bit-exact"
                 );
             }
         }
