@@ -776,6 +776,33 @@ impl<R: Runtime> Q80Weight<R> {
         out_h
     }
 
+    /// Split-K decode gemv through the Combs Kernel's WGSL path: 16
+    /// lanes cooperate per output row instead of one thread walking it —
+    /// 16x the occupancy on the projection shapes that dominate decode's
+    /// weight reads. WgpuRuntime only (the WGSL seam's runtime); the
+    /// caller routes m == 1 here behind the door and keeps the cube
+    /// kernels for everything else.
+    pub(crate) fn decode_gemv_wgsl(
+        &self,
+        client: &ComputeClient<cubecl::wgpu::WgpuRuntime>,
+        x: Handle,
+    ) -> Handle {
+        let out_h = client.empty(self.n_out * core::mem::size_of::<f32>());
+        crate::wgsl::launch_gemv(
+            client,
+            crate::wgsl::GemvKernel::Q8,
+            (self.n_out as u32).div_ceil(16),
+            vec![
+                x.binding(),
+                self.qs.clone().binding(),
+                self.d.clone().binding(),
+                out_h.clone().binding(),
+            ],
+            vec![self.n_out as u64, self.k as u64],
+        );
+        out_h
+    }
+
     /// Dequantizes the rows named by `ids` (u32 device handle, `n_tokens`
     /// entries) into a dense `[n_tokens, k]` f32 buffer — the embedding
     /// lookup for a packed table. Row-for-row bit-exact with the dequant
@@ -1512,6 +1539,31 @@ impl<R: Runtime> Q4KWeight<R> {
         (self.n_out * self.k / K_SUPERBLOCK) * (128 + 12 + 8)
     }
 
+    /// Split-K decode gemv through the Combs Kernel — see
+    /// `Q80Weight::decode_gemv_wgsl`. `k % 256 == 0` (whole superblocks)
+    /// is guaranteed by construction for Q4_K tables.
+    pub(crate) fn decode_gemv_wgsl(
+        &self,
+        client: &ComputeClient<cubecl::wgpu::WgpuRuntime>,
+        x: Handle,
+    ) -> Handle {
+        let out_h = client.empty(self.n_out * core::mem::size_of::<f32>());
+        crate::wgsl::launch_gemv(
+            client,
+            crate::wgsl::GemvKernel::Q4K,
+            (self.n_out as u32).div_ceil(16),
+            vec![
+                x.binding(),
+                self.qs.clone().binding(),
+                self.dd.clone().binding(),
+                self.scales.clone().binding(),
+                out_h.clone().binding(),
+            ],
+            vec![self.n_out as u64, self.k as u64],
+        );
+        out_h
+    }
+
     /// Dequantizes the rows named by `ids` into `[n_tokens, k]` f32 —
     /// the embedding lookup for a packed Q4_K table, row-for-row
     /// bit-exact with the dequant kernel.
@@ -1746,6 +1798,31 @@ impl<R: Runtime> Q6KWeight<R> {
         (self.n_out * self.k / K_SUPERBLOCK) * (128 + 64 + 16 + 4)
     }
 
+    /// Split-K decode gemv through the Combs Kernel — see
+    /// `Q80Weight::decode_gemv_wgsl`.
+    pub(crate) fn decode_gemv_wgsl(
+        &self,
+        client: &ComputeClient<cubecl::wgpu::WgpuRuntime>,
+        x: Handle,
+    ) -> Handle {
+        let out_h = client.empty(self.n_out * core::mem::size_of::<f32>());
+        crate::wgsl::launch_gemv(
+            client,
+            crate::wgsl::GemvKernel::Q6K,
+            (self.n_out as u32).div_ceil(16),
+            vec![
+                x.binding(),
+                self.ql.clone().binding(),
+                self.qh.clone().binding(),
+                self.sc.clone().binding(),
+                self.d.clone().binding(),
+                out_h.clone().binding(),
+            ],
+            vec![self.n_out as u64, self.k as u64],
+        );
+        out_h
+    }
+
     /// Dequantizes the rows named by `ids` into `[n_tokens, k]` f32 —
     /// the embedding lookup for a packed Q6_K table, row-for-row
     /// bit-exact with the dequant kernel.
@@ -1928,10 +2005,25 @@ impl QuantWeight {
         match self {
             QuantWeight::Q40(w) => w.matmul_device(client, x, m),
             QuantWeight::Q50(w) => w.matmul_device(client, x, m),
-            QuantWeight::Q80(w) => w.matmul_device(client, x, m),
-            QuantWeight::Q4K(w) => w.matmul_device(client, x, m),
+            QuantWeight::Q80(w) => {
+                if m == 1 && w.k % Q4_0_BLOCK == 0 && crate::wgsl::gemv_enabled() {
+                    return w.decode_gemv_wgsl(client, x);
+                }
+                w.matmul_device(client, x, m)
+            }
+            QuantWeight::Q4K(w) => {
+                if m == 1 && w.k % K_SUPERBLOCK == 0 && crate::wgsl::gemv_enabled() {
+                    return w.decode_gemv_wgsl(client, x);
+                }
+                w.matmul_device(client, x, m)
+            }
             QuantWeight::Q5K(w) => w.matmul_device(client, x, m),
-            QuantWeight::Q6K(w) => w.matmul_device(client, x, m),
+            QuantWeight::Q6K(w) => {
+                if m == 1 && w.k % K_SUPERBLOCK == 0 && crate::wgsl::gemv_enabled() {
+                    return w.decode_gemv_wgsl(client, x);
+                }
+                w.matmul_device(client, x, m)
+            }
         }
     }
 }
@@ -2273,6 +2365,79 @@ mod tests {
                     "row {row} at slot {t} must be bit-exact vs gguf.rs"
                 );
             }
+        }
+    }
+
+    /// The split-K WGSL decode gemvs vs the cube kernels and the CPU
+    /// reference, per format: different accumulation shape, same
+    /// arithmetic — ragged n_out (crosses the 16-row workgroup),
+    /// gemma-ish k for Q8, superblock-multiple k for the K-quants.
+    #[test]
+    fn wgsl_decode_gemv_matches_cube_and_reference() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let device = Default::default();
+        let client = WgpuRuntime::client(&device);
+        let check = |got: &[f32], cube: &[f32], x: &[f32], dense: &[f32], n_out: usize, k: usize, what: &str| {
+            for r in 0..n_out {
+                let expect: f32 = (0..k).map(|c| x[c] * dense[r * k + c]).sum();
+                let tol = 1e-3 * expect.abs().max(1.0);
+                assert!(
+                    (got[r] - expect).abs() <= tol,
+                    "{what} n_out={n_out} k={k} row {r}: wgsl {} vs reference {expect}",
+                    got[r]
+                );
+                assert!(
+                    (got[r] - cube[r]).abs() <= tol,
+                    "{what} n_out={n_out} k={k} row {r}: wgsl {} vs cube {}",
+                    got[r],
+                    cube[r]
+                );
+            }
+        };
+        let mk_x = |k: usize| -> Vec<f32> {
+            (0..k).map(|i| ((i as f32 * 0.311).sin() * 1.4) - 0.1).collect()
+        };
+
+        for (n_out, k) in [(37usize, 64usize), (1024, 1024), (211, 1152)] {
+            let data = synth_q8_0(n_out * k / 32);
+            let w = Q80Weight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k)
+                .expect("packed table");
+            let dense = combs_formats::quants::dequantize_q8_0(&data, n_out * k).unwrap();
+            let x = mk_x(k);
+            let x_h = client.create_from_slice(f32::as_bytes(&x));
+            let got_h = w.decode_gemv_wgsl(&client, x_h.clone());
+            let cube_h = w.matmul_device_with(&client, x_h, 1, false);
+            let got = f32::from_bytes(&client.read_one_unchecked(got_h)).to_vec();
+            let cube = f32::from_bytes(&client.read_one_unchecked(cube_h)).to_vec();
+            check(&got, &cube, &x, &dense, n_out, k, "q8_0");
+        }
+        for (n_out, k) in [(37usize, 256usize), (211, 1024)] {
+            let data = synth_q4_k(n_out * k / 256);
+            let w = Q4KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k)
+                .expect("packed table");
+            let dense = combs_formats::quants::dequantize_q4_k(&data, n_out * k).unwrap();
+            let x = mk_x(k);
+            let x_h = client.create_from_slice(f32::as_bytes(&x));
+            let got_h = w.decode_gemv_wgsl(&client, x_h.clone());
+            let cube_h = w.matmul_device_with(&client, x_h, 1, false);
+            let got = f32::from_bytes(&client.read_one_unchecked(got_h)).to_vec();
+            let cube = f32::from_bytes(&client.read_one_unchecked(cube_h)).to_vec();
+            check(&got, &cube, &x, &dense, n_out, k, "q4_k");
+        }
+        for (n_out, k) in [(37usize, 256usize), (211, 1024)] {
+            let data = synth_q6_k(n_out * k / 256);
+            let w = Q6KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k)
+                .expect("packed table");
+            let dense = combs_formats::quants::dequantize_q6_k(&data, n_out * k).unwrap();
+            let x = mk_x(k);
+            let x_h = client.create_from_slice(f32::as_bytes(&x));
+            let got_h = w.decode_gemv_wgsl(&client, x_h.clone());
+            let cube_h = w.matmul_device(&client, x_h, 1);
+            let got = f32::from_bytes(&client.read_one_unchecked(got_h)).to_vec();
+            let cube = f32::from_bytes(&client.read_one_unchecked(cube_h)).to_vec();
+            check(&got, &cube, &x, &dense, n_out, k, "q6_k");
         }
     }
 

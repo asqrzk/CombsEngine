@@ -35,14 +35,20 @@ struct Params {
   scale: vec2<u32>,
 }
 
-@group(0) @binding(0) var<storage, read_write> q: array<f32>;
-@group(0) @binding(1) var<storage, read_write> k: array<f32>;
+// q and k bind as vec4 words: the K-dot walks whole rows per lane, and
+// a 16-byte load per four values is the difference between one load
+// instruction per element and one per four. Row bases stay element
+// counts; divide by 4 at the access. Requires d % 4 == 0 (the
+// dispatcher guards; every real head dim qualifies). v stays scalar —
+// its access is one column per lane, already coalesced across lanes.
+@group(0) @binding(0) var<storage, read_write> q: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> k: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> v: array<f32>;
 @group(0) @binding(3) var<storage, read_write> table: array<u32>;
 @group(0) @binding(4) var<storage, read_write> out: array<f32>;
 @group(0) @binding(5) var<uniform> params: Params;
 
-var<workgroup> q_s: array<f32, 256>;
+var<workgroup> q_v: array<vec4<f32>, 64>;
 var<workgroup> p_s: array<f32, 256>;
 var<workgroup> red: array<f32, 256>;
 
@@ -70,8 +76,8 @@ fn main(
   let g = h / (params.n_q.x / params.n_kv.x);
   let scale = bitcast<f32>(params.scale.x);
 
-  if (lane < d) {
-    q_s[lane] = q[h * d + lane];
+  if (lane < d / 4u) {
+    q_v[lane] = q[(h * d) / 4u + lane];
   }
   workgroupBarrier();
 
@@ -85,12 +91,12 @@ fn main(
     let visible = j < total && (window == 0u || j + window >= total);
     var score = NEG_MAX;
     if (visible) {
-      let base = kv_base(j, g);
-      var dot = 0.0;
-      for (var c = 0u; c < d; c += 1u) {
-        dot += q_s[c] * k[base + c];
+      let base = kv_base(j, g) / 4u;
+      var acc = 0.0;
+      for (var c = 0u; c < d / 4u; c += 1u) {
+        acc += dot(q_v[c], k[base + c]);
       }
-      score = dot * scale;
+      score = acc * scale;
     }
 
     red[lane] = score;

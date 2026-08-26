@@ -86,6 +86,18 @@ wgsl_kernel!(RmsNorm, "rmsnorm.wgsl");
 wgsl_kernel!(DecodeAttn, "decode_attn.wgsl");
 wgsl_kernel!(DecodeAttnQ8, "decode_attn_q8.wgsl");
 wgsl_kernel!(RopeQk, "rope.wgsl");
+wgsl_kernel!(DecodeGemvQ8, "decode_gemv_q8.wgsl");
+wgsl_kernel!(DecodeGemvQ4K, "decode_gemv_q4k.wgsl");
+wgsl_kernel!(DecodeGemvQ6K, "decode_gemv_q6k.wgsl");
+
+/// Door for the split-K decode gemv (`COMBS_WGSL_GEMV=0` restores the
+/// cube untiled kernel); read once, like every door here.
+pub(crate) fn gemv_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        wgsl_enabled() && !matches!(std::env::var("COMBS_WGSL_GEMV").as_deref(), Ok("0"))
+    })
+}
 
 mod decode_attn;
 mod decode_attn_q8;
@@ -96,6 +108,34 @@ pub(crate) use decode_attn::{try_decode_attention, try_sliding_decode_attention}
 pub(crate) use decode_attn_q8::{QuantArena, try_decode_attention_q8};
 pub(crate) use rmsnorm::try_rms_norm;
 pub(crate) use rope::try_rope_qk;
+
+/// Which split-K decode gemv kernel to launch — the qmatmul family
+/// names its format, this seam owns the kernel objects.
+pub(crate) enum GemvKernel {
+    /// Q8_0 packed words + per-block scales.
+    Q8,
+    /// Q4_K superblocks (qs, [d, dmin] pairs, packed 6-bit scales).
+    Q4K,
+    /// Q6_K superblocks (ql, qh, i8 scales, d).
+    Q6K,
+}
+
+/// [`launch`] for the decode gemv, callable from the qmatmul family
+/// (which is hardwired to WgpuRuntime, same as this seam).
+pub(crate) fn launch_gemv(
+    client: &cubecl::prelude::ComputeClient<WgpuRuntime>,
+    kernel: GemvKernel,
+    workgroups: u32,
+    buffers: Vec<Binding>,
+    scalars: Vec<u64>,
+) {
+    let count = CubeCount::Static(workgroups, 1, 1);
+    match kernel {
+        GemvKernel::Q8 => launch(client, DecodeGemvQ8, count, buffers, scalars),
+        GemvKernel::Q4K => launch(client, DecodeGemvQ4K, count, buffers, scalars),
+        GemvKernel::Q6K => launch(client, DecodeGemvQ6K, count, buffers, scalars),
+    }
+}
 
 /// Launches one WGSL kernel on the runtime's stream.
 ///
@@ -281,6 +321,14 @@ pub async fn probe_report() -> Result<(), String> {
         tiled_matmul_canary(&client, format).await?;
     }
 
+    // --- split-K decode gemv canaries -------------------------------------
+    // The same fixtures at m = 1 through the WGSL gemv vs the cube
+    // untiled kernel: the decode path's dominant kernels, value-checked
+    // per format on this compiler before the door means anything here.
+    for format in ["q8_0", "q4_k", "q6_k"] {
+        gemv_canary(&client, format).await?;
+    }
+
     // --- compiled-tanh canary ---------------------------------------------
     // Goes through cubecl's WGSL compiler (not this module's hand-written
     // kernels) on purpose: it proves the safe-tanh workaround is active
@@ -358,6 +406,86 @@ pub async fn probe_report() -> Result<(), String> {
                     }
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// One split-K gemv canary: the tiled canary's synthetic weights at
+/// m = 1 through the WGSL kernel, checked against the CPU dequant
+/// reference (the cube kernel is checked by the tiled canary already).
+async fn gemv_canary(
+    client: &cubecl::prelude::ComputeClient<WgpuRuntime>,
+    format: &str,
+) -> Result<(), String> {
+    use cubecl::prelude::*;
+
+    let (n_out, k) = (211usize, 1024usize);
+    let synth = |block_bytes: usize, scale_offsets: &[usize]| -> Vec<u8> {
+        let blocks = match format {
+            "q8_0" => n_out * k / 32,
+            _ => n_out * k / 256,
+        };
+        let mut data: Vec<u8> = (0..blocks * block_bytes)
+            .map(|i| ((i * 37 + 11) % 251) as u8)
+            .collect();
+        for b in 0..blocks {
+            for (which, &off) in scale_offsets.iter().enumerate() {
+                let bits: u16 = if which == 0 { 0x3C00 } else { 0x3400 };
+                data[b * block_bytes + off..b * block_bytes + off + 2]
+                    .copy_from_slice(&bits.to_le_bytes());
+            }
+        }
+        data
+    };
+    let x: Vec<f32> = (0..k)
+        .map(|i| ((i as f32 * 0.311).sin() * 1.4) - 0.1)
+        .collect();
+    let x_h = client.create_from_slice(f32::as_bytes(&x));
+    let (dense, out_h) = match format {
+        "q8_0" => {
+            let data = synth(34, &[0]);
+            let w = crate::qmatmul::Q80Weight::<WgpuRuntime>::from_gguf_bytes(
+                client, &data, n_out, k,
+            )
+            .map_err(|e| format!("q8_0 pack failed: {e}"))?;
+            let dense = combs_formats::quants::dequantize_q8_0(&data, n_out * k)
+                .map_err(|e| format!("q8_0 reference failed: {e}"))?;
+            (dense, w.decode_gemv_wgsl(client, x_h))
+        }
+        "q4_k" => {
+            let data = synth(144, &[0, 2]);
+            let w = crate::qmatmul::Q4KWeight::<WgpuRuntime>::from_gguf_bytes(
+                client, &data, n_out, k,
+            )
+            .map_err(|e| format!("q4_k pack failed: {e}"))?;
+            let dense = combs_formats::quants::dequantize_q4_k(&data, n_out * k)
+                .map_err(|e| format!("q4_k reference failed: {e}"))?;
+            (dense, w.decode_gemv_wgsl(client, x_h))
+        }
+        _ => {
+            let data = synth(210, &[208]);
+            let w = crate::qmatmul::Q6KWeight::<WgpuRuntime>::from_gguf_bytes(
+                client, &data, n_out, k,
+            )
+            .map_err(|e| format!("q6_k pack failed: {e}"))?;
+            let dense = combs_formats::quants::dequantize_q6_k(&data, n_out * k)
+                .map_err(|e| format!("q6_k reference failed: {e}"))?;
+            (dense, w.decode_gemv_wgsl(client, x_h))
+        }
+    };
+    let bytes = client
+        .read_async(vec![out_h])
+        .await
+        .map_err(|e| format!("{format} gemv canary readback failed: {e:?}"))?;
+    let got = f32::from_bytes(&bytes[0]);
+    for r in 0..n_out {
+        let expect: f32 = (0..k).map(|c| x[c] * dense[r * k + c]).sum();
+        let g = got[r];
+        if !g.is_finite() || (g - expect).abs() > 1e-3 * expect.abs().max(1.0) {
+            return Err(format!(
+                "{format} gemv canary wrong at row {r}: got {g}, expected                  {expect} — the split-K gemv must stay doored off here"
+            ));
         }
     }
     Ok(())

@@ -90,6 +90,7 @@ pub(crate) fn try_decode_attention<B: Backend>(
     if seq != 1
         || d > WORKGROUP as usize
         || d == 0
+        || d % 4 != 0
         || arena_d != d
         || n_kv == 0
         || n_q % n_kv != 0
@@ -143,6 +144,7 @@ pub(crate) fn try_sliding_decode_attention<B: Backend>(
     if seq != 1
         || d > WORKGROUP as usize
         || d == 0
+        || d % 4 != 0
         || arena_d != d
         || n_kv == 0
         || n_q % n_kv != 0
