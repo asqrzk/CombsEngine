@@ -155,10 +155,15 @@ pub trait KVCache<B: Backend>: Send {
 pub struct PageStats {
     /// Pages holding live KV entries for this sequence.
     pub pages_used: usize,
-    /// Pages still available in this cache's arena.
+    /// Pages still available to this sequence — free ids in the
+    /// materialized arena plus capacity not yet materialized.
     pub pages_free: usize,
-    /// Total pages in the arena (`pages_used + pages_free` when healthy).
+    /// Total page capacity (`pages_used + pages_free` when healthy).
     pub num_pages: usize,
+    /// Pages every materialized layer arena is currently sized to. Grows
+    /// geometrically toward `num_pages` with the session's high-water
+    /// mark; memory cost tracks this, not capacity.
+    pub pages_materialized: usize,
     /// Tokens per page.
     pub page_size: usize,
     /// Cached sequence length in tokens.
@@ -198,7 +203,7 @@ fn repeat_kv<B: Backend>(x: Tensor<B, 4>, n_rep: usize) -> Tensor<B, 4> {
 /// exactly the `pos`-offset masking the manual path applies, so chunked
 /// prefill (`pos > 0`) is covered as well. Set `COMBS_ATTN=manual` to force
 /// the reference path.
-fn attend<B: Backend>(
+pub(crate) fn attend<B: Backend>(
     q: Tensor<B, 4>,
     k: Tensor<B, 4>,
     v: Tensor<B, 4>,
@@ -440,6 +445,14 @@ impl PageAllocator {
         self.free.len()
     }
 
+    /// Adds the ids `from..to` to the free stack, lowest-popping-first.
+    /// Only ever called with the free stack empty (the growth trigger in
+    /// `ensure_pages`), so ordering with previously freed ids never
+    /// arises and page-id determinism is preserved.
+    fn grow(&mut self, from: usize, to: usize) {
+        self.free.extend((from..to).rev());
+    }
+
     fn reset(&mut self, num_pages: usize) {
         *self = PageAllocator::new(num_pages);
     }
@@ -474,9 +487,28 @@ enum Arena<B: Backend> {
     },
 }
 
+impl<B: Backend> Arena<B> {
+    /// Pages this arena is currently sized to (dim 0).
+    fn num_pages(&self) -> usize {
+        match self {
+            Arena::Fp { k, .. } => k.dims()[0],
+            Arena::Quant { k_packed, .. } => k_packed.dims()[0],
+        }
+    }
+}
+
+/// Pages a fresh arena starts with (512 tokens at the default page
+/// size). Arenas double from here toward `CacheConfig::num_pages()` as
+/// the session actually grows — the capacity is a bound, not a bill.
+const INITIAL_ARENA_PAGES: usize = 32;
+
 pub struct PagedKVCache<B: Backend> {
     config: CacheConfig,
     allocator: PageAllocator,
+    /// Page count every materialized layer arena is sized to right now.
+    /// Shared across layers; grows geometrically in `ensure_pages` and
+    /// each layer's arena catches up on its next touch.
+    materialized_pages: usize,
     /// Page table: logical page index -> physical page id (single sequence).
     table: Vec<usize>,
     seq_len: usize,
@@ -524,8 +556,10 @@ impl<B: Backend> PagedKVCache<B> {
         for w in windows.iter().flatten() {
             assert!(*w >= 2, "sliding window must be >= 2, got {w}");
         }
+        let initial_pages = config.num_pages().min(INITIAL_ARENA_PAGES);
         PagedKVCache {
-            allocator: PageAllocator::new(config.num_pages()),
+            allocator: PageAllocator::new(initial_pages),
+            materialized_pages: initial_pages,
             config,
             table: Vec::new(),
             seq_len: 0,
@@ -538,17 +572,20 @@ impl<B: Backend> PagedKVCache<B> {
         }
     }
 
-    /// Number of free pages in the arena.
+    /// Pages still available to this sequence: free ids in the
+    /// materialized arena plus capacity not yet materialized.
     pub fn num_free_pages(&self) -> usize {
-        self.allocator.num_free()
+        self.allocator.num_free() + (self.config.num_pages() - self.materialized_pages)
     }
 
     /// Page-table snapshot (see [`KVCache::page_stats`]).
     pub fn page_stats_inner(&self) -> PageStats {
         PageStats {
             pages_used: self.table.len(),
-            pages_free: self.allocator.num_free(),
+            pages_free: self.allocator.num_free()
+                + (self.config.num_pages() - self.materialized_pages),
             num_pages: self.config.num_pages(),
+            pages_materialized: self.materialized_pages,
             page_size: self.config.page_size,
             seq_len: self.seq_len,
             layers_materialized: self.arenas.iter().filter(|a| a.is_some()).count(),
@@ -557,10 +594,23 @@ impl<B: Backend> PagedKVCache<B> {
         }
     }
 
-    /// Ensures the page table covers `total` positions.
+    /// Ensures the page table covers `total` positions, doubling the
+    /// materialized arena size when the free list runs dry and capacity
+    /// remains. `.max(pages_needed)` makes a long prefill chunk a single
+    /// growth event; the capacity assert in `attention_opts` fires before
+    /// true exhaustion, so the expect below stays a leak detector.
     fn ensure_pages(&mut self, total: usize) -> usize {
         let pages_needed = total.div_ceil(self.config.page_size);
         while self.table.len() < pages_needed {
+            if self.allocator.num_free() == 0
+                && self.materialized_pages < self.config.num_pages()
+            {
+                let grown = (self.materialized_pages * 2)
+                    .max(pages_needed)
+                    .min(self.config.num_pages());
+                self.allocator.grow(self.materialized_pages, grown);
+                self.materialized_pages = grown;
+            }
             let page = self
                 .allocator
                 .alloc()
@@ -738,9 +788,13 @@ impl<B: Backend> KVCache<B> for PagedKVCache<B> {
             return self.sliding_attention(layer, q, k, v, pos, scale, w);
         }
         let quant = self.config.quantize_kv && head_dim % KV_QUANT_GROUP == 0;
+        // Growth first: ensure_pages may raise materialized_pages, and
+        // both the first-touch allocation and the catch-up below size to
+        // the raised value.
+        let pages = self.ensure_pages(total);
+        let np = self.materialized_pages;
         if self.arenas[layer].is_none() {
             let device = k.device();
-            let np = self.config.num_pages();
             let ps = self.config.page_size;
             self.arenas[layer] = Some(if quant {
                 Arena::Quant {
@@ -756,9 +810,47 @@ impl<B: Backend> KVCache<B> for PagedKVCache<B> {
                     v: Tensor::zeros(shape, &device),
                 }
             });
+        } else if self.arenas[layer].as_ref().expect("checked").num_pages() < np {
+            // This layer's arena lags a growth event: reallocate at the
+            // new size and copy the old pages over. Physical page ids are
+            // dim-0 indices, so growth appends capacity without touching
+            // the table; the zero tail matches first-touch semantics. The
+            // copy rides the same stream as every other arena op.
+            let device = k.device();
+            self.arenas[layer] = Some(match self.arenas[layer].take().expect("checked") {
+                Arena::Fp { k: ak, v: av } => {
+                    let [old_np, nk, ps, d] = ak.dims();
+                    let span = [0..old_np, 0..nk, 0..ps, 0..d];
+                    Arena::Fp {
+                        k: Tensor::zeros([np, nk, ps, d], &device)
+                            .slice_assign(span.clone(), ak),
+                        v: Tensor::zeros([np, nk, ps, d], &device).slice_assign(span, av),
+                    }
+                }
+                Arena::Quant {
+                    k_packed,
+                    k_scales,
+                    v_packed,
+                    v_scales,
+                } => {
+                    let [old_np, nk, ps, dp] = k_packed.dims();
+                    let dg = k_scales.dims()[3];
+                    let span_p = [0..old_np, 0..nk, 0..ps, 0..dp];
+                    let span_s = [0..old_np, 0..nk, 0..ps, 0..dg];
+                    Arena::Quant {
+                        k_packed: Tensor::zeros([np, nk, ps, dp], &device)
+                            .slice_assign(span_p.clone(), k_packed),
+                        k_scales: Tensor::zeros([np, nk, ps, dg], &device)
+                            .slice_assign(span_s.clone(), k_scales),
+                        v_packed: Tensor::zeros([np, nk, ps, dp], &device)
+                            .slice_assign(span_p, v_packed),
+                        v_scales: Tensor::zeros([np, nk, ps, dg], &device)
+                            .slice_assign(span_s, v_scales),
+                    }
+                }
+            });
         }
 
-        let pages = self.ensure_pages(total);
         let page_size = self.config.page_size;
 
         // Write the new K/V into page slots (one slice_assign per touched
@@ -905,7 +997,10 @@ impl<B: Backend> KVCache<B> for PagedKVCache<B> {
         self.table.clear();
         self.table_device = None;
         self.table_dirty = true;
-        self.allocator.reset(self.config.num_pages());
+        // The arenas are KEPT at their grown size (capacity reuse), so
+        // the allocator must reset to the materialized count — ids past
+        // it would be out-of-bounds slice_assigns on the next write.
+        self.allocator.reset(self.materialized_pages);
         self.seq_len = 0;
         for slot in &mut self.sliding {
             *slot = None;
@@ -1333,6 +1428,129 @@ mod tests {
         }
     }
 
+    /// Growth parity: a cache that starts small and doubles must produce
+    /// bitwise-identical attention outputs to one born at full size —
+    /// growth is allocation policy, never arithmetic. Uses page_size 2 so
+    /// the 32-page floor is crossed within cheap CPU steps, covering two
+    /// doubling events and the popn/regrow interaction.
+    fn growth_parity_on(quantize: bool, tol: Option<f32>) {
+        let (n_kv, n_q, d) = (2usize, 2usize, 32usize);
+        let scale = 0.3;
+        let config = CacheConfig {
+            max_seq_len: 512,
+            page_size: 2,
+            kind: CacheKind::Paged,
+            quantize_kv: quantize,
+        };
+        // 256-page capacity, 32-page floor: growth at 33, 65, 129 pages.
+        let mut growing = PagedKVCache::<TestBackend>::new(1, config);
+        let mut control = PagedKVCache::<TestBackend>::new(1, config);
+        control.materialized_pages = config.num_pages();
+        control.allocator = PageAllocator::new(config.num_pages());
+
+        for i in 0..300 {
+            let (k, v) = kv_tok(i, n_kv, d);
+            let q = q_tok(i, n_q, d);
+            let a = growing.attention_opts(0, q.clone(), k.clone(), v.clone(), i, scale, None);
+            let b = control.attention_opts(0, q, k, v, i, scale, None);
+            match tol {
+                None => assert_close4(a, b, &format!("step {i}")),
+                Some(t) => {
+                    let av: Vec<f32> = a.into_data().to_vec().unwrap();
+                    let bv: Vec<f32> = b.into_data().to_vec().unwrap();
+                    for (j, (x, y)) in av.iter().zip(bv.iter()).enumerate() {
+                        assert!((x - y).abs() < t, "step {i}[{j}]: {x} vs {y}");
+                    }
+                }
+            }
+            if i == 100 {
+                // Roll back across nothing special, regrow — the freed
+                // ids stay inside the materialized span.
+                assert_eq!(growing.popn(3), 3);
+                assert_eq!(control.popn(3), 3);
+                let replay: Vec<_> = (98..101).collect();
+                for &r in &replay {
+                    let (k, v) = kv_tok(r, n_kv, d);
+                    let q = q_tok(r, n_q, d);
+                    let a = growing.attention_opts(0, q.clone(), k.clone(), v.clone(), r, scale, None);
+                    let b = control.attention_opts(0, q, k, v, r, scale, None);
+                    match tol {
+                        None => assert_close4(a, b, &format!("replay {r}")),
+                        Some(t) => {
+                            let av: Vec<f32> = a.into_data().to_vec().unwrap();
+                            let bv: Vec<f32> = b.into_data().to_vec().unwrap();
+                            for (j, (x, y)) in av.iter().zip(bv.iter()).enumerate() {
+                                assert!((x - y).abs() < t, "replay {r}[{j}]: {x} vs {y}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            growing.page_stats_inner().pages_materialized,
+            256,
+            "300 tokens at page_size 2 crosses 128 pages -> doubled to 256"
+        );
+        assert_eq!(control.page_stats_inner().pages_materialized, 256);
+    }
+
+    #[test]
+    fn grown_cache_matches_full_size_control_bitwise() {
+        growth_parity_on(false, None);
+    }
+
+    #[test]
+    fn grown_quant_cache_matches_full_size_control() {
+        // int8 KV round-trips are not bitwise across different write
+        // batching, but growth itself must not add error: same tolerance
+        // class as the quant parity test.
+        growth_parity_on(true, Some(1e-5));
+    }
+
+    /// The doubling sequence, popn interaction, single-event chunk jumps
+    /// and the reset landmine, on the allocator/table alone (no tensors).
+    #[test]
+    fn arena_growth_doubles_and_reset_keeps_the_materialized_size() {
+        let mut c = cache(4096, 16); // 256-page capacity, 32-page floor
+        assert_eq!(c.page_stats_inner().pages_materialized, 32);
+        assert_eq!(c.num_free_pages(), 256);
+
+        grow(&mut c, 32 * 16); // exactly the floor: no growth
+        assert_eq!(c.page_stats_inner().pages_materialized, 32);
+        grow(&mut c, 32 * 16 + 1); // one past: double
+        assert_eq!(c.page_stats_inner().pages_materialized, 64);
+        grow(&mut c, 200 * 16); // a chunk jump: straight to 200, doubled = 128 < 200
+        assert_eq!(c.page_stats_inner().pages_materialized, 200);
+        assert_eq!(c.num_free_pages(), 256 - 200);
+
+        c.reset();
+        assert_eq!(
+            c.page_stats_inner().pages_materialized,
+            200,
+            "arenas are kept at their grown size across reset"
+        );
+        assert_eq!(c.num_free_pages(), 256, "reset frees every page");
+        grow(&mut c, 200 * 16); // regrow to exactly the kept size: no event
+        assert_eq!(c.page_stats_inner().pages_materialized, 200);
+        grow(&mut c, 256 * 16); // to capacity
+        assert_eq!(c.page_stats_inner().pages_materialized, 256);
+        assert_eq!(c.num_free_pages(), 0);
+    }
+
+    /// The hard cap still rules: growth never mints capacity.
+    #[test]
+    #[should_panic(expected = "paged cache capacity exceeded")]
+    fn growth_never_exceeds_the_configured_capacity() {
+        let mut c = cache(64, 16);
+        for i in 0..=64 {
+            let (k, v) = kv_tok(i, 2, 4);
+            let q = q_tok(i, 2, 4);
+            // The 65th append asks for total = 65 > max_seq_len = 64.
+            c.attention_opts(0, q, k, v, i, 0.3, None);
+        }
+    }
+
     #[test]
     #[ignore = "gpu"]
     fn kv_quant_roundtrip_on_production_backend() {
@@ -1453,5 +1671,47 @@ mod tests {
     #[ignore = "gpu"]
     fn sliding_layer_matches_masked_global_on_production_backend() {
         sliding_parity_on::<combs_core::CombsBackend>(&Default::default(), 1e-3);
+    }
+
+    /// Arena growth under the fused decode kernel: a growing cache and a
+    /// full-size control run the same kernels over the same values — the
+    /// arena's dim-0 is invisible to the arithmetic, so outputs must stay
+    /// within readback tolerance across two doubling events on the
+    /// production backend (the guard that matters for the wasm path too).
+    fn growth_parity_gpu_on<B: Backend>(dev: &B::Device, tol: f32) {
+        let (n_kv, n_q, d) = (2usize, 4usize, 64usize);
+        let scale = 1.0 / (d as f64).sqrt();
+        let config = CacheConfig {
+            max_seq_len: 512,
+            page_size: 2,
+            kind: CacheKind::Paged,
+            quantize_kv: false,
+        };
+        let mut growing = PagedKVCache::<B>::new(1, config);
+        let mut control = PagedKVCache::<B>::new(1, config);
+        control.materialized_pages = config.num_pages();
+        control.allocator = PageAllocator::new(config.num_pages());
+        for i in 0..140 {
+            let (k, v) = kv_tok_on::<B>(dev, i, n_kv, d);
+            let q = q_tok_on::<B>(dev, i, n_q, d);
+            let a = growing.attention_opts(0, q.clone(), k.clone(), v.clone(), i, scale, None);
+            let b = control.attention_opts(0, q, k, v, i, scale, None);
+            let av: Vec<f32> = a.into_data().convert::<f32>().to_vec().unwrap();
+            let bv: Vec<f32> = b.into_data().convert::<f32>().to_vec().unwrap();
+            for (j, (x, y)) in av.iter().zip(bv.iter()).enumerate() {
+                assert!(x.is_finite(), "step {i}[{j}] not finite: {x}");
+                assert!((x - y).abs() < tol, "step {i}[{j}]: {x} vs {y}");
+            }
+        }
+        assert!(
+            growing.page_stats_inner().pages_materialized >= 128,
+            "140 tokens at page_size 2 must have crossed two growth events"
+        );
+    }
+
+    #[test]
+    #[ignore = "gpu"]
+    fn grown_cache_matches_control_under_the_decode_kernel() {
+        growth_parity_gpu_on::<combs_core::CombsBackend>(&Default::default(), 1e-5);
     }
 }
