@@ -1,10 +1,15 @@
-//! Hand-written WGSL kernels, launched on the runtime's own stream.
+//! The Combs Kernel: the engine's owned GPU path.
 //!
-//! The #[cube] DSL serves the quant-gemv family well; these kernels exist
-//! for the places where owning the exact WGSL matters — reductions and
-//! attention whose selection must be fixed by shape, not autotuned, and
-//! whose text must be auditable against the two validators it will meet
-//! (naga natively, Tint in a browser).
+//! This module is the hand-written-WGSL half of the suite — launched on
+//! the runtime's own stream through the template seam below; the
+//! `#[cube]` quant family in `qmatmul.rs` is the other half. Together
+//! they carry the whole decode hot path: packed embed gather, rms_norm,
+//! rope, decode attention (paged / sliding / int8), and every quant
+//! projection. Hand WGSL exists for the places where owning the exact
+//! text matters — reductions and attention whose selection must be
+//! fixed by shape, not autotuned, and whose source must be auditable
+//! against the two validators it will meet (naga natively, Tint in a
+//! browser).
 //!
 //! ## The contract every kernel here honors
 //!

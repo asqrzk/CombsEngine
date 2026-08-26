@@ -1,5 +1,7 @@
 //! Fused GGUF dequant-matmul CubeCL kernels: Q4_0, Q5_0, Q8_0 and the
 //! K-quants Q4_K, Q5_K, Q6_K — the formats real model files actually use.
+//! The `#[cube]` half of the Combs Kernel (see `wgsl/` for the
+//! hand-written half and the suite's contract).
 //!
 //! Weights stay packed at 4–6 bits in VRAM and are dequantized *inside*
 //! the matmul kernel — never materialized as f32. This is the memory win
