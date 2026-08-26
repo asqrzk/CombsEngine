@@ -112,6 +112,12 @@ pub async fn combs_wgsl_probe() -> Result<String, JsValue> {
 /// attention, flash attention at head_dim 256) against a host reference
 /// on THIS browser's compiler — the paths only GeluTanh-family models
 /// exercise, which the WGSL probe cannot cover.
+/// Compiled only with `--features forward-probe`: the burn-path canaries
+/// monomorphize ~6.8 MB of module the shipped bundle doesn't need — the
+/// always-on `combs_wgsl_probe` covers every Combs Kernel (tanh canary
+/// included); this one exists for investigating burn-composed paths on
+/// a misbehaving browser, which is an investigation build, not a ship.
+#[cfg(feature = "forward-probe")]
 #[wasm_bindgen]
 pub async fn combs_forward_probe() -> Result<String, JsValue> {
     ensure_device().await.map_err(js_err)?;
