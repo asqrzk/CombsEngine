@@ -925,6 +925,35 @@ impl<B: Backend> KVCache<B> for PagedKVCache<B> {
                     v_scales = v_scales.slice_assign(rs, vs.clone().narrow(2, written, run));
                     written += run;
                 }
+                // K3c: the single-token step attends over the packed
+                // arena in place, dequantizing in-register — the
+                // materialized gather + kv_dequantize below become the
+                // prefill/fallback path only.
+                if seq == 1 && window.is_none() {
+                    let table = self.page_indices(pages);
+                    if let Some(out) = crate::wgsl::try_decode_attention_q8(
+                        q.clone(),
+                        crate::wgsl::QuantArena {
+                            packed: k_packed.clone(),
+                            scales: k_scales.clone(),
+                        },
+                        crate::wgsl::QuantArena {
+                            packed: v_packed.clone(),
+                            scales: v_scales.clone(),
+                        },
+                        table,
+                        total,
+                        scale,
+                    ) {
+                        self.arenas[layer] = Some(Arena::Quant {
+                            k_packed,
+                            k_scales,
+                            v_packed,
+                            v_scales,
+                        });
+                        return out;
+                    }
+                }
                 let k_full = kv_dequantize(
                     self.gather_window_int(k_packed.clone(), pages, total),
                     self.gather_window(k_scales.clone(), pages, total),

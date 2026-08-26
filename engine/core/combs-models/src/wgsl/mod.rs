@@ -79,13 +79,16 @@ wgsl_kernel!(ProbeEcho, "probe_echo.wgsl");
 wgsl_kernel!(ProbeSmem, "probe_smem.wgsl");
 wgsl_kernel!(RmsNorm, "rmsnorm.wgsl");
 wgsl_kernel!(DecodeAttn, "decode_attn.wgsl");
+wgsl_kernel!(DecodeAttnQ8, "decode_attn_q8.wgsl");
 wgsl_kernel!(RopeQk, "rope.wgsl");
 
 mod decode_attn;
+mod decode_attn_q8;
 mod rmsnorm;
 mod rope;
 
 pub(crate) use decode_attn::{try_decode_attention, try_sliding_decode_attention};
+pub(crate) use decode_attn_q8::{QuantArena, try_decode_attention_q8};
 pub(crate) use rmsnorm::try_rms_norm;
 pub(crate) use rope::try_rope_qk;
 
@@ -246,6 +249,22 @@ pub async fn probe_report() -> Result<(), String> {
         decode_attn_canary(&client, mode, d, window, n_kv, total).await?;
     }
 
+    // --- quantized decode-attention canaries (K3c) ------------------------
+    // Grid-exact packed lanes (the i32::MAX corner word included) through
+    // the q8 kernel's bitcast/shift unpack — constructs no other canary
+    // exercises, value-checked against a host softmax at gemma3's d too.
+    // Two checks per head dim: total=1 makes the softmax weight exactly
+    // 1.0, so the output must be the dequantized V row to the last bit —
+    // an unpack bug (sign extension, lane order, scale indexing) cannot
+    // hide, and accumulation order cannot interfere. The long case then
+    // bounds cross-compiler accumulation noise against an f64 reference
+    // (Tint and naga contract fma differently; the quant grid's dynamic
+    // range makes 1e-3-relative too tight for a 300-key online softmax).
+    for d in [64usize, 256] {
+        decode_attn_q8_canary(&client, d, 1).await?;
+        decode_attn_q8_canary(&client, d, 300).await?;
+    }
+
     // --- tiled quant-matmul canaries --------------------------------------
     // Prefill (m > 1) takes the shared-memory TILED kernels while decode
     // takes the untiled gemv — a browser model can therefore decode
@@ -333,6 +352,155 @@ pub async fn probe_report() -> Result<(), String> {
                         ));
                     }
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One quantized decode-attention canary: chosen int8 lanes packed
+/// exactly like `kv_quantize` (lanes 0..2 offset-binary, lane 3 signed
+/// in the top byte — including the `i32::MAX` corner), power-of-two
+/// scales so the host dequant is exact, a shuffled page table, and a
+/// host softmax over the dequantized rows as the reference.
+async fn decode_attn_q8_canary(
+    client: &cubecl::prelude::ComputeClient<WgpuRuntime>,
+    d: usize,
+    total: usize,
+) -> Result<(), String> {
+    use cubecl::prelude::*;
+
+    let (n_q, n_kv, page_size) = (4usize, 2usize, 16usize);
+    let (dw, dg) = (d / 4, d / 32);
+    let pages = total.div_ceil(page_size);
+    let num_pages = pages + 2;
+    let table: Vec<i32> = (0..pages).map(|p| ((p + 1) % num_pages) as i32).collect();
+    let lanes = [-127i32, -1, 0, 1, 63, 127, -64, 5];
+    let scales = [0.5f32, 0.25, 1.0, 0.125];
+    let pack = |q0: i32, q1: i32, q2: i32, q3: i32| -> i32 {
+        (q0 + 128) | ((q1 + 128) << 8) | ((q2 + 128) << 16) | (q3 << 24)
+    };
+    let mut build = |salt: usize| {
+        let mut packed = vec![0i32; num_pages * n_kv * page_size * dw];
+        let mut scal = vec![0.0f32; num_pages * n_kv * page_size * dg];
+        let mut dense = vec![vec![0.0f32; d]; n_kv * total];
+        for j in 0..total {
+            let phys = table[j / page_size] as usize;
+            for g in 0..n_kv {
+                let row = (phys * n_kv + g) * page_size + j % page_size;
+                for grp in 0..dg {
+                    let sc = scales[(j + g + grp + salt) % scales.len()];
+                    scal[row * dg + grp] = sc;
+                    for w in 0..8 {
+                        let word = if j == 0 && g == 0 && grp == 0 && w == 0 {
+                            // The exact-i32::MAX corner: all-255 low
+                            // bytes, +127 top lane.
+                            pack(127, 127, 127, 127)
+                        } else {
+                            let pick = |l: usize| {
+                                lanes[(j * 31 + g * 7 + grp * 5 + w * 3 + l + salt)
+                                    % lanes.len()]
+                            };
+                            pack(pick(0), pick(1), pick(2), pick(3))
+                        };
+                        packed[row * dw + grp * 8 + w] = word;
+                        let base = grp * 32 + w * 4;
+                        let out = &mut dense[g * total + j];
+                        out[base] = ((word & 0xff) - 128) as f32 * sc;
+                        out[base + 1] = (((word >> 8) & 0xff) - 128) as f32 * sc;
+                        out[base + 2] = (((word >> 16) & 0xff) - 128) as f32 * sc;
+                        out[base + 3] = (word >> 24) as f32 * sc;
+                    }
+                }
+            }
+        }
+        (packed, scal, dense)
+    };
+    let (kp, ks, kd) = build(1);
+    let (vp, vs, vd) = build(9);
+    let qv: Vec<f32> = (0..n_q * d)
+        .map(|i| ((i as f32 * 0.437 + 4.2).sin() * 1.5))
+        .collect();
+    let scale = 1.0 / (d as f32).sqrt();
+
+    let q_h = client.create_from_slice(f32::as_bytes(&qv));
+    let kp_h = client.create_from_slice(i32::as_bytes(&kp));
+    let ks_h = client.create_from_slice(f32::as_bytes(&ks));
+    let vp_h = client.create_from_slice(i32::as_bytes(&vp));
+    let vs_h = client.create_from_slice(f32::as_bytes(&vs));
+    let t_h = client.create_from_slice(i32::as_bytes(&table));
+    let o_h = client.empty(n_q * d * core::mem::size_of::<f32>());
+    launch(
+        client,
+        DecodeAttnQ8,
+        CubeCount::Static(n_q as u32, 1, 1),
+        vec![
+            q_h.binding(),
+            kp_h.binding(),
+            ks_h.binding(),
+            vp_h.binding(),
+            vs_h.binding(),
+            t_h.binding(),
+            o_h.clone().binding(),
+        ],
+        vec![
+            n_q as u64,
+            n_kv as u64,
+            d as u64,
+            page_size as u64,
+            total as u64,
+            0,
+            0,
+            f32::to_bits(scale) as u64,
+        ],
+    );
+    let bytes = client
+        .read_async(vec![o_h])
+        .await
+        .map_err(|e| format!("q8 decode-attn readback failed: {e:?}"))?;
+    let got = f32::from_bytes(&bytes[0]);
+    for h in 0..n_q {
+        let g = h / (n_q / n_kv);
+        if total == 1 {
+            // Single visible key: weight is exactly 1.0 and the output is
+            // the dequantized V row, bit for bit.
+            for c in 0..d {
+                let expect = vd[g][c];
+                let gv = got[h * d + c];
+                if gv.to_bits() != expect.to_bits() {
+                    return Err(format!(
+                        "q8 decode-attn canary (d {d}) unpack wrong at [{h},{c}]: \
+                         got {gv}, expected exactly {expect} — the K3c kernel \
+                         must stay doored off here"
+                    ));
+                }
+            }
+            continue;
+        }
+        let qi = &qv[h * d..(h + 1) * d];
+        let sc: Vec<f64> = (0..total)
+            .map(|j| {
+                qi.iter()
+                    .zip(&kd[g * total + j])
+                    .map(|(a, b)| *a as f64 * *b as f64)
+                    .sum::<f64>()
+                    * scale as f64
+            })
+            .collect();
+        let m = sc.iter().cloned().fold(f64::MIN, f64::max);
+        let ps: Vec<f64> = sc.iter().map(|s| (s - m).exp()).collect();
+        let sum: f64 = ps.iter().sum();
+        for c in 0..d {
+            let expect: f64 = (0..total)
+                .map(|j| ps[j] / sum * vd[g * total + j][c] as f64)
+                .sum();
+            let gv = got[h * d + c] as f64;
+            if !gv.is_finite() || (gv - expect).abs() > 5e-3 * expect.abs().max(1.0) {
+                return Err(format!(
+                    "q8 decode-attn canary (d {d}) wrong at [{h},{c}]: got \
+                     {gv}, expected {expect} — the K3c kernel must stay \
+                     doored off here"
+                ));
             }
         }
     }

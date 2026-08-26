@@ -31,27 +31,28 @@ use super::{DecodeAttn, WORKGROUP, launch, wgsl_enabled};
 use crate::qlinear::{FusedF32, InnerF32, UnfusedF32};
 
 /// Per-kernel door on top of the master `COMBS_WGSL`; read once.
-fn attn_enabled() -> bool {
+pub(super) fn attn_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         wgsl_enabled() && !matches!(std::env::var("COMBS_WGSL_ATTN").as_deref(), Ok("0"))
     })
 }
 
-/// The geometry one dispatch needs, resolved host-side once.
+/// The geometry one dispatch needs, resolved host-side once. Shared
+/// with the q8 sibling, whose Params layout is identical by design.
 #[derive(Clone, Copy)]
-struct AttnGeom {
-    n_q: usize,
-    n_kv: usize,
-    d: usize,
-    page_size: usize,
-    total: usize,
-    window: usize,
-    mode: usize,
+pub(super) struct AttnGeom {
+    pub(super) n_q: usize,
+    pub(super) n_kv: usize,
+    pub(super) d: usize,
+    pub(super) page_size: usize,
+    pub(super) total: usize,
+    pub(super) window: usize,
+    pub(super) mode: usize,
 }
 
 impl AttnGeom {
-    fn scalar_slots(self, scale: f64) -> Vec<u64> {
+    pub(super) fn scalar_slots(self, scale: f64) -> Vec<u64> {
         vec![
             self.n_q as u64,
             self.n_kv as u64,
