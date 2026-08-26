@@ -26,7 +26,7 @@ mod native_driver_imports {
     pub(super) use std::sync::{Arc, Mutex, mpsc};
     pub(super) use std::thread::JoinHandle;
 
-    pub(super) use burn::tensor::{Tensor, TensorData};
+    pub(super) use burn::tensor::{Tensor, TensorData, backend::Backend as _};
     pub(super) use combs_core::{BufferPool, CombsBackend, CombsDevice};
     pub(super) use combs_formats::{ModelMetadata, ModelSource};
     pub(super) use combs_media::PixelBatch;
@@ -957,6 +957,7 @@ fn binding_limit(device: &CombsDevice) -> Option<u64> {
 }
 
 /// Worker-thread loop: executes queued requests serially until shutdown.
+#[cfg(not(target_family = "wasm"))]
 fn worker_loop(
     mut model: Box<dyn GenerativeModel<CombsBackend>>,
     tokenizer: Tokenizer,
@@ -989,8 +990,11 @@ fn worker_loop(
                     &mut token_table,
                 );
                 if sessions.evictions > evictions_before {
-                    // An LRU-evicted session just dropped its KV pages;
-                    // hand the freed blocks back instead of hoarding them.
+                    // An LRU-evicted session just dropped its KV pages.
+                    // Drain the fusion stream first — tensor drops ride
+                    // its queue, and a cleanup submitted before the
+                    // deregistrations land trims almost nothing.
+                    let _ = CombsBackend::sync(&device);
                     BufferPool::new().cleanup(&device);
                 }
                 update_stats(&stats, &result, &sessions, &device);
@@ -1032,6 +1036,7 @@ fn worker_loop(
                     None => sessions.clear_all(),
                 };
                 if removed > 0 {
+                    let _ = CombsBackend::sync(&device);
                     BufferPool::new().cleanup(&device);
                 }
                 if let Ok(mut snap) = stats.lock() {

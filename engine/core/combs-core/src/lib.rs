@@ -415,9 +415,11 @@ impl BufferPool {
 
     /// Runs `task` with the pool in persistent-allocation mode, so every
     /// buffer it creates is exempt from later [`BufferPool::cleanup`]
-    /// calls — meant for weight loading. Doored behind
-    /// `COMBS_PERSISTENT_LOAD=1` until the footprint test proves the
-    /// load-path transients don't get pinned along with the weights.
+    /// calls — meant for weight loading. On by default natively: the
+    /// footprint proof showed reserved landing exactly on live bytes
+    /// with no transient pinned (712.7 = 712.7 MB vs 721.5 doored off;
+    /// MEASUREMENTS §39). `COMBS_PERSISTENT_LOAD=0` opts out. The wasm
+    /// build keeps the plain path until the mode is proven in a browser.
     pub fn pin_persistent<R>(
         &self,
         device: &CombsDevice,
@@ -429,7 +431,7 @@ impl BufferPool {
         let door = {
             #[cfg(not(target_family = "wasm"))]
             {
-                matches!(std::env::var("COMBS_PERSISTENT_LOAD").as_deref(), Ok("1"))
+                !matches!(std::env::var("COMBS_PERSISTENT_LOAD").as_deref(), Ok("0"))
             }
             #[cfg(target_family = "wasm")]
             {

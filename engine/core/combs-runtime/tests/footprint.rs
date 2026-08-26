@@ -76,9 +76,12 @@ fn footprint_stays_bounded_and_cleanup_returns_memory() {
         after_clear.bytes_in_use as f64 / 1e6,
         after_clear.bytes_reserved as f64 / 1e6,
     );
+    // The worker's stream holds only session memory (weights live on the
+    // loader's stream), so a full clear + drained cleanup must return
+    // essentially everything.
     assert!(
-        after_clear.bytes_in_use <= after_gen.bytes_in_use,
-        "dropping the session must not grow live bytes ({} -> {})",
+        after_clear.bytes_in_use <= after_gen.bytes_in_use / 100,
+        "dropping every session must return the arena memory ({} -> {})",
         after_gen.bytes_in_use,
         after_clear.bytes_in_use,
     );
@@ -87,6 +90,22 @@ fn footprint_stays_bounded_and_cleanup_returns_memory() {
         "cleanup must never grow the pool ({} -> {})",
         after_gen.bytes_reserved,
         after_clear.bytes_reserved,
+    );
+
+    // Regrow: a fresh generation after the clear must land where the
+    // first one did — retained-but-reusable is fine, ratcheting is a leak.
+    engine.generate(&tokens, &config, |_, _, _| {}).expect("second generate");
+    let after_regen = engine.stats_snapshot().gpu.expect("gpu sample after regrow");
+    println!(
+        "[footprint] after regrow: in_use={:.1}MB reserved={:.1}MB",
+        after_regen.bytes_in_use as f64 / 1e6,
+        after_regen.bytes_reserved as f64 / 1e6,
+    );
+    assert!(
+        after_regen.bytes_in_use <= after_gen.bytes_in_use + after_gen.bytes_in_use / 20,
+        "the second life must not cost more than the first ({} -> {})",
+        after_gen.bytes_in_use,
+        after_regen.bytes_in_use,
     );
 }
 
