@@ -77,23 +77,25 @@ struct DeviceContext {
 static CONTEXT: std::sync::OnceLock<DeviceContext> = std::sync::OnceLock::new();
 
 /// Runtime options for the engine's device: the seam where memory-pool
-/// policy is chosen. Native defaults to cubecl's sub-slice pools;
-/// `COMBS_MEM_POOLS=exclusive` switches to one-buffer-per-allocation
-/// pools (offset 0 everywhere, aged out on a dealloc period). The wasm
-/// build has no environment and takes cubecl's wasm default, which is
-/// already exclusive pages.
+/// policy is chosen. Native defaults to exclusive pages — the footprint
+/// proof measured it at identical decode speed with reserved tracking
+/// live bytes almost exactly (721 vs 1862 MB after a qwen3-0.6b load
+/// under sub-slices; MEASUREMENTS §37). `COMBS_MEM_POOLS=subslices`
+/// restores cubecl's sub-slice pools; `=exclusive` names the default
+/// explicitly. The wasm build has no environment and takes cubecl's
+/// wasm default, which is already exclusive pages.
 fn combs_runtime_options() -> RuntimeOptions {
     #[cfg(not(target_family = "wasm"))]
     if matches!(
         std::env::var("COMBS_MEM_POOLS").as_deref(),
-        Ok("exclusive")
+        Ok("subslices")
     ) {
-        return RuntimeOptions {
-            memory_config: MemoryConfiguration::ExclusivePages,
-            ..RuntimeOptions::default()
-        };
+        return RuntimeOptions::default();
     }
-    RuntimeOptions::default()
+    RuntimeOptions {
+        memory_config: MemoryConfiguration::ExclusivePages,
+        ..RuntimeOptions::default()
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -393,19 +395,15 @@ fn info_from_setup(setup: &WgpuSetup) -> DeviceInfo {
     }
 }
 
-/// Facade over the GPU buffer pool.
+/// Facade over the GPU buffer pool, backed by cubecl's allocator.
 ///
-/// # Phase 1 status: documented no-op
-///
-/// The plan's hand-rolled slab/coalescing pool was deliberately replaced by
-/// cubecl's built-in allocator, which already does pooled slab allocation and
-/// reuse (configured through [`burn::backend::wgpu::MemoryConfiguration`]).
-/// burn 0.21 does not publicly expose cubecl 0.10's
-/// `ComputeClient::memory_cleanup`, and `memory_persistent_allocations` does
-/// not exist in cubecl 0.10's public API at all, so this facade currently does
-/// nothing. It exists so that the runtime can call `pool.cleanup()` /
-/// `pool.pin_persistent()` today and Phase 2 can back those calls with real
-/// handles (persistent KV/weight arenas) without changing call sites.
+/// The pool itself is cubecl's (slab allocation, reuse, configured through
+/// [`burn::backend::wgpu::MemoryConfiguration`]); this facade is the
+/// engine's two levers over it. Without [`BufferPool::cleanup`] the pool
+/// NEVER returns freed blocks to the driver — the failure mode behind two
+/// machine crashes — so the runtime calls it at the moments memory
+/// genuinely becomes garbage: after load transients, after session
+/// eviction.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BufferPool;
 
@@ -415,17 +413,46 @@ impl BufferPool {
         BufferPool
     }
 
-    /// Pin long-lived allocations (weights, KV arena) so the pool never
-    /// releases them. No-op in Phase 1 — cubecl's pooled allocator keeps
-    /// freed blocks for reuse anyway.
-    pub fn pin_persistent(&self) {
-        // no-op: see type-level docs.
+    /// Runs `task` with the pool in persistent-allocation mode, so every
+    /// buffer it creates is exempt from later [`BufferPool::cleanup`]
+    /// calls — meant for weight loading. Doored behind
+    /// `COMBS_PERSISTENT_LOAD=1` until the footprint test proves the
+    /// load-path transients don't get pinned along with the weights.
+    pub fn pin_persistent<R>(
+        &self,
+        device: &CombsDevice,
+        task: impl FnOnce() -> R + Send,
+    ) -> R
+    where
+        R: Send,
+    {
+        let door = {
+            #[cfg(not(target_family = "wasm"))]
+            {
+                matches!(std::env::var("COMBS_PERSISTENT_LOAD").as_deref(), Ok("1"))
+            }
+            #[cfg(target_family = "wasm")]
+            {
+                false
+            }
+        };
+        if !door {
+            return task();
+        }
+        let client =
+            <burn::backend::wgpu::WgpuRuntime as cubecl::prelude::Runtime>::client(device);
+        match client.memory_persistent_allocation((), |_| task()) {
+            Ok(out) => out,
+            Err(e) => panic!("persistent-mode load failed to submit: {e:?}"),
+        }
     }
 
-    /// Release cached free blocks back to the driver. No-op in Phase 1 —
-    /// cubecl 0.10's `memory_cleanup` is not reachable through burn's public
-    /// API.
-    pub fn cleanup(&self) {
-        // no-op: see type-level docs.
+    /// Asks the pool to release free blocks back to the driver — a plain
+    /// submit, safe on every target. The allocator decides what is
+    /// actually beneficial to free; persistent allocations are exempt.
+    pub fn cleanup(&self, device: &CombsDevice) {
+        let client =
+            <burn::backend::wgpu::WgpuRuntime as cubecl::prelude::Runtime>::client(device);
+        client.memory_cleanup();
     }
 }

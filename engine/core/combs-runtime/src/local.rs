@@ -107,7 +107,12 @@ impl LocalEngine {
         cache_config: CacheConfig,
     ) -> Result<Self> {
         let registry = ModelRegistry::<CombsBackend>::new();
-        let model = registry.load(source, &device)?;
+        let pool = combs_core::BufferPool::new();
+        let model = pool.pin_persistent(&device, || registry.load(source, &device))?;
+        // The load transients are garbage from here on; return them
+        // instead of hoarding — in a browser tab this is the difference
+        // between fitting and dying.
+        pool.cleanup(&device);
 
         let spec = source.tokenizer()?;
         let tokenizer = Tokenizer::from_bytes(spec.json_bytes()?)
@@ -451,10 +456,14 @@ impl LocalEngine {
 
     /// Drops one named KV session (`Some(id)`) or every session (`None`).
     pub fn clear_sessions(&mut self, id: Option<&str>) -> usize {
-        match id {
+        let removed = match id {
             Some(key) => self.sessions.take(key).map(|_| 1).unwrap_or(0),
             None => self.sessions.clear_all(),
+        };
+        if removed > 0 {
+            combs_core::BufferPool::new().cleanup(&self.device);
         }
+        removed
     }
 }
 

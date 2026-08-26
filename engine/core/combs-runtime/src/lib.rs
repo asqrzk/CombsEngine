@@ -83,6 +83,41 @@ pub enum EngineError {
     #[error("tensor readback error: {0}")]
     Readback(String),
 
+    /// One resident tensor is larger than the device can bind — refused
+    /// before any allocation, with the arithmetic shown.
+    #[error(
+        "tensor {tensor} needs {bytes} bytes resident but the device caps \
+         storage bindings at {limit} bytes"
+    )]
+    TensorExceedsDevice {
+        /// Offending tensor name.
+        tensor: String,
+        /// Estimated resident bytes.
+        bytes: u64,
+        /// Device `max_storage_buffer_binding_size`.
+        limit: u64,
+    },
+
+    /// The model does not fit the configured VRAM budget — refused before
+    /// any allocation, itemized so the number can be argued with.
+    #[error(
+        "model exceeds COMBS_VRAM_BUDGET_MB={budget_mb}: weights \
+         ~{weights_mb} MB + kv arena ~{kv_mb} MB + activation slack \
+         ~{slack_mb} MB = ~{total_mb} MB"
+    )]
+    OverBudget {
+        /// Estimated resident weight bytes, in MB.
+        weights_mb: u64,
+        /// Full KV arena bytes, in MB.
+        kv_mb: u64,
+        /// Activation / autotune slack, in MB.
+        slack_mb: u64,
+        /// Sum of the above, in MB.
+        total_mb: u64,
+        /// The configured budget, in MB.
+        budget_mb: u64,
+    },
+
     /// Prompt + requested generation exceeds the context budget (KV cache
     /// capacity, capped by the model's `max_position_embeddings`).
     #[error(

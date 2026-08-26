@@ -304,6 +304,13 @@ pub struct EngineStatsSnapshot {
     /// Bytes one KV page costs across all layers (both K and V), so
     /// consumers can turn page counts into memory: `pages × kv_page_bytes`.
     pub kv_page_bytes: u64,
+    /// Load-time estimate of resident weight bytes + the full KV arena —
+    /// what the S2c budget refusal reasons over, exported so observers
+    /// (and the footprint proof) can hold the allocator to it.
+    pub estimated_model_bytes: u64,
+    /// The weights alone — the part that must be live right after load
+    /// (the arena grows lazily toward the rest).
+    pub estimated_weight_bytes: u64,
 }
 
 /// Timing/count summary of one completed generation.
@@ -412,8 +419,59 @@ impl Engine {
         if matches!(std::env::var("COMBS_KV_QUANT").as_deref(), Ok("1")) {
             cache_config.quantize_kv = true;
         }
+        // S2c: refuse what cannot fit BEFORE any allocation. The paged
+        // arena math below is the same the observability snapshot uses.
+        let meta_pre = source.metadata();
+        let elem_bytes_pre: u64 = if cfg!(feature = "f16") { 2 } else { 4 };
+        let pattern_pre = &meta_pre.attention_pattern;
+        let globals = (0..meta_pre.num_hidden_layers)
+            .filter(|&i| pattern_pre.is_global_layer(i))
+            .count()
+            .max(1);
+        let kv_bytes_per_value_x8 = if cache_config.quantize_kv {
+            9
+        } else {
+            elem_bytes_pre * 8
+        };
+        let kv_bytes = cache_config.max_seq_len as u64
+            * meta_pre.num_key_value_heads as u64
+            * meta_pre.head_dim as u64
+            * kv_bytes_per_value_x8
+            / 8
+            * 2
+            * globals as u64;
+        let (weight_bytes, largest) = estimate_weight_bytes(source, elem_bytes_pre);
+        if let Some(caps_limit) = binding_limit(&device) {
+            if largest.1 > caps_limit {
+                return Err(EngineError::TensorExceedsDevice {
+                    tensor: largest.0,
+                    bytes: largest.1,
+                    limit: caps_limit,
+                });
+            }
+        }
+        if let Ok(budget_mb) = std::env::var("COMBS_VRAM_BUDGET_MB") {
+            if let Ok(budget_mb) = budget_mb.parse::<u64>() {
+                let slack = ((weight_bytes + kv_bytes) / 10).max(256 << 20);
+                let total = weight_bytes + kv_bytes + slack;
+                if total > budget_mb << 20 {
+                    return Err(EngineError::OverBudget {
+                        weights_mb: weight_bytes >> 20,
+                        kv_mb: kv_bytes >> 20,
+                        slack_mb: slack >> 20,
+                        total_mb: total >> 20,
+                        budget_mb,
+                    });
+                }
+            }
+        }
+
         let registry = ModelRegistry::<CombsBackend>::new();
-        let model = registry.load(source, &device)?;
+        let pool = BufferPool::new();
+        let model = pool.pin_persistent(&device, || registry.load(source, &device))?;
+        // The load path's transients (dequant staging, repack scratch) are
+        // garbage from here on; without this the pool holds them forever.
+        pool.cleanup(&device);
         let supports_embeddings = model.supports_hidden_states();
 
         let spec = source.tokenizer()?;
@@ -441,6 +499,8 @@ impl Engine {
         };
         let stats = Arc::new(Mutex::new(EngineStatsSnapshot {
             max_sessions: MAX_SESSIONS,
+            estimated_model_bytes: weight_bytes + kv_bytes,
+            estimated_weight_bytes: weight_bytes,
             kv_page_bytes: cache_config.page_size as u64
                 * meta.num_key_value_heads as u64
                 * meta.head_dim as u64
@@ -852,6 +912,50 @@ impl Drop for Engine {
 }
 
 #[cfg(not(target_family = "wasm"))]
+/// Estimates the bytes each weight tensor holds resident after load,
+/// summed, plus the single largest — the honest input to the S2c
+/// refusal. Quant tensors with a device kernel stay packed (their file
+/// bytes); an embedding in a format without a gather kernel dequantizes
+/// dense; everything else loads at the backend element size. Cheap by
+/// construction: packed bytes come from the mmap'd source, and only
+/// tensors that would dequantize at load anyway are opened.
+#[cfg(not(target_family = "wasm"))]
+fn estimate_weight_bytes(source: &dyn ModelSource, elem_bytes: u64) -> (u64, (String, u64)) {
+    let mut total = 0u64;
+    let mut largest = (String::new(), 0u64);
+    for name in source.tensor_names() {
+        let dense_embed = name.contains("embed_tokens") || name.contains("token_embd");
+        let bytes = match source.open_tensor_quant(&name) {
+            Ok(Some(qt)) => {
+                let packs = !dense_embed
+                    || matches!(qt.format, combs_formats::QuantFormat::Q8_0);
+                if packs {
+                    qt.data.len() as u64
+                } else {
+                    qt.shape.iter().product::<usize>() as u64 * elem_bytes
+                }
+            }
+            _ => match source.open_tensor(&name) {
+                Ok(reader) => {
+                    reader.shape().iter().product::<usize>() as u64 * elem_bytes
+                }
+                Err(_) => continue,
+            },
+        };
+        total += bytes;
+        if bytes > largest.1 {
+            largest = (name, bytes);
+        }
+    }
+    (total, largest)
+}
+
+/// The device's storage-binding ceiling, when the platform can answer.
+#[cfg(not(target_family = "wasm"))]
+fn binding_limit(device: &CombsDevice) -> Option<u64> {
+    Some(combs_core::device_caps(device).max_storage_buffer_binding_size)
+}
+
 /// Worker-thread loop: executes queued requests serially until shutdown.
 fn worker_loop(
     mut model: Box<dyn GenerativeModel<CombsBackend>>,
@@ -873,6 +977,7 @@ fn worker_loop(
         match cmd {
             Command::Shutdown => break,
             Command::Generate(req) => {
+                let evictions_before = sessions.evictions;
                 let result = run_generation(
                     model.as_mut(),
                     &tokenizer,
@@ -883,6 +988,11 @@ fn worker_loop(
                     &mut sessions,
                     &mut token_table,
                 );
+                if sessions.evictions > evictions_before {
+                    // An LRU-evicted session just dropped its KV pages;
+                    // hand the freed blocks back instead of hoarding them.
+                    BufferPool::new().cleanup(&device);
+                }
                 update_stats(&stats, &result, &sessions, &device);
                 // `req.pieces` closes when `req` drops at the end of this
                 // iteration; the reply is queued first, so the caller always
@@ -921,8 +1031,15 @@ fn worker_loop(
                     Some(key) => sessions.take(&key).map(|_| 1).unwrap_or(0),
                     None => sessions.clear_all(),
                 };
+                if removed > 0 {
+                    BufferPool::new().cleanup(&device);
+                }
                 if let Ok(mut snap) = stats.lock() {
                     snap.sessions = session_infos(&sessions);
+                    // Resample on this thread: cubecl's memory accounting
+                    // is per-stream, and the arenas live on the worker's —
+                    // a caller-side gpu_memory cannot see what just freed.
+                    snap.gpu = combs_core::gpu_memory(&device);
                 }
                 let _ = reply.send(removed);
             }
