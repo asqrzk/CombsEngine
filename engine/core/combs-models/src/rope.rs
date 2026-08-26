@@ -202,6 +202,27 @@ impl<B: Backend> RotaryEmbedding<B> {
         debug_assert_eq!(out.dims(), [batch, heads, seq, dim]);
         out
     }
+
+    /// Applies RoPE to q and k in one fused dispatch where the kernel
+    /// takes the shapes (wgpu f32 backends, decode and prefill alike);
+    /// otherwise exactly [`Self::apply`], twice.
+    pub fn apply_qk(
+        &self,
+        q: Tensor<B, 4>,
+        k: Tensor<B, 4>,
+        pos: usize,
+    ) -> (Tensor<B, 4>, Tensor<B, 4>) {
+        if let Some(out) = crate::wgsl::try_rope_qk(
+            q.clone(),
+            k.clone(),
+            self.cos.clone(),
+            self.sin.clone(),
+            pos,
+        ) {
+            return out;
+        }
+        (self.apply(q, pos), self.apply(k, pos))
+    }
 }
 
 #[cfg(test)]

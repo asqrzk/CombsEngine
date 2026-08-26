@@ -282,8 +282,7 @@ impl<B: Backend> LlamaModel<B> {
             }
 
             let rotary = self.rotary_for(layer_idx);
-            let q = rotary.apply(q, pos);
-            let k = rotary.apply(k, pos);
+            let (q, k) = rotary.apply_qk(q, k, pos);
 
             // The cache owns K/V layout, GQA expansion and masking
             // (causal + optional sliding window).

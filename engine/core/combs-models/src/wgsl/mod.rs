@@ -79,12 +79,15 @@ wgsl_kernel!(ProbeEcho, "probe_echo.wgsl");
 wgsl_kernel!(ProbeSmem, "probe_smem.wgsl");
 wgsl_kernel!(RmsNorm, "rmsnorm.wgsl");
 wgsl_kernel!(DecodeAttn, "decode_attn.wgsl");
+wgsl_kernel!(RopeQk, "rope.wgsl");
 
 mod decode_attn;
 mod rmsnorm;
+mod rope;
 
 pub(crate) use decode_attn::{try_decode_attention, try_sliding_decode_attention};
 pub(crate) use rmsnorm::try_rms_norm;
+pub(crate) use rope::try_rope_qk;
 
 /// Launches one WGSL kernel on the runtime's stream.
 ///
@@ -230,6 +233,65 @@ pub async fn probe_report() -> Result<(), String> {
     // with a window.
     for (mode, d, window) in [(0usize, 64usize, 0usize), (0, 256, 0), (1, 256, 5)] {
         decode_attn_canary(&client, mode, d, window).await?;
+    }
+
+    // --- rope canary (K2) -------------------------------------------------
+    // Two heads of q, one of k, a mid-table position — both outputs
+    // checked against the host rotate_half formula.
+    let (n_q, n_kv, seq, d, pos, max_position) = (2usize, 1usize, 3usize, 64usize, 40usize, 64usize);
+    let half = d / 2;
+    let table = |t: usize, salt: f64| ((t as f64) * 0.031 + salt).sin() as f32;
+    let cos_v: Vec<f32> = (0..max_position * d).map(|t| table(t, 0.0)).collect();
+    let sin_v: Vec<f32> = (0..max_position * d).map(|t| table(t, 2.0)).collect();
+    let xq: Vec<f32> = (0..n_q * seq * d).map(|i| table(i, 5.0)).collect();
+    let xk: Vec<f32> = (0..n_kv * seq * d).map(|i| table(i, 7.0)).collect();
+    let q_h = client.create_from_slice(f32::as_bytes(&xq));
+    let k_h = client.create_from_slice(f32::as_bytes(&xk));
+    let c_h = client.create_from_slice(f32::as_bytes(&cos_v));
+    let s_h = client.create_from_slice(f32::as_bytes(&sin_v));
+    let oq_h = client.empty(xq.len() * core::mem::size_of::<f32>());
+    let ok_h = client.empty(xk.len() * core::mem::size_of::<f32>());
+    let elems = (n_q + n_kv) * seq * d;
+    launch(
+        &client,
+        RopeQk,
+        CubeCount::Static(elems.div_ceil(WORKGROUP as usize) as u32, 1, 1),
+        vec![
+            q_h.binding(),
+            k_h.binding(),
+            c_h.binding(),
+            s_h.binding(),
+            oq_h.clone().binding(),
+            ok_h.clone().binding(),
+        ],
+        vec![n_q as u64, n_kv as u64, seq as u64, d as u64, pos as u64],
+    );
+    let bytes = client
+        .read_async(vec![oq_h, ok_h])
+        .await
+        .map_err(|e| format!("rope readback failed: {e:?}"))?;
+    for (which, x, heads, got) in [
+        ("q", &xq, n_q, f32::from_bytes(&bytes[0])),
+        ("k", &xk, n_kv, f32::from_bytes(&bytes[1])),
+    ] {
+        for h in 0..heads {
+            for r in 0..seq {
+                for c in 0..d {
+                    let i = (h * seq + r) * d + c;
+                    let mate = if c < half { -x[i + half] } else { x[i - half] };
+                    let t = (pos + r) * d + c;
+                    let expect = x[i] * cos_v[t] + mate * sin_v[t];
+                    if (got[i] - expect).abs() > 1e-5 * expect.abs().max(1.0) {
+                        return Err(format!(
+                            "rope canary wrong at {which}[{i}]: got {}, \
+                             expected {expect} — the K2 kernel must stay \
+                             doored off here",
+                            got[i]
+                        ));
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
