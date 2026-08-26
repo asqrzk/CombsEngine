@@ -83,7 +83,7 @@ wgsl_kernel!(DecodeAttn, "decode_attn.wgsl");
 mod decode_attn;
 mod rmsnorm;
 
-pub(crate) use decode_attn::try_decode_attention;
+pub(crate) use decode_attn::{try_decode_attention, try_sliding_decode_attention};
 pub(crate) use rmsnorm::try_rms_norm;
 
 /// Launches one WGSL kernel on the runtime's stream.
@@ -222,11 +222,29 @@ pub async fn probe_report() -> Result<(), String> {
         }
     }
 
-    // --- decode-attention canary (K3a) ------------------------------------
-    // A small paged fixture with a shuffled table, GQA 2:1, ragged total,
+    // --- decode-attention canaries (K3a paged, K3b contiguous) ------------
+    // Paged fixtures with a shuffled table, GQA 2:1, ragged totals,
     // checked against a host softmax — the same reference the harmony
-    // matrix uses natively.
-    let (n_q, n_kv, d, page_size, total) = (4usize, 2usize, 64usize, 16usize, 21usize);
+    // matrix uses natively. d = 256 is gemma3's head dim and exercises
+    // the full-workgroup column path; the contiguous case adds mode 1
+    // with a window.
+    for (mode, d, window) in [(0usize, 64usize, 0usize), (0, 256, 0), (1, 256, 5)] {
+        decode_attn_canary(&client, mode, d, window).await?;
+    }
+    Ok(())
+}
+
+/// One decode-attention canary case: build the fixture, launch, check
+/// every output element against a host softmax.
+async fn decode_attn_canary(
+    client: &cubecl::prelude::ComputeClient<WgpuRuntime>,
+    mode: usize,
+    d: usize,
+    window: usize,
+) -> Result<(), String> {
+    use cubecl::prelude::*;
+
+    let (n_q, n_kv, page_size, total) = (4usize, 2usize, 16usize, 21usize);
     let pages = total.div_ceil(page_size);
     let num_pages = pages + 2;
     let table: Vec<i32> = (0..pages).map(|p| ((p * 3 + 1) % num_pages) as i32).collect();
@@ -236,15 +254,24 @@ pub async fn probe_report() -> Result<(), String> {
     let mut av = vec![0.0f32; num_pages * n_kv * page_size * d];
     let key = |g: usize, j: usize, c: usize| val(c + (g * total + j) * d, 0.71);
     let value = |g: usize, j: usize, c: usize| val(c + (g * total + j) * d, 90.0);
-    for j in 0..total {
-        let phys = table[j / page_size] as usize;
-        for g in 0..n_kv {
-            let base = ((phys * n_kv + g) * page_size + j % page_size) * d;
-            for c in 0..d {
-                ak[base + c] = key(g, j, c);
-                av[base + c] = value(g, j, c);
+    if mode == 0 {
+        for j in 0..total {
+            let phys = table[j / page_size] as usize;
+            for g in 0..n_kv {
+                let base = ((phys * n_kv + g) * page_size + j % page_size) * d;
+                for c in 0..d {
+                    ak[base + c] = key(g, j, c);
+                    av[base + c] = value(g, j, c);
+                }
             }
         }
+    } else {
+        ak = (0..n_kv * total * d)
+            .map(|i| key(i / (total * d), (i / d) % total, i % d))
+            .collect();
+        av = (0..n_kv * total * d)
+            .map(|i| value(i / (total * d), (i / d) % total, i % d))
+            .collect();
     }
     let scale = 0.125f32;
     let q_h = client.create_from_slice(f32::as_bytes(&qv));
@@ -253,7 +280,7 @@ pub async fn probe_report() -> Result<(), String> {
     let t_h = client.create_from_slice(i32::as_bytes(&table));
     let o_h = client.empty(n_q * d * core::mem::size_of::<f32>());
     launch(
-        &client,
+        client,
         DecodeAttn,
         CubeCount::Static(n_q as u32, 1, 1),
         vec![
@@ -269,8 +296,8 @@ pub async fn probe_report() -> Result<(), String> {
             d as u64,
             page_size as u64,
             total as u64,
-            0,
-            0,
+            window as u64,
+            mode as u64,
             f32::to_bits(scale) as u64,
         ],
     );
@@ -282,8 +309,12 @@ pub async fn probe_report() -> Result<(), String> {
     for h in 0..n_q {
         let g = h / (n_q / n_kv);
         let qi = &qv[h * d..(h + 1) * d];
-        let scores: Vec<f32> = (0..total)
-            .map(|j| {
+        let visible: Vec<usize> = (0..total)
+            .filter(|&j| window == 0 || j + window >= total)
+            .collect();
+        let scores: Vec<f32> = visible
+            .iter()
+            .map(|&j| {
                 (0..d).map(|c| qi[c] * key(g, j, c)).sum::<f32>() * scale
             })
             .collect();
@@ -291,14 +322,17 @@ pub async fn probe_report() -> Result<(), String> {
         let ps: Vec<f32> = scores.iter().map(|s| (s - m).exp()).collect();
         let sum: f32 = ps.iter().sum();
         for c in 0..d {
-            let expect: f32 =
-                (0..total).map(|j| ps[j] / sum * value(g, j, c)).sum();
+            let expect: f32 = visible
+                .iter()
+                .enumerate()
+                .map(|(idx, &j)| ps[idx] / sum * value(g, j, c))
+                .sum();
             let gv = got[h * d + c];
             if (gv - expect).abs() > 1e-3 * expect.abs().max(1.0) {
                 return Err(format!(
-                    "decode-attn canary wrong at [{h},{c}]: got {gv}, \
-                     expected {expect} — the K3 kernel must stay doored \
-                     off here"
+                    "decode-attn canary (mode {mode}, d {d}, window \
+                     {window}) wrong at [{h},{c}]: got {gv}, expected \
+                     {expect} — the K3 kernel must stay doored off here"
                 ));
             }
         }
@@ -310,6 +344,17 @@ pub async fn probe_report() -> Result<(), String> {
 mod tests {
     use super::*;
     use cubecl::prelude::*;
+
+    /// The exact probe the browser runs, on the native compiler — when
+    /// the Chrome probe fails a canary that passes here, the divergence
+    /// is Tint's, not the fixture's.
+    #[test]
+    fn probe_report_passes_natively() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        cubecl::future::block_on(probe_report()).expect("all canaries green on naga");
+    }
 
     /// The host->kernel scalar layout, proven rather than assumed: u64
     /// slots as vec2<u32>, low word first, f32 via bit round-trip.

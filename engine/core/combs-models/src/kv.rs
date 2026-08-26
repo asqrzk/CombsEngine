@@ -601,14 +601,31 @@ impl<B: Backend> PagedKVCache<B> {
         };
         let full_len = k_full.dims()[2];
         let kv_offset = pos + seq - full_len;
-        let out = attend(
-            q,
-            k_full.clone(),
-            v_full.clone(),
-            pos - kv_offset,
-            scale,
-            Some(w),
-        );
+        // K3b: the decode step attends over the rolling window in one
+        // dispatch (contiguous mode of the decode-attention kernel);
+        // chunks and refusals take the materialized path below.
+        let fast = if seq == 1 {
+            crate::wgsl::try_sliding_decode_attention(
+                q.clone(),
+                k_full.clone(),
+                v_full.clone(),
+                w,
+                scale,
+            )
+        } else {
+            None
+        };
+        let out = match fast {
+            Some(out) => out,
+            None => attend(
+                q,
+                k_full.clone(),
+                v_full.clone(),
+                pos - kv_offset,
+                scale,
+                Some(w),
+            ),
+        };
         // Keep `w-1` past tokens: the next decode step appends one, giving
         // exactly `w` visible keys (transformers' `-window + 1` rule). A
         // prefill chunk longer than the window attends over its full concat
@@ -1393,5 +1410,48 @@ mod tests {
     #[ignore = "gpu"]
     fn paged_decode_matches_contiguous_on_production_backend() {
         paged_decode_parity_on::<combs_core::CombsBackend>(&Default::default(), 1e-3);
+    }
+
+    /// The sliding invariant on the production backend: a sliding layer
+    /// (K3b decode kernel over the rolling store) must match a global
+    /// layer that keeps everything and enforces the window purely via
+    /// masking (the materialized path — the K3a kernel excludes windowed
+    /// calls). Same structure as `sliding_layer_matches_masked_global`.
+    fn sliding_parity_on<B: Backend>(dev: &B::Device, tol: f32) {
+        let (n_kv, n_q, d, w) = (2usize, 4usize, 64usize, 5usize);
+        let cfg = CacheConfig::paged(64);
+        let scale = 1.0 / (d as f64).sqrt() * 0.9;
+        let mut global = PagedKVCache::<B>::new(1, cfg);
+        let mut sliding = PagedKVCache::<B>::new_with_windows(1, cfg, vec![Some(w)]);
+        let cmp = |a: Tensor<B, 4>, b: Tensor<B, 4>, what: &str| {
+            let av: Vec<f32> = a.into_data().convert::<f32>().to_vec().unwrap();
+            let bv: Vec<f32> = b.into_data().convert::<f32>().to_vec().unwrap();
+            for (j, (x, y)) in av.iter().zip(bv.iter()).enumerate() {
+                assert!(y.is_finite(), "{what}[{j}] not finite: {y}");
+                assert!((x - y).abs() < tol, "{what}[{j}]: {x} vs {y}");
+            }
+        };
+
+        let ks: Vec<_> = (0..7).map(|i| kv_tok_on::<B>(dev, i, n_kv, d)).collect();
+        let k7 = Tensor::cat(ks.iter().map(|(k, _)| k.clone()).collect(), 2);
+        let v7 = Tensor::cat(ks.iter().map(|(_, v)| v.clone()).collect(), 2);
+        let q7 = Tensor::cat((0..7).map(|i| q_tok_on::<B>(dev, i, n_q, d)).collect(), 2);
+        let a = global.attention_opts(0, q7.clone(), k7.clone(), v7.clone(), 0, scale, Some(w));
+        let b = sliding.attention_opts(0, q7, k7, v7, 0, scale, Some(w));
+        cmp(a, b, "prefill chunk");
+
+        for i in 7..14 {
+            let (k, v) = kv_tok_on::<B>(dev, i, n_kv, d);
+            let q = q_tok_on::<B>(dev, i, n_q, d);
+            let a = global.attention_opts(0, q.clone(), k.clone(), v.clone(), i, scale, Some(w));
+            let b = sliding.attention_opts(0, q, k, v, i, scale, Some(w));
+            cmp(a, b, &format!("decode step {i}"));
+        }
+    }
+
+    #[test]
+    #[ignore = "gpu"]
+    fn sliding_layer_matches_masked_global_on_production_backend() {
+        sliding_parity_on::<combs_core::CombsBackend>(&Default::default(), 1e-3);
     }
 }

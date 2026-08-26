@@ -123,6 +123,58 @@ pub(crate) fn try_decode_attention<B: Backend>(
     None
 }
 
+/// K3b: the same kernel in contiguous mode, for the sliding/rolling
+/// stores — `k`/`v` are the concatenated `[1, n_kv, total, d]` window and
+/// key j lives at `(g·total + j)·d`. The page table is a one-element
+/// dummy (the binding is always present; mode 1 never reads it).
+pub(crate) fn try_sliding_decode_attention<B: Backend>(
+    q: Tensor<B, 4>,
+    k: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+    window: usize,
+    scale: f64,
+) -> Option<Tensor<B, 4>> {
+    if !attn_enabled() {
+        return None;
+    }
+    let [_, n_q, seq, d] = q.dims();
+    let [_, n_kv, total, arena_d] = k.dims();
+    if seq != 1
+        || d > WORKGROUP as usize
+        || d == 0
+        || arena_d != d
+        || n_kv == 0
+        || n_q % n_kv != 0
+        || total == 0
+    {
+        return None;
+    }
+    let geom = AttnGeom {
+        n_q,
+        n_kv,
+        d,
+        page_size: 1,
+        total,
+        window,
+        mode: 1,
+    };
+    if TypeId::of::<B>() == TypeId::of::<UnfusedF32>() {
+        let q: Tensor<UnfusedF32, 4> = cast_any(q)?;
+        let k: Tensor<UnfusedF32, 4> = cast_any(k)?;
+        let v: Tensor<UnfusedF32, 4> = cast_any(v)?;
+        let t = Tensor::<UnfusedF32, 1, Int>::zeros([1], &q.device());
+        return cast_any(attn_unfused(q, k, v, t, geom, scale));
+    }
+    if TypeId::of::<B>() == TypeId::of::<FusedF32>() {
+        let q: Tensor<FusedF32, 4> = cast_any(q)?;
+        let k: Tensor<FusedF32, 4> = cast_any(k)?;
+        let v: Tensor<FusedF32, 4> = cast_any(v)?;
+        let t = Tensor::<FusedF32, 1, Int>::zeros([1], &q.device());
+        return cast_any(attn_fused(q, k, v, t, geom, scale));
+    }
+    None
+}
+
 /// The launch itself, shared by both backends once primitives are in hand.
 fn launch_attn(
     q: CubeTensor<WgpuRuntime>,
@@ -411,6 +463,57 @@ mod tests {
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Contiguous mode (K3b) against the same reference: the rolling-store
+    /// layout, windows on and off, totals straddling the tile boundary.
+    #[test]
+    fn contiguous_mode_matches_the_reference() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let device = Default::default();
+        for &d in &[64usize, 128] {
+            for &total in &[1usize, 15, 257, 300] {
+                for &window in &[0usize, 5, 256] {
+                    let (n_kv, n_rep) = (2usize, 3usize);
+                    let n_q = n_kv * n_rep;
+                    let scale = 1.0 / (d as f32).sqrt();
+                    let keys: Vec<Vec<f32>> = (0..n_kv * total)
+                        .map(|i| signal(d, i as f32 * 0.31))
+                        .collect();
+                    let vals: Vec<Vec<f32>> = (0..n_kv * total)
+                        .map(|i| signal(d, i as f32 * 0.31 + 70.0))
+                        .collect();
+                    let q = signal(n_q * d, 8.8);
+                    let expect = reference(&q, &keys, &vals, n_q, n_kv, d, window, scale);
+
+                    let flat_k: Vec<f32> = keys.iter().flatten().copied().collect();
+                    let flat_v: Vec<f32> = vals.iter().flatten().copied().collect();
+                    let qt: Tensor<UnfusedF32, 4> =
+                        Tensor::from_data(TensorData::new(q, [1, n_q, 1, d]), &device);
+                    let kt: Tensor<UnfusedF32, 4> = Tensor::from_data(
+                        TensorData::new(flat_k, [1, n_kv, total, d]),
+                        &device,
+                    );
+                    let vt: Tensor<UnfusedF32, 4> = Tensor::from_data(
+                        TensorData::new(flat_v, [1, n_kv, total, d]),
+                        &device,
+                    );
+                    let got = try_sliding_decode_attention(qt, kt, vt, window, scale as f64)
+                        .expect("geometry inside the kernel's envelope")
+                        .into_data()
+                        .to_vec::<f32>()
+                        .unwrap();
+                    assert_close(
+                        &got,
+                        &expect,
+                        1e-3,
+                        &format!("contiguous d={d} T={total} w={window}"),
+                    );
                 }
             }
         }
