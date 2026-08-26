@@ -8,6 +8,7 @@
 mod act;
 mod archspec;
 mod embed;
+mod forward_probe;
 mod kv;
 mod llama;
 mod matmul;
@@ -37,6 +38,7 @@ pub use qmatmul::{
 };
 pub use quant_linear::QuantizedLinear;
 pub use registry::ModelRegistry;
+pub use forward_probe::forward_probe_report;
 pub use wgsl::probe_report as wgsl_probe_report;
 pub use rope::RotaryEmbedding;
 pub use smolvlm::{SmolVlmModel, image_prompt_expansion, pixels_to_tensor};

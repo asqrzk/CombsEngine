@@ -108,6 +108,19 @@ pub async fn combs_wgsl_probe() -> Result<String, JsValue> {
         .map_err(js_err)
 }
 
+/// Value-checks the burn-composed forward paths (manual masked
+/// attention, flash attention at head_dim 256) against a host reference
+/// on THIS browser's compiler — the paths only GeluTanh-family models
+/// exercise, which the WGSL probe cannot cover.
+#[wasm_bindgen]
+pub async fn combs_forward_probe() -> Result<String, JsValue> {
+    ensure_device().await.map_err(js_err)?;
+    combs_models::forward_probe_report()
+        .await
+        .map(|()| "ok".to_string())
+        .map_err(js_err)
+}
+
 /// Creates an engine from a config JSON and the model's bytes.
 ///
 /// `model_bytes` must be the complete GGUF image: its tensor offsets are

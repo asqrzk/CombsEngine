@@ -638,6 +638,23 @@ fn synthesize_tokenizer_json(kv: &HashMap<String, MetaValue>) -> Result<String> 
         _ => vec![],
     };
 
+    // Two tokenizer families hide behind GGUF metadata:
+    // `tokenizer.ggml.model = "gpt2"` is byte-level BPE (qwen, smollm,
+    // llama3), synthesized below as before; `= "llama"` is SentencePiece
+    // Unigram (gemma, llama1/2, mistral) — token strings carry the U+2581
+    // word marker and <0xNN> byte-fallback entries, scores are unigram
+    // log-probs and there are no merges. Synthesizing BPE for an SPM
+    // vocab produces a tokenizer that mangles every prompt and prints
+    // literal U+2581 in output — exactly what the browser (which has no
+    // sibling tokenizer.json to fall back on) shipped for gemma3.
+    let spm = matches!(
+        kv.get("tokenizer.ggml.model"),
+        Some(MetaValue::String(m)) if m == "llama"
+    );
+    if spm {
+        return synthesize_spm_tokenizer_json(kv, tokens, &scores);
+    }
+
     let mut vocab = serde_json::Map::new();
     for (i, tok) in tokens.iter().enumerate() {
         vocab.insert(tok.clone(), serde_json::Value::from(i));
@@ -694,6 +711,125 @@ fn synthesize_tokenizer_json(kv: &HashMap<String, MetaValue>) -> Result<String> 
             "end_of_word_suffix": null,
             "fuse_unk": false,
             "byte_fallback": false,
+            "vocab": vocab,
+            "merges": merges,
+        }
+    });
+    serde_json::to_string(&json)
+        .map_err(|e| FormatError::Safetensors(format!("tokenizer json: {e}")))
+}
+
+/// Builds the HF `tokenizer.json` for the SentencePiece ("llama") GGUF
+/// family — SPM-flavored BPE, the shape transformers' own converter
+/// produces and the shape every sibling tokenizer.json of this family
+/// ships: vocab with U+2581 word markers and <0xNN> byte fallback,
+/// merges DERIVED from the piece scores (GGUF stores score = -merge_rank
+/// and no merges), a space -> U+2581 normalizer with the family's
+/// optional dummy prefix, and a Split-space pre-tokenizer.
+fn synthesize_spm_tokenizer_json(
+    kv: &HashMap<String, MetaValue>,
+    tokens: &[String],
+    scores: &[f32],
+) -> Result<String> {
+    let unk_token = match kv.get("tokenizer.ggml.unknown_token_id") {
+        Some(MetaValue::U32(v)) => tokens
+            .get(*v as usize)
+            .cloned()
+            .unwrap_or_else(|| "<unk>".to_string()),
+        _ => "<unk>".to_string(),
+    };
+    let prepend = match kv.get("tokenizer.ggml.add_space_prefix") {
+        Some(MetaValue::Bool(b)) => *b,
+        _ => true,
+    };
+
+    let mut vocab = serde_json::Map::new();
+    let mut ids: HashMap<&str, usize> = HashMap::with_capacity(tokens.len());
+    for (i, tok) in tokens.iter().enumerate() {
+        vocab.insert(tok.clone(), serde_json::Value::from(i));
+        ids.insert(tok.as_str(), i);
+    }
+
+    // transformers' generate_merges, verbatim in shape: every split of
+    // every piece whose halves are both in the vocab is a candidate,
+    // locally ordered by the halves' ids, globally ordered by the parent
+    // piece's score descending (score = -rank, so this restores the
+    // original merge order). A pair (l, r) determines its parent l+r
+    // uniquely, so no dedupe is needed.
+    let mut merges: Vec<(usize, usize, f32)> = Vec::new();
+    for (piece, &score) in tokens.iter().zip(scores) {
+        let mut local: Vec<(usize, usize)> = Vec::new();
+        for (split, _) in piece.char_indices().skip(1) {
+            let (l, r) = piece.split_at(split);
+            if let (Some(&li), Some(&ri)) = (ids.get(l), ids.get(r)) {
+                local.push((li, ri));
+            }
+        }
+        local.sort_unstable();
+        merges.extend(local.into_iter().map(|(l, r)| (l, r, score)));
+    }
+    merges.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    let merges: Vec<serde_json::Value> = merges
+        .into_iter()
+        .map(|(l, r, _)| serde_json::json!([tokens[l], tokens[r]]))
+        .collect();
+
+    let mut added_tokens = Vec::new();
+    if let Some(MetaValue::I32s(types)) = kv.get("tokenizer.ggml.token_type") {
+        for (i, (tok, ty)) in tokens.iter().zip(types.iter()).enumerate() {
+            if *ty == 3 || *ty == 4 {
+                added_tokens.push(serde_json::json!({
+                    "id": i,
+                    "content": tok,
+                    "single_word": false,
+                    "lstrip": false,
+                    "rstrip": false,
+                    "normalized": false,
+                    "special": true,
+                }));
+            }
+        }
+    }
+
+    let mut normalizers = Vec::new();
+    if prepend {
+        normalizers.push(serde_json::json!({"type": "Prepend", "prepend": "\u{2581}"}));
+    }
+    normalizers.push(serde_json::json!({
+        "type": "Replace", "pattern": {"String": " "}, "content": "\u{2581}"
+    }));
+    let mut decoders = vec![
+        serde_json::json!({"type": "Replace", "pattern": {"String": "\u{2581}"}, "content": " "}),
+        serde_json::json!({"type": "ByteFallback"}),
+        serde_json::json!({"type": "Fuse"}),
+    ];
+    if prepend {
+        decoders.push(serde_json::json!({"type": "Strip", "content": " ", "start": 1, "stop": 0}));
+    }
+
+    let json = serde_json::json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": added_tokens,
+        "normalizer": {"type": "Sequence", "normalizers": normalizers},
+        "pre_tokenizer": {
+            "type": "Split",
+            "pattern": {"String": " "},
+            "behavior": "MergedWithPrevious",
+            "invert": false
+        },
+        "post_processor": null,
+        "decoder": {"type": "Sequence", "decoders": decoders},
+        "model": {
+            "type": "BPE",
+            "dropout": null,
+            "unk_token": unk_token,
+            "continuing_subword_prefix": null,
+            "end_of_word_suffix": null,
+            "fuse_unk": true,
+            "byte_fallback": true,
+            "ignore_merges": false,
             "vocab": vocab,
             "merges": merges,
         }
