@@ -713,6 +713,7 @@ impl Engine {
                 }),
             }
         }
+        let messages = crate::template::sanitize_history(messages);
         let pairs: Vec<(String, String)> = messages
             .iter()
             .map(|m| (m.role.clone(), m.content.clone()))

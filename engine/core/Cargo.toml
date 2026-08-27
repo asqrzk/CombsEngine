@@ -44,6 +44,7 @@ tokenizers = { version = "0.22", default-features = false, features = ["fancy-re
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 minijinja = "2"
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 tiny_http = "0.12"
 dialoguer = "0.11"
 console = "0.15"

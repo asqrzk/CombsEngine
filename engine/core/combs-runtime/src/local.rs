@@ -480,6 +480,7 @@ impl ChatHost for LocalEngine {
             // A template that will not render degrades to the token-sniffed
             // wrap rather than breaking the turn.
         }
+        let messages = crate::template::sanitize_history(messages);
         let pairs: Vec<(String, String)> = messages
             .iter()
             .map(|m| (m.role.clone(), m.content.clone()))

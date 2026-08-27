@@ -39,6 +39,13 @@ impl ChatTemplate {
         // transformers compiles templates with trim_blocks + lstrip_blocks.
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
+        // HF templates lean on Python string methods (`.split`,
+        // `.lstrip`, ...). Without this callback minijinja's lenient
+        // mode resolves them to undefined and PRINTS EMPTY — qwen3's
+        // template half-rendered into empty message bodies with the
+        // reasoning kept, which is how think-block pollution reached
+        // the context.
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_function(
             "raise_exception",
             |msg: String| -> Result<String, JinjaError> {
@@ -48,6 +55,7 @@ impl ChatTemplate {
         env.add_function("strftime_now", |fmt: String| strftime_now(&fmt));
         env.add_filter("tojson", tojson_filter);
 
+        let messages = sanitize_history(messages);
         let msgs: Vec<serde_json::Value> =
             messages.iter().map(|m| m.to_template_value()).collect();
         // transformers passes `tools=None` when absent; jinja `none` keeps
@@ -229,5 +237,88 @@ mod tests {
             .render(&[crate::ChatMessage::text("user", "hi")], None)
             .unwrap_err();
         assert!(err.contains("roles must alternate"), "got: {err}");
+    }
+}
+
+/// Prior assistant turns must not carry reasoning back into the
+/// context: a closed `<think>` block reduces to the content after
+/// `</think>` (matching the official templates, and idempotent with
+/// them), and an UNCLOSED `<think>` — the residue of a turn that
+/// stopped mid-thought — drops from `<think>` onward entirely, so one
+/// broken turn cannot teach the model to imitate the break. The final
+/// message is untouched: assistant-continuation flows may legitimately
+/// carry open reasoning.
+pub(crate) fn sanitize_history(messages: &[crate::ChatMessage]) -> Vec<crate::ChatMessage> {
+    let last = messages.len().saturating_sub(1);
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            if i == last || m.role != "assistant" || !m.content.contains("<think>") {
+                return m.clone();
+            }
+            let mut cleaned = m.clone();
+            cleaned.content = match m.content.rfind("</think>") {
+                Some(p) => m.content[p + "</think>".len()..]
+                    .trim_start_matches('\n')
+                    .to_string(),
+                None => {
+                    let cut = m.content.find("<think>").expect("checked above");
+                    m.content[..cut].trim_end().to_string()
+                }
+            };
+            cleaned
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::sanitize_history;
+    use crate::ChatMessage;
+
+    fn msg(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.into(),
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn closed_think_reduces_to_the_answer() {
+        let out = sanitize_history(&[
+            msg("user", "hi"),
+            msg("assistant", "<think>\nsteps\n</think>\n\nHello!"),
+            msg("user", "next"),
+        ]);
+        assert_eq!(out[1].content, "Hello!");
+    }
+
+    #[test]
+    fn unclosed_think_drops_entirely() {
+        let out = sanitize_history(&[
+            msg("user", "hi"),
+            msg("assistant", "<think>\nnever finished"),
+            msg("user", "next"),
+        ]);
+        assert_eq!(out[1].content, "");
+    }
+
+    #[test]
+    fn the_final_message_is_untouched() {
+        let out = sanitize_history(&[
+            msg("user", "hi"),
+            msg("assistant", "<think>\nstill going"),
+        ]);
+        assert_eq!(out[1].content, "<think>\nstill going");
+    }
+
+    #[test]
+    fn plain_messages_pass_through() {
+        let out = sanitize_history(&[msg("user", "a"), msg("assistant", "b"), msg("user", "c")]);
+        assert_eq!(out[1].content, "b");
     }
 }

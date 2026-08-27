@@ -87,3 +87,49 @@ fn synthesized_tokenizer_matches_the_sibling() {
         BATTERY.len()
     );
 }
+
+/// The chat template must actually render — a silent fallback to the
+/// token-sniffed wrap discards the checkpoint's own conversation
+/// discipline (qwen3's reasoning-stripping included), which is how
+/// think-block pollution reached the context. This drives the REAL
+/// template from the model file through the real engine wrap.
+#[test]
+#[ignore = "requires COMBS_TEST_GGUF"]
+fn chat_template_renders_and_strips_prior_reasoning() {
+    let Ok(path) = std::env::var("COMBS_TEST_GGUF") else {
+        eprintln!("skipping: set COMBS_TEST_GGUF");
+        return;
+    };
+    let source = combs_formats::open_model_source(&path).expect("open model");
+    let engine =
+        combs_runtime::Engine::load(&source, combs_core::init_device()).expect("load");
+    let msgs = vec![
+        combs_runtime::ChatMessage {
+            role: "user".into(),
+            content: "who are you".into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+        },
+        combs_runtime::ChatMessage {
+            role: "assistant".into(),
+            content: "<think>\nreasoning here\n</think>\n\nI am an assistant.".into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+        },
+        combs_runtime::ChatMessage {
+            role: "user".into(),
+            content: "what can you do".into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+        },
+    ];
+    let prompt = engine.wrap_chat(&msgs);
+    println!("[wrap] rendered {} chars:\n{}", prompt.len(), prompt);
+    assert!(
+        !prompt.contains("reasoning here"),
+        "prior-turn reasoning must be stripped from the rendered history"
+    );
+}
