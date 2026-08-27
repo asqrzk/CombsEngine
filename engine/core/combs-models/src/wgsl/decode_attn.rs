@@ -27,7 +27,7 @@ use burn_ir::{CustomOpIr, HandleContainer, OperationIr, TensorIr, TensorStatus};
 use cubecl::prelude::CubeCount;
 
 use super::rmsnorm::cast_any;
-use super::{DecodeAttn, WORKGROUP, launch, wgsl_enabled};
+use super::{DecodeAttn, DecodeAttnCombine, DecodeAttnSplit, WORKGROUP, launch, wgsl_enabled};
 use crate::qlinear::{FusedF32, InnerF32, UnfusedF32};
 
 /// Per-kernel door on top of the master `COMBS_WGSL`; read once.
@@ -178,7 +178,15 @@ pub(crate) fn try_sliding_decode_attention<B: Backend>(
     None
 }
 
-/// The launch itself, shared by both backends once primitives are in hand.
+/// Keys per segment in the split path — two full softmax tiles. The
+/// single-pass kernel keeps totals at or below this (its serial tile
+/// walk is fine there); beyond it, segments multiply the workgroup
+/// count and the combine pass folds the partials.
+const SPLIT_SEG_LEN: usize = 512;
+
+/// The launch itself, shared by both backends once primitives are in
+/// hand — which is also why the fused custom op inherits the split path
+/// for free: routing happens below the fusion stream.
 fn launch_attn(
     q: CubeTensor<WgpuRuntime>,
     k: CubeTensor<WgpuRuntime>,
@@ -193,19 +201,67 @@ fn launch_attn(
     let table = into_contiguous(table);
     let client = q.client.clone();
     let out = client.empty(geom.n_q * geom.d * core::mem::size_of::<f32>());
-    launch(
-        &client,
-        DecodeAttn,
-        CubeCount::Static(geom.n_q as u32, 1, 1),
-        vec![
-            q.handle.binding(),
-            k.handle.binding(),
-            v.handle.binding(),
-            table.handle.binding(),
-            out.clone().binding(),
-        ],
-        geom.scalar_slots(scale),
-    );
+
+    // K8: a deep global-visibility paged total starves the single-pass
+    // kernel (one workgroup per head, serial tile walk), so the key
+    // range splits across (n_q × segs) workgroups and a combine pass
+    // merges the flash partials.
+    if geom.mode == 0 && geom.window == 0 && geom.total > SPLIT_SEG_LEN {
+        let segs = geom.total.div_ceil(SPLIT_SEG_LEN);
+        let m_part = client.empty(geom.n_q * segs * core::mem::size_of::<f32>());
+        let s_part = client.empty(geom.n_q * segs * core::mem::size_of::<f32>());
+        let o_part = client.empty(geom.n_q * segs * geom.d * core::mem::size_of::<f32>());
+        launch(
+            &client,
+            DecodeAttnSplit,
+            CubeCount::Static(geom.n_q as u32, segs as u32, 1),
+            vec![
+                q.handle.binding(),
+                k.handle.binding(),
+                v.handle.binding(),
+                table.handle.binding(),
+                m_part.clone().binding(),
+                s_part.clone().binding(),
+                o_part.clone().binding(),
+            ],
+            vec![
+                geom.n_q as u64,
+                geom.n_kv as u64,
+                geom.d as u64,
+                geom.page_size as u64,
+                geom.total as u64,
+                SPLIT_SEG_LEN as u64,
+                segs as u64,
+                f32::to_bits(scale as f32) as u64,
+            ],
+        );
+        launch(
+            &client,
+            DecodeAttnCombine,
+            CubeCount::Static(geom.n_q as u32, 1, 1),
+            vec![
+                m_part.binding(),
+                s_part.binding(),
+                o_part.binding(),
+                out.clone().binding(),
+            ],
+            vec![geom.n_q as u64, geom.d as u64, segs as u64],
+        );
+    } else {
+        launch(
+            &client,
+            DecodeAttn,
+            CubeCount::Static(geom.n_q as u32, 1, 1),
+            vec![
+                q.handle.binding(),
+                k.handle.binding(),
+                v.handle.binding(),
+                table.handle.binding(),
+                out.clone().binding(),
+            ],
+            geom.scalar_slots(scale),
+        );
+    }
     CubeTensor::new_contiguous(
         client,
         q.device.clone(),
@@ -520,6 +576,122 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The split path (totals past one segment): host-reference harmony
+    /// over multi-segment geometries, including a segment-boundary total,
+    /// a ragged tail, GQA and full-workgroup head dims.
+    #[test]
+    fn split_kv_decode_attention_matches_the_reference() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let device = Default::default();
+        for &d in &[64usize, 128, 256] {
+            for &n_rep in &[1usize, 2] {
+                for &total in &[513usize, 1024, 1500, 4900] {
+                    let n_kv = 2usize;
+                    let n_q = n_kv * n_rep;
+                    let page_size = 16usize;
+                    let scale = 1.0 / (d as f32).sqrt();
+                    let keys: Vec<Vec<f32>> = (0..n_kv * total)
+                        .map(|i| signal(d, i as f32 * 0.17))
+                        .collect();
+                    let vals: Vec<Vec<f32>> = (0..n_kv * total)
+                        .map(|i| signal(d, i as f32 * 0.17 + 50.0))
+                        .collect();
+                    let q = signal(n_q * d, 2.4);
+                    let expect = reference(&q, &keys, &vals, n_q, n_kv, d, 0, scale);
+                    let (ak, av, table, num_pages) =
+                        paged_layout(&keys, &vals, n_kv, d, total, page_size);
+                    let qt: Tensor<UnfusedF32, 4> =
+                        Tensor::from_data(TensorData::new(q, [1, n_q, 1, d]), &device);
+                    let kt: Tensor<UnfusedF32, 4> = Tensor::from_data(
+                        TensorData::new(ak, [num_pages, n_kv, page_size, d]),
+                        &device,
+                    );
+                    let vt: Tensor<UnfusedF32, 4> = Tensor::from_data(
+                        TensorData::new(av, [num_pages, n_kv, page_size, d]),
+                        &device,
+                    );
+                    let len = table.len();
+                    let tt: Tensor<UnfusedF32, 1, Int> =
+                        Tensor::from_data(TensorData::new(table, [len]), &device);
+                    let got = try_decode_attention(qt, kt, vt, tt, total, 0, scale as f64)
+                        .expect("geometry inside the kernel's envelope")
+                        .into_data()
+                        .to_vec::<f32>()
+                        .unwrap();
+                    assert_close(
+                        &got,
+                        &expect,
+                        1e-3,
+                        &format!("split d={d} n_rep={n_rep} T={total}"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Fused and unfused agree through the SPLIT path too (two launches
+    /// inside one custom-op execute).
+    #[test]
+    fn split_path_fused_agrees_with_unfused_exactly() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let (n_kv, n_rep, d, total, page_size) = (2usize, 2usize, 128usize, 1500usize, 16usize);
+        let n_q = n_kv * n_rep;
+        let keys: Vec<Vec<f32>> = (0..n_kv * total).map(|i| signal(d, i as f32)).collect();
+        let vals: Vec<Vec<f32>> =
+            (0..n_kv * total).map(|i| signal(d, i as f32 + 31.0)).collect();
+        let q = signal(n_q * d, 9.1);
+        let (ak, av, table, num_pages) =
+            paged_layout(&keys, &vals, n_kv, d, total, page_size);
+
+        let run_unfused = {
+            let device = Default::default();
+            let qt: Tensor<UnfusedF32, 4> =
+                Tensor::from_data(TensorData::new(q.clone(), [1, n_q, 1, d]), &device);
+            let kt: Tensor<UnfusedF32, 4> = Tensor::from_data(
+                TensorData::new(ak.clone(), [num_pages, n_kv, page_size, d]),
+                &device,
+            );
+            let vt: Tensor<UnfusedF32, 4> = Tensor::from_data(
+                TensorData::new(av.clone(), [num_pages, n_kv, page_size, d]),
+                &device,
+            );
+            let len = table.len();
+            let tt: Tensor<UnfusedF32, 1, Int> =
+                Tensor::from_data(TensorData::new(table.clone(), [len]), &device);
+            try_decode_attention(qt, kt, vt, tt, total, 0, 0.09)
+                .expect("kernel path")
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap()
+        };
+        let run_fused = {
+            let device = Default::default();
+            let qt: Tensor<FusedF32, 4> =
+                Tensor::from_data(TensorData::new(q, [1, n_q, 1, d]), &device);
+            let kt: Tensor<FusedF32, 4> = Tensor::from_data(
+                TensorData::new(ak, [num_pages, n_kv, page_size, d]),
+                &device,
+            );
+            let vt: Tensor<FusedF32, 4> = Tensor::from_data(
+                TensorData::new(av, [num_pages, n_kv, page_size, d]),
+                &device,
+            );
+            let len = table.len();
+            let tt: Tensor<FusedF32, 1, Int> =
+                Tensor::from_data(TensorData::new(table, [len]), &device);
+            try_decode_attention(qt, kt, vt, tt, total, 0, 0.09)
+                .expect("kernel path")
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap()
+        };
+        assert_eq!(run_unfused, run_fused, "one split pipeline, two dispatch routes");
     }
 
     /// Fused and unfused answers must agree bit-for-bit: same kernel, same

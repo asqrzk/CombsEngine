@@ -85,6 +85,8 @@ wgsl_kernel!(ProbeSmem, "probe_smem.wgsl");
 wgsl_kernel!(RmsNorm, "rmsnorm.wgsl");
 wgsl_kernel!(DecodeAttn, "decode_attn.wgsl");
 wgsl_kernel!(DecodeAttnQ8, "decode_attn_q8.wgsl");
+wgsl_kernel!(DecodeAttnSplit, "decode_attn_split.wgsl");
+wgsl_kernel!(DecodeAttnCombine, "decode_attn_combine.wgsl");
 wgsl_kernel!(RopeQk, "rope.wgsl");
 wgsl_kernel!(DecodeGemvQ8, "decode_gemv_q8.wgsl");
 wgsl_kernel!(DecodeGemvQ4K, "decode_gemv_q4k.wgsl");
@@ -294,6 +296,12 @@ pub async fn probe_report() -> Result<(), String> {
         decode_attn_canary(&client, mode, d, window, n_kv, total).await?;
     }
 
+    // --- split-KV decode-attention canary (K8) ----------------------------
+    // The two-pass deep path (segment partials + combine), value-checked
+    // at a multi-segment total with a ragged last segment and d = 256.
+    split_attn_canary(&client, 256, 1300).await?;
+    split_attn_canary(&client, 128, 700).await?;
+
     // --- quantized decode-attention canaries (K3c) ------------------------
     // Grid-exact packed lanes (the i32::MAX corner word included) through
     // the q8 kernel's bitcast/shift unpack — constructs no other canary
@@ -405,6 +413,114 @@ pub async fn probe_report() -> Result<(), String> {
                         ));
                     }
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One split-KV decode-attention canary: the deep-context two-pass
+/// pipeline (segment partials, then combine) against a host softmax,
+/// with the same fixtures the single-pass canary uses.
+async fn split_attn_canary(
+    client: &cubecl::prelude::ComputeClient<WgpuRuntime>,
+    d: usize,
+    total: usize,
+) -> Result<(), String> {
+    use cubecl::prelude::*;
+
+    let (n_q, n_kv, page_size, seg_len) = (4usize, 2usize, 16usize, 512usize);
+    let segs = total.div_ceil(seg_len);
+    let pages = total.div_ceil(page_size);
+    let num_pages = pages + 2;
+    let table: Vec<i32> = (0..pages).map(|p| ((p + 2) % num_pages) as i32).collect();
+    let val = |i: usize, salt: f32| ((i as f32 * 0.437 + salt).sin() * 1.5) as f32;
+    let qv: Vec<f32> = (0..n_q * d).map(|i| val(i, 42.5)).collect();
+    let mut ak = vec![0.0f32; num_pages * n_kv * page_size * d];
+    let mut av = vec![0.0f32; num_pages * n_kv * page_size * d];
+    let key = |g: usize, j: usize, c: usize| val(c + (g * total + j) * d, 0.71);
+    let value = |g: usize, j: usize, c: usize| val(c + (g * total + j) * d, 90.0);
+    for j in 0..total {
+        let phys = table[j / page_size] as usize;
+        for g in 0..n_kv {
+            let base = ((phys * n_kv + g) * page_size + j % page_size) * d;
+            for c in 0..d {
+                ak[base + c] = key(g, j, c);
+                av[base + c] = value(g, j, c);
+            }
+        }
+    }
+    let scale = 1.0 / (d as f32).sqrt();
+    let q_h = client.create_from_slice(f32::as_bytes(&qv));
+    let k_h = client.create_from_slice(f32::as_bytes(&ak));
+    let v_h = client.create_from_slice(f32::as_bytes(&av));
+    let t_h = client.create_from_slice(i32::as_bytes(&table));
+    let m_h = client.empty(n_q * segs * core::mem::size_of::<f32>());
+    let s_h = client.empty(n_q * segs * core::mem::size_of::<f32>());
+    let o_h = client.empty(n_q * segs * d * core::mem::size_of::<f32>());
+    let out_h = client.empty(n_q * d * core::mem::size_of::<f32>());
+    launch(
+        client,
+        DecodeAttnSplit,
+        CubeCount::Static(n_q as u32, segs as u32, 1),
+        vec![
+            q_h.binding(),
+            k_h.binding(),
+            v_h.binding(),
+            t_h.binding(),
+            m_h.clone().binding(),
+            s_h.clone().binding(),
+            o_h.clone().binding(),
+        ],
+        vec![
+            n_q as u64,
+            n_kv as u64,
+            d as u64,
+            page_size as u64,
+            total as u64,
+            seg_len as u64,
+            segs as u64,
+            f32::to_bits(scale) as u64,
+        ],
+    );
+    launch(
+        client,
+        DecodeAttnCombine,
+        CubeCount::Static(n_q as u32, 1, 1),
+        vec![
+            m_h.binding(),
+            s_h.binding(),
+            o_h.binding(),
+            out_h.clone().binding(),
+        ],
+        vec![n_q as u64, d as u64, segs as u64],
+    );
+    let bytes = client
+        .read_async(vec![out_h])
+        .await
+        .map_err(|e| format!("split-attn readback failed: {e:?}"))?;
+    let got = f32::from_bytes(&bytes[0]);
+    for h in 0..n_q {
+        let g = h / (n_q / n_kv);
+        let qi = &qv[h * d..(h + 1) * d];
+        let sc: Vec<f64> = (0..total)
+            .map(|j| {
+                (0..d).map(|c| qi[c] as f64 * key(g, j, c) as f64).sum::<f64>()
+                    * scale as f64
+            })
+            .collect();
+        let m = sc.iter().cloned().fold(f64::MIN, f64::max);
+        let ps: Vec<f64> = sc.iter().map(|s| (s - m).exp()).collect();
+        let sum: f64 = ps.iter().sum();
+        for c in 0..d {
+            let expect: f64 = (0..total)
+                .map(|j| ps[j] / sum * value(g, j, c) as f64)
+                .sum();
+            let gv = got[h * d + c] as f64;
+            if !gv.is_finite() || (gv - expect).abs() > 5e-3 * expect.abs().max(1.0) {
+                return Err(format!(
+                    "split-attn canary (d {d}, total {total}) wrong at                      [{h},{c}]: got {gv}, expected {expect} — the K8 path                      must stay doored off here"
+                ));
             }
         }
     }
