@@ -139,11 +139,37 @@ pub(crate) enum Submitted {
 
 /// One generation in flight: everything the token loop carries between
 /// steps, and nothing about how it is driven.
+/// Reasoning-marker discipline for the decode loop: while the CURRENT
+/// generation holds an open `<think>` with no matching `</think>`, the
+/// stop tokens are masked out of sampling — a model cannot legally end
+/// its turn mid-thought. Depth counts markers over accepted tokens
+/// only; `max_tokens` still bounds the run (finish_reason = length),
+/// so a model that refuses to close cannot spin forever.
+pub(crate) struct ThinkGuard {
+    open: u32,
+    close: u32,
+    stop_ids: Vec<u32>,
+    depth: u32,
+}
+
+/// The vocab's explicit reasoning markers, when both exist.
+/// `COMBS_THINK_GUARD=0` disables the guard for A/B runs.
+fn think_marker_ids(tokenizer: &Tokenizer) -> Option<(u32, u32)> {
+    if matches!(std::env::var("COMBS_THINK_GUARD").as_deref(), Ok("0")) {
+        return None;
+    }
+    Some((
+        tokenizer.token_to_id("<think>")?,
+        tokenizer.token_to_id("</think>")?,
+    ))
+}
+
 pub(crate) struct ActiveGeneration {
     cache: Box<dyn KVCache<CombsBackend>>,
     sampler: Box<dyn Sampler>,
     stop: StopDetector,
     constraint: Option<ConstraintState>,
+    think_guard: Option<ThinkGuard>,
     detok: IncrementalDetokenizer,
     /// Prompt + emitted tokens — what the sampler's penalties see.
     history: Vec<u32>,
@@ -291,8 +317,24 @@ pub(crate) fn begin_generation(
     // Penalties must never touch the stop tokens: `<|im_end|>` appears
     // once per prior turn in a chat prompt, so an unexempted penalty
     // suppresses the model's ability to end its turn — and gets worse
-    // the longer the conversation runs.
-    let sampler: Box<dyn Sampler> = sampler_from_params_exempting(&config.sampling, &eos_ids);
+    // the longer the conversation runs. The reasoning markers are
+    // structural in exactly the same way: penalizing `</think>` for
+    // having appeared in prior turns suppresses the model's ability to
+    // stop thinking.
+    let think_ids = think_marker_ids(tokenizer);
+    let mut penalty_exempt = eos_ids.clone();
+    if let Some((open, close)) = think_ids {
+        penalty_exempt.push(open);
+        penalty_exempt.push(close);
+    }
+    let sampler: Box<dyn Sampler> =
+        sampler_from_params_exempting(&config.sampling, &penalty_exempt);
+    let think_guard = think_ids.map(|(open, close)| ThinkGuard {
+        open,
+        close,
+        stop_ids: eos_ids.clone(),
+        depth: 0,
+    });
     let stop = StopDetector::new(eos_ids, config.stop_strings.clone());
 
     let t_start = Instant::now();
@@ -356,6 +398,7 @@ pub(crate) fn begin_generation(
         sampler,
         stop,
         constraint,
+        think_guard,
         detok: IncrementalDetokenizer::new(),
         history: prompt_tokens.to_vec(),
         next: 0,
@@ -409,6 +452,15 @@ impl ActiveGeneration {
                 return Ok(());
             }
         }
+        if let Some(g) = &self.think_guard {
+            if g.depth > 0 {
+                for &id in &g.stop_ids {
+                    if let Some(v) = row.get_mut(id as usize) {
+                        *v = f32::NEG_INFINITY;
+                    }
+                }
+            }
+        }
         let outcome = self.sampler.sample(&mut row, &self.history);
         self.next = outcome.token;
         self.next_logprobs = outcome.logprobs;
@@ -447,6 +499,13 @@ impl ActiveGeneration {
             return;
         }
         self.history.push(self.next);
+        if let Some(g) = self.think_guard.as_mut() {
+            if self.next == g.open {
+                g.depth += 1;
+            } else if self.next == g.close {
+                g.depth = g.depth.saturating_sub(1);
+            }
+        }
         let piece = match self.detok.push(tokenizer, self.next) {
             Ok(p) => p,
             Err(e) => {
