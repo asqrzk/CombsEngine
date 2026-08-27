@@ -7,8 +7,8 @@
 //! rows directly.
 //!
 //! The kernel also implements a contiguous mode (`mode = 1`) for the
-//! sliding/rolling stores; the dispatcher here wires the paged mode, and
-//! Stage 4 (K3b) opens the second one.
+//! sliding/rolling stores — K3b, dispatched through
+//! [`try_sliding_decode_attention`].
 //!
 //! Fallback discipline as everywhere: doors, foreign backends, f16,
 //! d > 256, or any geometry surprise → `None`, and the caller runs the
