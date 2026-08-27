@@ -870,22 +870,35 @@ impl<B: Backend> KVCache<B> for PagedKVCache<B> {
                     arena_v = arena_v.slice_assign(range, v.clone().narrow(2, written, run));
                     written += run;
                 }
-                // K3a: the single-token step attends in place — one
-                // dispatch reading K/V through the page table; no gather,
-                // no repeat_kv, no materialized scores. The slice_assign
-                // above is already enqueued on the same stream, so the
-                // kernel sees this token's K/V.
-                if seq == 1 && window.is_none() {
+                // K3a / K9: attend in place — one dispatch reading K/V
+                // through the page table; no gather, no repeat_kv, no
+                // materialized scores. The slice_assign above is already
+                // enqueued on the same stream, so the kernel sees this
+                // chunk's K/V. Decode and prefill take sibling kernels.
+                if window.is_none() {
                     let table = self.page_indices(pages);
-                    if let Some(out) = crate::wgsl::try_decode_attention(
-                        q.clone(),
-                        arena_k.clone(),
-                        arena_v.clone(),
-                        table,
-                        total,
-                        0,
-                        scale,
-                    ) {
+                    let fast = if seq == 1 {
+                        crate::wgsl::try_decode_attention(
+                            q.clone(),
+                            arena_k.clone(),
+                            arena_v.clone(),
+                            table,
+                            total,
+                            0,
+                            scale,
+                        )
+                    } else {
+                        crate::wgsl::try_prefill_attention(
+                            q.clone(),
+                            arena_k.clone(),
+                            arena_v.clone(),
+                            table,
+                            pos,
+                            total,
+                            scale,
+                        )
+                    };
+                    if let Some(out) = fast {
                         self.arenas[layer] = Some(Arena::Fp { k: arena_k, v: arena_v });
                         return out;
                     }

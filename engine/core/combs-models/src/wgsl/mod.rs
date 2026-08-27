@@ -87,6 +87,7 @@ wgsl_kernel!(DecodeAttn, "decode_attn.wgsl");
 wgsl_kernel!(DecodeAttnQ8, "decode_attn_q8.wgsl");
 wgsl_kernel!(DecodeAttnSplit, "decode_attn_split.wgsl");
 wgsl_kernel!(DecodeAttnCombine, "decode_attn_combine.wgsl");
+wgsl_kernel!(PrefillAttn, "prefill_attn.wgsl");
 wgsl_kernel!(RopeQk, "rope.wgsl");
 wgsl_kernel!(DecodeGemvQ8, "decode_gemv_q8.wgsl");
 wgsl_kernel!(DecodeGemvQ4K, "decode_gemv_q4k.wgsl");
@@ -106,7 +107,7 @@ mod decode_attn_q8;
 mod rmsnorm;
 mod rope;
 
-pub(crate) use decode_attn::{try_decode_attention, try_sliding_decode_attention};
+pub(crate) use decode_attn::{try_decode_attention, try_prefill_attention, try_sliding_decode_attention};
 pub(crate) use decode_attn_q8::{QuantArena, try_decode_attention_q8};
 pub(crate) use rmsnorm::try_rms_norm;
 pub(crate) use rope::try_rope_qk;

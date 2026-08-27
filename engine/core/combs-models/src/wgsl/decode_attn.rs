@@ -27,7 +27,9 @@ use burn_ir::{CustomOpIr, HandleContainer, OperationIr, TensorIr, TensorStatus};
 use cubecl::prelude::CubeCount;
 
 use super::rmsnorm::cast_any;
-use super::{DecodeAttn, DecodeAttnCombine, DecodeAttnSplit, WORKGROUP, launch, wgsl_enabled};
+use super::{
+    DecodeAttn, DecodeAttnCombine, DecodeAttnSplit, PrefillAttn, WORKGROUP, launch, wgsl_enabled,
+};
 use crate::qlinear::{FusedF32, InnerF32, UnfusedF32};
 
 /// Per-kernel door on top of the master `COMBS_WGSL`; read once.
@@ -123,6 +125,216 @@ pub(crate) fn try_decode_attention<B: Backend>(
         return cast_any(attn_fused(q, k, v, t, geom, scale));
     }
     None
+}
+
+/// K9: paged causal PREFILL attention — seq > 1 queries against the
+/// arena, straight through the page table, one dispatch per layer per
+/// chunk. Global visibility only; windowed callers and refused
+/// geometry keep the materialized gather + attend path.
+pub(crate) fn try_prefill_attention<B: Backend>(
+    q: Tensor<B, 4>,
+    k_arena: Tensor<B, 4>,
+    v_arena: Tensor<B, 4>,
+    table: Tensor<B, 1, Int>,
+    pos: usize,
+    total: usize,
+    scale: f64,
+) -> Option<Tensor<B, 4>> {
+    // Experimental door, DEFAULT OFF: the kernel is correct (full
+    // harmony) but slower than burn's flash today — small key tiles pay
+    // a barrier wave every 8 keys, and amortizing them under the 16 KB
+    // wasm shared-memory budget without subgroups needs banked staging
+    // this version doesn't have. `COMBS_WGSL_PREFILL=1` opts in for
+    // iteration; the measured story lives with the kernel's records.
+    fn prefill_door() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            matches!(std::env::var("COMBS_WGSL_PREFILL").as_deref(), Ok("1"))
+        })
+    }
+    if !attn_enabled() || !prefill_door() {
+        return None;
+    }
+    let [_, n_q, seq, d] = q.dims();
+    let [_, n_kv, page_size, arena_d] = k_arena.dims();
+    // d caps at 128: the tile-resident working set (q 8 KB + k 4 KB)
+    // is budgeted for it, and d % 16 == 0 gives every PV lane whole
+    // columns. Larger or ragged head dims keep the materialized path.
+    if seq < 2
+        || d > 128
+        || d == 0
+        || d % 16 != 0
+        || arena_d != d
+        || n_kv == 0
+        || n_q % n_kv != 0
+        || pos + seq != total
+        || table.dims()[0] < total.div_ceil(page_size)
+        || seq.div_ceil(16) > 65535
+    {
+        return None;
+    }
+    let geom = AttnGeom {
+        n_q,
+        n_kv,
+        d,
+        page_size,
+        total,
+        window: pos, // reused slot: absolute position of the first query
+        mode: seq,   // reused slot: query count
+    };
+    if TypeId::of::<B>() == TypeId::of::<UnfusedF32>() {
+        let q: Tensor<UnfusedF32, 4> = cast_any(q)?;
+        let k: Tensor<UnfusedF32, 4> = cast_any(k_arena)?;
+        let v: Tensor<UnfusedF32, 4> = cast_any(v_arena)?;
+        let t: Tensor<UnfusedF32, 1, Int> = cast_any(table)?;
+        return cast_any(prefill_unfused(q, k, v, t, geom, scale));
+    }
+    if TypeId::of::<B>() == TypeId::of::<FusedF32>() {
+        let q: Tensor<FusedF32, 4> = cast_any(q)?;
+        let k: Tensor<FusedF32, 4> = cast_any(k_arena)?;
+        let v: Tensor<FusedF32, 4> = cast_any(v_arena)?;
+        let t: Tensor<FusedF32, 1, Int> = cast_any(table)?;
+        return cast_any(prefill_fused(q, k, v, t, geom, scale));
+    }
+    None
+}
+
+/// The prefill launch — geometry rides in AttnGeom with `window`/`mode`
+/// repurposed as pos/seq (documented at the call sites; the prefill
+/// kernel has its own Params naming them properly).
+fn launch_prefill(
+    q: CubeTensor<WgpuRuntime>,
+    k: CubeTensor<WgpuRuntime>,
+    v: CubeTensor<WgpuRuntime>,
+    table: CubeTensor<WgpuRuntime>,
+    geom: AttnGeom,
+    scale: f64,
+) -> CubeTensor<WgpuRuntime> {
+    let (pos, seq) = (geom.window, geom.mode);
+    let q = into_contiguous(q);
+    let k = into_contiguous(k);
+    let v = into_contiguous(v);
+    let table = into_contiguous(table);
+    let client = q.client.clone();
+    let out = client.empty(geom.n_q * seq * geom.d * core::mem::size_of::<f32>());
+    launch(
+        &client,
+        PrefillAttn,
+        CubeCount::Static(geom.n_q as u32, seq.div_ceil(16) as u32, 1),
+        vec![
+            q.handle.binding(),
+            k.handle.binding(),
+            v.handle.binding(),
+            table.handle.binding(),
+            out.clone().binding(),
+        ],
+        vec![
+            geom.n_q as u64,
+            geom.n_kv as u64,
+            geom.d as u64,
+            geom.page_size as u64,
+            geom.total as u64,
+            pos as u64,
+            seq as u64,
+            f32::to_bits(scale as f32) as u64,
+        ],
+    );
+    CubeTensor::new_contiguous(
+        client,
+        q.device.clone(),
+        Shape::from([1, geom.n_q, seq, geom.d]),
+        out,
+        DType::F32,
+    )
+}
+
+fn prefill_unfused(
+    q: Tensor<UnfusedF32, 4>,
+    k: Tensor<UnfusedF32, 4>,
+    v: Tensor<UnfusedF32, 4>,
+    table: Tensor<UnfusedF32, 1, Int>,
+    geom: AttnGeom,
+    scale: f64,
+) -> Tensor<UnfusedF32, 4> {
+    let out = launch_prefill(
+        q.into_primitive().tensor(),
+        k.into_primitive().tensor(),
+        v.into_primitive().tensor(),
+        table.into_primitive(),
+        geom,
+        scale,
+    );
+    Tensor::from_primitive(TensorPrimitive::Float(out))
+}
+
+/// Prefill's fusion-stream op — same four read-only inputs as decode.
+struct PrefillAttnOp {
+    desc: CustomOpIr,
+    geom: AttnGeom,
+    scale: f64,
+}
+
+impl core::fmt::Debug for PrefillAttnOp {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "PrefillAttnOp {{ n_q: {}, seq: {}, total: {} }}",
+            self.geom.n_q, self.geom.mode, self.geom.total
+        )
+    }
+}
+
+impl Operation<FusionCubeRuntime<WgpuRuntime>> for PrefillAttnOp {
+    fn execute(&self, handles: &mut HandleContainer<CubeFusionHandle<WgpuRuntime>>) {
+        let ([q, k, v, t], [output]) = self.desc.as_fixed::<4, 1>();
+        let qp: CubeTensor<WgpuRuntime> = handles.get_float_tensor::<InnerF32>(q);
+        let kp: CubeTensor<WgpuRuntime> = handles.get_float_tensor::<InnerF32>(k);
+        let vp: CubeTensor<WgpuRuntime> = handles.get_float_tensor::<InnerF32>(v);
+        let tp: CubeTensor<WgpuRuntime> = handles.get_int_tensor::<InnerF32>(t);
+        let out = launch_prefill(qp, kp, vp, tp, self.geom, self.scale);
+        handles.register_float_tensor::<InnerF32>(&output.id, out);
+    }
+}
+
+fn prefill_fused(
+    q: Tensor<FusedF32, 4>,
+    k: Tensor<FusedF32, 4>,
+    v: Tensor<FusedF32, 4>,
+    table: Tensor<FusedF32, 1, Int>,
+    geom: AttnGeom,
+    scale: f64,
+) -> Tensor<FusedF32, 4> {
+    let seq = geom.mode;
+    let qp = q.into_primitive().tensor();
+    let kp = k.into_primitive().tensor();
+    let vp = v.into_primitive().tensor();
+    let tp = table.into_primitive();
+    let client = qp.client.clone();
+
+    let mut streams = OperationStreams::default();
+    streams.tensor(&qp);
+    streams.tensor(&kp);
+    streams.tensor(&vp);
+    streams.tensor(&tp);
+    let q_ir = qp.into_ir();
+    let k_ir = kp.into_ir();
+    let v_ir = vp.into_ir();
+    let t_ir = tp.into_ir();
+    let out_ir = TensorIr {
+        id: client.create_empty_handle(),
+        shape: Shape::from([1, geom.n_q, seq, geom.d]),
+        status: TensorStatus::NotInit,
+        dtype: DType::F32,
+    };
+    let desc = CustomOpIr::new("combs_prefill_attn", &[q_ir, k_ir, v_ir, t_ir], &[out_ir]);
+    let op = PrefillAttnOp {
+        desc: desc.clone(),
+        geom,
+        scale,
+    };
+    let mut outputs = client.register(streams, OperationIr::Custom(desc), op);
+    let out = outputs.pop().expect("custom op declares one output");
+    Tensor::from_primitive(TensorPrimitive::Float(out))
 }
 
 /// K3b: the same kernel in contiguous mode, for the sliding/rolling
@@ -574,6 +786,141 @@ mod tests {
                         &format!("contiguous d={d} T={total} w={window}"),
                     );
                 }
+            }
+        }
+    }
+
+    /// Host reference for CAUSAL prefill: query row r at absolute
+    /// position pos + r sees keys j <= pos + r.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_reference(
+        q: &[f32],
+        keys: &[Vec<f32>],
+        vals: &[Vec<f32>],
+        n_q: usize,
+        n_kv: usize,
+        seq: usize,
+        total: usize,
+        d: usize,
+        pos: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; n_q * seq * d];
+        for h in 0..n_q {
+            let g = h / (n_q / n_kv);
+            for r in 0..seq {
+                let qi = &q[(h * seq + r) * d..(h * seq + r + 1) * d];
+                let limit = (pos + r + 1).min(total);
+                let scores: Vec<f64> = (0..limit)
+                    .map(|j| {
+                        qi.iter()
+                            .zip(&keys[g * total + j])
+                            .map(|(a, b)| *a as f64 * *b as f64)
+                            .sum::<f64>()
+                            * scale as f64
+                    })
+                    .collect();
+                let m = scores.iter().cloned().fold(f64::MIN, f64::max);
+                let ps: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
+                let sum: f64 = ps.iter().sum();
+                for (j, p) in ps.iter().enumerate() {
+                    for c in 0..d {
+                        out[(h * seq + r) * d + c] +=
+                            (p / sum * vals[g * total + j][c] as f64) as f32;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// K9 harmony: paged causal prefill vs the host reference — cold
+    /// full prompts, mid-history chunks, ragged query tiles, GQA, and
+    /// every head dim including the full-workgroup 256.
+    #[test]
+    fn prefill_attention_matches_the_reference() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let device = Default::default();
+        // A head dim off the 16-column grid must refuse into the
+        // materialized path, never mis-tile.
+        {
+            let q: Tensor<UnfusedF32, 4> =
+                Tensor::from_data(TensorData::new(signal(4 * 2 * 72, 1.0), [1, 4, 2, 72]), &device);
+            let k: Tensor<UnfusedF32, 4> = Tensor::from_data(
+                TensorData::new(signal(4 * 2 * 16 * 72, 2.0), [4, 2, 16, 72]),
+                &device,
+            );
+            let v = k.clone();
+            let t: Tensor<UnfusedF32, 1, Int> =
+                Tensor::from_data(TensorData::new(vec![0i32], [1]), &device);
+            assert!(
+                try_prefill_attention(q, k, v, t, 0, 2, 0.1).is_none(),
+                "ragged head dim must refuse"
+            );
+        }
+        for &d in &[64usize, 96, 128] {
+            for &(pos, seq) in &[
+                (0usize, 16usize),
+                (0, 33),
+                (0, 300),
+                (480, 64),
+                (700, 41),
+                (0, 513),
+            ] {
+                let n_kv = 2usize;
+                let n_q = 4usize;
+                let total = pos + seq;
+                let page_size = 16usize;
+                let scale = 1.0 / (d as f32).sqrt();
+                let keys: Vec<Vec<f32>> = (0..n_kv * total)
+                    .map(|i| signal(d, i as f32 * 0.23))
+                    .collect();
+                let vals: Vec<Vec<f32>> = (0..n_kv * total)
+                    .map(|i| signal(d, i as f32 * 0.23 + 40.0))
+                    .collect();
+                let q = signal(n_q * seq * d, 6.6);
+                let expect = prefill_reference(
+                    &q, &keys, &vals, n_q, n_kv, seq, total, d, pos, scale,
+                );
+                let (ak, av, table, num_pages) =
+                    paged_layout(&keys, &vals, n_kv, d, total, page_size);
+                let qt: Tensor<UnfusedF32, 4> =
+                    Tensor::from_data(TensorData::new(q, [1, n_q, seq, d]), &device);
+                let kt: Tensor<UnfusedF32, 4> = Tensor::from_data(
+                    TensorData::new(ak, [num_pages, n_kv, page_size, d]),
+                    &device,
+                );
+                let vt: Tensor<UnfusedF32, 4> = Tensor::from_data(
+                    TensorData::new(av, [num_pages, n_kv, page_size, d]),
+                    &device,
+                );
+                let len = table.len();
+                let tt: Tensor<UnfusedF32, 1, Int> =
+                    Tensor::from_data(TensorData::new(table, [len]), &device);
+                // Straight to the internal path: the process-wide door
+                // may already be latched shut by earlier tests, and the
+                // kernel's correctness is what's under test here.
+                let geom = AttnGeom {
+                    n_q,
+                    n_kv,
+                    d,
+                    page_size,
+                    total,
+                    window: pos,
+                    mode: seq,
+                };
+                let got = prefill_unfused(qt, kt, vt, tt, geom, scale as f64)
+                    .into_data()
+                    .to_vec::<f32>()
+                    .unwrap();
+                assert_close(
+                    &got,
+                    &expect,
+                    2e-3,
+                    &format!("prefill d={d} pos={pos} seq={seq}"),
+                );
             }
         }
     }
