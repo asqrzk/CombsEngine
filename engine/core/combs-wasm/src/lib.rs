@@ -40,6 +40,8 @@ use combs_runtime::{
 };
 use wasm_bindgen::prelude::*;
 
+mod mount;
+
 /// Installs the panic hook so a Rust panic reaches the browser console as a
 /// stack trace instead of an opaque `unreachable executed`.
 #[wasm_bindgen(start)]
@@ -57,6 +59,12 @@ thread_local! {
     /// Cancel flags for in-flight requests, keyed by request id. Held apart
     /// from the engine so a Stop can land while the engine is checked out.
     static CANCELS: RefCell<HashMap<String, Arc<AtomicBool>>> = RefCell::new(HashMap::new());
+    /// In-flight chunk-appended mounts by handle (ids share NEXT_ID with
+    /// engines, so a mount handle can never be mistaken for an engine id
+    /// that exists). `finish` REMOVES the state before doing anything
+    /// else — a duplicate finish or a late append finds "no such mount"
+    /// instead of a half-consumed buffer.
+    static MOUNTS: RefCell<HashMap<u32, mount::MountState>> = RefCell::new(HashMap::new());
     /// The one device this module ever creates, and its capabilities.
     /// cubecl panics on a second setup, so this is initialized once and
     /// every later caller reuses it.
@@ -138,9 +146,18 @@ pub async fn combs_engine_create(
     model_bytes: Vec<u8>,
 ) -> Result<u32, JsValue> {
     ensure_device().await.map_err(js_err)?;
-
     let config: EngineConfigJson = serde_json::from_str(&config_json)
         .map_err(|e| js_err(format!("invalid engine config JSON: {e}")))?;
+    create_engine_from_bytes(config, model_bytes)
+}
+
+/// The shared load tail: parse the in-memory image, build the engine,
+/// register it. Both the one-shot create above and the chunked mount's
+/// finish land here.
+fn create_engine_from_bytes(
+    config: EngineConfigJson,
+    model_bytes: Vec<u8>,
+) -> Result<u32, JsValue> {
     let source = combs_formats::open_model_source_bytes(model_bytes)
         .map_err(|e| js_err(format!("loading model: {e}")))?;
 
@@ -171,6 +188,69 @@ pub async fn combs_engine_create(
     });
     ENGINES.with(|m| m.borrow_mut().insert(id, engine));
     Ok(id)
+}
+
+/// Opens a chunk-appended mount: validates the engine config and the
+/// declared byte length eagerly, reserves the whole buffer while the
+/// heap is still small, and initializes the device so it overlaps the
+/// download. Mode is `"buffer"` (`"stream"` is reserved). Returns a
+/// mount handle for [`combs_model_append`] / [`combs_model_finish`].
+#[wasm_bindgen]
+pub async fn combs_model_open(
+    config_json: String,
+    expected_len: f64,
+    mode: String,
+) -> Result<u32, JsValue> {
+    ensure_device().await.map_err(js_err)?;
+    // Config problems must surface before gigabytes move, not after.
+    let _: EngineConfigJson = serde_json::from_str(&config_json)
+        .map_err(|e| js_err(format!("invalid engine config JSON: {e}")))?;
+    let state = mount::open(config_json, expected_len, &mode).map_err(js_err)?;
+    let id = NEXT_ID.with(|n| {
+        let mut n = n.borrow_mut();
+        let id = *n;
+        *n += 1;
+        id
+    });
+    MOUNTS.with(|m| m.borrow_mut().insert(id, state));
+    Ok(id)
+}
+
+/// Appends one chunk to an open mount. Sync on purpose — bytes are
+/// already in the wasm heap when this is called, and the async side
+/// (the worker's reader loop) is the driver.
+#[wasm_bindgen]
+pub fn combs_model_append(handle: u32, chunk: &[u8]) -> Result<(), JsValue> {
+    MOUNTS.with(|m| {
+        let mut m = m.borrow_mut();
+        let state = m
+            .get_mut(&handle)
+            .ok_or_else(|| js_err(format!("no such mount: {handle}")))?;
+        mount::append(state, chunk).map_err(js_err)
+    })
+}
+
+/// Completes a mount: verifies every declared byte arrived, then runs
+/// the same load tail as [`combs_engine_create`] and returns the
+/// engine id. The mount state is consumed FIRST, so a duplicate
+/// finish or a late append is "no such mount", never double work.
+#[wasm_bindgen]
+pub async fn combs_model_finish(handle: u32) -> Result<u32, JsValue> {
+    let state = MOUNTS
+        .with(|m| m.borrow_mut().remove(&handle))
+        .ok_or_else(|| js_err(format!("no such mount: {handle}")))?;
+    mount::finish_check(&state).map_err(js_err)?;
+    let config: EngineConfigJson = serde_json::from_str(&state.config_json)
+        .map_err(|e| js_err(format!("invalid engine config JSON: {e}")))?;
+    create_engine_from_bytes(config, state.buf)
+}
+
+/// Drops a mount and frees its buffer. Idempotent: aborting a handle
+/// that is gone (or never existed) is a no-op, so error-path cleanup
+/// can never fail.
+#[wasm_bindgen]
+pub fn combs_model_abort(handle: u32) {
+    MOUNTS.with(|m| m.borrow_mut().remove(&handle));
 }
 
 /// The engine's model metadata as JSON (same shape as the C FFI's).

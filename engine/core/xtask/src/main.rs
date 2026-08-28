@@ -277,6 +277,7 @@ fn cmd_web(ctx: &Ctx, release: bool, out_dir: Option<PathBuf>) -> Result<()> {
     }
     let bytes = std::fs::metadata(&wasm).map(|m| m.len()).unwrap_or(0);
     eprintln!("built {} ({:.1} MB)", wasm.display(), bytes as f64 / 1e6);
+    check_wasm_max_memory(&wasm)?;
 
     let out = ctx.root.join("../js/core/pkg");
     let mut bindgen_args =
@@ -297,6 +298,20 @@ fn cmd_web(ctx: &Ctx, release: bool, out_dir: Option<PathBuf>) -> Result<()> {
     match bindgen {
         Ok(status) if status.success() => {
             eprintln!("bindings -> {}", out.display());
+            // The glue masks pointers with `>>> 0` so addresses past
+            // 2 GiB stay unsigned in JS. A bindgen that stopped
+            // emitting them would corrupt every big-model mount —
+            // loudly is the only acceptable way for that to surface.
+            let glue = out.join("combs_wasm.js");
+            match std::fs::read_to_string(&glue) {
+                Ok(text) if text.contains(">>> 0") => {}
+                Ok(_) => eprintln!(
+                    "WARNING: {} carries no '>>> 0' pointer masks — \
+                     mounts beyond 2 GiB will read the WRONG addresses",
+                    glue.display()
+                ),
+                Err(e) => eprintln!("WARNING: cannot read {}: {e}", glue.display()),
+            }
             if release {
                 // wasm-opt -Oz takes ~30s and buys ~12% on this module.
                 // Optional on purpose: a missing binaryen must not fail
@@ -344,6 +359,62 @@ fn cmd_web(ctx: &Ctx, release: bool, out_dir: Option<PathBuf>) -> Result<()> {
 /// Copies the worker script and the generated package into a host
 /// application's static directory. Both must land together and stay
 /// together: the worker imports `./pkg/combs_wasm.js` by relative path.
+/// Postcondition on the built module: linear memory must declare the
+/// full 4 GiB maximum (65536 pages). The linker defaults to 2 GiB, and
+/// a silently-reverted `--max-memory` link flag would cap every mount
+/// at half the address space — this reads the wasm memory section
+/// directly so the ceiling is a checked fact, not a build-config hope.
+fn check_wasm_max_memory(path: &std::path::Path) -> Result<()> {
+    const WANT_PAGES: u64 = 65536;
+    let bytes = std::fs::read(path)?;
+    anyhow::ensure!(bytes.len() > 8 && &bytes[0..4] == b"\0asm", "not a wasm module");
+    let mut pos = 8usize; // magic + version
+    let varint = |bytes: &[u8], pos: &mut usize| -> Result<u64> {
+        let mut out = 0u64;
+        for shift in (0..64).step_by(7) {
+            let b = *bytes.get(*pos).ok_or_else(|| anyhow::anyhow!("truncated wasm"))?;
+            *pos += 1;
+            out |= u64::from(b & 0x7f) << shift;
+            if b & 0x80 == 0 {
+                return Ok(out);
+            }
+        }
+        bail!("varint overflow");
+    };
+    while pos < bytes.len() {
+        let id = bytes[pos];
+        pos += 1;
+        let size = varint(&bytes, &mut pos)? as usize;
+        let body_end = pos + size;
+        if id == 5 {
+            // memory section: count, then per-memory limits.
+            let mut p = pos;
+            let count = varint(&bytes, &mut p)?;
+            anyhow::ensure!(count >= 1, "wasm module declares no memory");
+            let flags = varint(&bytes, &mut p)?;
+            let min = varint(&bytes, &mut p)?;
+            let max = if flags & 1 == 1 { Some(varint(&bytes, &mut p)?) } else { None };
+            match max {
+                Some(m) if m == WANT_PAGES => {
+                    eprintln!("memory: min {min} pages, max {m} pages (4 GiB ceiling ok)");
+                    return Ok(());
+                }
+                Some(m) => bail!(
+                    "wasm memory max is {m} pages ({:.2} GiB) — expected {WANT_PAGES}; \
+                     the --max-memory link flag in .cargo/config.toml got lost",
+                    m as f64 * 65536.0 / 1e9
+                ),
+                None => bail!(
+                    "wasm memory declares NO maximum — expected {WANT_PAGES} pages; \
+                     the --max-memory link flag in .cargo/config.toml got lost"
+                ),
+            }
+        }
+        pos = body_end;
+    }
+    bail!("no memory section found in {}", path.display());
+}
+
 fn copy_web_bundle(ctx: &Ctx, pkg: &std::path::Path, dest: &std::path::Path) -> Result<()> {
     let worker = ctx.root.join("../js/core/combs.worker.js");
     std::fs::create_dir_all(dest.join("pkg"))?;

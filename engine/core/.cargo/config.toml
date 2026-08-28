@@ -6,5 +6,14 @@ xtask = "run --package xtask --"
 # the feature alone is explicitly insufficient. Scoped to the wasm target,
 # so native builds are untouched. getrandom 0.4 (through rand) needs only
 # its `wasm_js` feature, declared in combs-core's Cargo.toml.
+#
+# --max-memory lifts the linker's default 2 GiB ceiling to wasm32's full
+# 4 GiB (65536 pages): a chunk-appended model buffer plus load transients
+# must fit linear memory, and the 2.5 GB model class dies at the default.
+# Appended HERE, never via env RUSTFLAGS — the environment variable
+# REPLACES this array and would silently drop the getrandom cfg.
 [target.wasm32-unknown-unknown]
-rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
+rustflags = [
+    '--cfg', 'getrandom_backend="wasm_js"',
+    '-C', 'link-arg=--max-memory=4294967296',
+]
