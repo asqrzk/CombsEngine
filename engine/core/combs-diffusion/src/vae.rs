@@ -224,6 +224,16 @@ impl<B: Backend> VAEDecoder<B> {
 
     /// Load SD 1.5 VAE decoder weights from a `ModelSource`.
     pub fn load_from(source: &dyn ModelSource, device: &burn::tensor::Device<B>) -> Result<Self> {
+        Self::load_with_latent_channels(source, LATENT_CHANNELS, device)
+    }
+
+    /// Same decoder, parametrized latent width — the flux2 autoencoder
+    /// is this exact architecture at 32 latent channels.
+    pub fn load_with_latent_channels(
+        source: &dyn ModelSource,
+        latent_channels: usize,
+        device: &burn::tensor::Device<B>,
+    ) -> Result<Self> {
         // AutoencoderKL applies a 1x1 `post_quant_conv` to the latent before
         // the decoder; skipping it decodes an un-projected latent. Absent
         // only from decoder-only extracts — warn, don't fail.
@@ -234,7 +244,7 @@ impl<B: Backend> VAEDecoder<B> {
             Some(load_conv2d(
                 source,
                 "post_quant_conv",
-                [LATENT_CHANNELS, LATENT_CHANNELS],
+                [latent_channels, latent_channels],
                 [1, 1],
                 [1, 1],
                 device,
@@ -250,7 +260,7 @@ impl<B: Backend> VAEDecoder<B> {
         let conv_in = load_conv2d(
             source,
             "decoder.conv_in",
-            [LATENT_CHANNELS, BLOCK_OUT_CHANNELS[3]],
+            [latent_channels, BLOCK_OUT_CHANNELS[3]],
             [3, 3],
             [1, 1],
             device,

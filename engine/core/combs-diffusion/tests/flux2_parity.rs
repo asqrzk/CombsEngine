@@ -14,9 +14,10 @@
 use burn::backend::NdArray;
 use burn::tensor::{Tensor, TensorData};
 use combs_diffusion::flux2::{
-    image_ids, rope_tables, split_mods, text_ids, Flux2Config, Flux2DoubleBlock,
-    Flux2SingleBlock, Flux2Transformer,
+    image_ids, rope_tables, split_mods, text_ids, unpack_latents, unpatchify_latents,
+    Flux2Config, Flux2DoubleBlock, Flux2LatentStats, Flux2SingleBlock, Flux2Transformer,
 };
+use combs_diffusion::VAEDecoder;
 use combs_formats::{ModelSource, SafetensorsSource};
 
 type B = NdArray<f32>;
@@ -226,4 +227,53 @@ fn flux2_stages_match_reference() {
     // Stage 4: end-to-end forward — everything at once, our own temb.
     let out = model.forward(input_img, input_txt, timestep, &img_ids, &txt_ids);
     check("end-to-end", &out, &dump.floats("output"), 5e-4);
+}
+
+/// The decode tail: packed tokens → grid → bn denorm → unpatchify →
+/// the (tiny random) flux2 autoencoder, each stage vs reference.
+#[test]
+#[ignore = "requires COMBS_FLUX2_PARITY_DIR (gen_flux2_reference.py dump)"]
+fn flux2_vae_decode_matches_reference() {
+    let Some(dump) = Dump::open() else {
+        eprintln!("skipping: set COMBS_FLUX2_PARITY_DIR");
+        return;
+    };
+    let device: burn::tensor::Device<B> = Default::default();
+    let vae_dir = dump.dir.join("vae");
+    let source = SafetensorsSource::load_weights_only(vae_dir.to_str().unwrap(), "flux2-vae")
+        .expect("vae weights");
+    let src: &dyn ModelSource = &source;
+
+    let latent_channels = dump.manifest["vae_config"]["latent_channels"]
+        .as_u64()
+        .unwrap() as usize;
+    let (grid_h, grid_w) = (3usize, 4usize);
+
+    let tokens = dump.tensor3("vae_tokens");
+    let grid = unpack_latents(tokens, grid_h, grid_w);
+
+    let stats = Flux2LatentStats::<B>::load(src, &device).expect("bn stats");
+    let denormed = stats.denormalize(grid);
+    let want = dump.floats("vae_denormed");
+    let got: Vec<f32> = denormed.clone().into_data().to_vec().unwrap();
+    let d = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    println!("[flux2-parity] vae denorm: max |diff| {d:e}");
+    assert!(d < 1e-6, "denorm drifted: {d}");
+
+    let unpatch = unpatchify_latents(denormed);
+    let want = dump.floats("vae_unpatchified");
+    let got: Vec<f32> = unpatch.clone().into_data().to_vec().unwrap();
+    let d = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    println!("[flux2-parity] vae unpatchify: max |diff| {d:e}");
+    assert!(d < 1e-7, "unpatchify must be a pure permutation: {d}");
+
+    let decoder =
+        VAEDecoder::<B>::load_with_latent_channels(src, latent_channels, &device).expect("decoder");
+    let image = decoder.forward(unpatch);
+    let want = dump.floats("vae_image");
+    let got: Vec<f32> = image.into_data().to_vec().unwrap();
+    assert_eq!(got.len(), want.len(), "image shape");
+    let d = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    println!("[flux2-parity] vae decode: max |diff| {d:e}");
+    assert!(d < 5e-4, "vae decode drifted: {d}");
 }

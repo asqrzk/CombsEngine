@@ -126,8 +126,53 @@ dump("output", out)
 for name, t in captures.items():
     dump(name, t)
 
+# ---- tiny flux2 autoencoder: decode path + latent bn round-trip -----
+from diffusers import AutoencoderKLFlux2  # noqa: E402
+
+# The REAL klein autoencoder geometry (block widths, groups, 32-ch
+# latent) so the shipped decoder path is exercised unmodified; only
+# the weights are random. ~200 MB on disk, local-only.
+VAE_CFG = dict(
+    in_channels=3,
+    out_channels=3,
+    block_out_channels=(128, 256, 512, 512),
+    layers_per_block=2,
+    latent_channels=32,
+    norm_num_groups=32,
+    sample_size=64,
+    patch_size=(2, 2),
+)
+vae = AutoencoderKLFlux2(**VAE_CFG)
+vae.eval()
+# Give the bn running stats non-trivial deterministic values (a fresh
+# module has mean 0 / var 1, which would hide denorm bugs).
+n_bn = 4 * VAE_CFG["latent_channels"]
+vae.bn.running_mean.copy_(det((n_bn,), scale=0.3).squeeze())
+vae.bn.running_var.copy_((det((n_bn,), scale=0.4, phase=2.0).squeeze() + 1.1).abs())
+
+os.makedirs(os.path.join(OUT, "vae"), exist_ok=True)
+vae_sd = vae.state_dict()
+save_file(
+    {k: v.contiguous() for k, v in vae_sd.items()},
+    os.path.join(OUT, "vae", "model.safetensors"),
+)
+
+# Packed tokens for a 3x4 grid of patchified 16-channel latents.
+tokens = det((1, 12, n_bn), scale=0.9, phase=3.0)
+dump("vae_tokens", tokens)
+grid = tokens.reshape(1, 12, n_bn).permute(0, 2, 1).reshape(1, n_bn, 3, 4)
+mean = vae.bn.running_mean.view(1, -1, 1, 1)
+std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1) + vae.config.batch_norm_eps)
+denormed = grid * std + mean
+dump("vae_denormed", denormed)
+unpatch = denormed.reshape(1, VAE_CFG["latent_channels"], 2, 2, 3, 4)
+unpatch = unpatch.permute(0, 1, 4, 2, 5, 3).reshape(1, VAE_CFG["latent_channels"], 6, 8)
+dump("vae_unpatchified", unpatch)
+dump("vae_image", vae.decode(unpatch, return_dict=False)[0])
+
 with open(os.path.join(OUT, "manifest.json"), "w") as f:
     json.dump({"config": {k: list(v) if isinstance(v, tuple) else v for k, v in CFG.items()},
+               "vae_config": {k: list(v) if isinstance(v, tuple) else v for k, v in VAE_CFG.items()},
                "tensors": manifest}, f, indent=1)
 print(f"[dump] {len(manifest)} tensors -> {OUT}")
 print("[names] first 40 weight keys:")

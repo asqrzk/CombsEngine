@@ -488,6 +488,57 @@ impl<B: Backend> Flux2Transformer<B> {
     }
 }
 
+/// The latent batch-norm statistics the flux2 autoencoder carries:
+/// generation runs in the normalized patchified-latent space, and the
+/// decoder wants `latent * sqrt(running_var + eps) + running_mean`.
+pub struct Flux2LatentStats<B: Backend> {
+    mean: Tensor<B, 1>,
+    std: Tensor<B, 1>,
+}
+
+impl<B: Backend> Flux2LatentStats<B> {
+    /// Loads `bn.running_mean` / `bn.running_var` from the autoencoder
+    /// checkpoint (batch_norm_eps 1e-4 per the shipped config).
+    pub fn load(source: &dyn ModelSource, device: &Device<B>) -> Result<Self> {
+        let mean: Tensor<B, 1> = source.open_tensor("bn.running_mean")?.load_to_tensor(device)?;
+        let var: Tensor<B, 1> = source.open_tensor("bn.running_var")?.load_to_tensor(device)?;
+        Ok(Self { mean, std: (var + 1e-4).sqrt() })
+    }
+
+    /// Denormalize a patchified latent `[b, c, h, w]` (c = the bn width,
+    /// 4 x latent_channels).
+    pub fn denormalize(&self, latent: Tensor<B, 4>) -> Tensor<B, 4> {
+        let c = self.mean.dims()[0];
+        latent * self.std.clone().reshape([1, c, 1, 1])
+            + self.mean.clone().reshape([1, c, 1, 1])
+    }
+}
+
+/// Packed tokens `[b, gh*gw, c]` (row-major grid order, the id scheme
+/// `image_ids` emits) back to the patchified grid `[b, c, gh, gw]`.
+pub fn unpack_latents<B: Backend>(
+    tokens: Tensor<B, 3>,
+    grid_h: usize,
+    grid_w: usize,
+) -> Tensor<B, 4> {
+    let [b, s, c] = tokens.dims();
+    assert_eq!(s, grid_h * grid_w, "token count must fill the grid");
+    tokens.permute([0, 2, 1]).reshape([b, c, grid_h, grid_w])
+}
+
+/// Inverse of the pipeline's 2x2 patchify: `[b, 4c, h, w]` →
+/// `[b, c, 2h, 2w]` (patchify was view(b,c,h,2,w,2) → permute
+/// (0,1,3,5,2,4) → reshape, so the channel axis orders as
+/// `[c][py][px]`).
+pub fn unpatchify_latents<B: Backend>(latent: Tensor<B, 4>) -> Tensor<B, 4> {
+    let [b, c4, h, w] = latent.dims();
+    let c = c4 / 4;
+    latent
+        .reshape([b, c, 2, 2, h, w])
+        .permute([0, 1, 4, 2, 5, 3])
+        .reshape([b, c, h * 2, w * 2])
+}
+
 /// Flow-matching Euler schedule with resolution-dependent exponential
 /// time shifting — the klein sampling loop. Deliberately NOT behind
 /// the `Scheduler` trait: that contract is epsilon-prediction over
