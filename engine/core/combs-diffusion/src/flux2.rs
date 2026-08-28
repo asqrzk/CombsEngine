@@ -202,6 +202,86 @@ fn rms_norm_head<B: Backend>(x: Tensor<B, 4>, weight: &Tensor<B, 1>, _eps: f64) 
     normed * weight.clone().reshape([1, 1, 1, weight.dims()[0]])
 }
 
+// ---- the profiling door ---------------------------------------------
+// COMBS_KLEIN_PROFILE=1 turns on phase timers across the transformer
+// forward and the klein loop around it. Every mark forces completion of
+// the queued GPU work with a one-element readback first — wgpu ops are
+// lazy, so without the force each span would measure enqueue time and
+// the whole step's cost would collapse into the final read. The forces
+// flush the pipeline, so profiled steps run somewhat slower than bare
+// ones; records must carry both numbers.
+
+fn profile_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COMBS_KLEIN_PROFILE").is_ok_and(|v| v != "0"))
+}
+
+struct ProfState {
+    last: std::time::Instant,
+    spans: std::collections::BTreeMap<&'static str, f64>,
+}
+
+fn prof_state() -> &'static std::sync::Mutex<ProfState> {
+    static S: std::sync::OnceLock<std::sync::Mutex<ProfState>> = std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        std::sync::Mutex::new(ProfState {
+            last: std::time::Instant::now(),
+            spans: std::collections::BTreeMap::new(),
+        })
+    })
+}
+
+/// Restart the running clock without charging the elapsed time to any
+/// span (the preceding work was not this profile's to count).
+pub(crate) fn prof_reset() {
+    if !profile_enabled() {
+        return;
+    }
+    prof_state().lock().unwrap().last = std::time::Instant::now();
+}
+
+/// Force completion of everything queued before `probe` (submission
+/// order guarantees earlier work finishes first), then charge the wall
+/// time since the previous mark to `name`. Spans accumulate across
+/// repeated marks (block loops sum into one span per name).
+pub(crate) fn prof_mark<B: Backend, const D: usize>(name: &'static str, probe: &Tensor<B, D>) {
+    if !profile_enabled() {
+        return;
+    }
+    let mut one = probe.clone();
+    for d in 0..D {
+        one = one.narrow(d, 0, 1);
+    }
+    let _ = one.into_data();
+    let mut s = prof_state().lock().unwrap();
+    let now = std::time::Instant::now();
+    let dt = now.duration_since(s.last).as_secs_f64();
+    *s.spans.entry(name).or_insert(0.0) += dt;
+    s.last = now;
+}
+
+/// Print the accumulated spans (largest first) under `label` and clear.
+pub(crate) fn prof_report(label: &str) {
+    if !profile_enabled() {
+        return;
+    }
+    let mut s = prof_state().lock().unwrap();
+    if s.spans.is_empty() {
+        return;
+    }
+    let total: f64 = s.spans.values().sum();
+    let mut rows: Vec<(&&'static str, &f64)> = s.spans.iter().collect();
+    rows.sort_by(|a, b| b.1.total_cmp(a.1));
+    let body = rows
+        .iter()
+        .map(|(n, v)| format!("{n} {v:.3}s ({:.0}%)", 100.0 * **v / total.max(1e-9)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!("[klein-profile] {label}: total {total:.3}s — {body}");
+    s.spans.clear();
+    s.last = std::time::Instant::now();
+}
+
 /// Rotary tables for a token sequence: half-width cos/sin `[s, d/2]`
 /// computed host-side in f64 (the reference uses f64 frequencies).
 /// Each id is a 4-axis coordinate; axis i contributes
@@ -393,23 +473,27 @@ impl<B: Backend> Flux2DoubleBlock<B> {
         let cq = rms_norm_head(to_heads(self.add_q.forward(n_txt.clone(), None), s_txt), &self.norm_added_q, eps);
         let ck = rms_norm_head(to_heads(self.add_k.forward(n_txt.clone(), None), s_txt), &self.norm_added_k, eps);
         let cv = to_heads(self.add_v.forward(n_txt, None), s_txt);
+        prof_mark("double.qkv", &cv);
 
         // Text first, matching the rope table order.
         let q = apply_rope(Tensor::cat(vec![cq, q], 1), rope.0, rope.1);
         let k = apply_rope(Tensor::cat(vec![ck, k], 1), rope.0, rope.1);
         let v = Tensor::cat(vec![cv, v], 1);
         let joint = attention(q, k, v);
+        prof_mark("double.attn", &joint);
 
         let txt_attn = self.to_add_out.forward(joint.clone().narrow(1, 0, s_txt), None);
         let img_attn = self.to_out.forward(joint.narrow(1, s_txt, s_img), None);
 
         let img = img + img_attn * gate_a.clone();
+        prof_mark("double.out", &img);
         let n = layer_norm(img.clone(), eps) * (scale_m.clone() + 1.0) + shift_m.clone();
         let img = img + self.ff.forward(n) * gate_m.clone();
 
         let txt = txt + txt_attn * c_gate_a.clone();
         let n = layer_norm(txt.clone(), eps) * (c_scale_m.clone() + 1.0) + c_shift_m.clone();
         let txt = txt + self.ff_context.forward(n) * c_gate_m.clone();
+        prof_mark("double.ff", &txt);
 
         (txt, img)
     }
@@ -457,6 +541,7 @@ impl<B: Backend> Flux2SingleBlock<B> {
 
         let n = layer_norm(x.clone(), eps) * (scale.clone() + 1.0) + shift.clone();
         let fused = self.to_qkv_mlp.forward(n, None);
+        prof_mark("single.fused", &fused);
 
         let to_heads = |t: Tensor<B, 3>| t.reshape([b, s, heads, hd]);
         let q = rms_norm_head(to_heads(fused.clone().narrow(2, 0, dim)), &self.norm_q, eps);
@@ -465,12 +550,15 @@ impl<B: Backend> Flux2SingleBlock<B> {
         let q = apply_rope(q, rope.0, rope.1);
         let k = apply_rope(k, rope.0, rope.1);
         let attn_out = attention(q, k, v);
+        prof_mark("single.attn", &attn_out);
 
         let gate_half = silu(fused.clone().narrow(2, 3 * dim, mlp));
         let mlp_out = gate_half * fused.narrow(2, 3 * dim + mlp, mlp);
 
         let out = self.to_out.forward(Tensor::cat(vec![attn_out, mlp_out], 2), None);
-        x + out * gate.clone()
+        let out = x + out * gate.clone();
+        prof_mark("single.out", &out);
+        out
     }
 }
 
@@ -488,7 +576,15 @@ pub struct Flux2Transformer<B: Backend> {
     single_blocks: Vec<Flux2SingleBlock<B>>,
     norm_out_linear: Linear<B>,
     proj_out: Linear<B>,
+    // Rope tables depend only on the token grid, which is fixed for a
+    // whole generation — rebuilding them was a host-side f64 trig loop
+    // plus an upload on EVERY forward call. Keyed by (s_txt, s_img,
+    // last img id): sequence lengths alone cannot tell a 2×8 grid from
+    // a 4×4 one, the last coordinate can.
+    rope_cache: std::sync::Mutex<Option<RopeCacheEntry<B>>>,
 }
+
+type RopeCacheEntry<B> = ((usize, usize, [f64; 4]), Tensor<B, 2>, Tensor<B, 2>);
 
 impl<B: Backend> Flux2Transformer<B> {
     pub fn load(
@@ -539,7 +635,35 @@ impl<B: Backend> Flux2Transformer<B> {
             norm_out_linear: load_linear(source, "norm_out.linear", dim, dim * 2, false, device)?,
             proj_out: load_linear(source, "proj_out", dim, config.in_channels, false, device)?,
             config,
+            rope_cache: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Cached rope tables over the text-first joint sequence.
+    fn rope_for(
+        &self,
+        txt_ids: &[[f64; 4]],
+        img_ids: &[[f64; 4]],
+        device: &Device<B>,
+    ) -> (Tensor<B, 2>, Tensor<B, 2>) {
+        let key = (
+            txt_ids.len(),
+            img_ids.len(),
+            img_ids.last().copied().unwrap_or_default(),
+        );
+        let mut cache = self.rope_cache.lock().unwrap();
+        if let Some((k, cos, sin)) = cache.as_ref() {
+            if *k == key {
+                return (cos.clone(), sin.clone());
+            }
+        }
+        let mut ids: Vec<[f64; 4]> = Vec::with_capacity(txt_ids.len() + img_ids.len());
+        ids.extend_from_slice(txt_ids);
+        ids.extend_from_slice(img_ids);
+        let (cos, sin) =
+            rope_tables::<B>(&ids, &self.config.axes_dims_rope, self.config.rope_theta, device);
+        *cache = Some((key, cos.clone(), sin.clone()));
+        (cos, sin)
     }
 
     /// Sinusoidal timestep projection, diffusers `Timesteps` with
@@ -579,7 +703,10 @@ impl<B: Backend> Flux2Transformer<B> {
         let temb = self
             .time_linear_2
             .forward(silu(self.time_linear_1.forward(self.time_proj(timestep * 1000.0, &device))));
-        let debug = std::env::var("COMBS_KLEIN_DEBUG").is_ok_and(|v| v != "0");
+        let debug = {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| std::env::var("COMBS_KLEIN_DEBUG").is_ok_and(|v| v != "0"))
+        };
         let peek = |label: &str, t: &Tensor<B, 3>| {
             if !debug {
                 return;
@@ -600,15 +727,14 @@ impl<B: Backend> Flux2Transformer<B> {
         let mods_img = split_mods(self.mod_img.forward(silu(temb.clone())), 2, dim);
         let mods_txt = split_mods(self.mod_txt.forward(silu(temb.clone())), 2, dim);
         let mods_single = split_mods(self.mod_single.forward(silu(temb.clone())), 1, dim);
+        prof_mark("mod", &mods_single[0].0);
 
         let mut img_h = self.x_embedder.forward(img);
         let mut txt_h = self.context_embedder.forward(txt);
+        prof_mark("embed", &txt_h);
 
-        // Rope tables over the text-first joint sequence.
-        let mut ids: Vec<[f64; 4]> = Vec::with_capacity(s_txt + s_img);
-        ids.extend_from_slice(txt_ids);
-        ids.extend_from_slice(img_ids);
-        let (cos, sin) = rope_tables::<B>(&ids, &cfg.axes_dims_rope, cfg.rope_theta, &device);
+        let (cos, sin) = self.rope_for(txt_ids, img_ids, &device);
+        prof_mark("rope", &sin);
 
         peek("img embed", &img_h);
         peek("txt embed", &txt_h);
@@ -634,7 +760,9 @@ impl<B: Backend> Flux2Transformer<B> {
         let scale = cond.clone().narrow(1, 0, dim).reshape([1, 1, dim]);
         let shift = cond.narrow(1, dim, dim).reshape([1, 1, dim]);
         let h = layer_norm(h, cfg.eps) * (scale + 1.0) + shift;
-        self.proj_out.forward(h)
+        let out = self.proj_out.forward(h);
+        prof_mark("head", &out);
+        out
     }
 }
 

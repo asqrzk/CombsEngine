@@ -24,8 +24,8 @@ use combs_models::{CacheConfig, GenerativeModel, LlamaModel};
 use minijinja::{context, Environment};
 
 use crate::flux2::{
-    image_ids, text_ids, unpack_latents, unpatchify_latents, FlowMatchEuler, Flux2Config,
-    Flux2LatentStats, Flux2Transformer,
+    image_ids, prof_mark, prof_report, prof_reset, text_ids, unpack_latents, unpatchify_latents,
+    FlowMatchEuler, Flux2Config, Flux2LatentStats, Flux2Transformer,
 };
 use crate::vae::VAEDecoder;
 use crate::{DiffusionModel, GenerationHooks, NoiseSource, PromptEmbed, SchedulerKind};
@@ -256,6 +256,7 @@ impl<B: Backend, VB: Backend> DiffusionModel<B> for Flux2KleinPipeline<B, VB> {
         let mut guard = self.encoder.lock().expect("encoder lock");
         let (encoder, cache) = &mut *guard;
         cache.reset();
+        prof_reset();
         let tokens: Tensor<B, 2, Int> =
             Tensor::from_data(TensorData::new(ids, [1, seq]), &self.device);
         let embedded = encoder.embed(tokens);
@@ -263,6 +264,8 @@ impl<B: Backend, VB: Backend> DiffusionModel<B> for Flux2KleinPipeline<B, VB> {
             .prefill_taps(embedded, cache.as_mut(), 0..seq as u32, &ENCODER_TAPS)
             .map_err(|e| FormatError::Safetensors(format!("klein taps: {e}")))?;
         cache.reset();
+        prof_mark("encode", &positive);
+        prof_report("encode");
         if debug_enabled() {
             eprintln!("[klein-debug] wrapped prompt ({} tokens): {:?}...", seq, &text[..text.len().min(120)]);
             stats("prompt embeds", &positive);
@@ -312,6 +315,7 @@ impl<B: Backend, VB: Backend> DiffusionModel<B> for Flux2KleinPipeline<B, VB> {
             stats("initial latent", &latent);
         }
         for i in 0..total {
+            prof_reset();
             let velocity = self.transformer.forward(
                 latent.clone(),
                 prompt.positive.clone(),
@@ -328,6 +332,8 @@ impl<B: Backend, VB: Backend> DiffusionModel<B> for Flux2KleinPipeline<B, VB> {
                 stats("latent", &latent);
             }
             let completed = i + 1;
+            prof_mark("sched", &latent);
+            prof_report(&format!("step {completed}/{total}"));
             if let Some(cb) = hooks.on_step.as_mut() {
                 // wgpu ops are lazy: without a readback the callback would
                 // fire at queue-submission time and step counts / ETAs
@@ -347,7 +353,10 @@ impl<B: Backend, VB: Backend> DiffusionModel<B> for Flux2KleinPipeline<B, VB> {
             }
         }
 
+        prof_reset();
         let image = self.decode_tokens(latent, grid_h, grid_w);
+        prof_mark("decode", &image);
+        prof_report("decode");
         Ok((image, noise.effective_seed()))
     }
 }
