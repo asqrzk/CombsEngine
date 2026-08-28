@@ -1597,6 +1597,27 @@ impl<R: Runtime> Q4KWeight<R> {
         })
     }
 
+    /// Transient full-width f32 copy on device (`[n_out, k]` row-major)
+    /// for the batched-matmul path — see `Q80Weight::dequant_device`.
+    pub fn dequant_device(&self, client: &ComputeClient<R>) -> Handle {
+        let n = self.n_out * self.k;
+        let n_sb = n / K_SUPERBLOCK;
+        let out_h = client.empty(n * core::mem::size_of::<f32>());
+        unsafe {
+            q4_k_dequant_kernel::launch_unchecked::<R>(
+                client,
+                cube_count_capped(n as u32),
+                CubeDim::new_1d(CUBE_DIM),
+                ArrayArg::from_raw_parts(self.qs.clone(), n_sb * 32),
+                ArrayArg::from_raw_parts(self.dd.clone(), n_sb * 2),
+                ArrayArg::from_raw_parts(self.scales.clone(), n_sb * 3),
+                ArrayArg::from_raw_parts(out_h.clone(), n),
+                n,
+            );
+        }
+        out_h
+    }
+
     /// Bytes in VRAM: 148 per 256 weights (4.63 bits/weight).
     pub fn vram_bytes(&self) -> usize {
         (self.n_out * self.k / K_SUPERBLOCK) * (128 + 12 + 8)
@@ -1775,6 +1796,28 @@ impl<R: Runtime> Q5KWeight<R> {
         (self.n_out * self.k / K_SUPERBLOCK) * (128 + 32 + 12 + 8)
     }
 
+    /// Transient full-width f32 copy on device (`[n_out, k]` row-major)
+    /// for the batched-matmul path — see `Q80Weight::dequant_device`.
+    pub fn dequant_device(&self, client: &ComputeClient<R>) -> Handle {
+        let n = self.n_out * self.k;
+        let n_sb = n / K_SUPERBLOCK;
+        let out_h = client.empty(n * core::mem::size_of::<f32>());
+        unsafe {
+            q5_k_dequant_kernel::launch_unchecked::<R>(
+                client,
+                cube_count_capped(n as u32),
+                CubeDim::new_1d(CUBE_DIM),
+                ArrayArg::from_raw_parts(self.qs.clone(), n_sb * 32),
+                ArrayArg::from_raw_parts(self.qh.clone(), n_sb * 8),
+                ArrayArg::from_raw_parts(self.dd.clone(), n_sb * 2),
+                ArrayArg::from_raw_parts(self.scales.clone(), n_sb * 3),
+                ArrayArg::from_raw_parts(out_h.clone(), n),
+                n,
+            );
+        }
+        out_h
+    }
+
     /// Device path: launch only, output handle returned (see
     /// [`Q40Weight::matmul_device`]).
     pub fn matmul_device(&self, client: &ComputeClient<R>, x: Handle, m: usize) -> Handle {
@@ -1859,6 +1902,28 @@ impl<R: Runtime> Q6KWeight<R> {
     /// Bytes in VRAM: 212 per 256 weights (6.63 bits/weight).
     pub fn vram_bytes(&self) -> usize {
         (self.n_out * self.k / K_SUPERBLOCK) * (128 + 64 + 16 + 4)
+    }
+
+    /// Transient full-width f32 copy on device (`[n_out, k]` row-major)
+    /// for the batched-matmul path — see `Q80Weight::dequant_device`.
+    pub fn dequant_device(&self, client: &ComputeClient<R>) -> Handle {
+        let n = self.n_out * self.k;
+        let n_sb = n / K_SUPERBLOCK;
+        let out_h = client.empty(n * core::mem::size_of::<f32>());
+        unsafe {
+            q6_k_dequant_kernel::launch_unchecked::<R>(
+                client,
+                cube_count_capped(n as u32),
+                CubeDim::new_1d(CUBE_DIM),
+                ArrayArg::from_raw_parts(self.ql.clone(), n_sb * 32),
+                ArrayArg::from_raw_parts(self.qh.clone(), n_sb * 16),
+                ArrayArg::from_raw_parts(self.sc.clone(), n_sb * 4),
+                ArrayArg::from_raw_parts(self.d.clone(), n_sb),
+                ArrayArg::from_raw_parts(out_h.clone(), n),
+                n,
+            );
+        }
+        out_h
     }
 
     /// Split-K decode gemv through the Combs Kernel — see
@@ -2059,9 +2124,9 @@ impl QuantWeight {
     }
 
     /// Fused dequant-matmul, device handles in and out.
-    /// Transient full-width f32 dequant on device — `None` for the
-    /// K-quant formats, whose dequant-only kernels don't exist yet
-    /// (they keep the fused per-row kernels for every m).
+    /// Transient full-width f32 dequant on device, every format — the
+    /// batched-matmul path's supply. (`Option` stays in the signature:
+    /// a future format without a dequant kernel falls back safely.)
     pub fn dequant_device(
         &self,
         client: &ComputeClient<cubecl::wgpu::WgpuRuntime>,
@@ -2070,7 +2135,9 @@ impl QuantWeight {
             QuantWeight::Q40(w) => Some(w.dequant_device(client)),
             QuantWeight::Q50(w) => Some(w.dequant_device(client)),
             QuantWeight::Q80(w) => Some(w.dequant_device(client)),
-            QuantWeight::Q4K(_) | QuantWeight::Q5K(_) | QuantWeight::Q6K(_) => None,
+            QuantWeight::Q4K(w) => Some(w.dequant_device(client)),
+            QuantWeight::Q5K(w) => Some(w.dequant_device(client)),
+            QuantWeight::Q6K(w) => Some(w.dequant_device(client)),
         }
     }
 
@@ -2572,6 +2639,58 @@ mod tests {
 
     /// Q5_0/Q8_0 GPU dequant must be **bit-exact** vs the CPU references —
     /// both are a single f32 multiply per value, same as Q4_0.
+    /// `dequant_device` (the batched-matmul supply, launched from the
+    /// RESIDENT weight handles with the capped grid) must match the CPU
+    /// reference bit-exactly for every format — same kernels as the
+    /// `dequantize_*_gpu` validation path, different plumbing.
+    #[test]
+    fn resident_dequant_matches_reference_all_formats() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let device = Default::default();
+        let client = WgpuRuntime::client(&device);
+        let read = |h: Handle, n: usize| -> Vec<f32> {
+            let bytes = client.read_one_unchecked(h);
+            f32::from_bytes(&bytes)[..n].to_vec()
+        };
+
+        let (n_out, k) = (6, 256);
+        let n = n_out * k;
+        let sb = n / K_SUPERBLOCK;
+        let blk = n / Q4_0_BLOCK;
+
+        let data = synth_q4_0(blk);
+        let w = Q40Weight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
+        let expect = combs_formats::quants::dequantize_q4_0(&data, n).unwrap();
+        assert_eq!(read(w.dequant_device(&client), n), expect, "q4_0");
+
+        let data = synth_q5_0(blk);
+        let w = Q50Weight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
+        let expect = combs_formats::quants::dequantize_q5_0(&data, n).unwrap();
+        assert_eq!(read(w.dequant_device(&client), n), expect, "q5_0");
+
+        let data = synth_q8_0(blk);
+        let w = Q80Weight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
+        let expect = combs_formats::quants::dequantize_q8_0(&data, n).unwrap();
+        assert_eq!(read(w.dequant_device(&client), n), expect, "q8_0");
+
+        let data = synth_q4_k(sb);
+        let w = Q4KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
+        let expect = combs_formats::quants::dequantize_q4_k(&data, n).unwrap();
+        assert_eq!(read(w.dequant_device(&client), n), expect, "q4_k");
+
+        let data = synth_q5_k(sb);
+        let w = Q5KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
+        let expect = combs_formats::quants::dequantize_q5_k(&data, n).unwrap();
+        assert_eq!(read(w.dequant_device(&client), n), expect, "q5_k");
+
+        let data = synth_q6_k(sb);
+        let w = Q6KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
+        let expect = combs_formats::quants::dequantize_q6_k(&data, n).unwrap();
+        assert_eq!(read(w.dequant_device(&client), n), expect, "q6_k");
+    }
+
     #[test]
     fn q5_0_and_q8_0_dequant_are_bit_exact() {
         if crate::skip_no_gpu() {
