@@ -67,6 +67,9 @@ pub fn cmd_generate_image(args: GenerateImageArgs) -> Result<()> {
     );
 
     let device = combs_core::init_device();
+    // Before the pipeline primes the cubecl runtime — device_caps does
+    // that setup itself and panics if called afterwards.
+    let device_type = combs_core::device_caps(&device).device_type;
     let lora = args
         .lora
         .as_ref()
@@ -86,7 +89,7 @@ pub fn cmd_generate_image(args: GenerateImageArgs) -> Result<()> {
                 combs_core::CombsBackendF32,
             >(&model_dir, llm, vae, &device, &device)
             .context("loading flux2-klein recipe")?;
-            run_generate(pipeline, &args)
+            run_generate(pipeline, &args, &device_type)
         }
         (None, None) => {
             let architecture = DiffusionArchitecture::detect(&model_dir)
@@ -95,7 +98,7 @@ pub fn cmd_generate_image(args: GenerateImageArgs) -> Result<()> {
                 combs_core::CombsBackendF32,
             >(architecture, &model_dir, &device, lora.as_ref())
             .context("loading diffusion pipeline")?;
-            run_generate(pipeline, &args)
+            run_generate(pipeline, &args, &device_type)
         }
         _ => anyhow::bail!("--llm and --vae come as a pair (the recipe needs both)"),
     }
@@ -104,6 +107,7 @@ pub fn cmd_generate_image(args: GenerateImageArgs) -> Result<()> {
 fn run_generate<B: burn::tensor::backend::Backend>(
     mut pipeline: Box<dyn DiffusionModel<B>>,
     args: &GenerateImageArgs,
+    device_type: &str,
 ) -> Result<()> {
 
     let scheduler = match SchedulerKind::parse(&args.scheduler) {
@@ -118,6 +122,28 @@ fn run_generate<B: burn::tensor::backend::Backend>(
         ),
     };
 
+
+    // The same refusal the worker makes. Without it this path is a way
+    // around the guard: the platform falls back to `generate-image`
+    // exactly when the worker could not be reached, and memory pressure
+    // is one of the reasons for that.
+    let refusal = crate::fit::image_refusal(
+        &crate::fit::PreflightContext {
+            working_set: pipeline.working_set().filter(|_| {
+                crate::fit::draws_on_host_memory(device_type)
+                    && !crate::fit::preflight_disabled()
+            }),
+            resident_at_load: crate::fit::process_footprint_bytes().unwrap_or(0),
+            // A fresh process has served nothing, so the pool gets no
+            // credit — every one-shot run is priced cold.
+            largest_completed_pixels: 0,
+        },
+        args.width,
+        args.height,
+    );
+    if let Some(err) = refusal {
+        anyhow::bail!("{err}");
+    }
 
     let embed = pipeline
         .encode_prompt(&args.prompt, args.negative_prompt.as_deref())

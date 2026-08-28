@@ -28,7 +28,9 @@ use crate::flux2::{
     FlowMatchEuler, Flux2Config, Flux2LatentStats, Flux2Transformer,
 };
 use crate::vae::VAEDecoder;
-use crate::{DiffusionModel, GenerationHooks, NoiseSource, PromptEmbed, SchedulerKind};
+use crate::{
+    DiffusionModel, GenerationHooks, NoiseSource, PromptEmbed, SchedulerKind, WorkingSet,
+};
 
 /// The reference pipeline's default encoder taps and prompt budget.
 const ENCODER_TAPS: [usize; 3] = [9, 18, 27];
@@ -278,6 +280,22 @@ impl<B: Backend, VB: Backend> DiffusionModel<B> for Flux2KleinPipeline<B, VB> {
 
     fn fixed_sampler(&self) -> Option<&'static str> {
         Some("flow-match-euler")
+    }
+
+    /// Fitted to two runs of THIS recipe (Q8 transformer + Q4_K_M
+    /// Qwen3-4B encoder + f32 autoencoder) on an 18 GB M3 Pro: a
+    /// 256x256 generation added 1774 MB over the resident weights, a
+    /// 512x512 one 2867 MB. The fixed term is autotune workspaces plus
+    /// the 512-token encoder pass; the per-pixel term is transformer
+    /// activations, decode, and preview decodes. The larger point was
+    /// measured WITH per-step previews, so the curve errs high for
+    /// preview-free runs — which is the direction to err.
+    fn working_set(&self) -> Option<WorkingSet> {
+        Some(WorkingSet {
+            fixed_bytes: 1_478_130_074,
+            bytes_per_pixel: 5_829,
+            measured_max_pixels: 512 * 512,
+        })
     }
 
     fn generate(

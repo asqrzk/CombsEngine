@@ -34,6 +34,10 @@ tiny_http.workspace = true
 dialoguer.workspace = true
 console.workspace = true
 ureq.workspace = true
+# Host memory + own-footprint probes for the image pre-flight check
+# (mach host_statistics64 / proc_pid_rusage; /proc on Linux). Already in
+# the tree transitively — no new crate enters the build.
+libc = "0.2"
 # TTS (`generate-audio`): Kokoro ONNX runs via onnxruntime — an external
 # runtime by design; the burn-native port is tracked as follow-up work.
 # onnxruntime backs `generate-audio` (Kokoro TTS). Upstream ships no

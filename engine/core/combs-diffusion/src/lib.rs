@@ -61,6 +61,18 @@ impl<B: Backend> Default for GenerationHooks<'_, B> {
     }
 }
 
+/// A pipeline's measured working-set growth, linear in output pixels:
+/// `fixed_bytes + bytes_per_pixel * pixels`. Every field comes from
+/// runs on real hardware — see the implementor for provenance — and
+/// `measured_max_pixels` marks where measurement stopped and
+/// extrapolation begins.
+#[derive(Clone, Copy, Debug)]
+pub struct WorkingSet {
+    pub fixed_bytes: u64,
+    pub bytes_per_pixel: u64,
+    pub measured_max_pixels: u64,
+}
+
 /// Model-agnostic diffusion contract. Analogous to `GenerativeModel` but for
 /// latent denoising instead of autoregressive token generation.
 pub trait DiffusionModel<B: Backend>: Send {
@@ -78,6 +90,16 @@ pub trait DiffusionModel<B: Backend>: Send {
     /// THIS name, not the request's, or the UI reports a sampler that
     /// never ran.
     fn fixed_sampler(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// How much memory a generation adds over this pipeline's resident
+    /// size, for callers that must decide whether a canvas fits before
+    /// attempting it. `None` — the default — means nobody has measured
+    /// this pipeline: a caller must then skip the question rather than
+    /// borrow another pipeline's curve, which would refuse work that
+    /// would have run fine.
+    fn working_set(&self) -> Option<WorkingSet> {
         None
     }
 

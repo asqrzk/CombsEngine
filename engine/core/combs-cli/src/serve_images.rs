@@ -78,6 +78,10 @@ pub fn cmd_serve_images(
 
     eprintln!("[serve-images] loading diffusion pipeline...");
     let device = combs_core::init_device();
+    // Captured BEFORE the pipeline primes the cubecl runtime: device_caps
+    // performs that setup itself and calling it afterwards panics with
+    // "Service already initialized" (the same ordering `cmd_run` keeps).
+    let device_type = combs_core::device_caps(&device).device_type;
     let lora_spec = lora.as_ref().map(|path| combs_diffusion::LoraSpec {
         path: path.clone(),
         scale: lora_scale,
@@ -106,7 +110,42 @@ pub fn cmd_serve_images(
     // Resolved once here so the stats route and the response echo never
     // need the pipeline mutex (which a running generation holds).
     let fixed_sampler = pipeline.fixed_sampler();
+    let working_set = pipeline.working_set();
     let pipeline: SharedPipeline = Arc::new(Mutex::new(pipeline));
+    // The baseline every later fit estimate is measured against: what
+    // this process holds with weights resident and nothing running.
+    let resident_at_load = crate::fit::process_footprint_bytes().unwrap_or(0);
+    // Only where the accelerator draws on host memory does host free
+    // memory decide whether a canvas fits (see `image_fit_refusal`).
+    let unified_memory = crate::fit::draws_on_host_memory(&device_type);
+    let preflight = ImagePreflight {
+        // This pipeline's own measured curve, or None when nobody has
+        // measured it — then the question goes unasked rather than
+        // answered with another pipeline's numbers.
+        working_set: working_set.filter(|_| {
+            unified_memory && resident_at_load > 0 && !crate::fit::preflight_disabled()
+        }),
+        resident_at_load,
+        largest_completed_pixels: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    };
+    match preflight.working_set {
+        Some(_) => eprintln!(
+            "[serve-images] memory pre-flight armed (resident {} MB, {device_type})",
+            resident_at_load / (1024 * 1024)
+        ),
+        None => eprintln!(
+            "[serve-images] memory pre-flight OFF ({})",
+            if crate::fit::preflight_disabled() {
+                "disabled by COMBS_IMAGE_PREFLIGHT=0"
+            } else if !unified_memory {
+                "accelerator does not draw on host memory"
+            } else if resident_at_load == 0 {
+                "no footprint probe on this platform"
+            } else {
+                "this pipeline's working set has not been measured"
+            }
+        ),
+    }
 
     let lora_info = match &lora_spec {
         Some(spec) => json!({
@@ -137,6 +176,7 @@ pub fn cmd_serve_images(
         let preview = preview.clone();
         let model_id = model_id.clone();
         let lora_info = lora_info.clone();
+        let preflight = preflight.clone();
         std::thread::spawn(move || {
             let url = request.url().to_string();
             let method = request.method().as_str().to_string();
@@ -240,6 +280,7 @@ pub fn cmd_serve_images(
                             &preview,
                             preview_every,
                             fixed_sampler,
+                            &preflight,
                         )
                     }
                 }
@@ -251,6 +292,34 @@ pub fn cmd_serve_images(
     Ok(())
 }
 
+/// Everything the pre-flight needs that outlives a single request. A
+/// `None` working set means the check is off, for one of the reasons
+/// logged at startup.
+#[derive(Clone)]
+struct ImagePreflight {
+    working_set: Option<combs_diffusion::WorkingSet>,
+    resident_at_load: u64,
+    /// Largest canvas served to completion — the pool is only credited
+    /// against shapes it has actually held.
+    largest_completed_pixels: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ImagePreflight {
+    fn refusal(&self, width: u32, height: u32) -> Option<String> {
+        crate::fit::image_refusal(
+            &crate::fit::PreflightContext {
+                working_set: self.working_set,
+                resident_at_load: self.resident_at_load,
+                largest_completed_pixels: self
+                    .largest_completed_pixels
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            },
+            width,
+            height,
+        )
+    }
+}
+
 fn handle_generate(
     pipeline: &SharedPipeline,
     body: &str,
@@ -258,6 +327,7 @@ fn handle_generate(
     preview: &PreviewStash,
     preview_every: usize,
     fixed_sampler: Option<&'static str>,
+    preflight: &ImagePreflight,
 ) -> HttpResponse {
     let req: Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -372,6 +442,15 @@ fn handle_generate(
         },
     };
 
+    // A canvas whose working set the machine cannot hand out does not
+    // fail — it wedges the whole system while the kernel thrashes. The
+    // only honest moment to say no is here: before the mutex, before
+    // the first allocation.
+    if let Some(err) = preflight.refusal(width, height) {
+        eprintln!("[serve-images] refused: {err}");
+        return json_response(507, error_json("insufficient_memory", &err));
+    }
+
     eprintln!(
         "[serve-images] generate: {prompt} ({width}x{height}, {steps} steps, {sampler_name}, cfg {guidance})"
     );
@@ -469,6 +548,11 @@ fn handle_generate(
         stats.phase.store(0, Relaxed);
         if let Ok((png, _)) = &result {
             stats.last_bytes.store(png.len() as u64, Relaxed);
+            // This shape is now proven to fit, so the pool may be
+            // credited against canvases up to this size.
+            preflight
+                .largest_completed_pixels
+                .fetch_max(width as u64 * height as u64, Relaxed);
         } else {
             stats.errors_total.fetch_add(1, Relaxed);
         }

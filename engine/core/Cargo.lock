@@ -1185,6 +1185,7 @@ dependencies = [
  "cubecl",
  "dialoguer",
  "image",
+ "libc",
  "ort",
  "serde",
  "serde_json",
