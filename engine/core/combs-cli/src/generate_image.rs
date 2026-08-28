@@ -189,14 +189,47 @@ pub(crate) fn tensor_to_rgb_image<B: burn::tensor::backend::Backend>(
          guidance_scale/steps)"
     );
 
+    // Round to nearest, matching the reference postprocess
+    // ((image * 255).round()); a bare `as u8` truncates, which darkens
+    // every pixel by half a step on average and turns each integer
+    // boundary into a cliff where one-ulp float jitter flips the byte.
+    let quant = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u8;
     let img = image::RgbImage::from_fn(width as u32, height as u32, |x, y| {
         let y = y as usize;
         let x = x as usize;
         let plane = height * width;
-        let r = (data[0 * plane + y * width + x] * 255.0).clamp(0.0, 255.0) as u8;
-        let g = (data[1 * plane + y * width + x] * 255.0).clamp(0.0, 255.0) as u8;
-        let b = (data[2 * plane + y * width + x] * 255.0).clamp(0.0, 255.0) as u8;
+        let r = quant(data[0 * plane + y * width + x]);
+        let g = quant(data[1 * plane + y * width + x]);
+        let b = quant(data[2 * plane + y * width + x]);
         image::Rgb([r, g, b])
     });
     Ok(img)
+}
+
+#[cfg(test)]
+mod tests {
+    use burn::backend::NdArray;
+    use burn::tensor::Tensor;
+
+    // 0.999999 * 255 = 254.99975: truncation said 254, the reference's
+    // round says 255. 0.5 * 255 = 127.5 rounds away to 128. The low
+    // end must not lift zero, and out-of-range must clamp.
+    #[test]
+    fn pixel_quantization_rounds_to_nearest() {
+        let device = Default::default();
+        let vals = [0.999_999f32, 0.5, 0.001, 0.0, 1.2, -0.3];
+        let per_plane = vals.len();
+        let mut data = Vec::with_capacity(per_plane * 3);
+        for _ in 0..3 {
+            data.extend_from_slice(&vals);
+        }
+        let t: Tensor<NdArray, 4> = Tensor::<NdArray, 1>::from_floats(
+            data.as_slice(),
+            &device,
+        )
+        .reshape([1, 3, 1, per_plane]);
+        let img = super::tensor_to_rgb_image(&t).unwrap();
+        let got: Vec<u8> = (0..per_plane as u32).map(|x| img.get_pixel(x, 0).0[0]).collect();
+        assert_eq!(got, vec![255, 128, 0, 0, 255, 0]);
+    }
 }

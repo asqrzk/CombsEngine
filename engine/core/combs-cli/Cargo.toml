@@ -12,6 +12,9 @@ path = "src/main.rs"
 [features]
 f16 = ["combs-core/f16", "combs-runtime/f16"]
 
+[dev-dependencies]
+burn = { version = "0.21.0", default-features = false, features = ["ndarray", "std"] }
+
 [dependencies]
 burn.workspace = true
 cubecl = { version = "0.10.0", default-features = false, features = ["wgpu", "std"] }
