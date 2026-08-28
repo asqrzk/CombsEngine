@@ -11,6 +11,8 @@ mod flatbuf;
 mod gguf;
 mod litertlm;
 mod onnx;
+mod onnx_quant;
+mod onnx_source;
 mod lora;
 mod metadata;
 mod protomin;
@@ -37,6 +39,8 @@ pub use safetensors::SafetensorsSource;
 pub use lora::{merge_lora, LoraFile, LoraMergedSource, LoraSpec};
 pub use litertlm::{SectionInfo, read_sections as litertlm_read_sections};
 pub use onnx::{MatMulNBitsNode, OnnxData, OnnxDtype, OnnxModel, OnnxTensorInfo};
+pub use onnx_quant::{dequantize_matmul_nbits, repack_matmul_nbits_q4_0};
+pub use onnx_source::OnnxSource;
 pub use source::{ModelSource, QuantFormat, QuantTensor, SamplerConfig, TensorDtype, TensorReader};
 pub use spm::{ensure_tokenizer_json_from_spm, spm_added_tokens};
 pub use tflite::TfliteSource;
@@ -64,6 +68,9 @@ pub fn open_model_source(path: impl AsRef<Path>) -> Result<Box<dyn ModelSource>>
     }
     if path.is_file() && path.extension().is_some_and(|e| e == "litertlm") {
         return litertlm::open_litertlm(path);
+    }
+    if path.is_file() && path.extension().is_some_and(|e| e == "onnx") {
+        return Ok(Box::new(OnnxSource::load(path)?));
     }
     if path.is_dir() {
         return Ok(Box::new(SafetensorsSource::load(path)?));
