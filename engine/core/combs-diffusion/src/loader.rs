@@ -147,7 +147,13 @@ pub fn load_flux2_klein_recipe<B: Backend>(
     vae_dir: impl AsRef<Path>,
     device: &B::Device,
 ) -> Result<Box<dyn DiffusionModel<B>>> {
-    let dit_dir = dit_dir.as_ref();
+    let mut dit_dir = dit_dir.as_ref();
+    // A checkout root (transformer/ inside) is as good as the
+    // transformer directory itself.
+    let descended = dit_dir.join("transformer");
+    if !dit_dir.join("config.json").exists() && descended.join("config.json").exists() {
+        dit_dir = &descended;
+    }
     let config: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(dit_dir.join("config.json")).map_err(FormatError::Io)?,
     )
