@@ -73,6 +73,14 @@ pub trait DiffusionModel<B: Backend>: Send {
     /// Encode prompt strings into conditioning embeddings.
     fn encode_prompt(&self, prompt: &str, negative_prompt: Option<&str>) -> Result<PromptEmbed<B>>;
 
+    /// `Some(name)` when the pipeline runs a fixed built-in sampler and
+    /// ignores the requested [`SchedulerKind`] — callers must surface
+    /// THIS name, not the request's, or the UI reports a sampler that
+    /// never ran.
+    fn fixed_sampler(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Run the full denoising loop and return the image tensor
     /// `[batch, channels, height, width]` in RGB order plus the effective
     /// seed (caller-provided, or entropy-drawn and echoed for reproduction).

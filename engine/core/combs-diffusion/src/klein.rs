@@ -273,6 +273,10 @@ impl<B: Backend, VB: Backend> DiffusionModel<B> for Flux2KleinPipeline<B, VB> {
         Ok(PromptEmbed { positive, negative: None })
     }
 
+    fn fixed_sampler(&self) -> Option<&'static str> {
+        Some("flow-match-euler")
+    }
+
     fn generate(
         &mut self,
         prompt: PromptEmbed<B>,
@@ -325,6 +329,11 @@ impl<B: Backend, VB: Backend> DiffusionModel<B> for Flux2KleinPipeline<B, VB> {
             }
             let completed = i + 1;
             if let Some(cb) = hooks.on_step.as_mut() {
+                // wgpu ops are lazy: without a readback the callback would
+                // fire at queue-submission time and step counts / ETAs
+                // would describe enqueued, not finished, work. One element
+                // is enough to force completion.
+                let _ = latent.clone().narrow(1, 0, 1).narrow(2, 0, 1).into_data();
                 cb(completed, total);
             }
             if hooks.preview_every > 0

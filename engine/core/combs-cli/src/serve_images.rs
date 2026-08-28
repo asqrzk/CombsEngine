@@ -9,9 +9,8 @@
 //! - `GET  /health` → `{"status":"ok"}`
 //! - `POST /v1/images/generations` → `{created, data: [{b64_json}]}`
 //!   body: `{prompt, negative_prompt?, size?: "WxH", width?, height?,
-//!           steps?, guidance_scale?, seed?}`
+//!           steps?, guidance_scale?, seed?, scheduler?, preview_every?}`
 
-use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,9 +19,7 @@ use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use serde_json::{Value, json};
 
-use combs_diffusion::{
-    DiffusionArchitecture, DiffusionModel, SchedulerKind, load_diffusion_model,
-};
+use combs_diffusion::{DiffusionArchitecture, DiffusionModel, SchedulerKind};
 
 use crate::generate_image::tensor_to_rgb_image;
 use crate::http::{HttpResponse, bytes_response, error_json, json_response, respond_preflight};
@@ -59,6 +56,9 @@ struct ImageStats {
     first_step_at_ms: std::sync::atomic::AtomicU64,
     // Last preview's step number (0 = none this run).
     preview_step: std::sync::atomic::AtomicU64,
+    // The cadence the RUNNING generation actually uses — a per-request
+    // override may differ from the spawn-time flag the top level reports.
+    preview_cadence: std::sync::atomic::AtomicU64,
     phase: std::sync::atomic::AtomicU8,
 }
 
@@ -103,6 +103,9 @@ pub fn cmd_serve_images(
     };
     let weights_ms = t_load.elapsed().as_millis() as u64 - open_ms;
     combs_core::progress::load("weights_done", None, None, Some(weights_ms));
+    // Resolved once here so the stats route and the response echo never
+    // need the pipeline mutex (which a running generation holds).
+    let fixed_sampler = pipeline.fixed_sampler();
     let pipeline: SharedPipeline = Arc::new(Mutex::new(pipeline));
 
     let lora_info = match &lora_spec {
@@ -178,6 +181,7 @@ pub fn cmd_serve_images(
                             } else {
                                 Value::Null
                             },
+                            "preview_every": stats.preview_cadence.load(Relaxed),
                             "elapsed_ms":
                                 now.saturating_sub(stats.started_at_ms.load(Relaxed)),
                         })
@@ -195,6 +199,14 @@ pub fn cmd_serve_images(
                             "last_bytes": stats.last_bytes.load(Relaxed),
                             "generation": generation,
                             "preview_every": preview_every,
+                            // Which sampler actually runs: pipelines with a
+                            // built-in schedule ignore the request's choice.
+                            "sampler": match fixed_sampler {
+                                Some(name) => json!({"fixed": name}),
+                                None => json!({
+                                    "choices": ["ddpm", "ddim", "dpm++2m"],
+                                }),
+                            },
                             "lora": lora_info,
                             "load": {"ms": load_ms, "open_ms": open_ms, "weights_ms": weights_ms},
                         }),
@@ -221,7 +233,14 @@ pub fn cmd_serve_images(
                     if request.as_reader().read_to_string(&mut body).is_err() {
                         json_response(400, error_json("invalid_request", "unreadable body"))
                     } else {
-                        handle_generate(&pipeline, &body, &stats, &preview, preview_every)
+                        handle_generate(
+                            &pipeline,
+                            &body,
+                            &stats,
+                            &preview,
+                            preview_every,
+                            fixed_sampler,
+                        )
                     }
                 }
                 _ => json_response(404, error_json("not_found", "unknown endpoint")),
@@ -238,6 +257,7 @@ fn handle_generate(
     stats: &ImageStats,
     preview: &PreviewStash,
     preview_every: usize,
+    fixed_sampler: Option<&'static str>,
 ) -> HttpResponse {
     let req: Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -309,10 +329,17 @@ fn handle_generate(
         );
     }
     let seed = req.get("seed").and_then(Value::as_u64);
-    let scheduler = match req.get("scheduler").and_then(Value::as_str) {
+    let requested_scheduler = req.get("scheduler").and_then(Value::as_str);
+    // Everything user-facing reports the sampler that RUNS. Fixed-schedule
+    // pipelines accept ANY scheduler string and drop it — including the
+    // very name the response echoes ("flow-match-euler"), which
+    // SchedulerKind cannot parse: rejecting it would 400 the replay of our
+    // own response. Choice-taking pipelines keep strict validation.
+    let scheduler = match requested_scheduler {
         None => SchedulerKind::default(),
         Some(s) => match SchedulerKind::parse(s) {
             Some(kind) => kind,
+            None if fixed_sampler.is_some() => SchedulerKind::default(),
             None => {
                 return json_response(
                     400,
@@ -324,10 +351,29 @@ fn handle_generate(
             }
         },
     };
+    let sampler_name = fixed_sampler.unwrap_or_else(|| scheduler.name());
+    if let (Some(fixed), Some(requested)) = (fixed_sampler, requested_scheduler) {
+        eprintln!("[serve-images] scheduler {requested:?} ignored — pipeline runs {fixed}");
+    }
+    // Preview cadence: the request may override the worker-wide flag, so a
+    // short distilled run (4 steps) can still ask for previews every step.
+    // The field never rejects — this endpoint tolerated unknown keys before
+    // it existed, so an uninterpretable value keeps the flag and says so.
+    let preview_every = match req.get("preview_every") {
+        None => preview_every,
+        Some(v) => match v.as_u64() {
+            Some(n) if n <= 1000 => n as usize,
+            _ => {
+                eprintln!(
+                    "[serve-images] preview_every {v} ignored — expected an integer in 0..=1000"
+                );
+                preview_every
+            }
+        },
+    };
 
     eprintln!(
-        "[serve-images] generate: {prompt} ({width}x{height}, {steps} steps, {}, cfg {guidance})",
-        scheduler.name()
+        "[serve-images] generate: {prompt} ({width}x{height}, {steps} steps, {sampler_name}, cfg {guidance})"
     );
 
     // Single in-flight generation: the pipeline holds VRAM-resident state.
@@ -340,6 +386,7 @@ fn handle_generate(
         stats.total_steps.store(steps as u64, Relaxed);
         stats.first_step_at_ms.store(0, Relaxed);
         stats.preview_step.store(0, Relaxed);
+        stats.preview_cadence.store(preview_every as u64, Relaxed);
         stats.phase.store(1, Relaxed);
         stats.started_at_ms.store(now_ms(), Relaxed);
     }
@@ -444,7 +491,7 @@ fn handle_generate(
                     // Echoed so the UI can display and replay the seed even
                     // when the request left it unset.
                     "seed": effective_seed,
-                    "scheduler": scheduler.name(),
+                    "scheduler": sampler_name,
                     "data": [{ "b64_json": B64.encode(png) }],
                 }),
             )

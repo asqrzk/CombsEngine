@@ -5,9 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Args;
 
-use combs_diffusion::{
-    DiffusionArchitecture, DiffusionModel, SchedulerKind, load_diffusion_model,
-};
+use combs_diffusion::{DiffusionArchitecture, DiffusionModel, SchedulerKind};
 
 #[derive(Args, Clone)]
 pub struct GenerateImageArgs {
@@ -108,8 +106,17 @@ fn run_generate<B: burn::tensor::backend::Backend>(
     args: &GenerateImageArgs,
 ) -> Result<()> {
 
-    let scheduler = SchedulerKind::parse(&args.scheduler)
-        .with_context(|| format!("unknown scheduler {:?} (ddpm | ddim | dpm++2m)", args.scheduler))?;
+    let scheduler = match SchedulerKind::parse(&args.scheduler) {
+        Some(kind) => kind,
+        // Fixed-schedule pipelines ignore the choice entirely; the success
+        // line prints "flow-match-euler", and that spelling must be
+        // replayable as a flag rather than failing before any work.
+        None if pipeline.fixed_sampler().is_some() => SchedulerKind::default(),
+        None => anyhow::bail!(
+            "unknown scheduler {:?} (ddpm | ddim | dpm++2m)",
+            args.scheduler
+        ),
+    };
 
 
     let embed = pipeline
@@ -139,10 +146,12 @@ fn run_generate<B: burn::tensor::backend::Backend>(
         .context("generating image")?;
 
     save_tensor_as_png(&image, &args.output).context("saving output image")?;
+    // Report the sampler that ran, not the flag: fixed-schedule pipelines
+    // (klein's flow-match) ignore --scheduler.
     println!(
         "saved {} ({}, seed {effective_seed})",
         args.output.display(),
-        scheduler.name()
+        pipeline.fixed_sampler().unwrap_or_else(|| scheduler.name())
     );
     Ok(())
 }
