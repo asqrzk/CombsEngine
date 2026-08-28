@@ -246,6 +246,26 @@ impl<R: Runtime> Q40Weight<R> {
         n_blocks * (16 + core::mem::size_of::<f32>())
     }
 
+    /// Transient full-width f32 copy on device (`[n_out, k]` row-major)
+    /// for the batched-matmul path — see the Q8_0 twin for the why.
+    pub fn dequant_device(&self, client: &ComputeClient<R>) -> Handle {
+        let n = self.n_out * self.k;
+        let n_blocks = n / Q4_0_BLOCK;
+        let out_h = client.empty(n * core::mem::size_of::<f32>());
+        unsafe {
+            q4_0_dequant_kernel::launch_unchecked::<R>(
+                client,
+                cube_count_capped(n as u32),
+                CubeDim::new_1d(CUBE_DIM),
+                ArrayArg::from_raw_parts(self.qs.clone(), n_blocks * 4),
+                ArrayArg::from_raw_parts(self.d.clone(), n_blocks),
+                ArrayArg::from_raw_parts(out_h.clone(), n),
+                n,
+            );
+        }
+        out_h
+    }
+
     /// Device path: `y = x @ W^T` with `x` already resident as a contiguous
     /// f32 buffer of `[m, k]`. Launch only — returns the output handle
     /// (`[m, n_out]` f32) without any host round-trip.
@@ -644,6 +664,27 @@ impl<R: Runtime> Q50Weight<R> {
         (self.n_out * self.k / Q4_0_BLOCK) * 24
     }
 
+    /// Transient full-width f32 copy on device (`[n_out, k]` row-major)
+    /// for the batched-matmul path — see the Q8_0 twin for the why.
+    pub fn dequant_device(&self, client: &ComputeClient<R>) -> Handle {
+        let n = self.n_out * self.k;
+        let n_blocks = n / Q4_0_BLOCK;
+        let out_h = client.empty(n * core::mem::size_of::<f32>());
+        unsafe {
+            q5_0_dequant_kernel::launch_unchecked::<R>(
+                client,
+                cube_count_capped(n as u32),
+                CubeDim::new_1d(CUBE_DIM),
+                ArrayArg::from_raw_parts(self.qs.clone(), n_blocks * 4),
+                ArrayArg::from_raw_parts(self.qh.clone(), n_blocks),
+                ArrayArg::from_raw_parts(self.d.clone(), n_blocks),
+                ArrayArg::from_raw_parts(out_h.clone(), n),
+                n,
+            );
+        }
+        out_h
+    }
+
     /// Device path: launch only, output handle returned.
     pub fn matmul_device(&self, client: &ComputeClient<R>, x: Handle, m: usize) -> Handle {
         let out_len = m * self.n_out;
@@ -722,6 +763,28 @@ impl<R: Runtime> Q80Weight<R> {
     /// Bytes in VRAM: 36 per 32 weights (9.0 bits/weight).
     pub fn vram_bytes(&self) -> usize {
         (self.n_out * self.k / Q4_0_BLOCK) * 36
+    }
+
+    /// Dequantize the whole weight into a transient f32 device buffer
+    /// (`[n_out, k]` row-major). The batched-matmul path pays this once
+    /// per call so the weight is READ once — the fused kernels re-read
+    /// it per activation row, which is the §54 wall.
+    pub fn dequant_device(&self, client: &ComputeClient<R>) -> Handle {
+        let n = self.n_out * self.k;
+        let n_blocks = n / Q4_0_BLOCK;
+        let out_h = client.empty(n * core::mem::size_of::<f32>());
+        unsafe {
+            q8_0_dequant_kernel::launch_unchecked::<R>(
+                client,
+                cube_count_capped(n as u32),
+                CubeDim::new_1d(CUBE_DIM),
+                ArrayArg::from_raw_parts(self.qs.clone(), n_blocks * 8),
+                ArrayArg::from_raw_parts(self.d.clone(), n_blocks),
+                ArrayArg::from_raw_parts(out_h.clone(), n),
+                n,
+            );
+        }
+        out_h
     }
 
     /// Device path: launch only, output handle returned. Decode (`m == 1`)
@@ -1996,6 +2059,21 @@ impl QuantWeight {
     }
 
     /// Fused dequant-matmul, device handles in and out.
+    /// Transient full-width f32 dequant on device — `None` for the
+    /// K-quant formats, whose dequant-only kernels don't exist yet
+    /// (they keep the fused per-row kernels for every m).
+    pub fn dequant_device(
+        &self,
+        client: &ComputeClient<cubecl::wgpu::WgpuRuntime>,
+    ) -> Option<Handle> {
+        match self {
+            QuantWeight::Q40(w) => Some(w.dequant_device(client)),
+            QuantWeight::Q50(w) => Some(w.dequant_device(client)),
+            QuantWeight::Q80(w) => Some(w.dequant_device(client)),
+            QuantWeight::Q4K(_) | QuantWeight::Q5K(_) | QuantWeight::Q6K(_) => None,
+        }
+    }
+
     pub fn matmul_device(
         &self,
         client: &ComputeClient<cubecl::wgpu::WgpuRuntime>,

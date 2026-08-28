@@ -32,6 +32,8 @@ use burn::tensor::backend::Backend;
 use burn::tensor::{DType, Device, FloatDType, Shape, Tensor, TensorPrimitive};
 use burn_cubecl::fusion::FusionCubeRuntime;
 use burn_cubecl::kernel::into_contiguous;
+use burn_cubecl::kernel::matmul::{matmul, MatmulStrategy};
+use burn_cubecl::ops::permute;
 use burn_cubecl_fusion::CubeFusionHandle;
 use burn_fusion::Fusion;
 use burn_fusion::stream::{Operation, OperationStreams};
@@ -112,6 +114,9 @@ impl CubeQuantLinear {
     /// Shared unfused path: contiguous f32 `CubeTensor` in, f32 out.
     fn forward_cube(&self, x: CubeTensor<WgpuRuntime>, batch: usize, seq: usize) -> CubeTensor<WgpuRuntime> {
         let x = into_contiguous(x);
+        if let Some(out) = try_batched_matmul(&self.w, &x, batch, seq) {
+            return out;
+        }
         let out_h = self.w.matmul_device(&x.client, x.handle.clone(), batch * seq);
         CubeTensor::new_contiguous(
             x.client.clone(),
@@ -140,6 +145,62 @@ fn to_dtype<B: Backend>(out: Tensor<B, 3>, dtype: DType) -> Tensor<B, 3> {
         DType::BF16 => out.cast(FloatDType::BF16),
         _ => out,
     }
+}
+
+/// Row count at which the batched path (transient device dequant +
+/// burn's tuned matmul) replaces the fused per-row kernels. The fused
+/// kernels re-read the packed weight once PER ACTIVATION ROW — decode
+/// never notices, but prompt-shaped calls drown in redundant weight
+/// traffic (§ the klein profile: ~95% of a step at ~2.6% of peak).
+/// `COMBS_QMATMUL_BATCHED=0` closes the door; any other value overrides
+/// the threshold.
+fn batched_threshold() -> usize {
+    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *T.get_or_init(|| match std::env::var("COMBS_QMATMUL_BATCHED").as_deref() {
+        Ok("0") => usize::MAX,
+        Ok(v) => v.parse().unwrap_or(8),
+        _ => 8,
+    })
+}
+
+/// The batched path: weight read ONCE (dequantized into a transient f32
+/// buffer that dies with the call), FLOPs handed to the tuned matmul.
+/// `None` below the threshold or for formats without a dequant kernel —
+/// the caller falls through to the fused kernels.
+fn try_batched_matmul(
+    w: &QuantWeight,
+    x: &CubeTensor<WgpuRuntime>,
+    batch: usize,
+    seq: usize,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    let m = batch * seq;
+    if m < batched_threshold() {
+        return None;
+    }
+    let (n_out, k) = (w.n_out(), w.k());
+    let w_h = w.dequant_device(&x.client)?;
+    let x2 = CubeTensor::new_contiguous(
+        x.client.clone(),
+        x.device.clone(),
+        Shape::from([m, k]),
+        x.handle.clone(),
+        DType::F32,
+    );
+    let w2 = CubeTensor::new_contiguous(
+        x.client.clone(),
+        x.device.clone(),
+        Shape::from([n_out, k]),
+        w_h,
+        DType::F32,
+    );
+    let out = matmul(x2, permute(w2, &[1, 0]), None, MatmulStrategy::default(), DType::F32).ok()?;
+    Some(CubeTensor::new_contiguous(
+        x.client.clone(),
+        x.device.clone(),
+        Shape::from([batch, seq, n_out]),
+        out.handle,
+        DType::F32,
+    ))
 }
 
 impl QuantLinearOp<UnfusedF32> for CubeQuantLinear {
@@ -213,6 +274,10 @@ impl Operation<FusionCubeRuntime<WgpuRuntime>> for QuantMatmulOp {
         let ([input], [output]) = self.desc.as_fixed::<1, 1>();
         let x: CubeTensor<WgpuRuntime> = handles.get_float_tensor::<InnerF32>(input);
         let x = into_contiguous(x);
+        if let Some(out) = try_batched_matmul(&self.w, &x, self.batch, self.seq) {
+            handles.register_float_tensor::<InnerF32>(&output.id, out);
+            return;
+        }
         let out_h = self.w.matmul_device(&x.client, x.handle.clone(), self.batch * self.seq);
         let out = CubeTensor::new_contiguous(
             x.client.clone(),
@@ -459,6 +524,40 @@ mod tests {
             .to_vec()
             .unwrap();
         assert_close(&got, &expect, 1e-4);
+    }
+
+    /// Above the batched threshold the SAME public path routes through
+    /// the transient-dequant + tuned matmul; it must match the dense
+    /// reference too (looser tolerance — the tuned matmul's accumulation
+    /// order legitimately differs from the fused kernels'). Runs on both
+    /// wgpu backends so both dispatch seams cover the new branch.
+    #[test]
+    fn batched_prompt_shape_matches_dense() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        pin_device_dtypes();
+        let (n_out, k, seq) = (48, 64, 64);
+
+        fn run<B: Backend>(n_out: usize, k: usize, seq: usize)
+        where
+            CubeQuantLinear: QuantLinearOp<B>,
+        {
+            let device: Device<B> = Default::default();
+            let (quant, dense) = quant_and_dense::<B>(&device, n_out, k, FloatDType::F32);
+            let x: Vec<f32> =
+                (0..seq * k).map(|i| ((i % 29) as f32) / 14.0 - 1.0).collect();
+            let x = Tensor::<B, 3>::from_data(TensorData::new(x, [1, seq, k]), &device)
+                .cast(FloatDType::F32);
+            let got: Vec<f32> =
+                quant.forward(x.clone(), None).into_data().to_vec().unwrap();
+            let expect: Vec<f32> =
+                dense.forward(x, None).into_data().to_vec().unwrap();
+            assert_close(&got, &expect, 1e-3);
+        }
+
+        run::<FusedF32>(n_out, k, seq);
+        run::<UnfusedF32>(n_out, k, seq);
     }
 
     /// The f16 build: activation is cast around the f32 kernel; tolerance
