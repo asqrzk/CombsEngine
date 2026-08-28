@@ -244,12 +244,37 @@ impl<B: Backend> LlamaModel<B> {
     /// token.
     pub(crate) fn forward_hidden(
         &self,
-        mut x: Tensor<B, 3>,
+        x: Tensor<B, 3>,
         cache: &mut dyn KVCache<B>,
         pos: usize,
     ) -> Tensor<B, 3> {
+        self.forward_taps(x, cache, pos, &[]).0
+    }
+
+    /// Runs the layer stack, returning the post-final-norm stream plus
+    /// the RAW residual stream captured after `taps[i]` layers, in tap
+    /// order. Tap index = number of layers applied: 0 is the embedding
+    /// stream itself, `num_hidden_layers` the pre-norm final stream —
+    /// the same coordinate system reference implementations use for
+    /// their hidden-state stacks, so published tap indices carry over
+    /// unchanged. No norm is applied to any tap. Callers validate
+    /// indices; an out-of-range tap panics here.
+    pub(crate) fn forward_taps(
+        &self,
+        mut x: Tensor<B, 3>,
+        cache: &mut dyn KVCache<B>,
+        pos: usize,
+        taps: &[usize],
+    ) -> (Tensor<B, 3>, Vec<Tensor<B, 3>>) {
         let m = &self.metadata;
         let [_, seq, _] = x.dims();
+
+        let mut captured: Vec<Option<Tensor<B, 3>>> = vec![None; taps.len()];
+        for (slot, &t) in taps.iter().enumerate() {
+            if t == 0 {
+                captured[slot] = Some(x.clone());
+            }
+        }
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let window = match self.spec.layers.get(layer_idx) {
@@ -305,9 +330,20 @@ impl<B: Backend> LlamaModel<B> {
                 mlp_out = self.norm(mlp_out, n);
             }
             x = x + mlp_out;
+
+            let applied = layer_idx + 1;
+            for (slot, &t) in taps.iter().enumerate() {
+                if t == applied {
+                    captured[slot] = Some(x.clone());
+                }
+            }
         }
 
-        self.norm(x, &self.final_norm)
+        let taps_out = captured
+            .into_iter()
+            .map(|c| c.expect("tap index exceeds layer count — callers validate"))
+            .collect();
+        (self.norm(x, &self.final_norm), taps_out)
     }
 
     /// Logits of every position: `[1, seq, hidden] -> [1, seq, vocab]`
@@ -445,6 +481,34 @@ impl<B: Backend> GenerativeModel<B> for LlamaModel<B> {
 
     fn supports_hidden_states(&self) -> bool {
         true
+    }
+
+    fn prefill_taps(
+        &mut self,
+        input: Tensor<B, 3>,
+        cache: &mut dyn KVCache<B>,
+        pos: Range<u32>,
+        taps: &[usize],
+    ) -> Result<Tensor<B, 3>> {
+        let [_, seq, _] = input.dims();
+        assert_eq!(
+            seq,
+            (pos.end - pos.start) as usize,
+            "prefill pos range must match the input sequence length"
+        );
+        if taps.is_empty() {
+            return Err(crate::ModelError::Unsupported(
+                "prefill_taps needs at least one tap index".to_string(),
+            ));
+        }
+        let layers = self.metadata.num_hidden_layers;
+        if let Some(&bad) = taps.iter().find(|&&t| t > layers) {
+            return Err(crate::ModelError::Unsupported(format!(
+                "tap {bad} exceeds the {layers}-layer stack"
+            )));
+        }
+        let (_, streams) = self.forward_taps(input, cache, pos.start as usize, taps);
+        Ok(Tensor::cat(streams, 2))
     }
 
     fn prefill_all_logits(

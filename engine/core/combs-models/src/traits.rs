@@ -103,6 +103,26 @@ pub trait GenerativeModel<B: Backend>: Send {
         false
     }
 
+    /// Runs (a chunk of) the prompt and returns the RAW residual stream
+    /// captured at several depths, concatenated on the last dimension in
+    /// tap order: shape `[1, seq, taps.len() * hidden]`. Tap index =
+    /// number of layers applied (0 = the embedding stream,
+    /// `num_hidden_layers` = the pre-final-norm stream); no norm is
+    /// applied to any tap. This is the conditioning surface diffusion
+    /// text encoders need (multi-depth hidden-state stacks). Same
+    /// cache/position contract as [`GenerativeModel::prefill`].
+    fn prefill_taps(
+        &mut self,
+        _input: Tensor<B, 3>,
+        _cache: &mut dyn KVCache<B>,
+        _pos: Range<u32>,
+        _taps: &[usize],
+    ) -> Result<Tensor<B, 3>> {
+        Err(crate::ModelError::Unsupported(
+            "this model does not expose multi-depth hidden states".to_string(),
+        ))
+    }
+
     /// Runs (a chunk of) the prompt and returns logits for **every**
     /// position, shape `[1, seq, vocab]` — the perplexity / speculative-
     /// decode path. Same cache/position contract as
