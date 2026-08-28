@@ -108,3 +108,88 @@ fn onnx_fp16_matches_the_safetensors_original() {
     assert!(max_diff < 0.25, "logit drift beyond fp16 storage noise: {max_diff}");
     assert_eq!(toks_onnx, toks_st, "greedy tokens diverged");
 }
+
+/// The int4 export: (a) on REAL tensors, the Q4_0 repack must
+/// dequantize bit-identically to the reference MatMulNBits semantics
+/// (f16 scales make the whole path lossless); (b) the model loads and
+/// greedy-decodes coherently against the fp16 export — Q4 rounding
+/// legitimately moves logits, so tokens are REPORTED with a
+/// first-token gate rather than promised identical.
+#[test]
+#[ignore = "requires the qwen3-0.6b onnx checkouts"]
+fn onnx_q4f16_repack_and_decode() {
+    let q4_path = std::env::var("COMBS_TEST_ONNX_Q4")
+        .unwrap_or_else(|_| home(".cache/combs/models/qwen3-0.6b-onnx/onnx/model_q4f16.onnx"));
+    let fp16_path = std::env::var("COMBS_TEST_ONNX")
+        .unwrap_or_else(|_| home(".cache/combs/models/qwen3-0.6b-onnx/onnx/model_fp16.onnx"));
+    if !std::path::Path::new(&q4_path).exists() {
+        eprintln!("skipping: {q4_path} not present");
+        return;
+    }
+    let device = Default::default();
+    let q4_src = open_model_source(&q4_path).expect("q4 source");
+
+    // (a) repacked kernel stream ≡ dequant fallback, on real weights.
+    let mut checked = 0;
+    for name in [
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.13.mlp.down_proj.weight",
+        "model.layers.27.self_attn.o_proj.weight",
+    ] {
+        let Some(qt) = q4_src.open_tensor_quant(name).expect("quant open") else {
+            panic!("{name} should serve a Q4_0 stream");
+        };
+        let n: usize = qt.shape[0];
+        let k: usize = qt.shape[1];
+        let via_kernel_stream =
+            combs_formats::quants::dequantize_q4_0(&qt.data, n * k).expect("q4_0 dequant");
+        let dense: Vec<f32> = q4_src
+            .open_tensor(name)
+            .expect("dense fallback")
+            .load_data()
+            .expect("load")
+            .to_vec()
+            .expect("f32 vec");
+        let worst = via_kernel_stream
+            .iter()
+            .zip(&dense)
+            .map(|(a, b): (&f32, &f32)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert_eq!(worst, 0.0, "{name}: repack path diverged from reference dequant");
+        checked += 1;
+    }
+    println!("[onnx-q4] {checked} real tensors: repack ≡ dequant, bit-exact");
+
+    // (b) coherence vs the fp16 export.
+    let fp16_src = open_model_source(&fp16_path).expect("fp16 source");
+    let tok = tokenizers::Tokenizer::from_bytes(
+        q4_src.tokenizer().unwrap().json_bytes().unwrap(),
+    )
+    .unwrap();
+    let prompt = "The capital of France is Paris, and the capital of Italy is";
+    let ids = tok.encode(prompt, false).unwrap().get_ids().to_vec();
+
+    let mut m_q4 = LlamaModel::<B>::load(q4_src.as_ref(), &device).expect("load q4");
+    let mut c_q4 = m_q4.create_kv_cache(&CacheConfig::contiguous(512));
+    let (toks_q4, logits_q4) = greedy(&mut m_q4, c_q4.as_mut(), &ids, 12);
+    drop(m_q4);
+    let mut m_fp = LlamaModel::<B>::load(fp16_src.as_ref(), &device).expect("load fp16");
+    let mut c_fp = m_fp.create_kv_cache(&CacheConfig::contiguous(512));
+    let (toks_fp, logits_fp) = greedy(&mut m_fp, c_fp.as_mut(), &ids, 12);
+
+    let max_diff = logits_q4
+        .iter()
+        .zip(&logits_fp)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let agree = toks_q4.iter().zip(&toks_fp).take_while(|(a, b)| a == b).count();
+    println!("[onnx-q4] first-position max |logit diff| {max_diff:.3} (Q4 rounding)");
+    println!("[onnx-q4] q4   tokens: {toks_q4:?}");
+    println!("[onnx-q4] fp16 tokens: {toks_fp:?}");
+    println!("[onnx-q4] greedy agreement: {agree}/12");
+    assert_eq!(
+        argmax(&logits_q4),
+        argmax(&logits_fp),
+        "first greedy token flipped under Q4"
+    );
+}

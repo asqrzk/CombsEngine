@@ -17,7 +17,8 @@ use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 
 use crate::onnx::{OnnxData, OnnxDtype, OnnxModel};
-use crate::source::{ModelSource, TensorDtype, TensorReader};
+use crate::onnx_quant::{dequantize_matmul_nbits, repack_matmul_nbits_q4_0};
+use crate::source::{ModelSource, QuantFormat, QuantTensor, TensorDtype, TensorReader};
 use crate::tokenizer::{TokenizerSource, TokenizerSpec};
 use crate::{FormatError, ModelMetadata, Result, SamplerConfig};
 
@@ -30,6 +31,21 @@ pub struct OnnxSource {
     sidecars: HashMap<String, Mmap>,
     /// HF-canonical name → (initializer name, needs transpose).
     names: HashMap<String, (String, bool)>,
+    /// HF-canonical name → block-quantized MatMulNBits weight.
+    quants: HashMap<String, QuantEntry>,
+}
+
+/// One MatMulNBits weight: the packed nibbles + scales initializers
+/// and the geometry from the node attributes.
+struct QuantEntry {
+    packed: String,
+    scales: String,
+    k: usize,
+    n: usize,
+    block_size: usize,
+    /// zero_points / g_idx present — Q4_0's fixed zero-point 8 no
+    /// longer applies, so only the dequant fallback serves it.
+    beyond_q4_0: bool,
 }
 
 /// Normalize an ONNX initializer name to the HF-canonical form the
@@ -173,15 +189,67 @@ impl OnnxSource {
             }
         }
 
+        // --- quant table -------------------------------------------------
+        // MatMulNBits weights come as `<name>.MatMul.weight_Q4` +
+        // `..._scales` initializer PAIRS addressed by the node; they
+        // surface under the canonical linear name, quantized — never
+        // as raw dense tensors.
+        let mut quants = HashMap::new();
+        for node in &model.matmul_nbits {
+            let Some(packed) = node.inputs.get(1) else { continue };
+            let Some(scales) = node.inputs.get(2) else { continue };
+            let base = packed.trim_end_matches("_Q4");
+            let Some((canonical, _)) = canonical_name(base) else { continue };
+            quants.insert(canonical, QuantEntry {
+                packed: packed.clone(),
+                scales: scales.clone(),
+                k: node.k as usize,
+                n: node.n as usize,
+                block_size: node.block_size as usize,
+                beyond_q4_0: node.inputs.len() > 3 || node.bits != 4,
+            });
+        }
+
         // --- name table --------------------------------------------------
+        let quant_parts: std::collections::HashSet<&String> = quants
+            .values()
+            .flat_map(|q| [&q.packed, &q.scales])
+            .collect();
         let mut names = HashMap::new();
         for raw in model.tensors.keys() {
+            if quant_parts.contains(raw) {
+                continue;
+            }
             if let Some((canonical, transposed)) = canonical_name(raw) {
                 names.insert(canonical, (raw.clone(), transposed));
             }
         }
 
-        Ok(Self { metadata, tokenizer, model, image, sidecars, names })
+        Ok(Self { metadata, tokenizer, model, image, sidecars, names, quants })
+    }
+
+    /// A quant entry's scales as f32 (stored f16 or f32).
+    fn scales_f32(&self, entry: &QuantEntry) -> Result<Vec<f32>> {
+        let info = self.model.tensors.get(&entry.scales).ok_or_else(|| {
+            FormatError::TensorNotFound(entry.scales.clone())
+        })?;
+        let bytes = self.tensor_bytes(info)?;
+        Ok(match info.dtype {
+            OnnxDtype::F32 => bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
+            OnnxDtype::F16 => bytes
+                .chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes(c.try_into().unwrap()).to_f32())
+                .collect(),
+            other => {
+                return Err(FormatError::UnsupportedDtype {
+                    tensor: entry.scales.clone(),
+                    dtype: format!("{other:?} scales"),
+                })
+            }
+        })
     }
 
     /// The parsed container table (quant-bridge and diagnostics).
@@ -221,10 +289,29 @@ impl ModelSource for OnnxSource {
     }
 
     fn tensor_names(&self) -> Vec<String> {
-        self.names.keys().cloned().collect()
+        self.names.keys().chain(self.quants.keys()).cloned().collect()
     }
 
     fn open_tensor(&self, name: &str) -> Result<TensorReader<'_>> {
+        // Quantized weights: dequantize (the fallback for formats the
+        // kernels don't take and for zero-point-carrying models).
+        if let Some(entry) = self.quants.get(name) {
+            let packed = self.tensor_bytes(
+                self.model
+                    .tensors
+                    .get(&entry.packed)
+                    .ok_or_else(|| FormatError::TensorNotFound(entry.packed.clone()))?,
+            )?;
+            let scales = self.scales_f32(entry)?;
+            let values =
+                dequantize_matmul_nbits(packed, &scales, entry.k, entry.n, entry.block_size)?;
+            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            return Ok(TensorReader::owned(
+                name.to_string(),
+                vec![entry.n, entry.k],
+                bytes,
+            ));
+        }
         let (raw, transposed) = self
             .names
             .get(name)
@@ -263,6 +350,28 @@ impl ModelSource for OnnxSource {
             ));
         }
         Ok(TensorReader::new(name.to_string(), shape, dtype, bytes))
+    }
+
+    fn open_tensor_quant(&self, name: &str) -> Result<Option<QuantTensor<'_>>> {
+        let Some(entry) = self.quants.get(name) else {
+            return Ok(None);
+        };
+        if entry.beyond_q4_0 || entry.block_size != 32 || entry.k % 32 != 0 {
+            return Ok(None); // dense fallback dequantizes instead
+        }
+        let packed = self.tensor_bytes(
+            self.model
+                .tensors
+                .get(&entry.packed)
+                .ok_or_else(|| FormatError::TensorNotFound(entry.packed.clone()))?,
+        )?;
+        let scales = self.scales_f32(entry)?;
+        let data = repack_matmul_nbits_q4_0(packed, &scales, entry.k, entry.n, entry.block_size)?;
+        Ok(Some(QuantTensor {
+            format: QuantFormat::Q4_0,
+            shape: vec![entry.n, entry.k],
+            data: std::borrow::Cow::Owned(data),
+        }))
     }
 
     fn tokenizer(&self) -> Result<TokenizerSpec> {
