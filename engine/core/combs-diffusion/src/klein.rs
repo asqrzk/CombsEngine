@@ -34,6 +34,28 @@ use crate::{DiffusionModel, GenerationHooks, NoiseSource, PromptEmbed, Scheduler
 const ENCODER_TAPS: [usize; 3] = [9, 18, 27];
 const MAX_PROMPT_TOKENS: usize = 512;
 
+fn debug_enabled() -> bool {
+    std::env::var("COMBS_KLEIN_DEBUG").is_ok_and(|v| v != "0")
+}
+
+fn stats<B: Backend, const D: usize>(label: &str, t: &Tensor<B, D>) {
+    let v: Vec<f32> = t.clone().into_data().convert::<f32>().to_vec().unwrap_or_default();
+    if v.is_empty() {
+        eprintln!("[klein-debug] {label}: EMPTY");
+        return;
+    }
+    let n = v.len() as f32;
+    let mean = v.iter().sum::<f32>() / n;
+    let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n;
+    let nan = v.iter().filter(|x| x.is_nan()).count();
+    let max = v.iter().fold(f32::MIN, |m, &x| m.max(x));
+    let min = v.iter().fold(f32::MAX, |m, &x| m.min(x));
+    eprintln!(
+        "[klein-debug] {label}: mean {mean:.4} std {:.4} min {min:.3} max {max:.3} nan {nan}",
+        var.sqrt()
+    );
+}
+
 /// Render the prompt through the checkpoint's chat template (thinking
 /// disabled, generation prompt appended), matching the reference
 /// conditioning exactly. A checkpoint without a template gets the
@@ -102,12 +124,17 @@ mod tests {
     }
 }
 
-pub struct Flux2KleinPipeline<B: Backend> {
+/// `VB` is the autoencoder's backend — the decoder overflows f16
+/// (GroupNorm squares + 512-wide conv stacks), so the f16 twin runs
+/// it on the f32 backend over the same wgpu device; the latent hop
+/// between backends is a ~0.5 MB host round-trip per decode.
+pub struct Flux2KleinPipeline<B: Backend, VB: Backend = B> {
     metadata: ModelMetadata,
     device: Device<B>,
+    vae_device: Device<VB>,
     transformer: Flux2Transformer<B>,
-    vae: VAEDecoder<B>,
-    latent_stats: Flux2LatentStats<B>,
+    vae: VAEDecoder<VB>,
+    latent_stats: Flux2LatentStats<VB>,
     /// `prefill_taps` takes `&mut` (the cache contract), encode_prompt
     /// is `&self` — one prompt at a time behind a lock.
     encoder: Mutex<(LlamaModel<B>, Box<dyn combs_models::KVCache<B>>)>,
@@ -115,20 +142,22 @@ pub struct Flux2KleinPipeline<B: Backend> {
     chat_template: Option<String>,
 }
 
-impl<B: Backend> Flux2KleinPipeline<B> {
+impl<B: Backend, VB: Backend> Flux2KleinPipeline<B, VB> {
     /// Assemble from the three-part recipe: the DiT weights, the Qwen3
     /// language model (any source the llama family loads — GGUF quants
-    /// are the practical choice), and the flux2 autoencoder.
+    /// are the practical choice), and the flux2 autoencoder (on its
+    /// own backend, see the type docs).
     pub fn load_recipe(
         dit: &dyn ModelSource,
         dit_config: Flux2Config,
         llm: &dyn ModelSource,
         vae: &dyn ModelSource,
         device: &Device<B>,
+        vae_device: &Device<VB>,
     ) -> Result<Self> {
         let transformer = Flux2Transformer::load(dit, dit_config, device)?;
-        let vae_decoder = VAEDecoder::load_with_latent_channels(vae, 32, device)?;
-        let latent_stats = Flux2LatentStats::load(vae, device)?;
+        let vae_decoder = VAEDecoder::load_with_latent_channels(vae, 32, vae_device)?;
+        let latent_stats = Flux2LatentStats::load(vae, vae_device)?;
 
         let encoder = LlamaModel::<B>::load(llm, device)
             .map_err(|e| FormatError::Safetensors(format!("klein text encoder: {e}")))?;
@@ -151,6 +180,7 @@ impl<B: Backend> Flux2KleinPipeline<B> {
         Ok(Self {
             metadata: crate::diffusion_metadata("flux2-klein"),
             device: device.clone(),
+            vae_device: vae_device.clone(),
             transformer,
             vae: vae_decoder,
             latent_stats,
@@ -164,16 +194,29 @@ impl<B: Backend> Flux2KleinPipeline<B> {
         render_prompt(self.chat_template.as_deref(), prompt)
     }
 
-    /// Packed latent tokens → RGB in [0, 1].
+    /// Packed latent tokens → RGB in [0, 1] (computed on `VB`, handed
+    /// back on `B`).
     fn decode_tokens(&self, tokens: Tensor<B, 3>, grid_h: usize, grid_w: usize) -> Tensor<B, 4> {
+        let tokens: Tensor<VB, 3> = Tensor::from_data(
+            tokens.into_data().convert::<f32>(),
+            &self.vae_device,
+        );
         let grid = unpack_latents(tokens, grid_h, grid_w);
-        let latent = unpatchify_latents(self.latent_stats.denormalize(grid));
+        let denormed = self.latent_stats.denormalize(grid);
+        let latent = unpatchify_latents(denormed);
+        if debug_enabled() {
+            stats("decode: denormed latent", &latent);
+        }
         let image = self.vae.forward(latent);
-        image.mul_scalar(0.5).add_scalar(0.5).clamp(0.0, 1.0)
+        if debug_enabled() {
+            stats("decode: vae output", &image);
+        }
+        let image = image.mul_scalar(0.5).add_scalar(0.5).clamp(0.0, 1.0);
+        Tensor::from_data(image.into_data().convert::<f32>(), &self.device)
     }
 }
 
-impl<B: Backend> DiffusionModel<B> for Flux2KleinPipeline<B> {
+impl<B: Backend, VB: Backend> DiffusionModel<B> for Flux2KleinPipeline<B, VB> {
     fn metadata(&self) -> &ModelMetadata {
         &self.metadata
     }
@@ -191,10 +234,23 @@ impl<B: Backend> DiffusionModel<B> for Flux2KleinPipeline<B> {
         let text = self.wrap_prompt(prompt);
         let encoding = self
             .tokenizer
-            .encode(text, false)
+            .encode(text.as_str(), false)
             .map_err(|e| FormatError::Safetensors(format!("klein encode: {e}")))?;
         let mut ids: Vec<i32> = encoding.get_ids().iter().map(|&t| t as i32).collect();
         ids.truncate(MAX_PROMPT_TOKENS);
+        // The reference pads EVERY prompt to the full budget
+        // (`padding="max_length"`) and feeds all positions — pad-derived
+        // states included — to the transformer; the model calibrated to
+        // that shape, and natural-length conditioning decodes to mush.
+        // (Known deviation: the reference masks pad KEYS inside the
+        // encoder; a causal LM with right-padding differs only in what
+        // pad positions themselves attend to.)
+        let pad = self
+            .tokenizer
+            .token_to_id("<|endoftext|>")
+            .or_else(|| self.tokenizer.token_to_id("<|im_end|>"))
+            .unwrap_or(0) as i32;
+        ids.resize(MAX_PROMPT_TOKENS, pad);
         let seq = ids.len();
 
         let mut guard = self.encoder.lock().expect("encoder lock");
@@ -207,6 +263,10 @@ impl<B: Backend> DiffusionModel<B> for Flux2KleinPipeline<B> {
             .prefill_taps(embedded, cache.as_mut(), 0..seq as u32, &ENCODER_TAPS)
             .map_err(|e| FormatError::Safetensors(format!("klein taps: {e}")))?;
         cache.reset();
+        if debug_enabled() {
+            eprintln!("[klein-debug] wrapped prompt ({} tokens): {:?}...", seq, &text[..text.len().min(120)]);
+            stats("prompt embeds", &positive);
+        }
 
         // Distilled klein runs guidance-free; the negative arm exists
         // only for future -base weights and stays empty here.
@@ -244,6 +304,9 @@ impl<B: Backend> DiffusionModel<B> for Flux2KleinPipeline<B> {
         let mut latent = flat.reshape([1, channels, grid_h * grid_w]).permute([0, 2, 1]);
 
         let total = schedule.num_steps();
+        if debug_enabled() {
+            stats("initial latent", &latent);
+        }
         for i in 0..total {
             let velocity = self.transformer.forward(
                 latent.clone(),
@@ -252,7 +315,14 @@ impl<B: Backend> DiffusionModel<B> for Flux2KleinPipeline<B> {
                 &img_ids,
                 &txt_ids,
             );
+            if debug_enabled() {
+                eprintln!("[klein-debug] step {i}: sigma {}", schedule.timestep(i));
+                stats("velocity", &velocity);
+            }
             latent = schedule.step(latent, velocity, i);
+            if debug_enabled() {
+                stats("latent", &latent);
+            }
             let completed = i + 1;
             if let Some(cb) = hooks.on_step.as_mut() {
                 cb(completed, total);

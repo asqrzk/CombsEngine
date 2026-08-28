@@ -85,9 +85,10 @@ pub fn cmd_serve_images(
     let pipeline = match (&llm, &vae) {
         (Some(llm), Some(vae)) => {
             anyhow::ensure!(lora_spec.is_none(), "LoRA is not wired for recipe pipelines yet");
-            combs_diffusion::loader::load_flux2_klein_recipe::<combs_core::CombsBackendF32>(
-                &model_dir, llm, vae, &device,
-            )
+            combs_diffusion::loader::load_flux2_klein_recipe_split::<
+                combs_core::CombsBackendF32,
+                combs_core::CombsBackendF32,
+            >(&model_dir, llm, vae, &device, &device)
             .context("loading flux2-klein recipe")?
         }
         (None, None) => {

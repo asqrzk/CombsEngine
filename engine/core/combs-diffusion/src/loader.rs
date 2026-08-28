@@ -119,6 +119,16 @@ fn load_flux2_klein_dir<B: Backend>(
     model_dir: &Path,
     device: &B::Device,
 ) -> Result<crate::Flux2KleinPipeline<B>> {
+    load_flux2_klein_dir_split::<B, B>(model_dir, device, device)
+}
+
+/// Same, with the autoencoder on its own backend (the f16 twin puts
+/// it on f32 — the decoder overflows half precision).
+fn load_flux2_klein_dir_split<B: Backend, VB: Backend>(
+    model_dir: &Path,
+    device: &B::Device,
+    vae_device: &VB::Device,
+) -> Result<crate::Flux2KleinPipeline<B, VB>> {
     let dit_dir = model_dir.join("transformer");
     let config: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(dit_dir.join("config.json")).map_err(FormatError::Io)?,
@@ -129,12 +139,13 @@ fn load_flux2_klein_dir<B: Backend>(
     })?;
     let dit_config = crate::flux2::Flux2Config::from_json(&config);
     let dit = SafetensorsSource::load_weights_only(&dit_dir, "flux2-transformer")?;
+    let dit = crate::flux2::QuantizingSource::new(&dit);
     let llm = SafetensorsSource::load_with_tokenizer_dir(
         model_dir.join("text_encoder"),
         model_dir.join("tokenizer"),
     )?;
     let vae = SafetensorsSource::load_weights_only(model_dir.join("vae"), "flux2-vae")?;
-    crate::Flux2KleinPipeline::load_recipe(&dit, dit_config, &llm, &vae, device)
+    crate::Flux2KleinPipeline::load_recipe(&dit, dit_config, &llm, &vae, device, vae_device)
 }
 
 /// Load klein from the three-part recipe: a transformer directory
@@ -146,6 +157,17 @@ pub fn load_flux2_klein_recipe<B: Backend>(
     llm_path: impl AsRef<Path>,
     vae_dir: impl AsRef<Path>,
     device: &B::Device,
+) -> Result<Box<dyn DiffusionModel<B>>> {
+    load_flux2_klein_recipe_split::<B, B>(dit_dir, llm_path, vae_dir, device, device)
+}
+
+/// The recipe with the autoencoder on its own backend.
+pub fn load_flux2_klein_recipe_split<B: Backend, VB: Backend>(
+    dit_dir: impl AsRef<Path>,
+    llm_path: impl AsRef<Path>,
+    vae_dir: impl AsRef<Path>,
+    device: &B::Device,
+    vae_device: &VB::Device,
 ) -> Result<Box<dyn DiffusionModel<B>>> {
     let mut dit_dir = dit_dir.as_ref();
     // A checkout root (transformer/ inside) is as good as the
@@ -163,18 +185,20 @@ pub fn load_flux2_klein_recipe<B: Backend>(
     })?;
     let dit_config = crate::flux2::Flux2Config::from_json(&config);
     let dit = SafetensorsSource::load_weights_only(dit_dir, "flux2-transformer")?;
+    let dit = crate::flux2::QuantizingSource::new(&dit);
     let llm = combs_formats::open_model_source(
         llm_path.as_ref().to_str().ok_or_else(|| {
             FormatError::MissingFile(llm_path.as_ref().display().to_string())
         })?,
     )?;
     let vae = SafetensorsSource::load_weights_only(vae_dir.as_ref(), "flux2-vae")?;
-    Ok(Box::new(crate::Flux2KleinPipeline::load_recipe(
+    Ok(Box::new(crate::Flux2KleinPipeline::<B, VB>::load_recipe(
         &dit,
         dit_config,
         llm.as_ref(),
         &vae,
         device,
+        vae_device,
     )?))
 }
 

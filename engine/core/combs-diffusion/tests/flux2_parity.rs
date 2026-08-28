@@ -12,6 +12,7 @@
 //! ```
 
 use burn::backend::NdArray;
+use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
 use combs_diffusion::flux2::{
     image_ids, rope_tables, split_mods, text_ids, unpack_latents, unpatchify_latents,
@@ -21,6 +22,7 @@ use combs_diffusion::VAEDecoder;
 use combs_formats::{ModelSource, SafetensorsSource};
 
 type B = NdArray<f32>;
+type G = burn::backend::Wgpu;
 
 struct Dump {
     dir: std::path::PathBuf,
@@ -59,12 +61,12 @@ impl Dump {
             .collect()
     }
 
-    fn tensor3(&self, name: &str) -> Tensor<B, 3> {
+    fn tensor3<BK: Backend>(&self, name: &str, device: &BK::Device) -> Tensor<BK, 3> {
         let shape = self.shape(name);
         assert_eq!(shape.len(), 3, "{name}");
         Tensor::from_data(
             TensorData::new(self.floats(name), [shape[0], shape[1], shape[2]]),
-            &Default::default(),
+            device,
         )
     }
 
@@ -91,7 +93,7 @@ impl Dump {
     }
 }
 
-fn max_diff(got: &Tensor<B, 3>, want: &[f32]) -> f32 {
+fn max_diff<BK: Backend>(got: &Tensor<BK, 3>, want: &[f32]) -> f32 {
     let g: Vec<f32> = got.clone().into_data().to_vec().unwrap();
     assert_eq!(g.len(), want.len(), "element count");
     g.iter()
@@ -100,7 +102,7 @@ fn max_diff(got: &Tensor<B, 3>, want: &[f32]) -> f32 {
         .fold(0.0, f32::max)
 }
 
-fn check(stage: &str, got: &Tensor<B, 3>, want: &[f32], tol: f32) {
+fn check<BK: Backend>(stage: &str, got: &Tensor<BK, 3>, want: &[f32], tol: f32) {
     let d = max_diff(got, want);
     println!("[flux2-parity] {stage}: max |diff| {d:e}");
     assert!(d < tol, "{stage} drifted: {d} (tol {tol})");
@@ -112,13 +114,26 @@ fn check(stage: &str, got: &Tensor<B, 3>, want: &[f32], tol: f32) {
 #[test]
 #[ignore = "requires COMBS_FLUX2_PARITY_DIR (gen_flux2_reference.py dump)"]
 fn flux2_stages_match_reference() {
+    run_stages::<B>("ndarray");
+}
+
+/// The SAME chain on the wgpu backend — a stage that is right on CPU
+/// and wrong here is a GPU-backend miscompute, not model code.
+#[test]
+#[ignore = "requires COMBS_FLUX2_PARITY_DIR (gen_flux2_reference.py dump)"]
+fn flux2_stages_match_reference_wgpu() {
+    run_stages::<G>("wgpu");
+}
+
+fn run_stages<BK: Backend>(label: &str) {
     let Some(dump) = Dump::open() else {
         eprintln!("skipping: set COMBS_FLUX2_PARITY_DIR");
         return;
     };
+    println!("[flux2-parity] backend: {label}");
     let cfg = dump.config();
     let dim = cfg.inner_dim();
-    let device: burn::tensor::Device<B> = Default::default();
+    let device: burn::tensor::Device<BK> = Default::default();
     let source =
         SafetensorsSource::load_weights_only(dump.dir.to_str().unwrap(), "flux2")
             .expect("dump weights");
@@ -132,7 +147,7 @@ fn flux2_stages_match_reference() {
     // Stage 1: rope tables vs the reference pos_embed output for the
     // TEXT ids (the hook captured the last pos_embed call). Reference
     // is repeat-interleaved [s, d]; ours is half-width [s, d/2].
-    let (cos, sin) = rope_tables::<B>(&txt_ids, &cfg.axes_dims_rope, cfg.rope_theta, &device);
+    let (cos, sin) = rope_tables::<BK>(&txt_ids, &cfg.axes_dims_rope, cfg.rope_theta, &device);
     let ref_cos = dump.floats("pos_embed_out0");
     let ref_sin = dump.floats("pos_embed_out1");
     let half: usize = cfg.axes_dims_rope.iter().map(|d| d / 2).sum();
@@ -152,21 +167,21 @@ fn flux2_stages_match_reference() {
 
     // Stage 2: the full model — loaded once, used for embedder and
     // end-to-end checks.
-    let model = Flux2Transformer::<B>::load(src, cfg.clone(), &device).expect("load");
-    let input_img = dump.tensor3("input_img");
-    let input_txt = dump.tensor3("input_txt");
+    let model = Flux2Transformer::<BK>::load(src, cfg.clone(), &device).expect("load");
+    let input_img = dump.tensor3::<BK>("input_img", &device);
+    let input_txt = dump.tensor3::<BK>("input_txt", &device);
 
     // Stage 3: per-block chain, each block fed REFERENCE inputs.
     // Mods are recomputed from the reference temb via the raw weights.
     let temb_ref = {
         let shape = dump.shape("time_guidance_embed_out0");
-        Tensor::<B, 2>::from_data(
+        Tensor::<BK, 2>::from_data(
             TensorData::new(dump.floats("time_guidance_embed_out0"), [shape[0], shape[1]]),
             &device,
         )
     };
-    let lin2 = |name: &str, din: usize, dout: usize| -> Tensor<B, 2> {
-        let t: Tensor<B, 2> = src
+    let lin2 = |name: &str, din: usize, dout: usize| -> Tensor<BK, 2> {
+        let t: Tensor<BK, 2> = src
             .open_tensor(name)
             .unwrap()
             .load_to_tensor(&device)
@@ -194,25 +209,25 @@ fn flux2_stages_match_reference() {
     // Joint rope over text-first ids, exactly as forward() builds it.
     let mut ids = txt_ids.clone();
     ids.extend_from_slice(&img_ids);
-    let (jcos, jsin) = rope_tables::<B>(&ids, &cfg.axes_dims_rope, cfg.rope_theta, &device);
+    let (jcos, jsin) = rope_tables::<BK>(&ids, &cfg.axes_dims_rope, cfg.rope_theta, &device);
 
-    let mut img_h = dump.tensor3("x_embedder_out0");
-    let mut txt_h = dump.tensor3("context_embedder_out0");
+    let mut img_h = dump.tensor3::<BK>("x_embedder_out0", &device);
+    let mut txt_h = dump.tensor3::<BK>("context_embedder_out0", &device);
     for i in 0..cfg.num_layers {
         let block =
-            Flux2DoubleBlock::<B>::load(src, &format!("transformer_blocks.{i}"), &cfg, &device)
+            Flux2DoubleBlock::<BK>::load(src, &format!("transformer_blocks.{i}"), &cfg, &device)
                 .expect("double block");
         let (t, im) = block.forward(img_h, txt_h, &mods_img, &mods_txt, (&jcos, &jsin), &cfg);
         check(&format!("double_{i}.txt"), &t, &dump.floats(&format!("double_{i}_out0")), 2e-4);
         check(&format!("double_{i}.img"), &im, &dump.floats(&format!("double_{i}_out1")), 2e-4);
         // Chain the REFERENCE outputs so drift never compounds.
-        txt_h = dump.tensor3(&format!("double_{i}_out0"));
-        img_h = dump.tensor3(&format!("double_{i}_out1"));
+        txt_h = dump.tensor3::<BK>(&format!("double_{i}_out0"), &device);
+        img_h = dump.tensor3::<BK>(&format!("double_{i}_out1"), &device);
     }
 
     let mut h = Tensor::cat(vec![txt_h, img_h], 1);
     for i in 0..cfg.num_single_layers {
-        let block = Flux2SingleBlock::<B>::load(
+        let block = Flux2SingleBlock::<BK>::load(
             src,
             &format!("single_transformer_blocks.{i}"),
             &cfg,
@@ -221,7 +236,7 @@ fn flux2_stages_match_reference() {
         .expect("single block");
         let out = block.forward(h, &mods_single[0], (&jcos, &jsin), &cfg);
         check(&format!("single_{i}"), &out, &dump.floats(&format!("single_{i}_out0")), 2e-4);
-        h = dump.tensor3(&format!("single_{i}_out0"));
+        h = dump.tensor3::<BK>(&format!("single_{i}_out0"), &device);
     }
 
     // Stage 4: end-to-end forward — everything at once, our own temb.
@@ -249,7 +264,7 @@ fn flux2_vae_decode_matches_reference() {
         .unwrap() as usize;
     let (grid_h, grid_w) = (3usize, 4usize);
 
-    let tokens = dump.tensor3("vae_tokens");
+    let tokens = dump.tensor3::<B>("vae_tokens", &device);
     let grid = unpack_latents(tokens, grid_h, grid_w);
 
     let stats = Flux2LatentStats::<B>::load(src, &device).expect("bn stats");

@@ -15,9 +15,88 @@ use burn::nn::Linear;
 use burn::tensor::activation::{silu, softmax};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Device, Tensor};
-use combs_formats::{ModelSource, Result};
+use combs_formats::{FormatError, ModelSource, QuantFormat, QuantTensor, Result, TokenizerSpec};
+use combs_models::Linear as BlockLinear;
 
-use crate::weights::{load_linear, load_param};
+use crate::weights::{load_linear, load_param, load_tensor};
+
+/// A source decorator that packs big rank-2 float tensors into Q8_0 on
+/// demand, so [`combs_models::try_quant_linear`] can bind them to the
+/// canaried quant kernels. This is how a bf16 DiT checkpoint runs on
+/// the f32 backend at 4.3 GB instead of 15.5: packed weights, f32
+/// activations — no f16 range cliffs, no Metal overcommit (which
+/// hands back buffers that silently READ AS ZERO instead of failing).
+pub struct QuantizingSource<'a> {
+    inner: &'a dyn ModelSource,
+}
+
+impl<'a> QuantizingSource<'a> {
+    pub fn new(inner: &'a dyn ModelSource) -> Self {
+        Self { inner }
+    }
+}
+
+impl ModelSource for QuantizingSource<'_> {
+    fn metadata(&self) -> &combs_formats::ModelMetadata {
+        self.inner.metadata()
+    }
+    fn tensor_names(&self) -> Vec<String> {
+        self.inner.tensor_names()
+    }
+    fn open_tensor(&self, name: &str) -> Result<combs_formats::TensorReader<'_>> {
+        self.inner.open_tensor(name)
+    }
+    fn tokenizer(&self) -> Result<TokenizerSpec> {
+        self.inner.tokenizer()
+    }
+    fn sampler_defaults(&self) -> Option<combs_formats::SamplerConfig> {
+        self.inner.sampler_defaults()
+    }
+    fn open_tensor_quant(&self, name: &str) -> Result<Option<QuantTensor<'_>>> {
+        // Pass through anything already packed.
+        if let Some(qt) = self.inner.open_tensor_quant(name)? {
+            return Ok(Some(qt));
+        }
+        let reader = self.inner.open_tensor(name)?;
+        let shape = reader.shape().to_vec();
+        let [n_out, k] = shape[..] else { return Ok(None) };
+        if k % 32 != 0 || n_out * k < (1 << 20) {
+            return Ok(None);
+        }
+        let values: Vec<f32> = reader
+            .load_data()?
+            .to_vec()
+            .map_err(|e| FormatError::Safetensors(format!("quantize {name}: {e:?}")))?;
+        let packed = combs_formats::quants::quantize_q8_0(&values)?;
+        Ok(Some(QuantTensor {
+            format: QuantFormat::Q8_0,
+            shape,
+            data: std::borrow::Cow::Owned(packed),
+        }))
+    }
+}
+
+/// A block linear: the quant kernels when the source serves packed
+/// blocks and the backend has them, the dense house matmul otherwise.
+fn load_block_linear<B: Backend>(
+    source: &dyn ModelSource,
+    prefix: &str,
+    k: usize,
+    n_out: usize,
+    device: &Device<B>,
+) -> Result<BlockLinear<B>> {
+    let name = format!("{prefix}.weight");
+    match combs_models::try_quant_linear::<B>(source, &name, device) {
+        Ok(Some(op)) => return Ok(BlockLinear::Quant(op)),
+        Ok(None) => {}
+        Err(e) => {
+            return Err(FormatError::Safetensors(format!("quant bind {name}: {e}")));
+        }
+    }
+    let w: Tensor<B, 2> = load_tensor(source, &name, device)?;
+    crate::weights::expect_shape(&name, &w.dims(), &[n_out, k])?;
+    Ok(BlockLinear::Dense(w))
+}
 
 /// Geometry of a FLUX.2 transformer checkpoint.
 #[derive(Debug, Clone)]
@@ -93,18 +172,33 @@ impl Flux2Config {
 }
 
 /// LayerNorm without affine parameters (torch biased-variance form).
-fn layer_norm<B: Backend>(x: Tensor<B, 3>, eps: f64) -> Tensor<B, 3> {
-    let mean = x.clone().mean_dim(2);
-    let centered = x - mean;
+///
+/// Rows are pre-scaled by their absolute maximum before any square or
+/// sum: the text stream carries |x| ~ 1.6e4 outliers (Qwen3 residual
+/// sinks), and x² or a 3072-wide sum overflows f16 to inf — the whole
+/// conditioning pathway then silently normalizes to ZERO on the f16
+/// backend. Normalization is scale-invariant, so dividing by the max
+/// first is mathematically free and keeps every intermediate bounded
+/// by the head/row width. (eps lands on the scaled variance; its only
+/// job — guarding all-zero rows — is done by the max clamp instead.)
+fn layer_norm<B: Backend>(x: Tensor<B, 3>, _eps: f64) -> Tensor<B, 3> {
+    let m = x.clone().abs().max_dim(2).clamp_min(1e-3);
+    let y = x / m;
+    let mean = y.clone().mean_dim(2);
+    let centered = y - mean;
     let var = centered.clone().powf_scalar(2.0).mean_dim(2);
-    centered / (var + eps).sqrt()
+    centered / (var + 1e-12).sqrt()
 }
 
 /// Per-head RMSNorm over the trailing head dim of `[b, s, heads, d]`,
-/// with an affine weight of shape `[d]`.
-fn rms_norm_head<B: Backend>(x: Tensor<B, 4>, weight: &Tensor<B, 1>, eps: f64) -> Tensor<B, 4> {
-    let ms = x.clone().powf_scalar(2.0).mean_dim(3);
-    let normed = x / (ms + eps).sqrt();
+/// with an affine weight of shape `[d]`. Same max-prescaling as
+/// [`layer_norm`] — q/k projections of the text stream overflow f16
+/// squares without it.
+fn rms_norm_head<B: Backend>(x: Tensor<B, 4>, weight: &Tensor<B, 1>, _eps: f64) -> Tensor<B, 4> {
+    let m = x.clone().abs().max_dim(3).clamp_min(1e-3);
+    let y = x / m;
+    let ms = y.clone().powf_scalar(2.0).mean_dim(3);
+    let normed = y / (ms + 1e-12).sqrt();
     normed * weight.clone().reshape([1, 1, 1, weight.dims()[0]])
 }
 
@@ -193,8 +287,8 @@ pub fn split_mods<B: Backend>(mods: Tensor<B, 2>, sets: usize, dim: usize) -> Ve
 
 /// SwiGLU feed-forward with the gate fused into `linear_in`.
 struct Flux2FeedForward<B: Backend> {
-    linear_in: Linear<B>,
-    linear_out: Linear<B>,
+    linear_in: BlockLinear<B>,
+    linear_out: BlockLinear<B>,
 }
 
 impl<B: Backend> Flux2FeedForward<B> {
@@ -206,30 +300,30 @@ impl<B: Backend> Flux2FeedForward<B> {
         device: &Device<B>,
     ) -> Result<Self> {
         Ok(Self {
-            linear_in: load_linear(source, &format!("{prefix}.linear_in"), dim, inner * 2, false, device)?,
-            linear_out: load_linear(source, &format!("{prefix}.linear_out"), inner, dim, false, device)?,
+            linear_in: load_block_linear(source, &format!("{prefix}.linear_in"), dim, inner * 2, device)?,
+            linear_out: load_block_linear(source, &format!("{prefix}.linear_out"), inner, dim, device)?,
         })
     }
 
     fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        let x = self.linear_in.forward(x);
+        let x = self.linear_in.forward(x, None);
         let half = x.dims()[2] / 2;
         let gate = silu(x.clone().narrow(2, 0, half));
-        self.linear_out.forward(gate * x.narrow(2, half, half))
+        self.linear_out.forward(gate * x.narrow(2, half, half), None)
     }
 }
 
 /// Double-stream block: separate img/txt projections, joint attention
 /// over the text-first concatenation, separate feed-forwards.
 pub struct Flux2DoubleBlock<B: Backend> {
-    to_q: Linear<B>,
-    to_k: Linear<B>,
-    to_v: Linear<B>,
-    to_out: Linear<B>,
-    add_q: Linear<B>,
-    add_k: Linear<B>,
-    add_v: Linear<B>,
-    to_add_out: Linear<B>,
+    to_q: BlockLinear<B>,
+    to_k: BlockLinear<B>,
+    to_v: BlockLinear<B>,
+    to_out: BlockLinear<B>,
+    add_q: BlockLinear<B>,
+    add_k: BlockLinear<B>,
+    add_v: BlockLinear<B>,
+    to_add_out: BlockLinear<B>,
     norm_q: Tensor<B, 1>,
     norm_k: Tensor<B, 1>,
     norm_added_q: Tensor<B, 1>,
@@ -247,8 +341,8 @@ impl<B: Backend> Flux2DoubleBlock<B> {
     ) -> Result<Self> {
         let dim = cfg.inner_dim();
         let a = format!("{prefix}.attn");
-        let lin = |name: &str| -> Result<Linear<B>> {
-            load_linear(source, &format!("{a}.{name}"), dim, dim, false, device)
+        let lin = |name: &str| -> Result<BlockLinear<B>> {
+            load_block_linear(source, &format!("{a}.{name}"), dim, dim, device)
         };
         let head = |name: &str| -> Result<Tensor<B, 1>> {
             Ok(load_param::<B, 1>(source, &format!("{a}.{name}.weight"), device)?.val())
@@ -293,12 +387,12 @@ impl<B: Backend> Flux2DoubleBlock<B> {
         let n_txt = layer_norm(txt.clone(), eps) * (c_scale_a.clone() + 1.0) + c_shift_a.clone();
 
         let to_heads = |t: Tensor<B, 3>, s: usize| t.reshape([b, s, heads, hd]);
-        let q = rms_norm_head(to_heads(self.to_q.forward(n_img.clone()), s_img), &self.norm_q, eps);
-        let k = rms_norm_head(to_heads(self.to_k.forward(n_img.clone()), s_img), &self.norm_k, eps);
-        let v = to_heads(self.to_v.forward(n_img), s_img);
-        let cq = rms_norm_head(to_heads(self.add_q.forward(n_txt.clone()), s_txt), &self.norm_added_q, eps);
-        let ck = rms_norm_head(to_heads(self.add_k.forward(n_txt.clone()), s_txt), &self.norm_added_k, eps);
-        let cv = to_heads(self.add_v.forward(n_txt), s_txt);
+        let q = rms_norm_head(to_heads(self.to_q.forward(n_img.clone(), None), s_img), &self.norm_q, eps);
+        let k = rms_norm_head(to_heads(self.to_k.forward(n_img.clone(), None), s_img), &self.norm_k, eps);
+        let v = to_heads(self.to_v.forward(n_img, None), s_img);
+        let cq = rms_norm_head(to_heads(self.add_q.forward(n_txt.clone(), None), s_txt), &self.norm_added_q, eps);
+        let ck = rms_norm_head(to_heads(self.add_k.forward(n_txt.clone(), None), s_txt), &self.norm_added_k, eps);
+        let cv = to_heads(self.add_v.forward(n_txt, None), s_txt);
 
         // Text first, matching the rope table order.
         let q = apply_rope(Tensor::cat(vec![cq, q], 1), rope.0, rope.1);
@@ -306,8 +400,8 @@ impl<B: Backend> Flux2DoubleBlock<B> {
         let v = Tensor::cat(vec![cv, v], 1);
         let joint = attention(q, k, v);
 
-        let txt_attn = self.to_add_out.forward(joint.clone().narrow(1, 0, s_txt));
-        let img_attn = self.to_out.forward(joint.narrow(1, s_txt, s_img));
+        let txt_attn = self.to_add_out.forward(joint.clone().narrow(1, 0, s_txt), None);
+        let img_attn = self.to_out.forward(joint.narrow(1, s_txt, s_img), None);
 
         let img = img + img_attn * gate_a.clone();
         let n = layer_norm(img.clone(), eps) * (scale_m.clone() + 1.0) + shift_m.clone();
@@ -324,8 +418,8 @@ impl<B: Backend> Flux2DoubleBlock<B> {
 /// Single-stream block: fused QKV+MLP projection, parallel attention
 /// and SwiGLU over the joint sequence, one fused output projection.
 pub struct Flux2SingleBlock<B: Backend> {
-    to_qkv_mlp: Linear<B>,
-    to_out: Linear<B>,
+    to_qkv_mlp: BlockLinear<B>,
+    to_out: BlockLinear<B>,
     norm_q: Tensor<B, 1>,
     norm_k: Tensor<B, 1>,
 }
@@ -341,8 +435,8 @@ impl<B: Backend> Flux2SingleBlock<B> {
         let mlp = dim * cfg.mlp_ratio;
         let a = format!("{prefix}.attn");
         Ok(Self {
-            to_qkv_mlp: load_linear(source, &format!("{a}.to_qkv_mlp_proj"), dim, dim * 3 + mlp * 2, false, device)?,
-            to_out: load_linear(source, &format!("{a}.to_out"), dim + mlp, dim, false, device)?,
+            to_qkv_mlp: load_block_linear(source, &format!("{a}.to_qkv_mlp_proj"), dim, dim * 3 + mlp * 2, device)?,
+            to_out: load_block_linear(source, &format!("{a}.to_out"), dim + mlp, dim, device)?,
             norm_q: load_param::<B, 1>(source, &format!("{a}.norm_q.weight"), device)?.val(),
             norm_k: load_param::<B, 1>(source, &format!("{a}.norm_k.weight"), device)?.val(),
         })
@@ -362,7 +456,7 @@ impl<B: Backend> Flux2SingleBlock<B> {
         let (shift, scale, gate) = mods;
 
         let n = layer_norm(x.clone(), eps) * (scale.clone() + 1.0) + shift.clone();
-        let fused = self.to_qkv_mlp.forward(n);
+        let fused = self.to_qkv_mlp.forward(n, None);
 
         let to_heads = |t: Tensor<B, 3>| t.reshape([b, s, heads, hd]);
         let q = rms_norm_head(to_heads(fused.clone().narrow(2, 0, dim)), &self.norm_q, eps);
@@ -375,7 +469,7 @@ impl<B: Backend> Flux2SingleBlock<B> {
         let gate_half = silu(fused.clone().narrow(2, 3 * dim, mlp));
         let mlp_out = gate_half * fused.narrow(2, 3 * dim + mlp, mlp);
 
-        let out = self.to_out.forward(Tensor::cat(vec![attn_out, mlp_out], 2));
+        let out = self.to_out.forward(Tensor::cat(vec![attn_out, mlp_out], 2), None);
         x + out * gate.clone()
     }
 }
@@ -485,6 +579,23 @@ impl<B: Backend> Flux2Transformer<B> {
         let temb = self
             .time_linear_2
             .forward(silu(self.time_linear_1.forward(self.time_proj(timestep * 1000.0, &device))));
+        let debug = std::env::var("COMBS_KLEIN_DEBUG").is_ok_and(|v| v != "0");
+        let peek = |label: &str, t: &Tensor<B, 3>| {
+            if !debug {
+                return;
+            }
+            let v: Vec<f32> = t.clone().into_data().convert::<f32>().to_vec().unwrap_or_default();
+            let n = v.len().max(1) as f32;
+            let mean = v.iter().sum::<f32>() / n;
+            let amax = v.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+            let nan = v.iter().filter(|x| x.is_nan()).count();
+            eprintln!("[flux2-debug] {label}: mean {mean:.5} amax {amax:.4} nan {nan}");
+        };
+        if debug {
+            let v: Vec<f32> = temb.clone().into_data().convert::<f32>().to_vec().unwrap_or_default();
+            let amax = v.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+            eprintln!("[flux2-debug] temb: amax {amax:.4}");
+        }
 
         let mods_img = split_mods(self.mod_img.forward(silu(temb.clone())), 2, dim);
         let mods_txt = split_mods(self.mod_txt.forward(silu(temb.clone())), 2, dim);
@@ -499,15 +610,21 @@ impl<B: Backend> Flux2Transformer<B> {
         ids.extend_from_slice(img_ids);
         let (cos, sin) = rope_tables::<B>(&ids, &cfg.axes_dims_rope, cfg.rope_theta, &device);
 
-        for block in &self.blocks {
+        peek("img embed", &img_h);
+        peek("txt embed", &txt_h);
+        for (bi, block) in self.blocks.iter().enumerate() {
             let (t, i) = block.forward(img_h, txt_h, &mods_img, &mods_txt, (&cos, &sin), cfg);
             txt_h = t;
             img_h = i;
+            peek(&format!("double_{bi} img"), &img_h);
         }
 
         let mut h = Tensor::cat(vec![txt_h, img_h], 1);
-        for block in &self.single_blocks {
+        for (bi, block) in self.single_blocks.iter().enumerate() {
             h = block.forward(h, &mods_single[0], (&cos, &sin), cfg);
+            if bi % 5 == 0 || bi + 1 == self.single_blocks.len() {
+                peek(&format!("single_{bi}"), &h);
+            }
         }
         let h = h.narrow(1, s_txt, s_img);
 

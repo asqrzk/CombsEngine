@@ -977,6 +977,30 @@ pub fn dequantize_q4_0(data: &[u8], n: usize) -> Result<Vec<f32>> {
 /// Dequantizes a Q8_0 tensor to f32.
 ///
 /// Public via [`crate::quants`] as the harmony reference for the GPU kernel.
+/// Quantizes f32 values into Q8_0 blocks (per-32 f16 scale + 32 i8),
+/// ggml's own rounding: `d = amax/127`, `q = round(x/d)`. The inverse
+/// of [`dequantize_q8_0`]; used to pack float checkpoints onto the
+/// quant kernels at load time. `values.len()` must be a multiple of 32.
+pub fn quantize_q8_0(values: &[f32]) -> Result<Vec<u8>> {
+    if values.len() % 32 != 0 {
+        return Err(FormatError::Safetensors(format!(
+            "q8_0 quantize: {} values is not a multiple of 32",
+            values.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(values.len() / 32 * 34);
+    for block in values.chunks_exact(32) {
+        let amax = block.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let d = amax / 127.0;
+        let inv = if d == 0.0 { 0.0 } else { 1.0 / d };
+        out.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+        for &v in block {
+            out.push((v * inv).round().clamp(-127.0, 127.0) as i8 as u8);
+        }
+    }
+    Ok(out)
+}
+
 pub fn dequantize_q8_0(data: &[u8], n: usize) -> Result<Vec<f32>> {
     let mut out = Vec::with_capacity(n);
     for block in data.chunks_exact(34) {

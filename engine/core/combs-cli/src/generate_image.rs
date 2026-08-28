@@ -75,27 +75,42 @@ pub fn cmd_generate_image(args: GenerateImageArgs) -> Result<()> {
         .map(|path| super::resolve_lora_arg(path))
         .transpose()?
         .map(|path| combs_diffusion::LoraSpec { path, scale: args.lora_scale });
-    let mut pipeline = match (&args.llm, &args.vae) {
+    // The recipe pipeline runs on the build's serving dtype
+    // (CombsBackend: f16 in the f16 twin) — the klein DiT is 7.75 GB
+    // of bf16 that must NOT widen to f32 on an 18 GB machine: Metal
+    // overcommit hands back zero-reading buffers instead of failing.
+    // The classic SD path keeps its proven f32 backend.
+    match (&args.llm, &args.vae) {
         (Some(llm), Some(vae)) => {
             anyhow::ensure!(lora.is_none(), "LoRA is not wired for recipe pipelines yet");
-            combs_diffusion::loader::load_flux2_klein_recipe::<combs_core::CombsBackendF32>(
-                &model_dir, llm, vae, &device,
-            )
-            .context("loading flux2-klein recipe")?
+            let pipeline = combs_diffusion::loader::load_flux2_klein_recipe_split::<
+                combs_core::CombsBackendF32,
+                combs_core::CombsBackendF32,
+            >(&model_dir, llm, vae, &device, &device)
+            .context("loading flux2-klein recipe")?;
+            run_generate(pipeline, &args)
         }
         (None, None) => {
             let architecture = DiffusionArchitecture::detect(&model_dir)
                 .context("detecting diffusion architecture")?;
-            combs_diffusion::loader::load_diffusion_model_with_lora::<
+            let pipeline = combs_diffusion::loader::load_diffusion_model_with_lora::<
                 combs_core::CombsBackendF32,
             >(architecture, &model_dir, &device, lora.as_ref())
-            .context("loading diffusion pipeline")?
+            .context("loading diffusion pipeline")?;
+            run_generate(pipeline, &args)
         }
         _ => anyhow::bail!("--llm and --vae come as a pair (the recipe needs both)"),
-    };
+    }
+}
+
+fn run_generate<B: burn::tensor::backend::Backend>(
+    mut pipeline: Box<dyn DiffusionModel<B>>,
+    args: &GenerateImageArgs,
+) -> Result<()> {
 
     let scheduler = SchedulerKind::parse(&args.scheduler)
         .with_context(|| format!("unknown scheduler {:?} (ddpm | ddim | dpm++2m)", args.scheduler))?;
+
 
     let embed = pipeline
         .encode_prompt(&args.prompt, args.negative_prompt.as_deref())
@@ -133,7 +148,10 @@ pub fn cmd_generate_image(args: GenerateImageArgs) -> Result<()> {
 }
 
 /// Save a `[batch, 3, height, width]` float tensor in [0, 1] as a PNG.
-fn save_tensor_as_png(tensor: &burn::tensor::Tensor<combs_core::CombsBackendF32, 4>, path: &PathBuf) -> Result<()> {
+fn save_tensor_as_png<B: burn::tensor::backend::Backend>(
+    tensor: &burn::tensor::Tensor<B, 4>,
+    path: &PathBuf,
+) -> Result<()> {
     let img = tensor_to_rgb_image(tensor)?;
     img.save(path)?;
     Ok(())
@@ -141,8 +159,8 @@ fn save_tensor_as_png(tensor: &burn::tensor::Tensor<combs_core::CombsBackendF32,
 
 /// Convert a `[1, 3, H, W]` float tensor in [0, 1] to an RGB image.
 /// Shared with `serve-images`, which encodes PNG bytes in memory.
-pub(crate) fn tensor_to_rgb_image(
-    tensor: &burn::tensor::Tensor<combs_core::CombsBackendF32, 4>,
+pub(crate) fn tensor_to_rgb_image<B: burn::tensor::backend::Backend>(
+    tensor: &burn::tensor::Tensor<B, 4>,
 ) -> Result<image::RgbImage> {
     let [batch, channels, height, width] = tensor.dims();
     anyhow::ensure!(batch == 1, "expected batch size 1, got {batch}");
