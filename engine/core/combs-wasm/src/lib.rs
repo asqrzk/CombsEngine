@@ -160,6 +160,13 @@ fn create_engine_from_bytes(
 ) -> Result<u32, JsValue> {
     let source = combs_formats::open_model_source_bytes(model_bytes)
         .map_err(|e| js_err(format!("loading model: {e}")))?;
+    create_engine_from_source(config, source)
+}
+
+fn create_engine_from_source(
+    config: EngineConfigJson,
+    source: Box<dyn combs_formats::ModelSource>,
+) -> Result<u32, JsValue> {
 
     let mut cache_config = combs_runtime::CacheConfig::paged(
         config
@@ -242,7 +249,12 @@ pub async fn combs_model_finish(handle: u32) -> Result<u32, JsValue> {
     mount::finish_check(&state).map_err(js_err)?;
     let config: EngineConfigJson = serde_json::from_str(&state.config_json)
         .map_err(|e| js_err(format!("invalid engine config JSON: {e}")))?;
-    create_engine_from_bytes(config, state.buf)
+    let source = combs_formats::open_model_source_segments(
+        state.into_segments(),
+        mount::SEGMENT_LEN,
+    )
+    .map_err(|e| js_err(format!("loading model: {e}")))?;
+    create_engine_from_source(config, source)
 }
 
 /// Drops a mount and frees its buffer. Idempotent: aborting a handle

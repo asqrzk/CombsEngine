@@ -7,9 +7,14 @@
 //! core; the `#[wasm_bindgen]` exports in lib.rs are thin wrappers
 //! around it.
 //!
-//! Contract: `open` reserves the whole buffer up front (while the
-//! heap is still small, and with `try_reserve_exact` so an allocation
-//! failure is an error, not an abort); `append` refuses overflow;
+//! The buffer is SEGMENTED, not one Vec: Rust caps every allocation at
+//! `isize::MAX`, which on wasm32 is ~2.14 GB — a 2.5 GB image can
+//! never be contiguous there, no matter the linear-memory ceiling.
+//! Fixed 1 GiB segments feed [`combs_formats::open_model_source_segments`].
+//!
+//! Contract: `open` reserves every segment up front (while the heap is
+//! still small, and with `try_reserve_exact` so an allocation failure
+//! is an error, not an abort); `append` refuses overflow;
 //! `finish_check` refuses short deliveries. Removal semantics (finish
 //! consumes the state FIRST, abort is idempotent) live with the
 //! caller's map, not here.
@@ -20,16 +25,48 @@
 /// fast and name its numbers.
 pub const MAX_BUFFER_MOUNT_BYTES: u64 = 3_200_000_000;
 
+/// Segment size. Comfortably under the 32-bit allocation ceiling and
+/// big enough that any GGUF header fits the first segment whole.
+pub const SEGMENT_LEN: usize = 1 << 30;
+
 /// One in-flight buffered mount.
 #[derive(Debug)]
 pub struct MountState {
     pub config_json: String,
     pub expected: usize,
-    pub buf: Vec<u8>,
+    received: usize,
+    seg_len: usize,
+    segments: Vec<Vec<u8>>,
+}
+
+impl MountState {
+    pub fn received(&self) -> usize {
+        self.received
+    }
+
+    pub fn seg_len(&self) -> usize {
+        self.seg_len
+    }
+
+    /// The completed image as its segments (finish-time handoff).
+    pub fn into_segments(self) -> Vec<Vec<u8>> {
+        self.segments
+    }
 }
 
 /// Validate the open parameters and reserve the buffer.
 pub fn open(config_json: String, expected_len: f64, mode: &str) -> Result<MountState, String> {
+    open_with_segment_len(config_json, expected_len, mode, SEGMENT_LEN)
+}
+
+/// [`open`] with an explicit segment length — tests cross real seams
+/// without gigabyte fixtures; production always uses [`SEGMENT_LEN`].
+pub fn open_with_segment_len(
+    config_json: String,
+    expected_len: f64,
+    mode: &str,
+    seg_len: usize,
+) -> Result<MountState, String> {
     match mode {
         "buffer" => {}
         "stream" => {
@@ -57,33 +94,49 @@ pub fn open(config_json: String, expected_len: f64, mode: &str) -> Result<MountS
         ));
     }
     let expected = expected as usize;
-    let mut buf = Vec::new();
-    buf.try_reserve_exact(expected)
-        .map_err(|e| format!("cannot reserve {expected} bytes for the model buffer: {e}"))?;
-    Ok(MountState { config_json, expected, buf })
+    let mut segments = Vec::new();
+    let mut remaining = expected;
+    while remaining > 0 {
+        let this = remaining.min(seg_len);
+        let mut seg = Vec::new();
+        seg.try_reserve_exact(this)
+            .map_err(|e| format!("cannot reserve a {this}-byte model segment: {e}"))?;
+        segments.push(seg);
+        remaining -= this;
+    }
+    Ok(MountState { config_json, expected, received: 0, seg_len, segments })
 }
 
-/// Append one chunk; refuses to grow past the declared length.
+/// Append one chunk, split across segment seams as needed; refuses to
+/// grow past the declared length (checked BEFORE any byte lands, so a
+/// refused append leaves the state untouched).
 pub fn append(state: &mut MountState, chunk: &[u8]) -> Result<(), String> {
-    let after = state.buf.len() + chunk.len();
-    if after > state.expected {
+    if state.received + chunk.len() > state.expected {
         return Err(format!(
             "append overflows the mount: {} + {} > declared {}",
-            state.buf.len(),
+            state.received,
             chunk.len(),
             state.expected
         ));
     }
-    state.buf.extend_from_slice(chunk);
+    let mut rest = chunk;
+    while !rest.is_empty() {
+        let seg = state.received / state.seg_len;
+        let off = state.received - seg * state.seg_len;
+        let take = rest.len().min(state.seg_len - off);
+        state.segments[seg].extend_from_slice(&rest[..take]);
+        state.received += take;
+        rest = &rest[take..];
+    }
     Ok(())
 }
 
 /// The finish precondition: every declared byte arrived.
 pub fn finish_check(state: &MountState) -> Result<(), String> {
-    if state.buf.len() != state.expected {
+    if state.received != state.expected {
         return Err(format!(
             "mount finished short: received {} of {} declared bytes",
-            state.buf.len(),
+            state.received,
             state.expected
         ));
     }
@@ -98,6 +151,10 @@ mod tests {
         (0..n).map(|i| (i * 31 % 251) as u8).collect()
     }
 
+    fn flat(st: MountState) -> Vec<u8> {
+        st.into_segments().concat()
+    }
+
     #[test]
     fn pathological_chunkings_reassemble_bitwise() {
         let data = payload(10_007); // prime-ish, misaligned everywhere
@@ -107,7 +164,30 @@ mod tests {
                 append(&mut st, chunk).unwrap();
             }
             finish_check(&st).unwrap();
-            assert_eq!(st.buf, data, "chunk_len {chunk_len}");
+            assert_eq!(flat(st), data, "chunk_len {chunk_len}");
+        }
+    }
+
+    #[test]
+    fn appends_split_across_segment_seams() {
+        // Real seams at a test-sized segment length: chunks straddle
+        // boundaries in every alignment, and each segment must hold
+        // exactly the bytes its global offsets name.
+        let data = payload(10_000);
+        for chunk_len in [1usize, 3, 1000, 1024, 2047, 4096, 9_999] {
+            let mut st =
+                open_with_segment_len("{}".into(), data.len() as f64, "buffer", 1024).unwrap();
+            for chunk in data.chunks(chunk_len) {
+                append(&mut st, chunk).unwrap();
+            }
+            finish_check(&st).unwrap();
+            let segs = st.into_segments();
+            assert_eq!(segs.len(), 10, "chunk_len {chunk_len}");
+            for (i, seg) in segs.iter().enumerate() {
+                let want = if i == 9 { 784 } else { 1024 };
+                assert_eq!(seg.len(), want, "segment {i} at chunk_len {chunk_len}");
+                assert_eq!(seg[..], data[i * 1024..i * 1024 + want], "segment {i} bytes");
+            }
         }
     }
 
@@ -117,7 +197,7 @@ mod tests {
         append(&mut st, &[1, 2, 3, 4, 5, 6]).unwrap();
         let err = append(&mut st, &[7, 8, 9]).unwrap_err();
         assert!(err.contains("overflows"), "{err}");
-        assert_eq!(st.buf.len(), 6, "failed append must not partially write");
+        assert_eq!(st.received(), 6, "failed append must not partially write");
         append(&mut st, &[7, 8]).unwrap();
         finish_check(&st).unwrap();
     }

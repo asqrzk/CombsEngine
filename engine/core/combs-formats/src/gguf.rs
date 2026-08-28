@@ -62,23 +62,96 @@ struct TensorInfo {
 /// The GGUF byte image and who holds it.
 ///
 /// Mapped from disk natively; owned outright when the bytes arrived
-/// without a file behind them. Both deref to the same slice, so every
-/// reader below is written once and neither origin is a special case.
+/// without a file behind them; SEGMENTED when they arrived by chunk
+/// append on a 32-bit target — Rust caps any single allocation at
+/// `isize::MAX`, which on wasm32 is ~2.14 GB, so a bigger image can
+/// never be one contiguous `Vec<u8>` no matter how much linear memory
+/// exists. All access goes through [`GgufData::slice`]; a payload
+/// inside one segment borrows, one straddling a boundary joins into
+/// an owned copy (bounded by the largest tensor, transient).
 enum GgufData {
     #[cfg(not(target_family = "wasm"))]
     Mmap(Mmap),
     Owned(Vec<u8>),
+    Segmented {
+        /// Every segment is exactly `seg_len` bytes except the last.
+        segments: Vec<Vec<u8>>,
+        seg_len: usize,
+        total: usize,
+    },
 }
 
-impl std::ops::Deref for GgufData {
-    type Target = [u8];
+impl GgufData {
+    fn len(&self) -> usize {
+        match self {
+            #[cfg(not(target_family = "wasm"))]
+            GgufData::Mmap(m) => m.len(),
+            GgufData::Owned(v) => v.len(),
+            GgufData::Segmented { total, .. } => *total,
+        }
+    }
 
-    fn deref(&self) -> &[u8] {
+    /// The contiguous head of the image — the whole slice for the
+    /// contiguous holders, segment 0 for the segmented one. The header
+    /// parser reads from here; segments are gigabyte-scale while GGUF
+    /// headers are megabytes, and a header that outruns the first
+    /// segment fails the parse loudly rather than silently.
+    fn prefix(&self) -> &[u8] {
         match self {
             #[cfg(not(target_family = "wasm"))]
             GgufData::Mmap(m) => m,
             GgufData::Owned(v) => v,
+            GgufData::Segmented { segments, .. } => {
+                segments.first().map(|s| s.as_slice()).unwrap_or(&[])
+            }
         }
+    }
+
+    /// `start..start + len` of the image; `None` past the end.
+    fn slice(&self, start: usize, len: usize) -> Option<std::borrow::Cow<'_, [u8]>> {
+        use std::borrow::Cow;
+        let end = start.checked_add(len)?;
+        if end > self.len() {
+            return None;
+        }
+        match self {
+            #[cfg(not(target_family = "wasm"))]
+            GgufData::Mmap(m) => m.get(start..end).map(Cow::Borrowed),
+            GgufData::Owned(v) => v.get(start..end).map(Cow::Borrowed),
+            GgufData::Segmented { segments, seg_len, .. } => {
+                let first = start / seg_len;
+                let last = (end - 1) / seg_len;
+                if first == last {
+                    let off = start - first * seg_len;
+                    return segments.get(first)?.get(off..off + len).map(Cow::Borrowed);
+                }
+                // Boundary-straddling payload: join. Rare (one tensor
+                // per gigabyte boundary) and bounded by tensor size.
+                let mut out = Vec::with_capacity(len);
+                let mut pos = start;
+                while pos < end {
+                    let seg = pos / seg_len;
+                    let off = pos - seg * seg_len;
+                    let take = (seg_len - off).min(end - pos);
+                    out.extend_from_slice(segments.get(seg)?.get(off..off + take)?);
+                    pos += take;
+                }
+                Some(Cow::Owned(out))
+            }
+        }
+    }
+}
+
+/// Narrow a payload to a byte range, borrowing when it already borrows.
+fn narrow_cow<'a>(
+    data: std::borrow::Cow<'a, [u8]>,
+    start: usize,
+    len: usize,
+) -> std::borrow::Cow<'a, [u8]> {
+    use std::borrow::Cow;
+    match data {
+        Cow::Borrowed(b) => Cow::Borrowed(&b[start..start + len]),
+        Cow::Owned(v) => Cow::Owned(v[start..start + len].to_vec()),
     }
 }
 
@@ -260,8 +333,37 @@ impl GgufSource {
         Self::parse(GgufData::Owned(bytes), None)
     }
 
+    /// [`GgufSource::from_bytes`] for an image held as fixed-size
+    /// segments — how chunk-appended mounts arrive on wasm32, where a
+    /// single allocation caps at `isize::MAX` (~2.14 GB) and a bigger
+    /// image can never be one `Vec<u8>`. Every segment must be exactly
+    /// `seg_len` bytes except the last.
+    pub fn from_segments(segments: Vec<Vec<u8>>, seg_len: usize) -> Result<Self> {
+        if seg_len == 0 {
+            return Err(FormatError::Safetensors("gguf: zero segment length".into()));
+        }
+        let total: usize = segments.iter().map(Vec::len).sum();
+        for (i, seg) in segments.iter().enumerate() {
+            let want = if i + 1 == segments.len() { seg.len() } else { seg_len };
+            if seg.len() != want || (i + 1 < segments.len() && seg.len() != seg_len) {
+                return Err(FormatError::Safetensors(format!(
+                    "gguf: segment {i} is {} bytes, expected {seg_len}",
+                    seg.len()
+                )));
+            }
+        }
+        Self::parse(GgufData::Segmented { segments, seg_len, total }, None).map_err(|e| {
+            FormatError::Safetensors(format!(
+                "{e} (segmented image: the header must fit the first segment —                  {seg_len} bytes here)"
+            ))
+        })
+    }
+
     fn parse(data: GgufData, path: Option<PathBuf>) -> Result<Self> {
-        let mut c = Cursor::new(&data);
+        // The header reads from the contiguous head of the image; a
+        // segmented image's first segment is gigabyte-scale while GGUF
+        // headers are megabytes, and overrunning it errors in Cursor.
+        let mut c = Cursor::new(data.prefix());
 
         if c.u32()? != GGUF_MAGIC {
             return Err(FormatError::Safetensors("gguf: bad magic".into()));
@@ -1342,7 +1444,7 @@ impl ModelSource for GgufSource {
         let start = self.data_start + info.offset;
         let data = self
             .data
-            .get(start..start + size)
+            .slice(start, size)
             .ok_or_else(|| FormatError::Safetensors(format!("gguf tensor {} out of bounds", info.name)))?;
 
         // HF layout = ggml dims reversed (row-major data needs no movement).
@@ -1359,9 +1461,10 @@ impl ModelSource for GgufSource {
                 }
                 let row_bytes = size / rows_total;
                 shape[0] = row_len;
-                &data[row_start * row_bytes..(row_start + row_len) * row_bytes]
+                narrow_cow(data, row_start * row_bytes, row_len * row_bytes)
             }
         };
+        let data_ref: &[u8] = &data;
         let n: usize = shape.iter().product();
         let rows = shape.first().copied().unwrap_or(1).max(1);
         // Fused slices and RoPE de-permutation never co-occur (phi3 vs
@@ -1387,7 +1490,7 @@ impl ModelSource for GgufSource {
                     dtype: format!("gemma norm must be F32, got ggml_type {}", info.ggml_type),
                 });
             }
-            let values: Vec<f32> = data
+            let values: Vec<f32> = data_ref
                 .chunks_exact(4)
                 .map(|b| f32::from_le_bytes(b.try_into().unwrap()) - 1.0)
                 .collect();
@@ -1401,13 +1504,20 @@ impl ModelSource for GgufSource {
                 _ => TensorDtype::BF16,
             };
             return Ok(match permute {
-                None => TensorReader::new(name.to_string(), shape, dtype, data),
+                None => match data {
+                    std::borrow::Cow::Borrowed(b) => {
+                        TensorReader::new(name.to_string(), shape, dtype, b)
+                    }
+                    std::borrow::Cow::Owned(v) => {
+                        TensorReader::owned_with_dtype(name.to_string(), shape, dtype, v)
+                    }
+                },
                 Some(n_head) => {
                     let row_bytes = size / rows;
                     let map = rope_depermute_src_rows(rows, n_head);
                     let mut out = Vec::with_capacity(size);
                     for src in map {
-                        out.extend_from_slice(&data[src * row_bytes..(src + 1) * row_bytes]);
+                        out.extend_from_slice(&data_ref[src * row_bytes..(src + 1) * row_bytes]);
                     }
                     TensorReader::owned_with_dtype(name.to_string(), shape, dtype, out)
                 }
@@ -1415,14 +1525,14 @@ impl ModelSource for GgufSource {
         }
 
         let values = match info.ggml_type {
-            GGML_Q4_0 => dequantize_q4_0(data, n)?,
-            GGML_Q4_1 => dequantize_q4_1(data, n)?,
-            GGML_Q5_0 => dequantize_q5_0(data, n)?,
-            GGML_Q5_1 => dequantize_q5_1(data, n)?,
-            GGML_Q8_0 => dequantize_q8_0(data, n)?,
-            GGML_Q4_K => dequantize_q4_k(data, n)?,
-            GGML_Q5_K => dequantize_q5_k(data, n)?,
-            GGML_Q6_K => dequantize_q6_k(data, n)?,
+            GGML_Q4_0 => dequantize_q4_0(data_ref, n)?,
+            GGML_Q4_1 => dequantize_q4_1(data_ref, n)?,
+            GGML_Q5_0 => dequantize_q5_0(data_ref, n)?,
+            GGML_Q5_1 => dequantize_q5_1(data_ref, n)?,
+            GGML_Q8_0 => dequantize_q8_0(data_ref, n)?,
+            GGML_Q4_K => dequantize_q4_k(data_ref, n)?,
+            GGML_Q5_K => dequantize_q5_k(data_ref, n)?,
+            GGML_Q6_K => dequantize_q6_k(data_ref, n)?,
             other => {
                 return Err(FormatError::UnsupportedDtype {
                     tensor: info.name.clone(),
@@ -1470,12 +1580,12 @@ impl ModelSource for GgufSource {
         };
         let size = tensor_byte_size(info)?;
         let start = self.data_start + info.offset;
-        let data = self.data.get(start..start + size).ok_or_else(|| {
+        let data = self.data.slice(start, size).ok_or_else(|| {
             FormatError::Safetensors(format!("gguf tensor {} out of bounds", info.name))
         })?;
         let mut shape: Vec<usize> = info.dims.iter().rev().copied().collect();
         // Row range of a fused projection: a contiguous packed byte range
-        // (whole blocks per row), so the mmap slice narrows in place.
+        // (whole blocks per row), so the payload narrows in place.
         let data = match slice {
             None => data,
             Some((row_start, row_len)) => {
@@ -1485,7 +1595,7 @@ impl ModelSource for GgufSource {
                 }
                 let row_bytes = size / rows_total;
                 shape[0] = row_len;
-                &data[row_start * row_bytes..(row_start + row_len) * row_bytes]
+                narrow_cow(data, row_start * row_bytes, row_len * row_bytes)
             }
         };
 
@@ -1495,7 +1605,7 @@ impl ModelSource for GgufSource {
         // cleanly addressable, fall back to the dense path (which
         // de-permutes after dequantization).
         let data = match self.depermute_heads(ggml_name) {
-            None => std::borrow::Cow::Borrowed(data),
+            None => data,
             Some(n_head) => {
                 let rows = shape.first().copied().unwrap_or(1).max(1);
                 if size % rows != 0 {

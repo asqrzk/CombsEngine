@@ -96,6 +96,26 @@ pub fn open_model_source_bytes(bytes: Vec<u8>) -> Result<Box<dyn ModelSource>> {
     )))
 }
 
+
+/// [`open_model_source_bytes`] for an image held as fixed-size
+/// segments — chunk-appended mounts on wasm32, where one allocation
+/// caps at `isize::MAX` (~2.14 GB). Every segment must be `seg_len`
+/// bytes except the last.
+pub fn open_model_source_segments(
+    segments: Vec<Vec<u8>>,
+    seg_len: usize,
+) -> Result<Box<dyn ModelSource>> {
+    const GGUF_MAGIC: &[u8; 4] = b"GGUF";
+    let head = segments.first().map(Vec::as_slice).unwrap_or(&[]);
+    if head.starts_with(GGUF_MAGIC) {
+        return Ok(Box::new(GgufSource::from_segments(segments, seg_len)?));
+    }
+    Err(FormatError::Safetensors(format!(
+        "unrecognized model bytes: expected a GGUF magic, found {:02x?}",
+        &head[..head.len().min(4)]
+    )))
+}
+
 /// Errors produced by format adapters.
 #[derive(Debug, thiserror::Error)]
 pub enum FormatError {
