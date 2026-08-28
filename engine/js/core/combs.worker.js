@@ -225,8 +225,13 @@ self.onmessage = async (event) => {
     switch (kind) {
       case "load":
         // Serialize loads: a second one arriving mid-download would race
-        // the first for the single engine slot.
-        ready = (ready ?? Promise.resolve()).then(() => load(id, payload));
+        // the first for the single engine slot. Chained on SETTLED, not
+        // success — a failed load already reported to its own requester,
+        // and letting its rejection poison every later load turned one
+        // refused mount into a dead worker.
+        ready = (ready ?? Promise.resolve())
+          .catch(() => {})
+          .then(() => load(id, payload));
         await ready;
         break;
       case "metadata":
