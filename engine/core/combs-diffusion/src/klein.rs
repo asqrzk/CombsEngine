@@ -34,6 +34,74 @@ use crate::{DiffusionModel, GenerationHooks, NoiseSource, PromptEmbed, Scheduler
 const ENCODER_TAPS: [usize; 3] = [9, 18, 27];
 const MAX_PROMPT_TOKENS: usize = 512;
 
+/// Render the prompt through the checkpoint's chat template (thinking
+/// disabled, generation prompt appended), matching the reference
+/// conditioning exactly. A checkpoint without a template gets the
+/// qwen conversation wrap.
+pub(crate) fn render_prompt(chat_template: Option<&str>, prompt: &str) -> String {
+    if let Some(template) = chat_template {
+        let mut env = Environment::new();
+        env.set_trim_blocks(true);
+        env.set_lstrip_blocks(true);
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        let rendered = env.render_str(
+            template,
+            context! {
+                messages => vec![serde_json::json!({"role": "user", "content": prompt})],
+                tools => serde_json::Value::Null,
+                add_generation_prompt => true,
+                enable_thinking => false,
+            },
+        );
+        match rendered {
+            Ok(text) => return text,
+            Err(e) => eprintln!("[klein] chat template failed ({e}); using the plain wrap"),
+        }
+    }
+    format!(
+        "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_prompt;
+
+    /// The real qwen3 chat template (from the cached qwen3-0.6b
+    /// checkout — the same family template klein's encoder ships)
+    /// must render a single user turn with thinking DISABLED: the
+    /// assistant turn opens with an empty think block, exactly the
+    /// conditioning text the reference pipeline builds.
+    #[test]
+    fn qwen3_template_renders_thinking_disabled() {
+        let home = std::env::var("HOME").expect("HOME");
+        let path = format!("{home}/.cache/combs/models/qwen3-0.6b/tokenizer_config.json");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!("skipping: no cached qwen3-0.6b checkout");
+            return;
+        };
+        let config: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let template = config["chat_template"].as_str().expect("chat_template");
+
+        let out = render_prompt(Some(template), "a red fox in the snow");
+        assert!(
+            out.contains("<|im_start|>user\na red fox in the snow<|im_end|>"),
+            "user turn wrapped: {out:?}"
+        );
+        assert!(
+            out.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            "assistant turn must open with the EMPTY think block (thinking disabled): {out:?}"
+        );
+    }
+
+    #[test]
+    fn missing_template_falls_back_to_the_qwen_wrap() {
+        let out = render_prompt(None, "hello");
+        assert!(out.starts_with("<|im_start|>user\nhello<|im_end|>"));
+        assert!(out.ends_with("</think>\n\n"));
+    }
+}
+
 pub struct Flux2KleinPipeline<B: Backend> {
     metadata: ModelMetadata,
     device: Device<B>,
@@ -92,33 +160,8 @@ impl<B: Backend> Flux2KleinPipeline<B> {
         })
     }
 
-    /// Render the prompt through the checkpoint's chat template
-    /// (thinking disabled, generation prompt appended), matching the
-    /// reference conditioning exactly. A checkpoint without a template
-    /// gets the qwen conversation wrap.
     fn wrap_prompt(&self, prompt: &str) -> String {
-        if let Some(template) = &self.chat_template {
-            let mut env = Environment::new();
-            env.set_trim_blocks(true);
-            env.set_lstrip_blocks(true);
-            env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-            let rendered = env.render_str(
-                template,
-                context! {
-                    messages => vec![serde_json::json!({"role": "user", "content": prompt})],
-                    tools => serde_json::Value::Null,
-                    add_generation_prompt => true,
-                    enable_thinking => false,
-                },
-            );
-            match rendered {
-                Ok(text) => return text,
-                Err(e) => eprintln!("[klein] chat template failed ({e}); using the plain wrap"),
-            }
-        }
-        format!(
-            "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-        )
+        render_prompt(self.chat_template.as_deref(), prompt)
     }
 
     /// Packed latent tokens → RGB in [0, 1].
