@@ -10,6 +10,7 @@
 mod flatbuf;
 mod gguf;
 mod litertlm;
+mod onnx;
 mod lora;
 mod metadata;
 mod protomin;
@@ -35,6 +36,7 @@ pub use metadata::{Activation, AttentionPattern, ModelMetadata, RopeScaling, Vis
 pub use safetensors::SafetensorsSource;
 pub use lora::{merge_lora, LoraFile, LoraMergedSource, LoraSpec};
 pub use litertlm::{SectionInfo, read_sections as litertlm_read_sections};
+pub use onnx::{MatMulNBitsNode, OnnxData, OnnxDtype, OnnxModel, OnnxTensorInfo};
 pub use source::{ModelSource, QuantFormat, QuantTensor, SamplerConfig, TensorDtype, TensorReader};
 pub use spm::{ensure_tokenizer_json_from_spm, spm_added_tokens};
 pub use tflite::TfliteSource;
