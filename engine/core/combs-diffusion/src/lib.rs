@@ -12,6 +12,7 @@ use combs_formats::{AttentionPattern, ModelMetadata, ModelSource, TokenizerSpec}
 
 pub mod blocks;
 pub mod clip;
+pub mod flux2;
 pub mod loader;
 pub mod noise;
 pub mod scheduler;
