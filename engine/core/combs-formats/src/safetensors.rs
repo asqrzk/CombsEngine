@@ -97,6 +97,19 @@ impl SafetensorsSource {
     /// Opens a model directory (see type docs for the expected layout).
     pub fn load(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref();
+        Self::load_with_tokenizer_dir(dir, dir)
+    }
+
+    /// Opens a model directory whose tokenizer files live elsewhere —
+    /// the diffusers multi-component layout keeps the text encoder's
+    /// weights+config in `text_encoder/` and its tokenizer in a
+    /// sibling `tokenizer/`.
+    pub fn load_with_tokenizer_dir(
+        dir: impl AsRef<Path>,
+        tokenizer_dir: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let dir = dir.as_ref();
+        let tokenizer_dir = tokenizer_dir.as_ref();
 
         // --- config + metadata -------------------------------------------------
         let config = read_json(&dir.join("config.json"), true)?.expect("required");
@@ -105,7 +118,7 @@ impl SafetensorsSource {
             ModelMetadata::from_hf_config(&config, generation_config.as_ref())?;
 
         // --- tokenizer ----------------------------------------------------------
-        let tokenizer_json = dir.join("tokenizer.json");
+        let tokenizer_json = tokenizer_dir.join("tokenizer.json");
         if !tokenizer_json.exists() {
             return Err(FormatError::MissingFile(
                 tokenizer_json.display().to_string(),
@@ -114,7 +127,7 @@ impl SafetensorsSource {
         let mut added_tokens = HashMap::new();
         let mut chat_template = None;
         let mut add_bos = None;
-        if let Some(tc) = read_json(&dir.join("tokenizer_config.json"), false)? {
+        if let Some(tc) = read_json(&tokenizer_dir.join("tokenizer_config.json"), false)? {
             if let Some(map) = tc.get("added_tokens_decoder").and_then(|v| v.as_object()) {
                 for (id, entry) in map {
                     if let (Ok(id), Some(content)) = (

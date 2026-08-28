@@ -135,6 +135,13 @@ enum Command {
         /// Each preview costs one extra VAE decode inside the loop.
         #[arg(long, default_value_t = 0)]
         preview_every: usize,
+        /// Language-model weights for recipe pipelines (flux2-klein:
+        /// a Qwen3 GGUF). With --vae, --model names the transformer dir.
+        #[arg(long)]
+        llm: Option<PathBuf>,
+        /// Autoencoder directory for recipe pipelines.
+        #[arg(long)]
+        vae: Option<PathBuf>,
     },
     /// Start a persistent speech worker (loads the TTS engine once,
     /// serves /v1/audio/speech and /v1/audio/voices).
@@ -233,9 +240,9 @@ fn main() -> Result<()> {
         Command::Convert { .. } => not_yet("convert", "model repackaging"),
         Command::GenerateImage(args) => generate_image::cmd_generate_image(args),
         Command::GenerateAudio(args) => generate_audio::cmd_generate_audio(args),
-        Command::ServeImages { model, port, lora, lora_scale, preview_every } => {
+        Command::ServeImages { model, port, lora, lora_scale, preview_every, llm, vae } => {
             let lora = lora.map(|l| resolve_lora_arg(&l)).transpose()?;
-            serve_images::cmd_serve_images(model, port, lora, lora_scale, preview_every)
+            serve_images::cmd_serve_images(model, port, lora, lora_scale, preview_every, llm, vae)
         }
         Command::ServeAudio { model, port, transcribe_model, language } => {
             serve_audio::cmd_serve_audio(model, port, transcribe_model, language)

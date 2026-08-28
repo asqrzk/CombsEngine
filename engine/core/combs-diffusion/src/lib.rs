@@ -13,6 +13,7 @@ use combs_formats::{AttentionPattern, ModelMetadata, ModelSource, TokenizerSpec}
 pub mod blocks;
 pub mod clip;
 pub mod flux2;
+pub mod klein;
 pub mod loader;
 pub mod noise;
 pub mod scheduler;
@@ -22,6 +23,7 @@ pub mod vae;
 pub mod weights;
 
 pub use clip::{input_ids_to_tensor, ClipTextModel};
+pub use klein::Flux2KleinPipeline;
 pub use loader::{load_diffusion_model, DiffusionArchitecture};
 pub use combs_formats::{LoraFile, LoraSpec};
 pub use noise::NoiseSource;
@@ -89,7 +91,7 @@ pub trait DiffusionModel<B: Backend>: Send {
     ) -> Result<(Tensor<B, 4>, u64)>;
 }
 
-fn diffusion_metadata(architecture: &str) -> ModelMetadata {
+pub(crate) fn diffusion_metadata(architecture: &str) -> ModelMetadata {
     ModelMetadata {
         architecture: architecture.to_string(),
         hidden_size: 0,

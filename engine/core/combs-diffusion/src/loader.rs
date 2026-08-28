@@ -9,7 +9,7 @@ use std::path::Path;
 
 use combs_formats::{FormatError, Result, SafetensorsSource, TokenizerSpec};
 
-use crate::StableDiffusionPipeline;
+use crate::{DiffusionModel, StableDiffusionPipeline};
 use burn::tensor::backend::Backend;
 
 /// Supported diffusion model families.
@@ -17,6 +17,8 @@ use burn::tensor::backend::Backend;
 pub enum DiffusionArchitecture {
     /// Stable Diffusion 1.5 (and 2.x, which share the same component layout).
     StableDiffusion1_5,
+    /// FLUX.2 [klein] — flow-matching MM-DiT with a Qwen3 text encoder.
+    Flux2Klein,
 }
 
 impl DiffusionArchitecture {
@@ -36,6 +38,9 @@ impl DiffusionArchitecture {
                 match class {
                     "StableDiffusionPipeline" | "StableDiffusionImg2ImgPipeline" | "StableDiffusionInpaintPipeline" => {
                         return Ok(Self::StableDiffusion1_5);
+                    }
+                    "Flux2KleinPipeline" => {
+                        return Ok(Self::Flux2Klein);
                     }
                     other => {
                         return Err(FormatError::Safetensors(format!(
@@ -78,7 +83,7 @@ pub fn load_diffusion_model<B: Backend>(
     architecture: DiffusionArchitecture,
     model_dir: impl AsRef<Path>,
     device: &B::Device,
-) -> Result<StableDiffusionPipeline<B>> {
+) -> Result<Box<dyn DiffusionModel<B>>> {
     load_diffusion_model_with_lora(architecture, model_dir, device, None)
 }
 
@@ -90,14 +95,81 @@ pub fn load_diffusion_model_with_lora<B: Backend>(
     model_dir: impl AsRef<Path>,
     device: &B::Device,
     lora: Option<&combs_formats::LoraSpec>,
-) -> Result<StableDiffusionPipeline<B>> {
+) -> Result<Box<dyn DiffusionModel<B>>> {
     let model_dir = model_dir.as_ref();
 
     match architecture {
-        DiffusionArchitecture::StableDiffusion1_5 => {
-            load_stable_diffusion_1_5(model_dir, device, lora)
+        DiffusionArchitecture::StableDiffusion1_5 => Ok(Box::new(
+            load_stable_diffusion_1_5(model_dir, device, lora)?,
+        )),
+        DiffusionArchitecture::Flux2Klein => {
+            if lora.is_some() {
+                return Err(FormatError::Safetensors(
+                    "LoRA fusion is not wired for flux2-klein yet".to_string(),
+                ));
+            }
+            Ok(Box::new(load_flux2_klein_dir(model_dir, device)?))
         }
     }
+}
+
+/// Load klein from a diffusers-layout directory: `transformer/`,
+/// `text_encoder/` (+ sibling `tokenizer/`), `vae/`.
+fn load_flux2_klein_dir<B: Backend>(
+    model_dir: &Path,
+    device: &B::Device,
+) -> Result<crate::Flux2KleinPipeline<B>> {
+    let dit_dir = model_dir.join("transformer");
+    let config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dit_dir.join("config.json")).map_err(FormatError::Io)?,
+    )
+    .map_err(|e| FormatError::Json {
+        context: dit_dir.join("config.json").display().to_string(),
+        source: e,
+    })?;
+    let dit_config = crate::flux2::Flux2Config::from_json(&config);
+    let dit = SafetensorsSource::load_weights_only(&dit_dir, "flux2-transformer")?;
+    let llm = SafetensorsSource::load_with_tokenizer_dir(
+        model_dir.join("text_encoder"),
+        model_dir.join("tokenizer"),
+    )?;
+    let vae = SafetensorsSource::load_weights_only(model_dir.join("vae"), "flux2-vae")?;
+    crate::Flux2KleinPipeline::load_recipe(&dit, dit_config, &llm, &vae, device)
+}
+
+/// Load klein from the three-part recipe: a transformer directory
+/// (diffusers layout: config.json + safetensors), ANY language-model
+/// source the llama family loads (a GGUF file is the practical
+/// choice), and the autoencoder directory.
+pub fn load_flux2_klein_recipe<B: Backend>(
+    dit_dir: impl AsRef<Path>,
+    llm_path: impl AsRef<Path>,
+    vae_dir: impl AsRef<Path>,
+    device: &B::Device,
+) -> Result<Box<dyn DiffusionModel<B>>> {
+    let dit_dir = dit_dir.as_ref();
+    let config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dit_dir.join("config.json")).map_err(FormatError::Io)?,
+    )
+    .map_err(|e| FormatError::Json {
+        context: dit_dir.join("config.json").display().to_string(),
+        source: e,
+    })?;
+    let dit_config = crate::flux2::Flux2Config::from_json(&config);
+    let dit = SafetensorsSource::load_weights_only(dit_dir, "flux2-transformer")?;
+    let llm = combs_formats::open_model_source(
+        llm_path.as_ref().to_str().ok_or_else(|| {
+            FormatError::MissingFile(llm_path.as_ref().display().to_string())
+        })?,
+    )?;
+    let vae = SafetensorsSource::load_weights_only(vae_dir.as_ref(), "flux2-vae")?;
+    Ok(Box::new(crate::Flux2KleinPipeline::load_recipe(
+        &dit,
+        dit_config,
+        llm.as_ref(),
+        &vae,
+        device,
+    )?))
 }
 
 fn load_stable_diffusion_1_5<B: Backend>(

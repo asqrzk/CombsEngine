@@ -49,12 +49,19 @@ pub struct GenerateImageArgs {
     /// LoRA strength multiplier.
     #[arg(long, default_value_t = 1.0)]
     pub lora_scale: f32,
+    /// Language-model weights for recipe-assembled pipelines
+    /// (flux2-klein: a Qwen3 GGUF file or safetensors directory).
+    /// With --vae, --model names the transformer directory instead of
+    /// a full diffusers checkout.
+    #[arg(long)]
+    pub llm: Option<PathBuf>,
+    /// Autoencoder directory for recipe-assembled pipelines.
+    #[arg(long)]
+    pub vae: Option<PathBuf>,
 }
 
 pub fn cmd_generate_image(args: GenerateImageArgs) -> Result<()> {
     let model_dir = super::resolve_model_arg(&args.model)?;
-    let architecture =
-        DiffusionArchitecture::detect(&model_dir).context("detecting diffusion architecture")?;
 
     eprintln!(
         "generating {}x{} image with prompt: {}",
@@ -68,10 +75,24 @@ pub fn cmd_generate_image(args: GenerateImageArgs) -> Result<()> {
         .map(|path| super::resolve_lora_arg(path))
         .transpose()?
         .map(|path| combs_diffusion::LoraSpec { path, scale: args.lora_scale });
-    let mut pipeline = combs_diffusion::loader::load_diffusion_model_with_lora::<
-        combs_core::CombsBackendF32,
-    >(architecture, &model_dir, &device, lora.as_ref())
-    .context("loading diffusion pipeline")?;
+    let mut pipeline = match (&args.llm, &args.vae) {
+        (Some(llm), Some(vae)) => {
+            anyhow::ensure!(lora.is_none(), "LoRA is not wired for recipe pipelines yet");
+            combs_diffusion::loader::load_flux2_klein_recipe::<combs_core::CombsBackendF32>(
+                &model_dir, llm, vae, &device,
+            )
+            .context("loading flux2-klein recipe")?
+        }
+        (None, None) => {
+            let architecture = DiffusionArchitecture::detect(&model_dir)
+                .context("detecting diffusion architecture")?;
+            combs_diffusion::loader::load_diffusion_model_with_lora::<
+                combs_core::CombsBackendF32,
+            >(architecture, &model_dir, &device, lora.as_ref())
+            .context("loading diffusion pipeline")?
+        }
+        _ => anyhow::bail!("--llm and --vae come as a pair (the recipe needs both)"),
+    };
 
     let scheduler = SchedulerKind::parse(&args.scheduler)
         .with_context(|| format!("unknown scheduler {:?} (ddpm | ddim | dpm++2m)", args.scheduler))?;

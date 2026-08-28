@@ -57,6 +57,39 @@ impl Flux2Config {
     pub fn inner_dim(&self) -> usize {
         self.num_attention_heads * self.attention_head_dim
     }
+
+    /// Read the diffusers `transformer/config.json` shape, falling
+    /// back to klein-4B values for absent keys.
+    pub fn from_json(config: &serde_json::Value) -> Self {
+        let d = Self::klein_4b();
+        let get = |key: &str, fallback: usize| {
+            config.get(key).and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(fallback)
+        };
+        Self {
+            in_channels: get("in_channels", d.in_channels),
+            num_layers: get("num_layers", d.num_layers),
+            num_single_layers: get("num_single_layers", d.num_single_layers),
+            attention_head_dim: get("attention_head_dim", d.attention_head_dim),
+            num_attention_heads: get("num_attention_heads", d.num_attention_heads),
+            joint_attention_dim: get("joint_attention_dim", d.joint_attention_dim),
+            mlp_ratio: config
+                .get("mlp_ratio")
+                .and_then(|v| v.as_f64())
+                .map(|v| v as usize)
+                .unwrap_or(d.mlp_ratio),
+            axes_dims_rope: config
+                .get("axes_dims_rope")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect())
+                .unwrap_or(d.axes_dims_rope),
+            rope_theta: config
+                .get("rope_theta")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(d.rope_theta),
+            eps: d.eps,
+            timestep_channels: get("timestep_guidance_channels", d.timestep_channels),
+        }
+    }
 }
 
 /// LayerNorm without affine parameters (torch biased-variance form).

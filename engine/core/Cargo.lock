@@ -1209,6 +1209,9 @@ version = "0.2.3"
 dependencies = [
  "burn",
  "combs-formats",
+ "combs-models",
+ "minijinja",
+ "minijinja-contrib",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",

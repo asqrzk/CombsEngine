@@ -68,11 +68,11 @@ pub fn cmd_serve_images(
     lora: Option<PathBuf>,
     lora_scale: f32,
     preview_every: usize,
+    llm: Option<PathBuf>,
+    vae: Option<PathBuf>,
 ) -> Result<()> {
     let t_load = std::time::Instant::now();
     let model_dir = super::resolve_model_arg(&model)?;
-    let architecture =
-        DiffusionArchitecture::detect(&model_dir).context("detecting diffusion architecture")?;
     let open_ms = t_load.elapsed().as_millis() as u64;
     combs_core::progress::load("open", None, None, Some(open_ms));
 
@@ -82,13 +82,27 @@ pub fn cmd_serve_images(
         path: path.clone(),
         scale: lora_scale,
     });
-    let pipeline = combs_diffusion::loader::load_diffusion_model_with_lora::<
-        combs_core::CombsBackendF32,
-    >(architecture, &model_dir, &device, lora_spec.as_ref())
-    .context("loading diffusion pipeline")?;
+    let pipeline = match (&llm, &vae) {
+        (Some(llm), Some(vae)) => {
+            anyhow::ensure!(lora_spec.is_none(), "LoRA is not wired for recipe pipelines yet");
+            combs_diffusion::loader::load_flux2_klein_recipe::<combs_core::CombsBackendF32>(
+                &model_dir, llm, vae, &device,
+            )
+            .context("loading flux2-klein recipe")?
+        }
+        (None, None) => {
+            let architecture = DiffusionArchitecture::detect(&model_dir)
+                .context("detecting diffusion architecture")?;
+            combs_diffusion::loader::load_diffusion_model_with_lora::<
+                combs_core::CombsBackendF32,
+            >(architecture, &model_dir, &device, lora_spec.as_ref())
+            .context("loading diffusion pipeline")?
+        }
+        _ => anyhow::bail!("--llm and --vae come as a pair (the recipe needs both)"),
+    };
     let weights_ms = t_load.elapsed().as_millis() as u64 - open_ms;
     combs_core::progress::load("weights_done", None, None, Some(weights_ms));
-    let pipeline: SharedPipeline = Arc::new(Mutex::new(Box::new(pipeline)));
+    let pipeline: SharedPipeline = Arc::new(Mutex::new(pipeline));
 
     let lora_info = match &lora_spec {
         Some(spec) => json!({
