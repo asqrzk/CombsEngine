@@ -28,19 +28,54 @@ pub struct OnnxSource {
     image: Mmap,
     /// External-data sidecars by their manifest `location`.
     sidecars: HashMap<String, Mmap>,
-    /// HF-canonical name → initializer name.
-    names: HashMap<String, String>,
+    /// HF-canonical name → (initializer name, needs transpose).
+    names: HashMap<String, (String, bool)>,
 }
 
 /// Normalize an ONNX initializer name to the HF-canonical form the
-/// loaders speak. torch.onnx exports keep state-dict paths but may
-/// prefix graph scoping (`/model/...`) or `onnx::` artifacts.
-fn canonical_name(raw: &str) -> String {
+/// loaders speak, and say whether its bytes need transposing.
+///
+/// The transformers.js / genai export dialect (verified on
+/// onnx-community Qwen3): linear weights carry a fused-op suffix and
+/// are stored `[in, out]` (ONNX MatMul computes X·W directly — the
+/// transpose of HF's `[out, in]` linears); `self_attn` shortens to
+/// `attn`; q/k norms gain a `.layernorm` segment; the final norm
+/// masquerades as one-past-the-last layer
+/// (`model.layers.{L}.final_norm_layernorm.weight`). Rope caches and
+/// other non-weight initializers return None and stay hidden — the
+/// tied head is a graph-level Transpose of the embedding, so
+/// tied-by-absence loading works untouched.
+fn canonical_name(raw: &str) -> Option<(String, bool)> {
     let mut s = raw.trim_start_matches('/').replace('/', ".");
     if let Some(rest) = s.strip_prefix("onnx..") {
         s = rest.to_string();
     }
-    s
+    if !(s.starts_with("model.") || s.starts_with("lm_head.")) {
+        return None; // cos_cache / sin_cache / graph scratch
+    }
+    if s.ends_with(".final_norm_layernorm.weight") && s.starts_with("model.layers.") {
+        // The pseudo-layer index here is the layer COUNT, not a layer.
+        return Some(("model.norm.weight".to_string(), false));
+    }
+    let transposed = s.contains(".MatMul.");
+    let s = s
+        .replace(".MatMul.weight", ".weight")
+        .replace(".attn.", ".self_attn.")
+        .replace(".layernorm.weight", ".weight");
+    Some((s, transposed))
+}
+
+/// Transpose a row-major `[r, c]` element buffer to `[c, r]`.
+fn transpose_bytes(data: &[u8], r: usize, c: usize, elem: usize) -> Vec<u8> {
+    let mut out = vec![0u8; data.len()];
+    for i in 0..r {
+        for j in 0..c {
+            let src = (i * c + j) * elem;
+            let dst = (j * r + i) * elem;
+            out[dst..dst + elem].copy_from_slice(&data[src..src + elem]);
+        }
+    }
+    out
 }
 
 fn read_json(path: &Path) -> Result<Option<serde_json::Value>> {
@@ -141,7 +176,9 @@ impl OnnxSource {
         // --- name table --------------------------------------------------
         let mut names = HashMap::new();
         for raw in model.tensors.keys() {
-            names.insert(canonical_name(raw), raw.clone());
+            if let Some((canonical, transposed)) = canonical_name(raw) {
+                names.insert(canonical, (raw.clone(), transposed));
+            }
         }
 
         Ok(Self { metadata, tokenizer, model, image, sidecars, names })
@@ -188,7 +225,7 @@ impl ModelSource for OnnxSource {
     }
 
     fn open_tensor(&self, name: &str) -> Result<TensorReader<'_>> {
-        let raw = self
+        let (raw, transposed) = self
             .names
             .get(name)
             .ok_or_else(|| FormatError::TensorNotFound(name.to_string()))?;
@@ -210,12 +247,22 @@ impl ModelSource for OnnxSource {
             }
         };
         let shape: Vec<usize> = info.dims.iter().map(|&d| d as usize).collect();
-        Ok(TensorReader::new(
-            name.to_string(),
-            shape,
-            dtype,
-            self.tensor_bytes(info)?,
-        ))
+        let bytes = self.tensor_bytes(info)?;
+        if *transposed {
+            let [r, c] = shape[..] else {
+                return Err(FormatError::Safetensors(format!(
+                    "onnx: transposed tensor {name} is rank {}, expected 2",
+                    shape.len()
+                )));
+            };
+            return Ok(TensorReader::owned_with_dtype(
+                name.to_string(),
+                vec![c, r],
+                dtype,
+                transpose_bytes(bytes, r, c, dtype.size()),
+            ));
+        }
+        Ok(TensorReader::new(name.to_string(), shape, dtype, bytes))
     }
 
     fn tokenizer(&self) -> Result<TokenizerSpec> {
