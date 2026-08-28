@@ -59,7 +59,7 @@ target-f16/
 target-lora/
 
 # Internal reasoning / measurement docs — local-only, never publish.
-/QUANTIZATION_PLAN.md
+/*_PLAN.md
 /docs/
 /documentations/
 
