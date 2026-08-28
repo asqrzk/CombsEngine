@@ -194,6 +194,11 @@ fn try_batched_matmul(
         DType::F32,
     );
     let out = matmul(x2, permute(w2, &[1, 0]), None, MatmulStrategy::default(), DType::F32).ok()?;
+    // Submit now so the dequant transient's slot recycles before the
+    // NEXT block allocates its own — unflushed, the transients stack
+    // across a step's 25 block linears and the peak walks into
+    // machine-killing territory on unified memory (the 2026-08-28 OOM).
+    let _ = x.client.flush();
     Some(CubeTensor::new_contiguous(
         x.client.clone(),
         x.device.clone(),
