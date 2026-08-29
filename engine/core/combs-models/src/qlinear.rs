@@ -193,7 +193,14 @@ fn try_batched_matmul(
         w_h,
         DType::F32,
     );
-    let out = matmul(x2, permute(w2, &[1, 0]), None, MatmulStrategy::default(), DType::F32).ok()?;
+    // The strategy is load-bearing for CORRECTNESS here, not only for
+    // speed: swapping in the untuned kernel turns generated images into
+    // flat grey, even though the two agree exactly when the same matmul
+    // is run in isolation at these shapes (see the strategy test). Until
+    // that is understood, this stays on the strategy that is known to
+    // produce right answers in the live pipeline.
+    let out = matmul(x2, permute(w2, &[1, 0]), None, MatmulStrategy::default(), DType::F32)
+        .ok()?;
     // Submit now so the dequant transient's slot recycles before the
     // NEXT block allocates its own — unflushed, the transients stack
     // across a step's 25 block linears and the peak walks into
@@ -529,6 +536,58 @@ mod tests {
             .to_vec()
             .unwrap();
         assert_close(&got, &expect, 1e-4);
+    }
+
+    /// The batched path hands its FLOPs to burn's matmul, so which
+    /// strategy that resolves to is load-bearing. In ISOLATION the
+    /// tuned and untuned kernels agree to 1e-3 at the diffusion
+    /// blocks' real shape and token count — which is the surprise
+    /// worth pinning: in the live pipeline the untuned one yields flat
+    /// grey images. Whatever the difference is, it is not this matmul
+    /// alone, and this test is the boundary of what has been ruled
+    /// out.
+    #[test]
+    fn matmul_strategies_must_agree_before_one_is_chosen() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        pin_device_dtypes();
+        let device: Device<UnfusedF32> = Default::default();
+        // A single-stream block's real fused projection shape.
+        let (m, k, n) = (768usize, 3072usize, 27648usize);
+        let x: Vec<f32> = (0..m * k).map(|i| ((i % 37) as f32) / 18.0 - 1.0).collect();
+        let w: Vec<f32> = (0..n * k).map(|i| ((i % 53) as f32) / 26.0 - 1.0).collect();
+        let xt = Tensor::<UnfusedF32, 2>::from_data(TensorData::new(x, [m, k]), &device);
+        let wt = Tensor::<UnfusedF32, 2>::from_data(TensorData::new(w, [n, k]), &device);
+        // The reference: burn's own tensor-level matmul.
+        let expect: Vec<f32> = xt
+            .clone()
+            .matmul(wt.clone().transpose())
+            .into_data()
+            .to_vec()
+            .unwrap();
+
+        let prim = |t: Tensor<UnfusedF32, 2>| t.into_primitive().tensor();
+        for (label, strategy) in [
+            ("default", MatmulStrategy::default()),
+            ("cube", MatmulStrategy::Cube),
+        ] {
+            let out = matmul(
+                prim(xt.clone()),
+                permute(prim(wt.clone()), &[1, 0]),
+                None,
+                strategy,
+                DType::F32,
+            )
+            .expect("matmul launches");
+            let got: Vec<f32> =
+                Tensor::<UnfusedF32, 2>::from_primitive(TensorPrimitive::Float(out))
+                    .into_data()
+                    .to_vec()
+                    .unwrap();
+            assert_close(&got, &expect, 1e-3);
+            let _ = label;
+        }
     }
 
     /// Above the batched threshold the SAME public path routes through
