@@ -279,6 +279,19 @@ pub fn merge_lora<S: ModelSource>(
             dense_fallback_bytes / (1024 * 1024)
         );
     }
+    // What actually fused, at what strength, and what it cost — an
+    // adapter that silently skipped half its pairs looks exactly like a
+    // model that ignored the adapter.
+    combs_core::provenance::event(
+        "engine",
+        "adapter.fuse",
+        &[
+            ("applied", merged.len().to_string()),
+            ("skipped", skipped.len().to_string()),
+            ("scale", scale.to_string()),
+            ("dense_fallback_mb", (dense_fallback_bytes / (1024 * 1024)).to_string()),
+        ],
+    );
     Ok(LoraMergedSource { base, applied: merged.len(), merged, skipped })
 }
 

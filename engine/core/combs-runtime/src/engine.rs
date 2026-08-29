@@ -468,11 +468,27 @@ impl Engine {
 
         let registry = ModelRegistry::<CombsBackend>::new();
         let pool = BufferPool::new();
+        let mount = combs_core::provenance::turn(
+            "engine",
+            "mount",
+            &[
+                ("arch", meta_pre.architecture.clone()),
+                ("layers", meta_pre.num_hidden_layers.to_string()),
+                ("kv_heads", meta_pre.num_key_value_heads.to_string()),
+                ("head_dim", meta_pre.head_dim.to_string()),
+                ("max_seq_len", cache_config.max_seq_len.to_string()),
+                ("kv_quant", cache_config.quantize_kv.to_string()),
+                ("weights_mb", (weight_bytes >> 20).to_string()),
+                ("kv_mb", (kv_bytes >> 20).to_string()),
+                ("largest_tensor", format!("{} ({} MB)", largest.0, largest.1 >> 20)),
+            ],
+        );
         let model = pool.pin_persistent(&device, || registry.load(source, &device))?;
         // The load path's transients (dequant staging, repack scratch) are
         // garbage from here on; without this the pool holds them forever.
         pool.cleanup(&device);
         let supports_embeddings = model.supports_hidden_states();
+        mount.ok(&[("embeddings", supports_embeddings.to_string())]);
 
         let spec = source.tokenizer()?;
         let default_pooling = detect_pooling(spec.json_dir());
@@ -991,6 +1007,14 @@ fn worker_loop(
                     &mut token_table,
                 );
                 if sessions.evictions > evictions_before {
+                    combs_core::provenance::event(
+                        "engine",
+                        "kv.evict",
+                        &[
+                            ("evicted", (sessions.evictions - evictions_before).to_string()),
+                            ("evictions_total", sessions.evictions.to_string()),
+                        ],
+                    );
                     // An LRU-evicted session just dropped its KV pages.
                     // Drain the fusion stream first — tensor drops ride
                     // its queue, and a cleanup submitted before the

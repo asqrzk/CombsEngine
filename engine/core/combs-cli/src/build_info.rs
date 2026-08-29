@@ -54,6 +54,17 @@ pub fn manifest() -> Value {
     })
 }
 
+/// The same facts a stats route should carry: which binary, and how
+/// this surface is configured. Assembled here because this crate owns
+/// JSON; `combs_core::provenance` owns the emitting.
+pub fn stats(role: &str, config: &[(&str, String)]) -> Value {
+    let mut cfg = serde_json::Map::new();
+    for (k, v) in config {
+        cfg.insert((*k).to_string(), Value::String(v.clone()));
+    }
+    json!({ "role": role, "build": manifest(), "config": Value::Object(cfg) })
+}
+
 /// One line for a startup log: enough to tell two builds apart at a
 /// glance, including the two that have cost real time — an f16 twin
 /// mistaken for the f32 build, and a stale binary mistaken for a fresh

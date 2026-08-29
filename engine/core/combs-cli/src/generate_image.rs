@@ -70,6 +70,15 @@ pub fn cmd_generate_image(args: GenerateImageArgs) -> Result<()> {
     // Before the pipeline primes the cubecl runtime — device_caps does
     // that setup itself and panics if called afterwards.
     let device_type = combs_core::device_caps(&device).device_type;
+    combs_core::provenance::startup(
+        "image-oneshot",
+        &[
+            ("device", device_type.clone()),
+            ("dtype", crate::build_info::SERVING_DTYPE.to_string()),
+            ("model", model_dir.display().to_string()),
+            ("recipe", if args.llm.is_some() { "llm+vae".into() } else { "checkout".to_string() }),
+        ],
+    );
     let lora = args
         .lora
         .as_ref()
@@ -145,6 +154,17 @@ fn run_generate<B: burn::tensor::backend::Backend>(
         anyhow::bail!("{err}");
     }
 
+    let turn = combs_core::provenance::turn(
+        "image-oneshot",
+        "generate",
+        &[
+            ("size", format!("{}x{}", args.width, args.height)),
+            ("steps", args.steps.to_string()),
+            ("sampler", pipeline.fixed_sampler().unwrap_or(scheduler.name()).to_string()),
+            ("cfg", args.guidance_scale.to_string()),
+            ("seed", args.seed.map_or("entropy".into(), |s| s.to_string())),
+        ],
+    );
     let embed = pipeline
         .encode_prompt(&args.prompt, args.negative_prompt.as_deref())
         .context("encoding prompt")?;
@@ -172,6 +192,10 @@ fn run_generate<B: burn::tensor::backend::Backend>(
         .context("generating image")?;
 
     save_tensor_as_png(&image, &args.output).context("saving output image")?;
+    turn.ok(&[
+        ("output", args.output.display().to_string()),
+        ("seed", effective_seed.to_string()),
+    ]);
     // Report the sampler that ran, not the flag: fixed-schedule pipelines
     // (klein's flow-match) ignore --scheduler.
     println!(

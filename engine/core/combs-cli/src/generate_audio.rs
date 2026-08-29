@@ -53,6 +53,10 @@ pub struct GenerateAudioArgs {
 }
 
 pub fn cmd_generate_audio(args: GenerateAudioArgs) -> Result<()> {
+    combs_core::provenance::startup(
+        "audio-oneshot",
+        &[("dtype", crate::build_info::SERVING_DTYPE.to_string())],
+    );
     let model_dir = super::resolve_model_arg(&args.model)?;
 
     if args.list_voices {

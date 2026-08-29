@@ -58,12 +58,12 @@ pub fn serve(
         in_flight: AtomicU64::new(0),
     });
     let static_info = Arc::new(static_info);
-    eprintln!("combs serve: build {}", crate::build_info::summary());
-    eprintln!(
-        "combs serve: {} pipeline, {}",
-        crate::build_info::SERVING_DTYPE,
-        combs_models::batched_matmul_summary()
-    );
+    let provenance_config = vec![
+        ("model", model_id.clone()),
+        ("dtype", crate::build_info::SERVING_DTYPE.to_string()),
+        ("matmul", combs_models::batched_matmul_summary()),
+    ];
+    combs_core::provenance::startup("text", &provenance_config);
     eprintln!("combs serve: listening on http://{addr} (model: {model_id})");
 
     for mut request in server.incoming_requests() {

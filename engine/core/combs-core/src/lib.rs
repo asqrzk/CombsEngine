@@ -10,7 +10,9 @@
 pub use burn::backend::wgpu;
 
 pub mod progress;
+pub mod provenance;
 pub mod quant;
+pub mod timefmt;
 
 use burn::backend::wgpu::{
     MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuSetup, graphics::AutoGraphicsApi,

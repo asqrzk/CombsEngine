@@ -138,7 +138,7 @@ pub fn cmd_serve_images(
         ("sampler", fixed_sampler.unwrap_or("caller's choice").to_string()),
         ("lora", lora_spec.as_ref().map_or("none".into(), |s| format!("{:?} x{}", s.path.file_name().unwrap_or_default(), s.scale))),
     ]);
-    crate::provenance::startup("image", &provenance_config);
+    combs_core::provenance::startup("image", &provenance_config);
     match preflight.working_set {
         Some(_) => eprintln!(
             "[serve-images] memory pre-flight armed (resident {} MB, {device_type})",
@@ -243,7 +243,7 @@ pub fn cmd_serve_images(
                         json!({
                             "object": "image_worker.stats",
                             "model": model_id,
-                            "provenance": crate::provenance::manifest("image", &provenance_config),
+                            "provenance": crate::build_info::stats("image", &provenance_config),
                             // try_lock fails iff a generation holds the pipeline.
                             "busy": pipeline.try_lock().is_err(),
                             "requests_total": stats.requests_total.load(Relaxed),
@@ -460,12 +460,12 @@ fn handle_generate(
     // only honest moment to say no is here: before the mutex, before
     // the first allocation.
     if let Some(err) = preflight.refusal(width, height) {
-        crate::provenance::turn("image", "generate", &[("size", format!("{width}x{height}"))])
+        combs_core::provenance::turn("image", "generate", &[("size", format!("{width}x{height}"))])
             .failed(&err);
         return json_response(507, error_json("insufficient_memory", &err));
     }
 
-    let turn = crate::provenance::turn(
+    let turn = combs_core::provenance::turn(
         "image",
         "generate",
         &[

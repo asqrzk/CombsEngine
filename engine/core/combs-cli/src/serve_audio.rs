@@ -40,6 +40,15 @@ pub fn cmd_serve_audio(
 ) -> Result<()> {
     let model_dir = super::resolve_model_arg(&model)?;
 
+    combs_core::provenance::startup(
+        "audio",
+        &[
+            ("dtype", crate::build_info::SERVING_DTYPE.to_string()),
+            ("model", model.display().to_string()),
+            ("transcribe", transcribe_model.as_ref().map_or("none".into(), |p| p.display().to_string())),
+            ("language", language.clone()),
+        ],
+    );
     eprintln!("[serve-audio] loading TTS engine...");
     let engine = TtsEngine::load(&model_dir).context("loading TTS engine")?;
     let voices = engine.voices().unwrap_or_default();

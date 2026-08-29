@@ -18,7 +18,7 @@ use std::process::Command;
 
 // Same formatter the binary logs with — one implementation, so a
 // build stamp and a runtime line can never disagree about the time.
-include!("src/timefmt.rs");
+include!("../combs-core/src/timefmt.rs");
 
 fn git(args: &[&str]) -> Option<String> {
     let out = Command::new("git").args(args).output().ok()?;

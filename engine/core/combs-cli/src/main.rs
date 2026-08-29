@@ -19,12 +19,10 @@ mod fit;
 mod generate_audio;
 mod generate_image;
 mod http;
-mod provenance;
 mod pull;
 mod serve;
 mod serve_audio;
 mod serve_images;
-mod timefmt;
 
 #[derive(Parser)]
 #[command(name = "combs", version, about = "Combs Engine — cross-platform edge AI inference")]
@@ -237,8 +235,38 @@ enum ChewMode {
     DebateKvUi(chew::ChewArgs),
 }
 
+impl Command {
+    /// The label a run is recorded under. Explicit rather than derived
+    /// so a renamed variant cannot silently change the record's shape.
+    fn name(&self) -> &'static str {
+        match self {
+            Command::Run(_) => "run",
+            Command::Devices => "devices",
+            Command::BuildInfo { .. } => "build-info",
+            Command::Pull { .. } => "pull",
+            Command::Convert { .. } => "convert",
+            Command::GenerateImage(_) => "generate-image",
+            Command::GenerateAudio(_) => "generate-audio",
+            Command::ServeImages { .. } => "serve-images",
+            Command::ServeAudio { .. } => "serve-audio",
+            Command::Transcribe { .. } => "transcribe",
+            Command::Serve { .. } => "serve",
+            _ => "combs",
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    // Hand the build's account of itself to the layer everything else
+    // logs through, so a mount or a cache eviction can cite the same
+    // binary the CLI reports.
+    combs_core::provenance::set_build(
+        build_info::summary(),
+        build_info::manifest().to_string(),
+    );
     let cli = Cli::parse();
+    // Before anything loads: which binary is about to do the work.
+    combs_core::provenance::process(cli.command.name());
     match cli.command {
         Command::Run(args) => cmd_run(args),
         Command::Devices => cmd_devices(),
