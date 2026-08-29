@@ -76,8 +76,13 @@ pub fn summary() -> String {
     } else {
         format!(" [{FEATURES}]")
     };
+    // The build TIME is in here because a commit is not an identity:
+    // two builds from the same dirty tree are otherwise indistinguishable
+    // in a log, and an A/B that unknowingly compared a fresh binary with
+    // a stale one would look exactly like a real finding.
     format!(
-        "combs {VERSION} {SERVING_DTYPE} ({PROFILE}, {COMMIT_SHORT}{dirty}, {TARGET}){features}"
+        "combs {VERSION} {SERVING_DTYPE} ({PROFILE}, {COMMIT_SHORT}{dirty}, \
+         built {BUILT_AT_RFC3339}, {TARGET}){features}"
     )
 }
 
@@ -100,6 +105,8 @@ mod tests {
         assert_eq!(m["serving_dtype"], SERVING_DTYPE);
         assert!(m["git"]["dirty_as_of_build"].is_boolean());
         assert!(summary().contains(VERSION));
+        // A build's identity must include when it was built.
+        assert!(summary().contains(BUILT_AT_RFC3339), "{}", summary());
     }
 
     /// The f16 twin and the f32 build differ in exactly the way that has

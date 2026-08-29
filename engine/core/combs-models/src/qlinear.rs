@@ -680,6 +680,72 @@ mod tests {
         }
     }
 
+    /// The live path does not upload its weight — it WRITES one with
+    /// the dequant kernel into a fresh device allocation and hands that
+    /// straight to matmul. This builds the right-hand side exactly that
+    /// way, which is the last difference between the isolated test
+    /// (where the strategies agree) and the pipeline (where the untuned
+    /// one produces grey).
+    #[test]
+    fn strategies_agree_on_a_freshly_dequantized_weight() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        pin_device_dtypes();
+        let device: Device<UnfusedF32> = Default::default();
+        let client = <WgpuRuntime as Runtime>::client(&Default::default());
+        let (m, k, n) = (768usize, 2560usize, 1024usize);
+
+        let data = synth_q4_0(n * k / 32);
+        let w = QuantWeight::from_quant_tensor(
+            &client,
+            combs_formats::QuantFormat::Q4_0,
+            &data,
+            n,
+            k,
+        )
+        .unwrap();
+        let reference_w = combs_formats::quants::dequantize_q4_0(&data, n * k).unwrap();
+
+        let x: Vec<f32> = (0..m * k).map(|i| ((i % 37) as f32) / 18.0 - 1.0).collect();
+        let xt = Tensor::<UnfusedF32, 2>::from_data(TensorData::new(x, [m, k]), &device);
+        let wt = Tensor::<UnfusedF32, 2>::from_data(
+            TensorData::new(reference_w, [n, k]),
+            &device,
+        );
+        let expect: Vec<f32> = xt
+            .clone()
+            .matmul(wt.transpose())
+            .into_data()
+            .to_vec()
+            .unwrap();
+
+        for (label, strategy) in [
+            ("default", MatmulStrategy::default()),
+            ("cube", MatmulStrategy::Cube),
+        ] {
+            // A fresh dequant per arm: the transient is single-use.
+            let w_h = w.dequant_device(&client).expect("dequant kernel");
+            let w2 = CubeTensor::new_contiguous(
+                client.clone(),
+                Default::default(),
+                Shape::from([n, k]),
+                w_h,
+                DType::F32,
+            );
+            let x2 = xt.clone().into_primitive().tensor();
+            let out = matmul(x2, permute(w2, &[1, 0]), None, strategy, DType::F32)
+                .expect("matmul launches");
+            let got: Vec<f32> =
+                Tensor::<UnfusedF32, 2>::from_primitive(TensorPrimitive::Float(out))
+                    .into_data()
+                    .to_vec()
+                    .unwrap();
+            assert_close(&got, &expect, 1e-3);
+            let _ = label;
+        }
+    }
+
     /// Above the batched threshold the SAME public path routes through
     /// the transient-dequant + tuned matmul; it must match the dense
     /// reference too (looser tolerance — the tuned matmul's accumulation
