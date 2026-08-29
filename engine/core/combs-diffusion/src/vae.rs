@@ -327,17 +327,33 @@ impl<B: Backend> VAEDecoder<B> {
     /// - input:  `[batch, 4, height, width]`
     /// - output: `[batch, 3, height * 8, width * 8]`
     pub fn forward(&self, latent: Tensor<B, 4>) -> Tensor<B, 4> {
+        use crate::flux2::{prof_mark, prof_report, prof_reset};
+        prof_reset();
         let latent = match &self.post_quant_conv {
             Some(conv) => conv.forward(latent),
             None => latent,
         };
         let mut h = self.conv_in.forward(latent);
+        prof_mark("vae.in", &h);
         h = self.mid_block.forward(h);
-        for up in &self.up_blocks {
+        prof_mark("vae.mid", &h);
+        // The up-stack doubles resolution at every stage, so the last
+        // block does most of the work on the largest tensor — worth
+        // separating rather than summing.
+        for (i, up) in self.up_blocks.iter().enumerate() {
             h = up.forward(h);
+            match i {
+                0 => prof_mark("vae.up0", &h),
+                1 => prof_mark("vae.up1", &h),
+                2 => prof_mark("vae.up2", &h),
+                _ => prof_mark("vae.up3+", &h),
+            }
         }
         h = silu(self.conv_norm_out.forward(h));
-        self.conv_out.forward(h)
+        let out = self.conv_out.forward(h);
+        prof_mark("vae.out", &out);
+        prof_report("vae decode");
+        out
     }
 }
 
