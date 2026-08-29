@@ -282,18 +282,28 @@ impl<B: Backend, VB: Backend> DiffusionModel<B> for Flux2KleinPipeline<B, VB> {
         Some("flow-match-euler")
     }
 
-    /// Fitted to two runs of THIS recipe (Q8 transformer + Q4_K_M
-    /// Qwen3-4B encoder + f32 autoencoder) on an 18 GB M3 Pro: a
-    /// 256x256 generation added 1774 MB over the resident weights, a
-    /// 512x512 one 2867 MB. The fixed term is autotune workspaces plus
-    /// the 512-token encoder pass; the per-pixel term is transformer
-    /// activations, decode, and preview decodes. The larger point was
-    /// measured WITH per-step previews, so the curve errs high for
-    /// preview-free runs — which is the direction to err.
+    /// Fitted to a controlled series on THIS recipe (Q8 transformer +
+    /// Q4_K_M Qwen3-4B encoder + f32 autoencoder, 18 GB M3 Pro): four
+    /// steps, previews off, one fresh process per point, because the
+    /// device pool never shrinks and a second run in the same process
+    /// measures the first one's high-water. 256x256 added 1828 MB over
+    /// the resident weights; 512x512 added 3649 MB.
+    ///
+    /// The earlier pair this replaced differed in two variables at once
+    /// (size AND whether previews ran) and came from a build before the
+    /// encoder joined the batched matmul path — it under-estimated
+    /// 512x512 by 782 MB, which is the direction that lets a run
+    /// through that should have been refused. Re-measure after any
+    /// change to how weights are staged: this curve describes the code
+    /// as much as the model.
+    ///
+    /// Per-step previews cost ~207 MB on top (measured, same series) —
+    /// inside the caller's headroom, so the curve stays preview-free
+    /// rather than pretending to know the cadence.
     fn working_set(&self) -> Option<WorkingSet> {
         Some(WorkingSet {
-            fixed_bytes: 1_478_130_074,
-            bytes_per_pixel: 5_829,
+            fixed_bytes: 1_280_311_296,
+            bytes_per_pixel: 9_712,
             measured_max_pixels: 512 * 512,
         })
     }

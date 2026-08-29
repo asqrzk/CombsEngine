@@ -397,11 +397,11 @@ mod tests {
     const GB: u64 = 1024 * MB;
     const RESIDENT: u64 = 8_445 * MB;
 
-    /// klein's own curve, as the pipeline reports it.
+    /// klein's own curve, as the pipeline reports it (§62's series).
     fn klein() -> combs_diffusion::WorkingSet {
         combs_diffusion::WorkingSet {
-            fixed_bytes: 1_478_130_074,
-            bytes_per_pixel: 5_829,
+            fixed_bytes: 1_280_311_296,
+            bytes_per_pixel: 9_712,
             measured_max_pixels: 512 * 512,
         }
     }
@@ -424,16 +424,27 @@ mod tests {
         }
     }
 
-    /// The curve must reproduce the runs it was fitted to (§56): within
-    /// a megabyte of 1774 MB at 256px and 2867 MB at 512px.
+    /// The curve must reproduce the series it was fitted to (§62):
+    /// 1828 MB at 256px and 3649 MB at 512px, previews off.
     #[test]
     fn delta_model_reproduces_the_measured_runs() {
         let small = estimate_image_delta(&klein(), 256 * 256);
-        assert!(small.bytes.abs_diff(1_774 * MB) < MB, "256px: {} MB", small.bytes / MB);
+        assert!(small.bytes.abs_diff(1_828 * MB) < MB, "256px: {} MB", small.bytes / MB);
         assert!(!small.extrapolated);
         let large = estimate_image_delta(&klein(), 512 * 512);
-        assert!(large.bytes.abs_diff(2_867 * MB) < MB, "512px: {} MB", large.bytes / MB);
+        assert!(large.bytes.abs_diff(3_649 * MB) < MB, "512px: {} MB", large.bytes / MB);
         assert!(!large.extrapolated);
+    }
+
+    /// 768px tripped a 12 GB guard on an 18 GB machine (§62), so the
+    /// curve must price it above what that machine can lend — this is
+    /// the case the estimate exists to refuse.
+    #[test]
+    fn a_canvas_that_did_not_fit_is_priced_as_not_fitting() {
+        let delta = estimate_image_delta(&klein(), 768 * 768);
+        assert!(delta.extrapolated);
+        let peak = 7_355 * MB + delta.bytes;
+        assert!(peak > 13 * GB, "768px peak priced at {} MB", peak / MB);
     }
 
     /// Past the measured range only the EXCESS pixels inflate, so the
@@ -459,9 +470,9 @@ mod tests {
         let err = check_image_fit(&klein(), &inputs(512, 512, RESIDENT, 0, 2 * GB)).unwrap_err();
         assert!(err.contains("512x512"), "{err}");
         assert!(err.contains("MB more"), "growth is named: {err}");
-        // The peak this predicts is the one the crashing run actually
-        // reached (11312 MB measured, §56) — a live check on the curve.
-        assert!(err.contains("estimated peak 1131"), "{err}");
+        // Priced against the measured resident, this lands where the
+        // series put a 512px run: ~11 GB (§62).
+        assert!(err.contains("estimated peak 12"), "{err}");
         assert!(err.contains("smaller image"), "{err}");
         assert!(!err.contains("extrapolated"), "512px is measured: {err}");
     }
@@ -473,7 +484,7 @@ mod tests {
     /// feature targets.)
     #[test]
     fn a_warm_pool_asking_for_nothing_is_never_refused() {
-        let warm = RESIDENT + 2_867 * MB;
+        let warm = RESIDENT + 3_649 * MB;
         for available in [0, MB, 512 * MB, 2 * GB] {
             assert!(
                 check_image_fit(&klein(), &inputs(512, 512, warm, 512 * 512, available)).is_ok(),
@@ -487,7 +498,7 @@ mod tests {
     /// a small canvas cannot satisfy a larger one's buffers.
     #[test]
     fn a_bigger_canvas_gets_no_credit_for_a_smaller_run() {
-        let warm_from_256 = RESIDENT + 1_774 * MB;
+        let warm_from_256 = RESIDENT + 1_828 * MB;
         let up = check_image_fit(
             &klein(),
             &inputs(512, 512, warm_from_256, 256 * 256, 1500 * MB),
