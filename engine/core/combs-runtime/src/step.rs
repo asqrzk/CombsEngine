@@ -116,6 +116,11 @@ impl SessionSet {
                 .min_by_key(|(_, s)| s.last_used)
                 .map(|(k, _)| k.clone())
             {
+                combs_core::provenance::event(
+                    "engine",
+                    "kv.session.evict",
+                    &[("session", oldest.clone()), ("live", self.map.len().to_string())],
+                );
                 self.map.remove(&oldest);
                 self.evictions += 1;
             }

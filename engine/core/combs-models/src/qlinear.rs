@@ -407,10 +407,35 @@ fn cast_op<B: Backend, T: Backend>(op: Box<dyn QuantLinearOp<T>>) -> Option<Box<
 /// Tries to build the quantized fast path for `name`: packed bytes from the
 /// source + a kernel dispatch matching `B`. `None` → caller uses the dense
 /// fallback. Errors only on malformed packed data.
+/// Every weight's dispatch decision is counted, whether or not anyone
+/// is watching: the per-tensor detail stays behind `COMBS_DEBUG_QUANT`,
+/// but the totals answer "did this model actually get the fast path?"
+/// — a question that has been answered by assumption before.
+static QUANT_DECISIONS: std::sync::Mutex<Vec<(String, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
 fn debug_quant(name: &str, outcome: &str) {
     if std::env::var_os("COMBS_DEBUG_QUANT").is_some() {
         eprintln!("quant-linear {name}: {outcome}");
     }
+    if let Ok(mut counts) = QUANT_DECISIONS.lock() {
+        match counts.iter_mut().find(|(o, _)| o == outcome) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((outcome.to_string(), 1)),
+        }
+    }
+}
+
+/// The dispatch census so far, most common first — e.g.
+/// `"packed on device=196, no packed quant tensor=4"`. Empty when no
+/// quantized linear has been considered.
+pub fn quant_census() -> String {
+    let Ok(counts) = QUANT_DECISIONS.lock() else {
+        return String::new();
+    };
+    let mut rows: Vec<&(String, usize)> = counts.iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows.iter().map(|(o, n)| format!("{o}={n}")).collect::<Vec<_>>().join(", ")
 }
 
 /// Wraps an already-packed weight as a [`QuantLinearOp`] for `B` — the

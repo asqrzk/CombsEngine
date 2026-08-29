@@ -488,7 +488,10 @@ impl Engine {
         // garbage from here on; without this the pool holds them forever.
         pool.cleanup(&device);
         let supports_embeddings = model.supports_hidden_states();
-        mount.ok(&[("embeddings", supports_embeddings.to_string())]);
+        mount.ok(&[
+            ("embeddings", supports_embeddings.to_string()),
+            ("quant_dispatch", combs_models::quant_census()),
+        ]);
 
         let spec = source.tokenizer()?;
         let default_pooling = detect_pooling(spec.json_dir());

@@ -301,6 +301,24 @@ fn caps_from_setup(setup: &WgpuSetup) -> DeviceCaps {
     let info = setup.adapter.get_info();
     let limits = setup.adapter.limits();
     let features = setup.adapter.features();
+    // Which adapter was actually selected — the first question asked
+    // whenever output is wrong or slow, and the one a container can
+    // answer differently from the host it claims to be.
+    crate::provenance::event(
+        "device",
+        "device.select",
+        &[
+            ("name", info.name.clone()),
+            ("type", format!("{:?}", info.device_type)),
+            ("backend", format!("{:?}", info.backend)),
+            ("driver", format!("{} ({})", info.driver, info.driver_info)),
+            ("max_buffer_mb", (limits.max_buffer_size >> 20).to_string()),
+            (
+                "max_binding_mb",
+                ((limits.max_storage_buffer_binding_size as u64) >> 20).to_string(),
+            ),
+        ],
+    );
     DeviceCaps {
         name: info.name.clone(),
         backend: format!("{:?}", info.backend),
