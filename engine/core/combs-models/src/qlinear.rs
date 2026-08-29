@@ -163,6 +163,62 @@ fn batched_threshold() -> usize {
     })
 }
 
+/// Which matmul the batched path uses. `MatmulStrategy::Cube` is a
+/// DIAGNOSTIC ONLY: it is known to produce flat-grey images in the live
+/// diffusion pipeline while agreeing with the tuned kernel to 1e-3 when
+/// the same matmul runs in isolation. It exists so that discrepancy can
+/// be investigated with real logging instead of inference.
+fn matmul_strategy() -> MatmulStrategy {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let untuned = *S.get_or_init(|| {
+        let untuned =
+            matches!(std::env::var("COMBS_QMATMUL_STRATEGY").as_deref(), Ok("cube"));
+        if untuned {
+            eprintln!(
+                "[qmatmul] WARNING: COMBS_QMATMUL_STRATEGY=cube — diagnostic only, \
+                 known to produce wrong images in the diffusion pipeline"
+            );
+        }
+        untuned
+    });
+    if untuned { MatmulStrategy::Cube } else { MatmulStrategy::default() }
+}
+
+/// One line describing what the batched path will actually do, so a run
+/// records its configuration instead of leaving it to be assumed.
+pub fn batched_matmul_summary() -> String {
+    let threshold = batched_threshold();
+    let strategy = if matches!(matmul_strategy(), MatmulStrategy::Cube) {
+        "cube (DIAGNOSTIC)"
+    } else {
+        "tuned"
+    };
+    if threshold == usize::MAX {
+        "batched matmul OFF (COMBS_QMATMUL_BATCHED=0)".to_string()
+    } else {
+        format!("batched matmul from {threshold} rows, {strategy} kernel")
+    }
+}
+
+/// First few batched calls report the shapes and dtypes they actually
+/// saw under `COMBS_QMATMUL_DEBUG=1` — the ground truth an A/B needs,
+/// since burn resolves tensor dtypes from per-device defaults and an
+/// f32 backend can still be handed f16 tensors.
+fn debug_first_calls(m: usize, k: usize, n: usize, x_dtype: DType, out_dtype: DType) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("COMBS_QMATMUL_DEBUG").as_deref() == Ok("1")) {
+        return;
+    }
+    static SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n_seen = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n_seen < 8 {
+        eprintln!(
+            "[qmatmul] call {n_seen}: m {m} k {k} n {n} | x {x_dtype:?} out {out_dtype:?} | {}",
+            batched_matmul_summary()
+        );
+    }
+}
+
 /// The batched path: weight read ONCE (dequantized into a transient f32
 /// buffer that dies with the call), FLOPs handed to the tuned matmul.
 /// `None` below the threshold or for formats without a dequant kernel —
@@ -193,14 +249,13 @@ fn try_batched_matmul(
         w_h,
         DType::F32,
     );
+    debug_first_calls(m, k, n_out, x.dtype, DType::F32);
     // The strategy is load-bearing for CORRECTNESS here, not only for
-    // speed: swapping in the untuned kernel turns generated images into
-    // flat grey, even though the two agree exactly when the same matmul
-    // is run in isolation at these shapes (see the strategy test). Until
-    // that is understood, this stays on the strategy that is known to
-    // produce right answers in the live pipeline.
-    let out = matmul(x2, permute(w2, &[1, 0]), None, MatmulStrategy::default(), DType::F32)
-        .ok()?;
+    // speed: the untuned kernel turns generated images flat grey even
+    // though the two agree to 1e-3 when the same matmul runs in
+    // isolation at these shapes (see the strategy test). Diagnostic
+    // door only — the default stays on what demonstrably works.
+    let out = matmul(x2, permute(w2, &[1, 0]), None, matmul_strategy(), DType::F32).ok()?;
     // Submit now so the dequant transient's slot recycles before the
     // NEXT block allocates its own — unflushed, the transients stack
     // across a step's 25 block linears and the peak walks into
@@ -553,8 +608,17 @@ mod tests {
         }
         pin_device_dtypes();
         let device: Device<UnfusedF32> = Default::default();
-        // A single-stream block's real fused projection shape.
-        let (m, k, n) = (768usize, 3072usize, 27648usize);
+        // Shapes the live pipeline actually runs, logged from a real
+        // generation: the text encoder's projections first (its output
+        // is the conditioning, and a dead conditioning pathway is
+        // exactly what grey images look like), then a single-stream
+        // block's fused projection.
+        for (m, k, n) in [
+            (512usize, 2560usize, 4096usize),
+            (512, 2560, 1024),
+            (512, 4096, 2560),
+            (768, 3072, 27648),
+        ] {
         let x: Vec<f32> = (0..m * k).map(|i| ((i % 37) as f32) / 18.0 - 1.0).collect();
         let w: Vec<f32> = (0..n * k).map(|i| ((i % 53) as f32) / 26.0 - 1.0).collect();
         let xt = Tensor::<UnfusedF32, 2>::from_data(TensorData::new(x, [m, k]), &device);
@@ -587,6 +651,7 @@ mod tests {
                     .unwrap();
             assert_close(&got, &expect, 1e-3);
             let _ = label;
+            }
         }
     }
 

@@ -13,15 +13,18 @@ use combs_formats::{ModelSource, open_model_source};
 use combs_media::ImagePreprocessor;
 use combs_runtime::{Engine, GenerationConfig};
 
+mod build_info;
 mod chew;
 mod fit;
 mod generate_audio;
 mod generate_image;
 mod http;
+mod provenance;
 mod pull;
 mod serve;
 mod serve_audio;
 mod serve_images;
+mod timefmt;
 
 #[derive(Parser)]
 #[command(name = "combs", version, about = "Combs Engine — cross-platform edge AI inference")]
@@ -102,6 +105,13 @@ enum Command {
     },
     /// Print wgpu device information.
     Devices,
+    /// Print how this binary was built (version, commit, features,
+    /// serving dtype) — the manifest compiled in at build time.
+    BuildInfo {
+        /// Emit the full manifest as JSON instead of one line.
+        #[arg(long)]
+        json: bool,
+    },
     /// Download a model into the local cache (~/.cache/combs/models).
     Pull {
         /// Preset id (smollm2-135m) or HuggingFace repo (org/name).
@@ -232,6 +242,14 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Run(args) => cmd_run(args),
         Command::Devices => cmd_devices(),
+        Command::BuildInfo { json } => {
+            if json {
+                println!("{:#}", build_info::manifest());
+            } else {
+                println!("{}", build_info::summary());
+            }
+            Ok(())
+        }
         Command::Pull { source } => {
             let dir = pull::pull(&source)?;
             println!("cached at: {}", dir.display());

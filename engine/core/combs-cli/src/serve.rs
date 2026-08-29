@@ -58,6 +58,12 @@ pub fn serve(
         in_flight: AtomicU64::new(0),
     });
     let static_info = Arc::new(static_info);
+    eprintln!("combs serve: build {}", crate::build_info::summary());
+    eprintln!(
+        "combs serve: {} pipeline, {}",
+        crate::build_info::SERVING_DTYPE,
+        combs_models::batched_matmul_summary()
+    );
     eprintln!("combs serve: listening on http://{addr} (model: {model_id})");
 
     for mut request in server.incoming_requests() {
@@ -169,6 +175,7 @@ fn stats_response(
         200,
         json!({
             "object": "engine.stats",
+            "build": crate::build_info::manifest(),
             "model": model_id,
             "architecture": &meta.architecture,
             "uptime_s": counters.started.elapsed().as_secs(),

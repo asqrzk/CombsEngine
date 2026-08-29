@@ -128,6 +128,17 @@ pub fn cmd_serve_images(
         resident_at_load,
         largest_completed_pixels: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
+    // What this process will actually do, recorded rather than assumed:
+    // an A/B that infers its own configuration proves nothing.
+    let provenance_config = Arc::new(vec![
+        ("device", device_type.clone()),
+        ("dtype", crate::build_info::SERVING_DTYPE.to_string()),
+        ("matmul", combs_models::batched_matmul_summary()),
+        ("preview_every", preview_every.to_string()),
+        ("sampler", fixed_sampler.unwrap_or("caller's choice").to_string()),
+        ("lora", lora_spec.as_ref().map_or("none".into(), |s| format!("{:?} x{}", s.path.file_name().unwrap_or_default(), s.scale))),
+    ]);
+    crate::provenance::startup("image", &provenance_config);
     match preflight.working_set {
         Some(_) => eprintln!(
             "[serve-images] memory pre-flight armed (resident {} MB, {device_type})",
@@ -177,6 +188,7 @@ pub fn cmd_serve_images(
         let model_id = model_id.clone();
         let lora_info = lora_info.clone();
         let preflight = preflight.clone();
+        let provenance_config = provenance_config.clone();
         std::thread::spawn(move || {
             let url = request.url().to_string();
             let method = request.method().as_str().to_string();
@@ -231,6 +243,7 @@ pub fn cmd_serve_images(
                         json!({
                             "object": "image_worker.stats",
                             "model": model_id,
+                            "provenance": crate::provenance::manifest("image", &provenance_config),
                             // try_lock fails iff a generation holds the pipeline.
                             "busy": pipeline.try_lock().is_err(),
                             "requests_total": stats.requests_total.load(Relaxed),
@@ -447,12 +460,23 @@ fn handle_generate(
     // only honest moment to say no is here: before the mutex, before
     // the first allocation.
     if let Some(err) = preflight.refusal(width, height) {
-        eprintln!("[serve-images] refused: {err}");
+        crate::provenance::turn("image", "generate", &[("size", format!("{width}x{height}"))])
+            .failed(&err);
         return json_response(507, error_json("insufficient_memory", &err));
     }
 
-    eprintln!(
-        "[serve-images] generate: {prompt} ({width}x{height}, {steps} steps, {sampler_name}, cfg {guidance})"
+    let turn = crate::provenance::turn(
+        "image",
+        "generate",
+        &[
+            ("size", format!("{width}x{height}")),
+            ("steps", steps.to_string()),
+            ("sampler", sampler_name.to_string()),
+            ("cfg", guidance.to_string()),
+            ("seed", seed.map_or("entropy".into(), |s| s.to_string())),
+            ("preview_every", preview_every.to_string()),
+            ("prompt_chars", prompt.chars().count().to_string()),
+        ],
     );
 
     // Single in-flight generation: the pipeline holds VRAM-resident state.
@@ -560,11 +584,10 @@ fn handle_generate(
 
     match result {
         Ok((png, effective_seed)) => {
-            eprintln!(
-                "[serve-images] done in {:.1}s ({} bytes, seed {effective_seed})",
-                started.elapsed().as_secs_f64(),
-                png.len()
-            );
+            turn.ok(&[
+                ("bytes", png.len().to_string()),
+                ("seed", effective_seed.to_string()),
+            ]);
             json_response(
                 200,
                 json!({
@@ -581,7 +604,7 @@ fn handle_generate(
             )
         }
         Err(e) => {
-            eprintln!("[serve-images] failed: {e}");
+            turn.failed(&e.to_string());
             json_response(500, error_json("engine_error", &e.to_string()))
         }
     }
