@@ -89,6 +89,57 @@ impl<B: Backend> ModelRegistry<B> {
         self.loaders.insert(architecture.to_string(), loader);
     }
 
+    /// Whether an architecture can be built from weights staged off a
+    /// stream. Everything riding the universal decoder can; SmolVLM
+    /// cannot, because its vision tower is loaded apart from the text
+    /// stack and streaming has not been taught that shape.
+    ///
+    /// Asked at the HEADER, before any payload is pulled: refusing a
+    /// gigabyte in is a worse answer than refusing at the first packet,
+    /// and it is the same fact either way.
+    pub fn supports_streaming(architecture: &str) -> bool {
+        matches!(
+            architecture,
+            "llama"
+                | "smollm2"
+                | "qwen2"
+                | "qwen3"
+                | "mistral"
+                | "phi3"
+                | "gemma3"
+                | "gemma3_text"
+        )
+    }
+
+    /// Builds a model from already-staged weights. The architecture is
+    /// read from the metadata the header carried; the prefix is decided
+    /// from the names actually staged, the same way the whole-file load
+    /// decides it from the source's tensor list.
+    pub fn load_staged(
+        &self,
+        staged: &mut crate::staged::StagedWeights<B>,
+        device: &Device<B>,
+    ) -> Result<Box<dyn GenerativeModel<B>>> {
+        let arch = staged.metadata().architecture.clone();
+        if !Self::supports_streaming(&arch) {
+            return Err(ModelError::UnsupportedArchitecture(format!(
+                "{arch} cannot be mounted from a stream"
+            )));
+        }
+        let prefix = if staged
+            .names()
+            .iter()
+            .any(|n| n == "model.embed_tokens.weight" || n == "model.embed_tokens")
+        {
+            "model"
+        } else {
+            ""
+        };
+        Ok(Box::new(crate::llama::LlamaModel::<B>::load_staged(
+            staged, device, prefix,
+        )?))
+    }
+
     /// Whether an architecture id has a loader.
     pub fn supports(&self, architecture: &str) -> bool {
         self.loaders.contains_key(architecture)

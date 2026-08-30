@@ -22,7 +22,7 @@ mod spm;
 mod tflite;
 mod tokenizer;
 
-pub use gguf::GgufSource;
+pub use gguf::{GgufHeaderInfo, GgufSource, read_gguf_header};
 
 /// Reference CPU dequantizers for GGUF quant formats. These scalar
 /// implementations are the harmony reference that the fused GPU kernels in

@@ -18,6 +18,8 @@ use std::ops::Range;
 use burn::tensor::{Device, Int, Tensor, backend::Backend};
 use combs_formats::{ModelMetadata, ModelSource};
 
+use crate::staged::WeightSupply;
+
 use crate::archspec::{ArchSpec, LayerKind, NormFlavor};
 use crate::kv::{CacheConfig, CacheKind, ContiguousKVCache, KVCache, PagedKVCache};
 use crate::matmul::safe_matmul;
@@ -156,12 +158,12 @@ fn load_optional_bias<B: Backend>(
 /// are row-sliced into split names by the format adapter before reaching
 /// this loader.
 fn split_fused_rows<B: Backend, const N: usize>(
-    source: &dyn ModelSource,
+    supply: &mut WeightSupply<'_, B>,
     device: &Device<B>,
     name: &str,
     rows: [usize; N],
 ) -> Result<[Linear<B>; N]> {
-    let w: Tensor<B, 2> = load_weight(source, device, name)?;
+    let w: Tensor<B, 2> = supply.weight(device, name)?;
     let [total, cols] = w.dims();
     let expect: usize = rows.iter().sum();
     if total != expect {
@@ -181,12 +183,12 @@ fn split_fused_rows<B: Backend, const N: usize>(
 
 /// Row-splits a fused projection's bias when present.
 fn split_fused_bias<B: Backend, const N: usize>(
-    source: &dyn ModelSource,
+    supply: &mut WeightSupply<'_, B>,
     device: &Device<B>,
     name: &str,
     rows: [usize; N],
 ) -> Result<Option<[Tensor<B, 1>; N]>> {
-    let Some(b) = load_optional_bias(source, device, name)? else {
+    let Some(b) = supply.optional(device, name)? else {
         return Ok(None);
     };
     let [total] = b.dims();
@@ -551,7 +553,27 @@ impl<B: Backend> LlamaModel<B> {
         device: &Device<B>,
         prefix: &str,
     ) -> Result<Self> {
-        let m = source.metadata().clone();
+        Self::load_from(&mut WeightSupply::Source(source), device, prefix)
+    }
+
+    /// The same load, driven from weights already staged off a stream.
+    /// Nothing below this line knows which it is reading from, which is
+    /// the point: one loader, one set of architecture decisions, two
+    /// ways for the bytes to have arrived.
+    pub(crate) fn load_staged(
+        staged: &mut crate::staged::StagedWeights<B>,
+        device: &Device<B>,
+        prefix: &str,
+    ) -> Result<Self> {
+        Self::load_from(&mut WeightSupply::Staged(staged), device, prefix)
+    }
+
+    fn load_from(
+        supply: &mut WeightSupply<'_, B>,
+        device: &Device<B>,
+        prefix: &str,
+    ) -> Result<Self> {
+        let m = supply.metadata().clone();
         let spec = ArchSpec::resolve(&m);
         // Dotted prefix, or nothing for bare exports.
         let prefix = if prefix.is_empty() {
@@ -566,14 +588,7 @@ impl<B: Backend> LlamaModel<B> {
         // packed tied-head op it comes paired with. Any refusal falls
         // back to the dense load, byte-for-byte today's behavior.
         let embed_name = format!("{prefix}embed_tokens.weight");
-        let (embed, packed_head) =
-            match crate::embed::try_quant_embedding::<B>(source, &embed_name, device)? {
-                Some((e, head)) => (e, Some(head)),
-                None => {
-                    let t: Tensor<B, 2> = load_weight(source, device, &embed_name)?;
-                    (crate::embed::Embedding::Dense(t), None)
-                }
-            };
+        let (embed, packed_head) = supply.embedding(device, &embed_name)?;
         Self::expect_shape(
             "embed_tokens.weight",
             &embed.dims(),
@@ -588,7 +603,7 @@ impl<B: Backend> LlamaModel<B> {
         let lm_head = if m.tie_word_embeddings {
             tied_head()
         } else {
-            match load_linear(source, device, "lm_head.weight") {
+            match supply.linear(device, "lm_head.weight") {
                 Ok(w) => {
                     Self::expect_shape(
                         "lm_head.weight",
@@ -612,7 +627,7 @@ impl<B: Backend> LlamaModel<B> {
         };
 
         let final_norm: Tensor<B, 1> =
-            load_weight(source, device, &format!("{prefix}norm.weight"))?;
+            supply.weight(device, &format!("{prefix}norm.weight"))?;
 
         // Sandwich-norm architectures (gemma) rename the pre-MLP norm and
         // add output norms around both residual adds.
@@ -630,23 +645,23 @@ impl<B: Backend> LlamaModel<B> {
             // Phi-family checkpoints fuse the attention input projections
             // (`qkv_proj` = [q|k|v] rows); probe the split names first.
             let (q, k, v, fused_qkv_bias) =
-                match load_linear(source, device, &format!("{p}.self_attn.q_proj.weight")) {
+                match supply.linear(device, &format!("{p}.self_attn.q_proj.weight")) {
                     Ok(q) => (
                         q,
-                        load_linear(source, device, &format!("{p}.self_attn.k_proj.weight"))?,
-                        load_linear(source, device, &format!("{p}.self_attn.v_proj.weight"))?,
+                        supply.linear(device, &format!("{p}.self_attn.k_proj.weight"))?,
+                        supply.linear(device, &format!("{p}.self_attn.v_proj.weight"))?,
                         None,
                     ),
                     Err(ModelError::MissingTensor(_)) => {
                         let name = format!("{p}.self_attn.qkv_proj");
                         let [q, k, v] = split_fused_rows(
-                            source,
+                            supply,
                             device,
                             &format!("{name}.weight"),
                             [q_rows, kv_rows, kv_rows],
                         )?;
                         let b = split_fused_bias(
-                            source,
+                            supply,
                             device,
                             &format!("{name}.bias"),
                             [q_rows, kv_rows, kv_rows],
@@ -655,7 +670,7 @@ impl<B: Backend> LlamaModel<B> {
                     }
                     Err(e) => return Err(e),
                 };
-            let o = load_linear(source, device, &format!("{p}.self_attn.o_proj.weight"))?;
+            let o = supply.linear(device, &format!("{p}.self_attn.o_proj.weight"))?;
             Self::expect_shape(
                 &format!("{p}.self_attn.q_proj.weight"),
                 &q.dims(),
@@ -668,14 +683,14 @@ impl<B: Backend> LlamaModel<B> {
             )?;
             // Same fusion for the MLP input (`gate_up_proj` = [gate|up]).
             let (gate, up) =
-                match load_linear(source, device, &format!("{p}.mlp.gate_proj.weight")) {
+                match supply.linear(device, &format!("{p}.mlp.gate_proj.weight")) {
                     Ok(gate) => (
                         gate,
-                        load_linear(source, device, &format!("{p}.mlp.up_proj.weight"))?,
+                        supply.linear(device, &format!("{p}.mlp.up_proj.weight"))?,
                     ),
                     Err(ModelError::MissingTensor(_)) => {
                         let [gate, up] = split_fused_rows(
-                            source,
+                            supply,
                             device,
                             &format!("{p}.mlp.gate_up_proj.weight"),
                             [m.intermediate_size, m.intermediate_size],
@@ -689,26 +704,34 @@ impl<B: Backend> LlamaModel<B> {
             // `attention_bias` (the bias is implicit in the modeling code),
             // so gating on metadata would silently skip real bias tensors.
             // Plain llama/smollm checkpoints have none and probe to `None`.
-            let bias = |proj: &str| -> Result<Option<Tensor<B, 1>>> {
-                load_optional_bias(source, device, &format!("{p}.{proj}.bias"))
-            };
             let (q_bias, k_bias, v_bias) = match fused_qkv_bias {
                 Some([qb, kb, vb]) => (Some(qb), Some(kb), Some(vb)),
                 None => (
-                    bias("self_attn.q_proj")?,
-                    bias("self_attn.k_proj")?,
-                    bias("self_attn.v_proj")?,
+                    supply.optional(device, &format!("{p}.self_attn.q_proj.bias"))?,
+                    supply.optional(device, &format!("{p}.self_attn.k_proj.bias"))?,
+                    supply.optional(device, &format!("{p}.self_attn.v_proj.bias"))?,
                 ),
             };
-
-            let optional_norm = |name: &str| -> Result<Option<Tensor<B, 1>>> {
-                match source.open_tensor(&format!("{p}.{name}.weight")) {
-                    Ok(reader) => Ok(Some(
-                        reader.load_to_tensor::<B, 1>(device).map_err(ModelError::Format)?,
-                    )),
-                    Err(combs_formats::FormatError::TensorNotFound(_)) => Ok(None),
-                    Err(e) => Err(ModelError::Format(e)),
-                }
+            let o_bias = supply.optional(device, &format!("{p}.self_attn.o_proj.bias"))?;
+            let q_norm = if spec.qk_norm {
+                supply.optional(device, &format!("{p}.self_attn.q_norm.weight"))?
+            } else {
+                None
+            };
+            let k_norm = if spec.qk_norm {
+                supply.optional(device, &format!("{p}.self_attn.k_norm.weight"))?
+            } else {
+                None
+            };
+            let attn_out_norm = if spec.sandwich_norms {
+                supply.optional(device, &format!("{p}.post_attention_layernorm.weight"))?
+            } else {
+                None
+            };
+            let mlp_out_norm = if spec.sandwich_norms {
+                supply.optional(device, &format!("{p}.post_feedforward_layernorm.weight"))?
+            } else {
+                None
             };
 
             layers.push(LlamaLayer {
@@ -719,28 +742,16 @@ impl<B: Backend> LlamaModel<B> {
                 q_bias,
                 k_bias,
                 v_bias,
-                o_bias: bias("self_attn.o_proj")?,
-                q_norm: if spec.qk_norm { optional_norm("self_attn.q_norm")? } else { None },
-                k_norm: if spec.qk_norm { optional_norm("self_attn.k_norm")? } else { None },
+                o_bias,
+                q_norm,
+                k_norm,
                 gate,
                 up,
-                down: load_linear(source, device, &format!("{p}.mlp.down_proj.weight"))?,
-                input_norm: load_weight(source, device, &format!("{p}.input_layernorm.weight"))?,
-                pre_mlp_norm: load_weight(
-                    source,
-                    device,
-                    &format!("{p}.{pre_mlp_name}.weight"),
-                )?,
-                attn_out_norm: if spec.sandwich_norms {
-                    optional_norm("post_attention_layernorm")?
-                } else {
-                    None
-                },
-                mlp_out_norm: if spec.sandwich_norms {
-                    optional_norm("post_feedforward_layernorm")?
-                } else {
-                    None
-                },
+                down: supply.linear(device, &format!("{p}.mlp.down_proj.weight"))?,
+                input_norm: supply.weight(device, &format!("{p}.input_layernorm.weight"))?,
+                pre_mlp_norm: supply.weight(device, &format!("{p}.{pre_mlp_name}.weight"))?,
+                attn_out_norm,
+                mlp_out_norm,
             });
             combs_core::progress::load(
                 "weights",

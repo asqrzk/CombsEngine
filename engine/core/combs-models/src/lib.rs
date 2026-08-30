@@ -22,6 +22,7 @@ mod registry;
 mod wgsl;
 mod rope;
 mod smolvlm;
+pub mod staged;
 mod traits;
 mod whisper;
 

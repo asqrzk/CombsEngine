@@ -69,7 +69,7 @@ pub(crate) struct TensorInfo {
 /// exists. All access goes through [`GgufData::slice`]; a payload
 /// inside one segment borrows, one straddling a boundary joins into
 /// an owned copy (bounded by the largest tensor, transient).
-enum GgufData {
+pub(crate) enum GgufData {
     #[cfg(not(target_family = "wasm"))]
     Mmap(Mmap),
     Owned(Vec<u8>),
@@ -275,6 +275,50 @@ impl GgufHeader {
 
         Ok(Some(GgufHeader { version, kv, tensors, data_start }))
     }
+}
+
+/// Where every tensor lives, and where the payloads begin — the map a
+/// streaming mount steers by. Read from the first bytes off the wire,
+/// before any payload has been asked for.
+#[derive(Debug, Clone)]
+pub struct GgufHeaderInfo {
+    /// Offset of the first payload byte.
+    pub data_start: usize,
+    /// Model architecture, so a mount can refuse an unsupported one
+    /// here rather than a gigabyte later.
+    pub architecture: String,
+    /// `(ggml name, absolute start, byte length)`, **sorted by start**.
+    /// One `Response.body` delivers bytes in file order, so this is the
+    /// order a mount will meet them in.
+    pub tensors: Vec<(String, usize, usize)>,
+}
+
+/// Read a GGUF header from a prefix of the file. `Ok(None)` means the
+/// header is not all here yet — feed more and ask again; `Err` means it
+/// will never parse. `total` is the file's eventual length when known,
+/// which is what separates the two.
+pub fn read_gguf_header(bytes: &[u8], total: Option<usize>) -> Result<Option<GgufHeaderInfo>> {
+    let Some(header) = GgufHeader::try_parse(bytes, total)? else {
+        return Ok(None);
+    };
+    let architecture = match header.kv.get("general.architecture") {
+        Some(MetaValue::String(s)) => s.clone(),
+        _ => String::new(),
+    };
+    let mut tensors: Vec<(String, usize, usize)> = header
+        .tensors
+        .values()
+        .map(|info| {
+            tensor_byte_size(info)
+                .map(|size| (info.name.clone(), header.data_start + info.offset, size))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    tensors.sort_by_key(|(_, start, _)| *start);
+    Ok(Some(GgufHeaderInfo {
+        data_start: header.data_start,
+        architecture,
+        tensors,
+    }))
 }
 
 /// Narrow a payload to a byte range, borrowing when it already borrows.
@@ -1560,7 +1604,7 @@ impl GgufSource {
     /// for; a fused projection answers with all of its parts, each with
     /// its row range. An empty result means nothing in the model wants
     /// these bytes, which is a fact to act on and not an error.
-    pub(crate) fn hf_names_for_ggml(&self, ggml: &str) -> Vec<(String, Option<(usize, usize)>)> {
+    pub fn hf_names_for_ggml(&self, ggml: &str) -> Vec<(String, Option<(usize, usize)>)> {
         // Fused projections are asked about FIRST, and the order is
         // load-bearing rather than tidy. On phi3 the fused gate+up
         // tensor is named `ffn_up.weight`, which the forward map — which
