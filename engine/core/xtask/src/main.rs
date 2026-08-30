@@ -59,6 +59,21 @@ enum XCommand {
         #[arg(long)]
         check: bool,
     },
+    /// Run every public gate: formatting, lints, and the test tiers.
+    ///
+    /// One command so a change is checked the same way by everyone,
+    /// rather than by whichever subset each person remembers.
+    Gates {
+        /// Skip the GPU-backed tiers (formats and models take minutes
+        /// and need an adapter); leaves formatting, lints and the
+        /// backend-free crates.
+        #[arg(long)]
+        quick: bool,
+        /// Treat formatting and lints as failures rather than as the
+        /// standing debt they currently are.
+        #[arg(long)]
+        strict: bool,
+    },
     /// Build the browser engine: combs-wasm for wasm32-unknown-unknown,
     /// plus the wasm-bindgen ES module in js/core/pkg/.
     Web {
@@ -259,6 +274,87 @@ fn build_target(ctx: &Ctx, target: &Target, force_check: bool) -> Result<PathBuf
 /// wasm-bindgen shim that knows how to pass strings and closures across
 /// the boundary. When `wasm-bindgen` is missing this says so and stops,
 /// rather than leaving a `pkg/` that looks built and imports nothing.
+/// Every gate that can live in the repository.
+///
+/// Deliberately only the public half: formatting, lints and tests. The
+/// checks that read a private vocabulary live with that vocabulary, in
+/// tooling this repository does not carry and must not name — a
+/// committed file that points at them would leak their existence, which
+/// is the one thing they exist to prevent.
+///
+/// Formatting and lints REPORT by default rather than fail. The
+/// workspace does not currently satisfy either, by a wide margin, and a
+/// gate that can never pass is a gate everyone learns to ignore —
+/// which is worse than one that says plainly, every time it runs, how
+/// large the debt is. `--strict` makes them binding, and is what a
+/// cleanup change should be judged by.
+fn cmd_gates(ctx: &Ctx, quick: bool, strict: bool) -> Result<()> {
+    let mut failed: Vec<String> = Vec::new();
+    let mut debt: Vec<String> = Vec::new();
+
+    let output = |args: &[&str]| -> (bool, String) {
+        let out = Command::new(cargo())
+            .current_dir(&ctx.root)
+            .args(args)
+            .output();
+        match out {
+            Ok(o) => {
+                let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+                text.push_str(&String::from_utf8_lossy(&o.stderr));
+                (o.status.success(), text)
+            }
+            Err(e) => (false, e.to_string()),
+        }
+    };
+
+    eprintln!("== fmt ==");
+    let (fmt_ok, fmt_out) = output(&["fmt", "--check"]);
+    if !fmt_ok {
+        let n = fmt_out.lines().filter(|l| l.starts_with("Diff in ")).count();
+        eprintln!("   {n} formatting differences");
+        if strict { failed.push("fmt".into()) } else { debt.push(format!("fmt: {n}")) }
+    }
+
+    eprintln!("== clippy ==");
+    let (_, clippy_out) = output(&["clippy", "--workspace", "--all-targets"]);
+    let n = clippy_out
+        .lines()
+        .filter(|l| l.starts_with("warning: ") || l.starts_with("error: "))
+        .count();
+    if n > 0 {
+        eprintln!("   {n} lint findings");
+        if strict { failed.push("clippy".into()) } else { debt.push(format!("clippy: {n}")) }
+    }
+
+    let mut tier = |name: &str, args: &[&str]| {
+        eprintln!("== {name} ==");
+        let mut cmd = Command::new(cargo());
+        cmd.current_dir(&ctx.root).args(args);
+        if run(cmd).is_err() {
+            failed.push(name.to_string());
+        }
+    };
+    tier("core", &["test", "--release", "-p", "combs-core", "-p", "combs-media"]);
+    if !quick {
+        // These need a GPU adapter and take minutes; a machine without
+        // one skips their GPU cases rather than failing them.
+        tier("formats", &["test", "--release", "-p", "combs-formats"]);
+        tier("models", &["test", "--release", "-p", "combs-models", "--lib"]);
+        tier("runtime", &["test", "--release", "-p", "combs-runtime"]);
+        tier("diffusion", &["test", "--release", "-p", "combs-diffusion", "--lib"]);
+    }
+
+    if !debt.is_empty() {
+        eprintln!("\nstanding debt (not failing; --strict makes it): {}", debt.join(", "));
+    }
+    if failed.is_empty() {
+        eprintln!("all gates passed");
+        Ok(())
+    } else {
+        bail!("gates failed: {}", failed.join(", "))
+    }
+}
+
 fn cmd_web(ctx: &Ctx, release: bool, out_dir: Option<PathBuf>, f16: bool) -> Result<()> {
     const TRIPLE: &str = "wasm32-unknown-unknown";
 
@@ -562,6 +658,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        XCommand::Gates { quick, strict } => cmd_gates(&ctx, quick, strict),
         XCommand::Web { debug, out, f16 } => cmd_web(&ctx, !debug, out, f16),
         XCommand::Matrix => {
             cmd_matrix();
