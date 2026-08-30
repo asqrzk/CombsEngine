@@ -38,12 +38,12 @@ pub enum MountError {
     /// header, before any payload is pulled.
     Unsupported(String),
     /// More bytes arrived than the file was said to hold.
-    Overflow { expected: usize, got: usize },
+    Overflow { expected: u64, got: u64 },
     /// The stream ended early. Names what was still owed, because "mount
     /// failed" sends someone to the wrong place.
     Truncated {
-        received: usize,
-        expected: usize,
+        received: u64,
+        expected: u64,
         staged: usize,
         tensors: usize,
     },
@@ -77,8 +77,8 @@ impl std::error::Error for MountError {}
 /// How far along a mount is, for the caller to report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Progress {
-    pub received: usize,
-    pub expected: usize,
+    pub received: u64,
+    pub expected: u64,
     pub tensors_staged: usize,
     pub tensors_total: usize,
     /// Bytes the window is holding right now.
@@ -99,8 +99,8 @@ pub struct StreamMount {
     phase: Phase,
     device: CombsDevice,
     pool: BufferPool,
-    expected: usize,
-    received: usize,
+    expected: u64,
+    received: u64,
 
     header_bytes: Vec<u8>,
     header: Option<GgufHeaderInfo>,
@@ -108,7 +108,7 @@ pub struct StreamMount {
     /// Bytes `[base, base + window.len())` — everything arrived and not
     /// yet consumed.
     window: Vec<u8>,
-    base: usize,
+    base: u64,
     next_tensor: usize,
     since_flush: usize,
 
@@ -118,7 +118,7 @@ pub struct StreamMount {
 
 impl StreamMount {
     /// Open a mount for a file of `expected` bytes.
-    pub fn new(expected: usize, device: CombsDevice) -> Self {
+    pub fn new(expected: u64, device: CombsDevice) -> Self {
         StreamMount {
             phase: Phase::Header,
             device,
@@ -140,13 +140,13 @@ impl StreamMount {
     /// meaning — a tensor may span any number of them, and any number of
     /// tensors may land inside one.
     pub fn append(&mut self, chunk: &[u8]) -> Result<Progress, MountError> {
-        if self.received + chunk.len() > self.expected {
+        if self.received + chunk.len() as u64 > self.expected {
             return Err(MountError::Overflow {
                 expected: self.expected,
-                got: self.received + chunk.len(),
+                got: self.received + chunk.len() as u64,
             });
         }
-        self.received += chunk.len();
+        self.received += chunk.len() as u64;
 
         if matches!(self.phase, Phase::Header) {
             self.header_bytes.extend_from_slice(chunk);
@@ -162,9 +162,12 @@ impl StreamMount {
                     // The header may have arrived with payload behind it
                     // in the same chunk; that payload opens the window.
                     self.base = header.data_start;
-                    self.window = self.header_bytes[header.data_start.min(self.header_bytes.len())..]
-                        .to_vec();
-                    self.header_bytes.truncate(header.data_start);
+                    // The header may have arrived with payload behind it in
+                    // the same chunk; `data_start` fits usize here because
+                    // those bytes are in hand.
+                    let split = (header.data_start as usize).min(self.header_bytes.len());
+                    self.window = self.header_bytes[split..].to_vec();
+                    self.header_bytes.truncate(split);
                     self.header = Some(header);
                     self.phase = Phase::Body;
                 }
@@ -185,22 +188,33 @@ impl StreamMount {
         let Some(header) = self.header.clone() else {
             return Ok(());
         };
-        let end = self.base + self.window.len();
+        let end = self.base + self.window.len() as u64;
+        if self.next_tensor >= header.tensors.len() {
+            return Ok(());
+        }
+        let (_, first_start, first_size) = &header.tensors[self.next_tensor];
+        if first_start + first_size > end {
+            return Ok(());
+        }
+
+        // The window is MOVED into the source and moved back out, not
+        // copied. Copying would cost the whole model in memcpy and, at
+        // the moment the widest tensor is resident, would have two
+        // copies of it live at once — which is most of the difference
+        // between a mount that fits a tab and one that does not.
+        let buf = std::mem::take(&mut self.window);
+        let source =
+            GgufSource::from_window(&self.header_bytes, buf, self.base, self.expected)
+                .map_err(|e| MountError::Staging(e.to_string()))?;
+
+        let mut consumed_to = self.base;
+        let mut staged_bytes = 0u64;
+        let mut failure = None;
         while self.next_tensor < header.tensors.len() {
             let (name, start, size) = header.tensors[self.next_tensor].clone();
             if start + size > end {
                 break;
             }
-            // A source over the window as it stands. The header is kept
-            // apart precisely so this can be rebuilt cheaply: the window
-            // has no header in it any more.
-            let source = GgufSource::from_window(
-                &self.header_bytes,
-                self.window.clone(),
-                self.base,
-                self.expected,
-            )
-            .map_err(|e| MountError::Staging(e.to_string()))?;
             let weights = self
                 .staged
                 .get_or_insert_with(|| StagedWeights::new(source.metadata().clone()));
@@ -208,22 +222,41 @@ impl StreamMount {
             // outlives the buffers that built it, and the pool facade
             // already knows where that is worth doing and where it is
             // still unproven (it declines on wasm, deliberately).
+            let mut hit = None;
             for (hf, _range) in source.hf_names_for_ggml(&name) {
-                self.pool
+                if let Err(e) = self
+                    .pool
                     .pin_persistent(&self.device, || weights.stage(&source, &self.device, &hf))
-                    .map_err(|e| MountError::Staging(format!("{name} -> {hf}: {e}")))?;
+                {
+                    hit = Some(MountError::Staging(format!("{name} -> {hf}: {e}")));
+                    break;
+                }
+            }
+            if let Some(e) = hit {
+                failure = Some(e);
+                break;
             }
             self.next_tensor += 1;
+            consumed_to = start + size;
+            staged_bytes += size;
+        }
 
-            let consumed = start + size - self.base;
-            self.window.drain(..consumed);
-            self.base = start + size;
+        // Reclaimed before any early return, so a staging failure does
+        // not also lose the window.
+        self.window = source
+            .into_window_buf()
+            .expect("the source was built over a window");
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        let consumed = (consumed_to - self.base) as usize;
+        self.window.drain(..consumed);
+        self.base = consumed_to;
 
-            self.since_flush += size;
-            if self.since_flush >= FLUSH_EVERY_BYTES {
-                combs_models::flush_device::<CombsBackend>(&self.device);
-                self.since_flush = 0;
-            }
+        self.since_flush += staged_bytes as usize;
+        if self.since_flush >= FLUSH_EVERY_BYTES {
+            combs_models::flush_device::<CombsBackend>(&self.device);
+            self.since_flush = 0;
         }
         if self.next_tensor == header.tensors.len() {
             self.phase = Phase::Done;

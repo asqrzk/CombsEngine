@@ -56,7 +56,10 @@ pub(crate) struct TensorInfo {
     name: String,
     dims: Vec<usize>, // ggml order (fastest dim first)
     ggml_type: u32,
-    offset: usize, // relative to data section
+    /// Relative to the data section. `u64` because a 7B checkpoint's
+    /// later tensors sit past 4 GB, and `usize` is 32 bits on wasm32 —
+    /// the one target where a model that large is the whole point.
+    offset: u64,
 }
 
 /// The GGUF byte image and who holds it.
@@ -86,18 +89,18 @@ pub(crate) enum GgufData {
     /// lets a model be mounted without ever holding it whole.
     Window {
         buf: Vec<u8>,
-        base: usize,
-        total: usize,
+        base: u64,
+        total: u64,
     },
 }
 
 impl GgufData {
-    fn len(&self) -> usize {
+    fn len(&self) -> u64 {
         match self {
             #[cfg(not(target_family = "wasm"))]
-            GgufData::Mmap(m) => m.len(),
-            GgufData::Owned(v) => v.len(),
-            GgufData::Segmented { total, .. } => *total,
+            GgufData::Mmap(m) => m.len() as u64,
+            GgufData::Owned(v) => v.len() as u64,
+            GgufData::Segmented { total, .. } => *total as u64,
             GgufData::Window { total, .. } => *total,
         }
     }
@@ -124,40 +127,50 @@ impl GgufData {
         }
     }
 
-    /// `start..start + len` of the image; `None` past the end.
-    fn slice(&self, start: usize, len: usize) -> Option<std::borrow::Cow<'_, [u8]>> {
+    /// `start..start + len` of the image; `None` past the end or, for a
+    /// window, outside what it holds.
+    fn slice(&self, start: u64, len: u64) -> Option<std::borrow::Cow<'_, [u8]>> {
         use std::borrow::Cow;
         let end = start.checked_add(len)?;
         if end > self.len() {
             return None;
         }
+        // Everything below indexes a buffer that is in memory, so it fits
+        // `usize` by construction — a held buffer cannot be larger than
+        // the address space that holds it.
+        let (start_us, end_us, len_us) = (
+            usize::try_from(start).ok(),
+            usize::try_from(end).ok(),
+            usize::try_from(len).ok()?,
+        );
         match self {
             #[cfg(not(target_family = "wasm"))]
-            GgufData::Mmap(m) => m.get(start..end).map(Cow::Borrowed),
-            GgufData::Owned(v) => v.get(start..end).map(Cow::Borrowed),
+            GgufData::Mmap(m) => m.get(start_us?..end_us?).map(Cow::Borrowed),
+            GgufData::Owned(v) => v.get(start_us?..end_us?).map(Cow::Borrowed),
             GgufData::Segmented { segments, seg_len, .. } => {
-                let first = start / seg_len;
-                let last = (end - 1) / seg_len;
+                let seg = *seg_len as u64;
+                let first = (start / seg) as usize;
+                let last = ((end - 1) / seg) as usize;
                 if first == last {
-                    let off = start - first * seg_len;
-                    return segments.get(first)?.get(off..off + len).map(Cow::Borrowed);
+                    let off = (start - first as u64 * seg) as usize;
+                    return segments.get(first)?.get(off..off + len_us).map(Cow::Borrowed);
                 }
                 // Boundary-straddling payload: join. Rare (one tensor
                 // per gigabyte boundary) and bounded by tensor size.
-                let mut out = Vec::with_capacity(len);
+                let mut out = Vec::with_capacity(len_us);
                 let mut pos = start;
                 while pos < end {
-                    let seg = pos / seg_len;
-                    let off = pos - seg * seg_len;
-                    let take = (seg_len - off).min(end - pos);
-                    out.extend_from_slice(segments.get(seg)?.get(off..off + take)?);
-                    pos += take;
+                    let idx = (pos / seg) as usize;
+                    let off = (pos - idx as u64 * seg) as usize;
+                    let take = ((seg - off as u64).min(end - pos)) as usize;
+                    out.extend_from_slice(segments.get(idx)?.get(off..off + take)?);
+                    pos += take as u64;
                 }
                 Some(Cow::Owned(out))
             }
             GgufData::Window { buf, base, .. } => {
-                let off = start.checked_sub(*base)?;
-                buf.get(off..off.checked_add(len)?).map(Cow::Borrowed)
+                let off = usize::try_from(start.checked_sub(*base)?).ok()?;
+                buf.get(off..off.checked_add(len_us)?).map(Cow::Borrowed)
             }
         }
     }
@@ -173,7 +186,7 @@ pub(crate) struct GgufHeader {
     pub(crate) tensors: HashMap<String, TensorInfo>,
     /// Offset of the first payload byte — the alignment boundary after
     /// the info section.
-    pub(crate) data_start: usize,
+    pub(crate) data_start: u64,
 }
 
 impl GgufHeader {
@@ -182,7 +195,7 @@ impl GgufHeader {
     /// bytes arrive. Pass `total` when the image's eventual length is
     /// known — it is what separates a header still in flight from a
     /// corrupt length field claiming the file is enormous.
-    pub(crate) fn try_parse(bytes: &[u8], total: Option<usize>) -> Result<Option<Self>> {
+    pub(crate) fn try_parse(bytes: &[u8], total: Option<u64>) -> Result<Option<Self>> {
         let mut c = Cursor::with_limit(bytes, total);
         macro_rules! more {
             ($e:expr) => {
@@ -213,9 +226,9 @@ impl GgufHeader {
         // that is only a few bytes in.
         let entry_floor = 12usize; // smallest possible kv or tensor record
         if let Some(limit) = total {
-            let claimed = tensor_count
+            let claimed = (tensor_count
                 .saturating_add(kv_count)
-                .saturating_mul(entry_floor);
+                .saturating_mul(entry_floor)) as u64;
             if claimed > limit {
                 return Err(FormatError::Safetensors(format!(
                     "gguf: header claims {kv_count} metadata entries and \
@@ -241,7 +254,7 @@ impl GgufHeader {
                 dims.push(more!(c.u64()) as usize);
             }
             let ggml_type = more!(c.u32());
-            let offset = more!(c.u64()) as usize;
+            let offset = more!(c.u64());
             tensors.insert(name.clone(), TensorInfo { name, dims, ggml_type, offset });
         }
 
@@ -251,7 +264,7 @@ impl GgufHeader {
             _ => 32,
         };
         let alignment = alignment.max(1);
-        let data_start = c.pos.div_ceil(alignment) * alignment;
+        let data_start = (c.pos.div_ceil(alignment) * alignment) as u64;
 
         // Split GGUFs (llama.cpp `gguf-split` shards, `…-00001-of-0000N`)
         // carry only a slice of the tensors; loading one would fail later
@@ -283,21 +296,21 @@ impl GgufHeader {
 #[derive(Debug, Clone)]
 pub struct GgufHeaderInfo {
     /// Offset of the first payload byte.
-    pub data_start: usize,
+    pub data_start: u64,
     /// Model architecture, so a mount can refuse an unsupported one
     /// here rather than a gigabyte later.
     pub architecture: String,
     /// `(ggml name, absolute start, byte length)`, **sorted by start**.
     /// One `Response.body` delivers bytes in file order, so this is the
     /// order a mount will meet them in.
-    pub tensors: Vec<(String, usize, usize)>,
+    pub tensors: Vec<(String, u64, u64)>,
 }
 
 /// Read a GGUF header from a prefix of the file. `Ok(None)` means the
 /// header is not all here yet — feed more and ask again; `Err` means it
 /// will never parse. `total` is the file's eventual length when known,
 /// which is what separates the two.
-pub fn read_gguf_header(bytes: &[u8], total: Option<usize>) -> Result<Option<GgufHeaderInfo>> {
+pub fn read_gguf_header(bytes: &[u8], total: Option<u64>) -> Result<Option<GgufHeaderInfo>> {
     let Some(header) = GgufHeader::try_parse(bytes, total)? else {
         return Ok(None);
     };
@@ -305,12 +318,12 @@ pub fn read_gguf_header(bytes: &[u8], total: Option<usize>) -> Result<Option<Ggu
         Some(MetaValue::String(s)) => s.clone(),
         _ => String::new(),
     };
-    let mut tensors: Vec<(String, usize, usize)> = header
+    let mut tensors: Vec<(String, u64, u64)> = header
         .tensors
         .values()
         .map(|info| {
             tensor_byte_size(info)
-                .map(|size| (info.name.clone(), header.data_start + info.offset, size))
+                .map(|size| (info.name.clone(), header.data_start + info.offset, size as u64))
         })
         .collect::<Result<Vec<_>>>()?;
     tensors.sort_by_key(|(_, start, _)| *start);
@@ -342,7 +355,7 @@ pub struct GgufSource {
     metadata: ModelMetadata,
     kv: HashMap<String, MetaValue>,
     tensors: HashMap<String, TensorInfo>,
-    data_start: usize,
+    data_start: u64,
     tokenizer: TokenizerSource,
     added_tokens: HashMap<u32, String>,
     eos_ids: Vec<u32>,
@@ -365,20 +378,20 @@ struct Cursor<'a> {
     /// malformed however few bytes are in hand — without it, a corrupt
     /// string length asking for a terabyte would masquerade as a
     /// truncated header forever.
-    limit: Option<usize>,
+    limit: Option<u64>,
 }
 
 impl<'a> Cursor<'a> {
     fn new(buf: &'a [u8]) -> Self {
         Cursor { buf, pos: 0, exhausted: false, limit: None }
     }
-    fn with_limit(buf: &'a [u8], limit: Option<usize>) -> Self {
+    fn with_limit(buf: &'a [u8], limit: Option<u64>) -> Self {
         Cursor { buf, pos: 0, exhausted: false, limit }
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         if self.pos + n > self.buf.len() {
             let within_image = match self.limit {
-                Some(limit) => self.pos.saturating_add(n) <= limit,
+                Some(limit) => self.pos.saturating_add(n) as u64 <= limit,
                 None => true,
             };
             self.exhausted = within_image;
@@ -585,8 +598,8 @@ impl GgufSource {
     pub fn from_window(
         header_bytes: &[u8],
         window: Vec<u8>,
-        base: usize,
-        total: usize,
+        base: u64,
+        total: u64,
     ) -> Result<Self> {
         let header = GgufHeader::try_parse(header_bytes, Some(total))?.ok_or_else(|| {
             FormatError::Safetensors(
@@ -594,6 +607,19 @@ impl GgufSource {
             )
         })?;
         Self::from_header(header, GgufData::Window { buf: window, base, total }, None)
+    }
+
+    /// Take the window's buffer back.
+    ///
+    /// A mount hands its window in to read from and wants it back to
+    /// keep filling — copying it in and out would cost the whole model
+    /// in memcpy and, worse, double the live bytes at the moment the
+    /// largest tensor is resident.
+    pub fn into_window_buf(self) -> Option<Vec<u8>> {
+        match self.data {
+            GgufData::Window { buf, .. } => Some(buf),
+            _ => None,
+        }
     }
 
     /// Assemble a source from a header that has ALREADY been parsed and
@@ -1577,7 +1603,7 @@ impl GgufSource {
     /// and a tensor asked for out of order fails here with its name on
     /// it rather than somewhere downstream with a shape mismatch.
     fn tensor_bytes(&self, info: &TensorInfo) -> Result<std::borrow::Cow<'_, [u8]>> {
-        let size = tensor_byte_size(info)?;
+        let size = tensor_byte_size(info)? as u64;
         let start = self.data_start + info.offset;
         self.data.slice(start, size).ok_or_else(|| {
             FormatError::Safetensors(format!(
@@ -1589,7 +1615,7 @@ impl GgufSource {
                     GgufData::Window { base, buf, .. } => format!(
                         " — the mount window holds {}..{}",
                         base,
-                        base + buf.len()
+                        base + buf.len() as u64
                     ),
                     _ => " (out of bounds)".to_string(),
                 }
@@ -1930,6 +1956,63 @@ mod depermute_tests {
 }
 
 #[cfg(test)]
+mod wide_offset_tests {
+    use super::*;
+
+    /// A header describing one tensor at `offset`, `elements` f32 long.
+    fn header_with_tensor_at(offset: u64, elements: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        out.extend_from_slice(&3u32.to_le_bytes()); // version
+        out.extend_from_slice(&1u64.to_le_bytes()); // one tensor
+        out.extend_from_slice(&0u64.to_le_bytes()); // no metadata
+        let name = b"output.weight";
+        out.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        out.extend_from_slice(name);
+        out.extend_from_slice(&1u32.to_le_bytes()); // one dimension
+        out.extend_from_slice(&elements.to_le_bytes());
+        out.extend_from_slice(&GGML_F32.to_le_bytes());
+        out.extend_from_slice(&offset.to_le_bytes());
+        out
+    }
+
+    /// A tensor's end must be computed in a width that can hold it.
+    ///
+    /// The numbers are the ones that failed: a 447,068,160-byte tensor at
+    /// offset 4,236,006,176 in a 4.68 GB checkpoint. Their sum is
+    /// 4,683,074,336, which is past `u32::MAX` — and `usize` is 32 bits
+    /// on wasm32, the one target where a model that large is the entire
+    /// point. The wrap turned an end into something smaller than its own
+    /// start, and the reader reported a range it could not possibly
+    /// serve. Nothing under 4 GB was reachable before per-tensor
+    /// streaming, which is why this waited to be found.
+    ///
+    /// On a 64-bit host this passes either way; its job is to state the
+    /// requirement in the numbers, next to the reader it constrains.
+    #[test]
+    fn a_tensor_past_four_gigabytes_keeps_its_place() {
+        const OFFSET: u64 = 4_236_006_176;
+        const SIZE: u64 = 447_068_160;
+        let bytes = header_with_tensor_at(OFFSET, SIZE / 4);
+        let total = OFFSET + SIZE + 4096;
+        let header = read_gguf_header(&bytes, Some(total))
+            .expect("parses")
+            .expect("the whole header is here");
+
+        let (name, start, size) = &header.tensors[0];
+        assert_eq!(name, "output.weight");
+        assert_eq!(*size, SIZE);
+        assert_eq!(*start, header.data_start + OFFSET);
+        let end = start + size;
+        assert!(
+            end > u32::MAX as u64,
+            "the case only bites past 4 GB; this one ends at {end}"
+        );
+        assert!(end > *start, "a tensor's end came out before its start");
+    }
+}
+
+#[cfg(test)]
 mod window_tests {
     use super::*;
     use crate::ModelSource;
@@ -1979,7 +2062,7 @@ mod window_tests {
             let mut checked = 0usize;
             for ggml in ggml_names {
                 let info = &full.tensors[&ggml];
-                let Ok(size) = tensor_byte_size(info) else { continue };
+                let Ok(size) = tensor_byte_size(info).map(|n| n as u64) else { continue };
                 let start = full.data_start + info.offset;
                 let Some(window) = full.data.slice(start, size) else { continue };
                 let win =

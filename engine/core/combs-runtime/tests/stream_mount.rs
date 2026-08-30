@@ -48,18 +48,18 @@ fn the_window_never_grows_past_the_largest_tensor() {
     };
     let bytes = std::fs::read(&path).unwrap();
     let device = combs_core::init_device();
-    let header = read_gguf_header(&bytes, Some(bytes.len()))
+    let header = read_gguf_header(&bytes, Some(bytes.len() as u64))
         .unwrap()
         .unwrap();
     let largest = header.tensors.iter().map(|(_, _, size)| *size).max().unwrap();
 
     for chunk in [1 << 20, 8 << 20] {
-        let mut mount = StreamMount::new(bytes.len(), device.clone());
+        let mut mount = StreamMount::new(bytes.len() as u64, device.clone());
         feed(&mut mount, &bytes, chunk).expect("stream feeds");
         let (weights, _header) = mount.finish().expect("mount completes");
         drop(weights);
         // Re-measured from a fresh mount each time; `finish` consumes.
-        let mut probe = StreamMount::new(bytes.len(), device.clone());
+        let mut probe = StreamMount::new(bytes.len() as u64, device.clone());
         feed(&mut probe, &bytes, chunk).expect("stream feeds");
         let peak = probe.window_high_water();
         eprintln!(
@@ -70,11 +70,11 @@ fn the_window_never_grows_past_the_largest_tensor() {
             bytes.len() as f64 / 1e6
         );
         assert!(
-            peak <= largest + 2 * chunk,
+            peak as u64 <= largest + 2 * chunk as u64,
             "window peaked at {peak}, above the largest tensor {largest} plus two chunks"
         );
         assert!(
-            peak < bytes.len() / 2,
+            (peak as u64) < bytes.len() as u64 / 2,
             "a window holding half the file is not a stream"
         );
     }
@@ -90,11 +90,12 @@ fn a_stream_that_stops_early_never_yields_a_model() {
     };
     let bytes = std::fs::read(&path).unwrap();
     let device = combs_core::init_device();
-    let header = read_gguf_header(&bytes, Some(bytes.len()))
+    let header = read_gguf_header(&bytes, Some(bytes.len() as u64))
         .unwrap()
         .unwrap();
-    let data_start = header.data_start;
+    let data_start = header.data_start as usize;
     let (_, first_start, first_size) = header.tensors[0].clone();
+    let (first_start, first_size) = (first_start as usize, first_size as usize);
 
     let cuts = [
         ("nothing at all", 0usize),
@@ -104,7 +105,7 @@ fn a_stream_that_stops_early_never_yields_a_model() {
         ("one byte short", bytes.len() - 1),
     ];
     for (what, cut) in cuts {
-        let mut mount = StreamMount::new(bytes.len(), device.clone());
+        let mut mount = StreamMount::new(bytes.len() as u64, device.clone());
         feed(&mut mount, &bytes[..cut], 4 << 20).expect("a short stream still feeds");
         let err = match mount.finish() {
             Ok(_) => panic!("{what}: a {cut}-byte stream produced a model"),
@@ -112,8 +113,8 @@ fn a_stream_that_stops_early_never_yields_a_model() {
         };
         match err {
             MountError::Truncated { received, expected, .. } => {
-                assert_eq!(received, cut, "{what}: reported the wrong received count");
-                assert_eq!(expected, bytes.len(), "{what}: reported the wrong expectation");
+                assert_eq!(received, cut as u64, "{what}: reported the wrong received count");
+                assert_eq!(expected, bytes.len() as u64, "{what}: reported the wrong expectation");
             }
             other => panic!("{what}: expected a truncation, got {other}"),
         }

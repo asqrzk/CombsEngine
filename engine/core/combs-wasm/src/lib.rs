@@ -291,7 +291,7 @@ pub async fn combs_model_open(
         let state = Mount::Streaming {
             config_json,
             mount: combs_runtime::stream_mount::StreamMount::new(
-                expected_len as usize,
+                expected_len as u64,
                 combs_core::init_device(),
             ),
         };

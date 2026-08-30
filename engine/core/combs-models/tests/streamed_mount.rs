@@ -71,13 +71,14 @@ fn mount_streamed(
     let header = loop {
         have = (have + chunks.next().max(64 << 10)).min(total);
         asks += 1;
-        match read_gguf_header(&bytes[..have], Some(total)).expect("header parses or fails") {
+        match read_gguf_header(&bytes[..have], Some(total as u64)).expect("header parses or fails") {
             Some(h) => break h,
             None => assert!(have < total, "header never parsed even with the whole file"),
         }
     };
     assert!(asks > 0);
-    let header_bytes = bytes[..header.data_start].to_vec();
+    let data_start = header.data_start as usize;
+    let header_bytes = bytes[..data_start].to_vec();
     assert!(
         ModelRegistry::<B>::supports_streaming(&header.architecture),
         "{} refused for streaming at the header",
@@ -88,14 +89,15 @@ fn mount_streamed(
     // arrived and not yet been consumed; every tensor is staged the
     // moment it is complete, and the window then forgets it.
     let mut staged: Option<StagedWeights<B>> = None;
-    let mut base = header.data_start;
+    let mut base = data_start;
     let mut window: Vec<u8> = Vec::new();
-    let mut cursor = header.data_start;
+    let mut cursor = data_start;
     let mut next_tensor = 0usize;
     let mut peak_window = 0usize;
 
     while next_tensor < header.tensors.len() {
         let (name, start, size) = header.tensors[next_tensor].clone();
+        let (start, size) = (start as usize, size as usize);
         // Pull until this tensor is entirely in the window.
         while cursor < start + size {
             let take = chunks.next().min(total - cursor);
@@ -106,7 +108,7 @@ fn mount_streamed(
                 break;
             }
         }
-        let source = GgufSource::from_window(&header_bytes, window.clone(), base, total)
+        let source = GgufSource::from_window(&header_bytes, window.clone(), base as u64, total as u64)
             .expect("windowed source");
         let weights = staged.get_or_insert_with(|| StagedWeights::new(source.metadata().clone()));
         for (hf, _range) in source.hf_names_for_ggml(&name) {
@@ -204,10 +206,10 @@ fn a_short_header_says_not_yet_and_never_lies() {
     };
     let bytes = std::fs::read(&path).expect("read file");
     let total = bytes.len();
-    let full = read_gguf_header(&bytes, Some(total))
+    let full = read_gguf_header(&bytes, Some(total as u64))
         .expect("whole file parses")
         .expect("whole file is enough");
-    let end = full.data_start;
+    let end = full.data_start as usize;
 
     // `data_start` is the ALIGNMENT boundary after the info section, so
     // its last bytes are padding the parser never reads and a prefix a
@@ -216,17 +218,17 @@ fn a_short_header_says_not_yet_and_never_lies() {
     // stops well clear of it — asserting `end - 1` says not-yet would be
     // asserting something untrue about padding.
     for n in [0usize, 1, 4, 8, 24, end / 4, end / 2, end - 64] {
-        let got = read_gguf_header(&bytes[..n], Some(total));
+        let got = read_gguf_header(&bytes[..n], Some(total as u64));
         assert!(
             matches!(got, Ok(None)),
             "a {n}-byte prefix of a {end}-byte header should be `not yet`, got {:?}",
             got.map(|o| o.map(|h| h.data_start))
         );
     }
-    let at_end = read_gguf_header(&bytes[..end], Some(total))
+    let at_end = read_gguf_header(&bytes[..end], Some(total as u64))
         .expect("parses")
         .expect("the header is all there at data_start");
-    assert_eq!(at_end.data_start, end);
+    assert_eq!(at_end.data_start as usize, end);
     assert_eq!(at_end.tensors.len(), full.tensors.len());
 
     // Corruption is not shortness. A bad magic never becomes valid by
@@ -235,7 +237,7 @@ fn a_short_header_says_not_yet_and_never_lies() {
     let mut wrong = bytes[..end].to_vec();
     wrong[0] ^= 0xFF;
     assert!(
-        read_gguf_header(&wrong, Some(total)).is_err(),
+        read_gguf_header(&wrong, Some(total as u64)).is_err(),
         "a corrupt magic reported as `not yet` would hang a mount"
     );
 }
