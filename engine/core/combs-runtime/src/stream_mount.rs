@@ -18,8 +18,7 @@
 //! The window's floor is therefore the largest single tensor: it must be
 //! whole to be uploaded. Everything else is chunk-sized.
 
-use burn::tensor::Device;
-use burn::tensor::backend::Backend;
+use combs_core::{BufferPool, CombsBackend, CombsDevice};
 use combs_formats::{GgufHeaderInfo, GgufSource, ModelSource, read_gguf_header};
 use combs_models::staged::StagedWeights;
 
@@ -96,9 +95,10 @@ enum Phase {
 }
 
 /// A mount in flight.
-pub struct StreamMount<B: Backend> {
+pub struct StreamMount {
     phase: Phase,
-    device: Device<B>,
+    device: CombsDevice,
+    pool: BufferPool,
     expected: usize,
     received: usize,
 
@@ -112,16 +112,17 @@ pub struct StreamMount<B: Backend> {
     next_tensor: usize,
     since_flush: usize,
 
-    staged: Option<StagedWeights<B>>,
+    staged: Option<StagedWeights<CombsBackend>>,
     window_high_water: usize,
 }
 
-impl<B: Backend> StreamMount<B> {
+impl StreamMount {
     /// Open a mount for a file of `expected` bytes.
-    pub fn new(expected: usize, device: Device<B>) -> Self {
+    pub fn new(expected: usize, device: CombsDevice) -> Self {
         StreamMount {
             phase: Phase::Header,
             device,
+            pool: BufferPool::new(),
             expected,
             received: 0,
             header_bytes: Vec::new(),
@@ -153,7 +154,7 @@ impl<B: Backend> StreamMount<B> {
                 Err(e) => return Err(MountError::BadHeader(e.to_string())),
                 Ok(None) => return Ok(self.progress()),
                 Ok(Some(header)) => {
-                    if !combs_models::ModelRegistry::<B>::supports_streaming(
+                    if !combs_models::ModelRegistry::<CombsBackend>::supports_streaming(
                         &header.architecture,
                     ) {
                         return Err(MountError::Unsupported(header.architecture));
@@ -203,9 +204,13 @@ impl<B: Backend> StreamMount<B> {
             let weights = self
                 .staged
                 .get_or_insert_with(|| StagedWeights::new(source.metadata().clone()));
+            // Pinned the way the whole-file load pins: a staged weight
+            // outlives the buffers that built it, and the pool facade
+            // already knows where that is worth doing and where it is
+            // still unproven (it declines on wasm, deliberately).
             for (hf, _range) in source.hf_names_for_ggml(&name) {
-                weights
-                    .stage(&source, &self.device, &hf)
+                self.pool
+                    .pin_persistent(&self.device, || weights.stage(&source, &self.device, &hf))
                     .map_err(|e| MountError::Staging(format!("{name} -> {hf}: {e}")))?;
             }
             self.next_tensor += 1;
@@ -216,7 +221,7 @@ impl<B: Backend> StreamMount<B> {
 
             self.since_flush += size;
             if self.since_flush >= FLUSH_EVERY_BYTES {
-                combs_models::flush_device::<B>(&self.device);
+                combs_models::flush_device::<CombsBackend>(&self.device);
                 self.since_flush = 0;
             }
         }
@@ -247,7 +252,7 @@ impl<B: Backend> StreamMount<B> {
     /// A stream that stopped early fails here rather than producing a
     /// model with holes in it, and everything staged so far is dropped
     /// on the way out, which is what returns the device memory.
-    pub fn finish(mut self) -> Result<StagedWeights<B>, MountError> {
+    pub fn finish(mut self) -> Result<StagedWeights<CombsBackend>, MountError> {
         let tensors = self.header.as_ref().map(|h| h.tensors.len()).unwrap_or(0);
         if self.received != self.expected || self.next_tensor != tensors {
             return Err(MountError::Truncated {
@@ -257,7 +262,7 @@ impl<B: Backend> StreamMount<B> {
                 tensors,
             });
         }
-        combs_models::flush_device::<B>(&self.device);
+        combs_models::flush_device::<CombsBackend>(&self.device);
         let mut weights = self.staged.take().ok_or(MountError::Truncated {
             received: self.received,
             expected: self.expected,

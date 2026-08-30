@@ -11,7 +11,7 @@
 use combs_formats::read_gguf_header;
 use combs_runtime::stream_mount::{MountError, StreamMount};
 
-type B = burn::backend::Wgpu<f32, i32, u32>;
+use combs_core::CombsBackend as B;
 
 fn cached(dir: &str) -> Option<std::path::PathBuf> {
     let path = std::path::PathBuf::from(std::env::var("HOME").ok()?)
@@ -22,7 +22,7 @@ fn cached(dir: &str) -> Option<std::path::PathBuf> {
 }
 
 fn feed(
-    mount: &mut StreamMount<B>,
+    mount: &mut StreamMount,
     bytes: &[u8],
     chunk: usize,
 ) -> Result<(), MountError> {
@@ -47,19 +47,19 @@ fn the_window_never_grows_past_the_largest_tensor() {
         return;
     };
     let bytes = std::fs::read(&path).unwrap();
-    let device = burn::backend::wgpu::WgpuDevice::default();
+    let device = combs_core::init_device();
     let header = read_gguf_header(&bytes, Some(bytes.len()))
         .unwrap()
         .unwrap();
     let largest = header.tensors.iter().map(|(_, _, size)| *size).max().unwrap();
 
     for chunk in [1 << 20, 8 << 20] {
-        let mut mount = StreamMount::<B>::new(bytes.len(), device.clone());
+        let mut mount = StreamMount::new(bytes.len(), device.clone());
         feed(&mut mount, &bytes, chunk).expect("stream feeds");
         let weights = mount.finish().expect("mount completes");
         drop(weights);
         // Re-measured from a fresh mount each time; `finish` consumes.
-        let mut probe = StreamMount::<B>::new(bytes.len(), device.clone());
+        let mut probe = StreamMount::new(bytes.len(), device.clone());
         feed(&mut probe, &bytes, chunk).expect("stream feeds");
         let peak = probe.window_high_water();
         eprintln!(
@@ -89,7 +89,7 @@ fn a_stream_that_stops_early_never_yields_a_model() {
         return;
     };
     let bytes = std::fs::read(&path).unwrap();
-    let device = burn::backend::wgpu::WgpuDevice::default();
+    let device = combs_core::init_device();
     let header = read_gguf_header(&bytes, Some(bytes.len()))
         .unwrap()
         .unwrap();
@@ -104,7 +104,7 @@ fn a_stream_that_stops_early_never_yields_a_model() {
         ("one byte short", bytes.len() - 1),
     ];
     for (what, cut) in cuts {
-        let mut mount = StreamMount::<B>::new(bytes.len(), device.clone());
+        let mut mount = StreamMount::new(bytes.len(), device.clone());
         feed(&mut mount, &bytes[..cut], 4 << 20).expect("a short stream still feeds");
         let err = match mount.finish() {
             Ok(_) => panic!("{what}: a {cut}-byte stream produced a model"),
@@ -134,8 +134,8 @@ fn a_stream_that_overruns_is_refused_at_the_append() {
         return;
     };
     let bytes = std::fs::read(&path).unwrap();
-    let device = burn::backend::wgpu::WgpuDevice::default();
-    let mut mount = StreamMount::<B>::new(100_000, device);
+    let device = combs_core::init_device();
+    let mut mount = StreamMount::new(100_000, device);
     mount.append(&bytes[..60_000]).expect("under the limit");
     match mount.append(&bytes[60_000..120_000]) {
         Err(MountError::Overflow { expected, got }) => {
@@ -150,8 +150,8 @@ fn a_stream_that_overruns_is_refused_at_the_append() {
 /// the whole thing has been pulled.
 #[test]
 fn a_malformed_header_fails_immediately() {
-    let device = burn::backend::wgpu::WgpuDevice::default();
-    let mut mount = StreamMount::<B>::new(1 << 20, device);
+    let device = combs_core::init_device();
+    let mut mount = StreamMount::new(1 << 20, device);
     match mount.append(b"not a gguf file at all, not even close") {
         Err(MountError::BadHeader(_)) => {}
         other => panic!("expected a bad header, got {other:?}"),
