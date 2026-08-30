@@ -163,11 +163,52 @@ fn batched_threshold() -> usize {
     })
 }
 
-/// Which matmul the batched path uses. `MatmulStrategy::Cube` is a
-/// DIAGNOSTIC ONLY: it is known to produce flat-grey images in the live
-/// diffusion pipeline while agreeing with the tuned kernel to 1e-3 when
-/// the same matmul runs in isolation. It exists so that discrepancy can
-/// be investigated with real logging instead of inference.
+/// Which matmul the batched path uses.
+///
+/// `MatmulStrategy::Cube` is DIAGNOSTIC ONLY, and now for a known
+/// reason: it launches with cubek's DEFAULT strategy rather than one
+/// chosen for the shape, and at the widths a transformer block runs
+/// that launch reports success and writes nothing. The caller gets the
+/// output buffer exactly as it was allocated — every element zero —
+/// and because the launch returned `Ok`, nothing falls back. A
+/// conditioning of zeros, or a velocity field of zeros, is a grey
+/// image. Measured: 1,572,864 of 1,572,864 outputs zero at
+/// m 768, k 3072, n 2048, on both backends; correct at m 64, k 512,
+/// n 256. Autotune is immune because it measures its candidates, and a
+/// routine that writes nothing loses.
+/// Which `k` widths the diagnostic untuned kernel is allowed to take,
+/// when the door is open. Empty = all of them.
+///
+/// The grey-image fault appears only in the diffusion pipeline, and
+/// that pipeline runs two models: a text encoder with hidden 2560 and a
+/// transformer with hidden 3072. Their `k` widths are disjoint, so `k`
+/// is a usable proxy for WHICH model a call belongs to — the crudest
+/// possible bisection, and the one that needs no plumbing through five
+/// layers to ask a question worth two runs.
+fn cube_k_filter() -> &'static [usize] {
+    static F: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    F.get_or_init(|| {
+        std::env::var("COMBS_QMATMUL_CUBE_K")
+            .ok()
+            .map(|v| v.split(',').filter_map(|n| n.trim().parse().ok()).collect())
+            .unwrap_or_default()
+    })
+}
+
+/// The strategy for a call of this width. Identical to
+/// [`matmul_strategy`] unless the k-filter narrows the diagnostic door
+/// to part of the pipeline.
+fn matmul_strategy_for(k: usize) -> MatmulStrategy {
+    let chosen = matmul_strategy();
+    if matches!(chosen, MatmulStrategy::Cube) {
+        let filter = cube_k_filter();
+        if !filter.is_empty() && !filter.contains(&k) {
+            return MatmulStrategy::default();
+        }
+    }
+    chosen
+}
+
 fn matmul_strategy() -> MatmulStrategy {
     static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let untuned = *S.get_or_init(|| {
@@ -175,8 +216,9 @@ fn matmul_strategy() -> MatmulStrategy {
             matches!(std::env::var("COMBS_QMATMUL_STRATEGY").as_deref(), Ok("cube"));
         if untuned {
             eprintln!(
-                "[qmatmul] WARNING: COMBS_QMATMUL_STRATEGY=cube — diagnostic only, \
-                 known to produce wrong images in the diffusion pipeline"
+                "[qmatmul] WARNING: COMBS_QMATMUL_STRATEGY=cube — diagnostic only. \
+                 At transformer-block widths this launch writes nothing and leaves \
+                 the output buffer at zero, which reaches you as a grey image."
             );
         }
         untuned
@@ -226,10 +268,14 @@ pub fn batched_matmul_summary() -> String {
         DType::F16 => "f16 operands/f32 accumulator",
         _ => "f32 operands",
     };
+    let scope = match cube_k_filter() {
+        [] => String::new(),
+        widths => format!(", cube limited to k in {widths:?}"),
+    };
     if threshold == usize::MAX {
         "batched matmul OFF (COMBS_QMATMUL_BATCHED=0)".to_string()
     } else {
-        format!("batched matmul from {threshold} rows, {strategy} kernel, {operand}")
+        format!("batched matmul from {threshold} rows, {strategy} kernel, {operand}{scope}")
     }
 }
 
@@ -336,7 +382,7 @@ fn try_batched_matmul_with(
     // though the two agree to 1e-3 when the same matmul runs in
     // isolation at these shapes (see the strategy test). Diagnostic
     // door only — the default stays on what demonstrably works.
-    let out = matmul(x2, permute(w2, &[1, 0]), None, matmul_strategy(), DType::F32).ok()?;
+    let out = matmul(x2, permute(w2, &[1, 0]), None, matmul_strategy_for(k), DType::F32).ok()?;
     // Undo the normalization on the f32 result, where the product has
     // room. Exact: the scale is a power of two.
     let out = match scale {
@@ -1028,6 +1074,84 @@ mod tests {
                  {:.3e} of the output RMS {rms:.3e}, over 1e-2",
                 worst_abs / rms
             );
+        }
+    }
+
+    /// Many quantized linears, interleaved with the ordinary tensor work
+    /// a real forward does, on the fusion backend.
+    ///
+    /// This is the last thing that differs. The untuned kernel ruins a
+    /// diffusion run and leaves text untouched, and everything else that
+    /// separated the two has been excluded: the model (the same
+    /// Qwen3-4B is byte-identical as text and corrupt as an encoder),
+    /// the sequence length (630 tokens, identical), the taps forward
+    /// path (matches the reference under either kernel), determinism
+    /// (six million outputs agree between two identical calls), and the
+    /// half of the pipeline (BOTH halves corrupt, differently). What is
+    /// left is that a generation puts hundreds of these calls into a
+    /// busy fusion stream, and no test did.
+    ///
+    /// Run under `COMBS_QMATMUL_STRATEGY=cube` to ask the question this
+    /// exists for; under the default it guards the shipping path.
+    #[test]
+    fn many_interleaved_calls_agree_with_dense() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        pin_device_dtypes();
+        // Both backends, small widths and the widths a transformer block
+        // actually runs. Four cells, and the fault lives in exactly one.
+        fn round_trip<B: Backend>(n_out: usize, k: usize, seq: usize, rounds: usize, label: &str)
+        where
+            CubeQuantLinear: QuantLinearOp<B>,
+        {
+        let device: Device<B> = Default::default();
+        let (quant, dense) = quant_and_dense::<B>(&device, n_out, k, FloatDType::F32);
+
+        let x0: Vec<f32> = (0..seq * k).map(|i| ((i % 29) as f32) / 14.0 - 1.0).collect();
+        let base = Tensor::<B, 3>::from_data(TensorData::new(x0, [1, seq, k]), &device)
+            .cast(FloatDType::F32);
+
+        // Between the linears, the shapes of work a block actually does:
+        // a scale, a residual add, a normalization, a transpose. Enough
+        // to keep the stream busy and to make the custom op one
+        // participant among many rather than the only thing in flight.
+        let mut worst = 0.0f32;
+        for round in 0..rounds {
+            let drift = (round as f32) * 0.01;
+            let x = base.clone() * (1.0 + drift) + drift;
+            let x = x.clone() - x.clone().mean_dim(2);
+            let got: Vec<f32> = quant.forward(x.clone(), None).into_data().to_vec().unwrap();
+            let expect: Vec<f32> = dense.forward(x, None).into_data().to_vec().unwrap();
+            assert_eq!(got.len(), expect.len());
+            for (g, e) in got.iter().zip(expect.iter()) {
+                worst = worst.max((g - e).abs() / e.abs().max(1.0));
+            }
+            if worst > 1e-3 {
+                // How it is wrong matters more than that it is. All
+                // zeros means the kernel was launched and wrote
+                // nothing, leaving the output buffer as allocated —
+                // which is a different fault from arithmetic drift and
+                // points at a different place.
+                let zeros = got.iter().filter(|v| **v == 0.0).count();
+                panic!(
+                    "{label} at m {seq} k {k} n {n_out}, round {round}: drifted from \
+                     dense by {worst:.3e}; {zeros} of {} outputs are exactly zero",
+                    got.len()
+                );
+            }
+        }
+        println!(
+            "{label:8} m {seq:>4} k {k:>5} n {n_out:>5}: {rounds} rounds, worst relative {worst:.2e}"
+        );
+        }
+
+        println!("{}", batched_matmul_summary());
+        for (n_out, k, seq, rounds) in
+            [(256usize, 512usize, 64usize, 48usize), (2048, 3072, 768, 8)]
+        {
+            round_trip::<UnfusedF32>(n_out, k, seq, rounds, "unfused");
+            round_trip::<FusedF32>(n_out, k, seq, rounds, "fused");
         }
     }
 
