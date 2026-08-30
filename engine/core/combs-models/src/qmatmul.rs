@@ -70,7 +70,7 @@ pub fn repack_q4_0(data: &[u8]) -> Result<(Vec<u32>, Vec<f32>)> {
 /// the exact arithmetic of the CPU reference (`(nibble as i32 - 8) as f32
 /// * d`), so results are bit-identical. One thread per output value.
 #[cube(launch_unchecked)]
-fn q4_0_dequant_kernel(qs: &Array<u32>, d: &Array<f32>, out: &mut Array<f32>, n: usize) {
+fn q4_0_dequant_kernel<F: Float>(qs: &Array<u32>, d: &Array<f32>, out: &mut Array<F>, n: usize) {
     if ABSOLUTE_POS < n {
         let block = ABSOLUTE_POS / 32;
         let j = ABSOLUTE_POS % 32;
@@ -81,7 +81,7 @@ fn q4_0_dequant_kernel(qs: &Array<u32>, d: &Array<f32>, out: &mut Array<f32>, n:
         if j >= 16 {
             nib = byte >> 4;
         }
-        out[ABSOLUTE_POS] = f32::cast_from(i32::cast_from(nib) - 8) * d[block];
+        out[ABSOLUTE_POS] = F::cast_from(f32::cast_from(i32::cast_from(nib) - 8) * d[block]);
     }
 }
 
@@ -177,7 +177,7 @@ pub fn dequantize_q4_0_gpu<R: Runtime>(client: &ComputeClient<R>, data: &[u8]) -
     let d_h = client.create_from_slice(f32::as_bytes(&d));
     let out_h = client.empty(n * core::mem::size_of::<f32>());
     unsafe {
-        q4_0_dequant_kernel::launch_unchecked::<R>(
+        q4_0_dequant_kernel::launch_unchecked::<f32, R>(
             client,
             cube_count_1d(n as u32),
             CubeDim::new_1d(CUBE_DIM),
@@ -248,12 +248,12 @@ impl<R: Runtime> Q40Weight<R> {
 
     /// Transient full-width f32 copy on device (`[n_out, k]` row-major)
     /// for the batched-matmul path — see the Q8_0 twin for the why.
-    pub fn dequant_device(&self, client: &ComputeClient<R>) -> Handle {
+    pub fn dequant_device<F: Float>(&self, client: &ComputeClient<R>) -> Handle {
         let n = self.n_out * self.k;
         let n_blocks = n / Q4_0_BLOCK;
-        let out_h = client.empty(n * core::mem::size_of::<f32>());
+        let out_h = client.empty(n * core::mem::size_of::<F>());
         unsafe {
-            q4_0_dequant_kernel::launch_unchecked::<R>(
+            q4_0_dequant_kernel::launch_unchecked::<F, R>(
                 client,
                 cube_count_capped(n as u32),
                 CubeDim::new_1d(CUBE_DIM),
@@ -380,11 +380,11 @@ pub fn repack_q8_0(data: &[u8]) -> Result<(Vec<u32>, Vec<f32>)> {
 /// `((nibble | high_bit«4) − 16) · d`, high bit `j` of the block's u32 for
 /// value `j` (low nibbles), `j+16` for the highs.
 #[cube(launch_unchecked)]
-fn q5_0_dequant_kernel(
+fn q5_0_dequant_kernel<F: Float>(
     qs: &Array<u32>,
     qh: &Array<u32>,
     d: &Array<f32>,
-    out: &mut Array<f32>,
+    out: &mut Array<F>,
     n: usize,
 ) {
     if ABSOLUTE_POS < n {
@@ -399,7 +399,7 @@ fn q5_0_dequant_kernel(
         }
         let hi_bit = (qh[block] >> u32::cast_from(j)) & 1;
         let q = i32::cast_from(nib | (hi_bit << 4)) - 16;
-        out[ABSOLUTE_POS] = f32::cast_from(q) * d[block];
+        out[ABSOLUTE_POS] = F::cast_from(f32::cast_from(q) * d[block]);
     }
 }
 
@@ -446,14 +446,14 @@ fn q5_0_matmul_kernel(
 
 /// Q8_0 dequant-only kernel: sign-extended i8 times the block scale.
 #[cube(launch_unchecked)]
-fn q8_0_dequant_kernel(qs: &Array<u32>, d: &Array<f32>, out: &mut Array<f32>, n: usize) {
+fn q8_0_dequant_kernel<F: Float>(qs: &Array<u32>, d: &Array<f32>, out: &mut Array<F>, n: usize) {
     if ABSOLUTE_POS < n {
         let block = ABSOLUTE_POS / 32;
         let j = ABSOLUTE_POS % 32;
         let word = qs[block * 8 + j / 4];
         let byte = (word >> (u32::cast_from(j % 4) * 8)) & 0xFF;
         let q = (i32::cast_from(byte) << 24) >> 24;
-        out[ABSOLUTE_POS] = f32::cast_from(q) * d[block];
+        out[ABSOLUTE_POS] = F::cast_from(f32::cast_from(q) * d[block]);
     }
 }
 
@@ -584,7 +584,7 @@ pub fn dequantize_q5_0_gpu<R: Runtime>(client: &ComputeClient<R>, data: &[u8]) -
     let d_h = client.create_from_slice(f32::as_bytes(&d));
     let out_h = client.empty(n * core::mem::size_of::<f32>());
     unsafe {
-        q5_0_dequant_kernel::launch_unchecked::<R>(
+        q5_0_dequant_kernel::launch_unchecked::<f32, R>(
             client,
             cube_count_1d(n as u32),
             CubeDim::new_1d(CUBE_DIM),
@@ -607,7 +607,7 @@ pub fn dequantize_q8_0_gpu<R: Runtime>(client: &ComputeClient<R>, data: &[u8]) -
     let d_h = client.create_from_slice(f32::as_bytes(&d));
     let out_h = client.empty(n * core::mem::size_of::<f32>());
     unsafe {
-        q8_0_dequant_kernel::launch_unchecked::<R>(
+        q8_0_dequant_kernel::launch_unchecked::<f32, R>(
             client,
             cube_count_1d(n as u32),
             CubeDim::new_1d(CUBE_DIM),
@@ -666,12 +666,12 @@ impl<R: Runtime> Q50Weight<R> {
 
     /// Transient full-width f32 copy on device (`[n_out, k]` row-major)
     /// for the batched-matmul path — see the Q8_0 twin for the why.
-    pub fn dequant_device(&self, client: &ComputeClient<R>) -> Handle {
+    pub fn dequant_device<F: Float>(&self, client: &ComputeClient<R>) -> Handle {
         let n = self.n_out * self.k;
         let n_blocks = n / Q4_0_BLOCK;
-        let out_h = client.empty(n * core::mem::size_of::<f32>());
+        let out_h = client.empty(n * core::mem::size_of::<F>());
         unsafe {
-            q5_0_dequant_kernel::launch_unchecked::<R>(
+            q5_0_dequant_kernel::launch_unchecked::<F, R>(
                 client,
                 cube_count_capped(n as u32),
                 CubeDim::new_1d(CUBE_DIM),
@@ -769,12 +769,12 @@ impl<R: Runtime> Q80Weight<R> {
     /// (`[n_out, k]` row-major). The batched-matmul path pays this once
     /// per call so the weight is READ once — the fused kernels re-read
     /// it per activation row, which is the §54 wall.
-    pub fn dequant_device(&self, client: &ComputeClient<R>) -> Handle {
+    pub fn dequant_device<F: Float>(&self, client: &ComputeClient<R>) -> Handle {
         let n = self.n_out * self.k;
         let n_blocks = n / Q4_0_BLOCK;
-        let out_h = client.empty(n * core::mem::size_of::<f32>());
+        let out_h = client.empty(n * core::mem::size_of::<F>());
         unsafe {
-            q8_0_dequant_kernel::launch_unchecked::<R>(
+            q8_0_dequant_kernel::launch_unchecked::<F, R>(
                 client,
                 cube_count_capped(n as u32),
                 CubeDim::new_1d(CUBE_DIM),
@@ -995,11 +995,11 @@ pub fn repack_q4_k(data: &[u8]) -> Result<(Vec<u32>, Vec<f32>, Vec<u32>)> {
 /// Q4_K dequant-only kernel, arithmetic mirrored from the CPU reference:
 /// `out = (d·sc) · q - (dmin·m)` per 32-value sub-block.
 #[cube(launch_unchecked)]
-fn q4_k_dequant_kernel(
+fn q4_k_dequant_kernel<F: Float>(
     qs: &Array<u32>,
     dd: &Array<f32>,
     scales: &Array<u32>,
-    out: &mut Array<f32>,
+    out: &mut Array<F>,
     n: usize,
 ) {
     if ABSOLUTE_POS < n {
@@ -1018,7 +1018,7 @@ fn q4_k_dequant_kernel(
         let mn = k4_min(scales, sb * 12, sidx);
         let d1 = dd[sb * 2] * f32::cast_from(sc);
         let fmin = dd[sb * 2 + 1] * f32::cast_from(mn);
-        out[ABSOLUTE_POS] = d1 * f32::cast_from(q) - fmin;
+        out[ABSOLUTE_POS] = F::cast_from(d1 * f32::cast_from(q) - fmin);
     }
 }
 
@@ -1247,12 +1247,12 @@ pub fn repack_q5_k(data: &[u8]) -> Result<(Vec<u32>, Vec<u32>, Vec<f32>, Vec<u32
 /// Q4_K plus the high-bit plane — group `j` reads bit `2j + t` of `qh[l]`
 /// and the value is `(d·sc) · (nib | hi«4) - (dmin·m)`.
 #[cube(launch_unchecked)]
-fn q5_k_dequant_kernel(
+fn q5_k_dequant_kernel<F: Float>(
     qs: &Array<u32>,
     qh: &Array<u32>,
     dd: &Array<f32>,
     scales: &Array<u32>,
-    out: &mut Array<f32>,
+    out: &mut Array<F>,
     n: usize,
 ) {
     if ABSOLUTE_POS < n {
@@ -1272,7 +1272,7 @@ fn q5_k_dequant_kernel(
         let mn = k4_min(scales, sb * 12, sidx);
         let d1 = dd[sb * 2] * f32::cast_from(sc);
         let fmin = dd[sb * 2 + 1] * f32::cast_from(mn);
-        out[ABSOLUTE_POS] = d1 * f32::cast_from(nib | (hi << 4)) - fmin;
+        out[ABSOLUTE_POS] = F::cast_from(d1 * f32::cast_from(nib | (hi << 4)) - fmin);
     }
 }
 
@@ -1370,12 +1370,12 @@ pub fn repack_q6_k(data: &[u8]) -> Result<(Vec<u32>, Vec<u32>, Vec<u32>, Vec<f32
 /// half yields quadrants t 0..4 with `q = (ql nibble) | (qh 2-bit « 4)`,
 /// biased −32, times `d · scales[i8]`.
 #[cube(launch_unchecked)]
-fn q6_k_dequant_kernel(
+fn q6_k_dequant_kernel<F: Float>(
     ql: &Array<u32>,
     qh: &Array<u32>,
     sc: &Array<u32>,
     d: &Array<f32>,
-    out: &mut Array<f32>,
+    out: &mut Array<F>,
     n: usize,
 ) {
     if ABSOLUTE_POS < n {
@@ -1392,7 +1392,7 @@ fn q6_k_dequant_kernel(
         let hi = (byte_at(qh, sb * 64 + half * 32 + l) >> (u32::cast_from(t) * 2)) & 3;
         let q = i32::cast_from(nib | (hi << 4)) - 32;
         let scale = i8_at(sc, sb * 16 + half * 8 + l / 16 + 2 * t);
-        out[ABSOLUTE_POS] = d[sb] * f32::cast_from(scale) * f32::cast_from(q);
+        out[ABSOLUTE_POS] = F::cast_from(d[sb] * f32::cast_from(scale) * f32::cast_from(q));
     }
 }
 
@@ -1490,7 +1490,7 @@ pub fn dequantize_q4_k_gpu<R: Runtime>(client: &ComputeClient<R>, data: &[u8]) -
     let sc_h = client.create_from_slice(u32::as_bytes(&scales));
     let out_h = client.empty(n * core::mem::size_of::<f32>());
     unsafe {
-        q4_k_dequant_kernel::launch_unchecked::<R>(
+        q4_k_dequant_kernel::launch_unchecked::<f32, R>(
             client,
             cube_count_1d(n as u32),
             CubeDim::new_1d(CUBE_DIM),
@@ -1515,7 +1515,7 @@ pub fn dequantize_q5_k_gpu<R: Runtime>(client: &ComputeClient<R>, data: &[u8]) -
     let sc_h = client.create_from_slice(u32::as_bytes(&scales));
     let out_h = client.empty(n * core::mem::size_of::<f32>());
     unsafe {
-        q5_k_dequant_kernel::launch_unchecked::<R>(
+        q5_k_dequant_kernel::launch_unchecked::<f32, R>(
             client,
             cube_count_1d(n as u32),
             CubeDim::new_1d(CUBE_DIM),
@@ -1541,7 +1541,7 @@ pub fn dequantize_q6_k_gpu<R: Runtime>(client: &ComputeClient<R>, data: &[u8]) -
     let d_h = client.create_from_slice(f32::as_bytes(&d));
     let out_h = client.empty(n * core::mem::size_of::<f32>());
     unsafe {
-        q6_k_dequant_kernel::launch_unchecked::<R>(
+        q6_k_dequant_kernel::launch_unchecked::<f32, R>(
             client,
             cube_count_1d(n as u32),
             CubeDim::new_1d(CUBE_DIM),
@@ -1599,12 +1599,12 @@ impl<R: Runtime> Q4KWeight<R> {
 
     /// Transient full-width f32 copy on device (`[n_out, k]` row-major)
     /// for the batched-matmul path — see `Q80Weight::dequant_device`.
-    pub fn dequant_device(&self, client: &ComputeClient<R>) -> Handle {
+    pub fn dequant_device<F: Float>(&self, client: &ComputeClient<R>) -> Handle {
         let n = self.n_out * self.k;
         let n_sb = n / K_SUPERBLOCK;
-        let out_h = client.empty(n * core::mem::size_of::<f32>());
+        let out_h = client.empty(n * core::mem::size_of::<F>());
         unsafe {
-            q4_k_dequant_kernel::launch_unchecked::<R>(
+            q4_k_dequant_kernel::launch_unchecked::<F, R>(
                 client,
                 cube_count_capped(n as u32),
                 CubeDim::new_1d(CUBE_DIM),
@@ -1798,12 +1798,12 @@ impl<R: Runtime> Q5KWeight<R> {
 
     /// Transient full-width f32 copy on device (`[n_out, k]` row-major)
     /// for the batched-matmul path — see `Q80Weight::dequant_device`.
-    pub fn dequant_device(&self, client: &ComputeClient<R>) -> Handle {
+    pub fn dequant_device<F: Float>(&self, client: &ComputeClient<R>) -> Handle {
         let n = self.n_out * self.k;
         let n_sb = n / K_SUPERBLOCK;
-        let out_h = client.empty(n * core::mem::size_of::<f32>());
+        let out_h = client.empty(n * core::mem::size_of::<F>());
         unsafe {
-            q5_k_dequant_kernel::launch_unchecked::<R>(
+            q5_k_dequant_kernel::launch_unchecked::<F, R>(
                 client,
                 cube_count_capped(n as u32),
                 CubeDim::new_1d(CUBE_DIM),
@@ -1906,12 +1906,12 @@ impl<R: Runtime> Q6KWeight<R> {
 
     /// Transient full-width f32 copy on device (`[n_out, k]` row-major)
     /// for the batched-matmul path — see `Q80Weight::dequant_device`.
-    pub fn dequant_device(&self, client: &ComputeClient<R>) -> Handle {
+    pub fn dequant_device<F: Float>(&self, client: &ComputeClient<R>) -> Handle {
         let n = self.n_out * self.k;
         let n_sb = n / K_SUPERBLOCK;
-        let out_h = client.empty(n * core::mem::size_of::<f32>());
+        let out_h = client.empty(n * core::mem::size_of::<F>());
         unsafe {
-            q6_k_dequant_kernel::launch_unchecked::<R>(
+            q6_k_dequant_kernel::launch_unchecked::<F, R>(
                 client,
                 cube_count_capped(n as u32),
                 CubeDim::new_1d(CUBE_DIM),
@@ -2123,22 +2123,35 @@ impl QuantWeight {
         )
     }
 
-    /// Fused dequant-matmul, device handles in and out.
-    /// Transient full-width f32 dequant on device, every format — the
-    /// batched-matmul path's supply. (`Option` stays in the signature:
-    /// a future format without a dequant kernel falls back safely.)
-    pub fn dequant_device(
+    /// Transient full-width dequant on device, every format — the
+    /// batched-matmul path's supply. The output element is the caller's
+    /// choice: `f32` reproduces the CPU reference bit for bit, `f16`
+    /// halves both the transient and the traffic the multiply that
+    /// follows has to move, which is where the time actually goes
+    /// (`notes/proposed/narrow-operand-matmul.md`). The arithmetic is
+    /// identical either way — only the final store narrows. (`Option`
+    /// stays in the signature: a future format without a dequant kernel
+    /// falls back safely.)
+    pub fn dequant_device_as<F: Float>(
         &self,
         client: &ComputeClient<cubecl::wgpu::WgpuRuntime>,
     ) -> Option<Handle> {
         match self {
-            QuantWeight::Q40(w) => Some(w.dequant_device(client)),
-            QuantWeight::Q50(w) => Some(w.dequant_device(client)),
-            QuantWeight::Q80(w) => Some(w.dequant_device(client)),
-            QuantWeight::Q4K(w) => Some(w.dequant_device(client)),
-            QuantWeight::Q5K(w) => Some(w.dequant_device(client)),
-            QuantWeight::Q6K(w) => Some(w.dequant_device(client)),
+            QuantWeight::Q40(w) => Some(w.dequant_device::<F>(client)),
+            QuantWeight::Q50(w) => Some(w.dequant_device::<F>(client)),
+            QuantWeight::Q80(w) => Some(w.dequant_device::<F>(client)),
+            QuantWeight::Q4K(w) => Some(w.dequant_device::<F>(client)),
+            QuantWeight::Q5K(w) => Some(w.dequant_device::<F>(client)),
+            QuantWeight::Q6K(w) => Some(w.dequant_device::<F>(client)),
         }
+    }
+
+    /// The f32 dequant, which is what every existing caller means.
+    pub fn dequant_device(
+        &self,
+        client: &ComputeClient<cubecl::wgpu::WgpuRuntime>,
+    ) -> Option<Handle> {
+        self.dequant_device_as::<f32>(client)
     }
 
     pub fn matmul_device(
@@ -2176,6 +2189,7 @@ impl QuantWeight {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn::tensor::f16 as F16;
     use cubecl::wgpu::WgpuRuntime;
 
     /// Deterministic pseudo-random Q4_0 block stream: valid finite f16
@@ -2654,6 +2668,24 @@ mod tests {
             let bytes = client.read_one_unchecked(h);
             f32::from_bytes(&bytes)[..n].to_vec()
         };
+        // The narrow store must not be a second arithmetic: the kernel
+        // computes the same f32 value and rounds it once on the way out,
+        // so every element has to equal the reference put through the
+        // same rounding. Anything else means the dequant maths moved.
+        let read_f16 = |h: Handle, n: usize| -> Vec<f32> {
+            let bytes = client.read_one_unchecked(h);
+            F16::from_bytes(&bytes)[..n]
+                .iter()
+                .map(|v| v.to_f32())
+                .collect()
+        };
+        let assert_narrowed = |got: &[f32], expect: &[f32], what: &str| {
+            assert_eq!(got.len(), expect.len(), "{what}: length");
+            for (i, (g, e)) in got.iter().zip(expect.iter()).enumerate() {
+                let rounded = F16::from_f32(*e).to_f32();
+                assert_eq!(*g, rounded, "{what}[{i}]: f16 store drifted");
+            }
+        };
 
         let (n_out, k) = (6, 256);
         let n = n_out * k;
@@ -2663,32 +2695,38 @@ mod tests {
         let data = synth_q4_0(blk);
         let w = Q40Weight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
         let expect = combs_formats::quants::dequantize_q4_0(&data, n).unwrap();
-        assert_eq!(read(w.dequant_device(&client), n), expect, "q4_0");
+        assert_eq!(read(w.dequant_device::<f32>(&client), n), expect, "q4_0");
+        assert_narrowed(&read_f16(w.dequant_device::<F16>(&client), n), &expect, "q4_0");
 
         let data = synth_q5_0(blk);
         let w = Q50Weight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
         let expect = combs_formats::quants::dequantize_q5_0(&data, n).unwrap();
-        assert_eq!(read(w.dequant_device(&client), n), expect, "q5_0");
+        assert_eq!(read(w.dequant_device::<f32>(&client), n), expect, "q5_0");
+        assert_narrowed(&read_f16(w.dequant_device::<F16>(&client), n), &expect, "q5_0");
 
         let data = synth_q8_0(blk);
         let w = Q80Weight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
         let expect = combs_formats::quants::dequantize_q8_0(&data, n).unwrap();
-        assert_eq!(read(w.dequant_device(&client), n), expect, "q8_0");
+        assert_eq!(read(w.dequant_device::<f32>(&client), n), expect, "q8_0");
+        assert_narrowed(&read_f16(w.dequant_device::<F16>(&client), n), &expect, "q8_0");
 
         let data = synth_q4_k(sb);
         let w = Q4KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
         let expect = combs_formats::quants::dequantize_q4_k(&data, n).unwrap();
-        assert_eq!(read(w.dequant_device(&client), n), expect, "q4_k");
+        assert_eq!(read(w.dequant_device::<f32>(&client), n), expect, "q4_k");
+        assert_narrowed(&read_f16(w.dequant_device::<F16>(&client), n), &expect, "q4_k");
 
         let data = synth_q5_k(sb);
         let w = Q5KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
         let expect = combs_formats::quants::dequantize_q5_k(&data, n).unwrap();
-        assert_eq!(read(w.dequant_device(&client), n), expect, "q5_k");
+        assert_eq!(read(w.dequant_device::<f32>(&client), n), expect, "q5_k");
+        assert_narrowed(&read_f16(w.dequant_device::<F16>(&client), n), &expect, "q5_k");
 
         let data = synth_q6_k(sb);
         let w = Q6KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
         let expect = combs_formats::quants::dequantize_q6_k(&data, n).unwrap();
-        assert_eq!(read(w.dequant_device(&client), n), expect, "q6_k");
+        assert_eq!(read(w.dequant_device::<f32>(&client), n), expect, "q6_k");
+        assert_narrowed(&read_f16(w.dequant_device::<F16>(&client), n), &expect, "q6_k");
     }
 
     #[test]

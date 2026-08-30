@@ -31,7 +31,7 @@ use burn::backend::wgpu::{CubeBackend, CubeTensor, WgpuDevice, WgpuRuntime};
 use burn::tensor::backend::Backend;
 use burn::tensor::{DType, Device, FloatDType, Shape, Tensor, TensorPrimitive};
 use burn_cubecl::fusion::FusionCubeRuntime;
-use burn_cubecl::kernel::into_contiguous;
+use burn_cubecl::kernel::{cast, into_contiguous};
 use burn_cubecl::kernel::matmul::{matmul, MatmulStrategy};
 use burn_cubecl::ops::permute;
 use burn_cubecl_fusion::CubeFusionHandle;
@@ -184,6 +184,35 @@ fn matmul_strategy() -> MatmulStrategy {
     if untuned { MatmulStrategy::Cube } else { MatmulStrategy::default() }
 }
 
+/// The element width the batched path hands its operands to the matmul
+/// in. The multiply is 88–97% of a batched call and this machine has no
+/// matrix units reachable from WGSL, so the multiply's cost tracks the
+/// bytes it moves: narrowing both operands to f16, with the accumulator
+/// and the output left f32, measured a 2.3x image step and a 1.8x
+/// 641-token prefill. Activations are never STORED narrow — the tensor
+/// arriving is f32 and the tensor leaving is f32 — which is what
+/// separates this from the f16 pipeline the flow-matching model's range
+/// closed off.
+///
+/// **Off by default, and the reason is a gate that failed rather than a
+/// doubt.** The narrow operands answer the wide ones to ~1.3e-3 of the
+/// output RMS, but a four-step sampler amplifies that: the same prompt
+/// and seed produce the same fox, matching in mean and standard
+/// deviation to 0.02% and visually indistinguishable, with 0.07% of
+/// channels differing by more than 10 and a worst channel of 27. The
+/// gate written down beforehand asked for 2. It is a real change to
+/// what images come out, so it is offered, not imposed:
+/// `COMBS_QMATMUL_OPERAND=f16` takes it.
+fn operand_dtype() -> DType {
+    static D: std::sync::OnceLock<DType> = std::sync::OnceLock::new();
+    *D.get_or_init(
+        || match std::env::var("COMBS_QMATMUL_OPERAND").as_deref() {
+            Ok("f16") => DType::F16,
+            _ => DType::F32,
+        },
+    )
+}
+
 /// One line describing what the batched path will actually do, so a run
 /// records its configuration instead of leaving it to be assumed.
 pub fn batched_matmul_summary() -> String {
@@ -193,10 +222,14 @@ pub fn batched_matmul_summary() -> String {
     } else {
         "tuned"
     };
+    let operand = match operand_dtype() {
+        DType::F16 => "f16 operands/f32 accumulator",
+        _ => "f32 operands",
+    };
     if threshold == usize::MAX {
         "batched matmul OFF (COMBS_QMATMUL_BATCHED=0)".to_string()
     } else {
-        format!("batched matmul from {threshold} rows, {strategy} kernel")
+        format!("batched matmul from {threshold} rows, {strategy} kernel, {operand}")
     }
 }
 
@@ -204,7 +237,7 @@ pub fn batched_matmul_summary() -> String {
 /// saw under `COMBS_QMATMUL_DEBUG=1` — the ground truth an A/B needs,
 /// since burn resolves tensor dtypes from per-device defaults and an
 /// f32 backend can still be handed f16 tensors.
-fn debug_first_calls(m: usize, k: usize, n: usize, x_dtype: DType, out_dtype: DType) {
+fn debug_first_calls(m: usize, k: usize, n: usize, x_dtype: DType, operand: DType) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var("COMBS_QMATMUL_DEBUG").as_deref() == Ok("1")) {
         return;
@@ -213,7 +246,7 @@ fn debug_first_calls(m: usize, k: usize, n: usize, x_dtype: DType, out_dtype: DT
     let n_seen = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if n_seen < 8 {
         eprintln!(
-            "[qmatmul] call {n_seen}: m {m} k {k} n {n} | x {x_dtype:?} out {out_dtype:?} | {}",
+            "[qmatmul] call {n_seen}: m {m} k {k} n {n} | x {x_dtype:?} operands {operand:?} out F32 | {}",
             batched_matmul_summary()
         );
     }
@@ -229,12 +262,31 @@ fn try_batched_matmul(
     batch: usize,
     seq: usize,
 ) -> Option<CubeTensor<WgpuRuntime>> {
+    try_batched_matmul_with(w, x, batch, seq, operand_dtype())
+}
+
+/// The batched path with its operand width named rather than read from
+/// the door, so a single process can run both widths and compare them.
+fn try_batched_matmul_with(
+    w: &QuantWeight,
+    x: &CubeTensor<WgpuRuntime>,
+    batch: usize,
+    seq: usize,
+    operand: DType,
+) -> Option<CubeTensor<WgpuRuntime>> {
     let m = batch * seq;
     if m < batched_threshold() {
         return None;
     }
     let (n_out, k) = (w.n_out(), w.k());
-    let w_h = w.dequant_device(&x.client)?;
+    // The weight is written at the operand width by the dequant kernel
+    // itself. A separate narrowing pass would cost about what the whole
+    // dequant costs — a wasted full-weight pass is expensive, which the
+    // cost-split instrument prices directly.
+    let w_h = match operand {
+        DType::F16 => w.dequant_device_as::<burn::tensor::f16>(&x.client)?,
+        _ => w.dequant_device(&x.client)?,
+    };
     let x2 = CubeTensor::new_contiguous(
         x.client.clone(),
         x.device.clone(),
@@ -242,20 +294,60 @@ fn try_batched_matmul(
         x.handle.clone(),
         DType::F32,
     );
+    // Both operands must share a dtype for the matmul to bind them, so
+    // narrowing the weight means narrowing the activation too — and the
+    // activation is the one with a range problem. Measured on a
+    // flow-matching image run: the deep single-stream blocks reach
+    // 60551, against f16's largest finite value of 65504. An 8% margin,
+    // on a quantity that moves with prompt, seed, canvas and step, and
+    // whose overflow is Inf rather than a small error. So the operands
+    // are normalized first: divide by a power of two that brings the
+    // largest magnitude to 1, and multiply the f32 result back by the
+    // same. A power of two only moves exponents, so the scaling is
+    // exact both ways and the sole remaining error is still the f16
+    // store. The scale is computed and applied ON DEVICE — reading it
+    // back would sync the queue once per linear, which costs far more
+    // than it saves.
+    let (x2, scale) = match operand {
+        DType::F32 => (x2, None),
+        dt => {
+            let xt = Tensor::<InnerF32, 2>::from_primitive(TensorPrimitive::Float(x2));
+            let ln2 = core::f32::consts::LN_2;
+            let amax = xt.clone().abs().max().clamp_min(f32::MIN_POSITIVE);
+            let exponent = (amax.log() / ln2).ceil();
+            let scale = (exponent * ln2).exp().reshape([1, 1]);
+            let normalized = xt.div(scale.clone().expand([m, k])).cast(FloatDType::F16);
+            (
+                cast(normalized.into_primitive().tensor(), dt),
+                Some(scale),
+            )
+        }
+    };
     let w2 = CubeTensor::new_contiguous(
         x.client.clone(),
         x.device.clone(),
         Shape::from([n_out, k]),
         w_h,
-        DType::F32,
+        operand,
     );
-    debug_first_calls(m, k, n_out, x.dtype, DType::F32);
+    debug_first_calls(m, k, n_out, x.dtype, operand);
     // The strategy is load-bearing for CORRECTNESS here, not only for
     // speed: the untuned kernel turns generated images flat grey even
     // though the two agree to 1e-3 when the same matmul runs in
     // isolation at these shapes (see the strategy test). Diagnostic
     // door only — the default stays on what demonstrably works.
     let out = matmul(x2, permute(w2, &[1, 0]), None, matmul_strategy(), DType::F32).ok()?;
+    // Undo the normalization on the f32 result, where the product has
+    // room. Exact: the scale is a power of two.
+    let out = match scale {
+        None => out,
+        Some(scale) => {
+            let ot = Tensor::<InnerF32, 2>::from_primitive(TensorPrimitive::Float(out));
+            ot.mul(scale.expand([m, n_out]))
+                .into_primitive()
+                .tensor()
+        }
+    };
     // Submit now so the dequant transient's slot recycles before the
     // NEXT block allocates its own — unflushed, the transients stack
     // across a step's 25 block linears and the peak walks into
@@ -809,5 +901,574 @@ mod tests {
             .to_vec()
             .unwrap();
         assert_close(&got, &expect, 1e-2);
+    }
+
+    fn lcg_bytes(n: usize, seed: u32) -> Vec<u8> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                (s >> 24) as u8
+            })
+            .collect()
+    }
+
+    fn synth_q8_0(n_blocks: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n_blocks * crate::qmatmul::Q8_0_BLOCK_BYTES);
+        for b in 0..n_blocks {
+            let scale = burn::tensor::f16::from_f32(0.003 * ((b % 11) as f32 + 1.0));
+            out.extend_from_slice(&scale.to_le_bytes());
+            out.extend_from_slice(&lcg_bytes(32, 0x80C0 ^ b as u32));
+        }
+        out
+    }
+
+    fn synth_q4_k(n_sb: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n_sb * crate::qmatmul::Q4_K_BLOCK_BYTES);
+        for b in 0..n_sb {
+            let d = burn::tensor::f16::from_f32(0.002 * ((b % 9) as f32 + 1.0));
+            let dmin = burn::tensor::f16::from_f32(0.001 * ((b % 5) as f32 + 1.0));
+            out.extend_from_slice(&d.to_le_bytes());
+            out.extend_from_slice(&dmin.to_le_bytes());
+            out.extend_from_slice(&lcg_bytes(140, 0xC0FFEE ^ b as u32));
+        }
+        out
+    }
+
+    /// The narrow-operand path must answer what the wide one answers.
+    /// Shapes are the live pipeline's, with the widest output dimension
+    /// cut down: the arithmetic that could drift is per-element and per
+    /// accumulation, so `n` only multiplies the count of independent
+    /// checks — it does not add a way to be wrong. The row counts, which
+    /// DO change which kernel runs, are the real ones (512 encoder, 768
+    /// at a 256 canvas, 1536 at 512). Full-size shapes are covered by
+    /// the image parity gate.
+    #[test]
+    fn narrow_operands_agree_with_wide_ones() {
+        use combs_formats::QuantFormat;
+        use cubecl::server::Handle;
+
+        if crate::skip_no_gpu() {
+            return;
+        }
+        pin_device_dtypes();
+        let device: Device<UnfusedF32> = Default::default();
+        let client = <WgpuRuntime as Runtime>::client(&Default::default());
+        let mk = |h: &Handle, dims: [usize; 2], dt: DType| {
+            CubeTensor::new_contiguous(
+                client.clone(),
+                WgpuDevice::default(),
+                Shape::from(dims),
+                h.clone(),
+                dt,
+            )
+        };
+
+        for (fmt, m, k, n) in [
+            (QuantFormat::Q4K, 512usize, 2560usize, 1024usize),
+            (QuantFormat::Q4K, 512, 4096, 1024),
+            (QuantFormat::Q8_0, 768, 3072, 1024),
+            (QuantFormat::Q8_0, 1536, 3072, 1024),
+        ] {
+            let data = match fmt {
+                QuantFormat::Q8_0 => synth_q8_0(n * k / 32),
+                _ => synth_q4_k(n * k / 256),
+            };
+            let w = QuantWeight::from_quant_tensor(&client, fmt, &data, n, k).unwrap();
+            let xv: Vec<f32> = (0..m * k).map(|i| ((i % 37) as f32) / 18.0 - 1.0).collect();
+            let x_h = Tensor::<UnfusedF32, 2>::from_data(TensorData::new(xv, [m, k]), &device)
+                .into_primitive()
+                .tensor()
+                .handle;
+
+            // The production path itself, both widths, in one process —
+            // not a copy of it that could drift from what ships.
+            let run = |operand: DType| -> Vec<f32> {
+                let out =
+                    try_batched_matmul_with(&w, &mk(&x_h, [m, k], DType::F32), 1, m, operand)
+                        .expect("batched path engages at these row counts");
+                Tensor::<UnfusedF32, 3>::from_primitive(TensorPrimitive::Float(out))
+                    .into_data()
+                    .to_vec()
+                    .unwrap()
+            };
+
+            let wide = run(DType::F32);
+            let narrow = run(DType::F16);
+            assert_eq!(wide.len(), narrow.len());
+            let mut worst_abs = 0.0f32;
+            let mut worst_elem = 0.0f32;
+            let mut sq = 0.0f64;
+            let mut peak = 0.0f32;
+            for (g, e) in narrow.iter().zip(wide.iter()) {
+                worst_abs = worst_abs.max((g - e).abs());
+                worst_elem = worst_elem.max((g - e).abs() / e.abs().max(1.0));
+                sq += (*e as f64) * (*e as f64);
+                peak = peak.max(e.abs());
+            }
+            let rms = (sq / wide.len() as f64).sqrt() as f32;
+            // Two denominators, because they answer different questions.
+            // Elementwise (the one first written down) divides by the
+            // output's own magnitude, so at an output that cancelled to
+            // near zero it reports the cancellation, not the operands'
+            // precision — a matmul whose terms are large and whose sum
+            // is small will fail it at any operand width below the
+            // reference. Against the output RMS the number is the one
+            // the pre-registered 1e-2 was reasoning about: how much of
+            // the signal the narrow operands cost.
+            println!(
+                "narrow-vs-wide {fmt:?} m {m} k {k} n {n}: \
+                 worst abs {worst_abs:.3e} · rms {rms:.3e} · peak {peak:.3e} · \
+                 rms-relative {:.2e} · elementwise {worst_elem:.2e}",
+                worst_abs / rms
+            );
+            assert!(
+                worst_abs / rms <= 1e-2,
+                "{fmt:?} m {m} k {k} n {n}: worst delta {worst_abs:.3e} is \
+                 {:.3e} of the output RMS {rms:.3e}, over 1e-2",
+                worst_abs / rms
+            );
+        }
+    }
+
+    /// Range safety, which is the reason the narrow path normalizes at
+    /// all. A flow-matching image run puts 60551 through these linears,
+    /// against f16's largest finite value of 65504 — and an overflow
+    /// there is Inf, which the pipeline turns into a dead image rather
+    /// than a slightly wrong one. Magnitudes here straddle that ceiling
+    /// and go three orders past it, plus one far below where an
+    /// unnormalized cast would flush to zero instead.
+    #[test]
+    fn narrow_operands_survive_activations_past_the_f16_ceiling() {
+        use combs_formats::QuantFormat;
+        use cubecl::server::Handle;
+
+        if crate::skip_no_gpu() {
+            return;
+        }
+        pin_device_dtypes();
+        let device: Device<UnfusedF32> = Default::default();
+        let client = <WgpuRuntime as Runtime>::client(&Default::default());
+        let mk = |h: &Handle, dims: [usize; 2]| {
+            CubeTensor::new_contiguous(
+                client.clone(),
+                WgpuDevice::default(),
+                Shape::from(dims),
+                h.clone(),
+                DType::F32,
+            )
+        };
+
+        let (m, k, n) = (64usize, 256usize, 128usize);
+        let data = synth_q8_0(n * k / 32);
+        let w = QuantWeight::from_quant_tensor(&client, QuantFormat::Q8_0, &data, n, k).unwrap();
+
+        for magnitude in [6.0e4f32, 6.5e4, 1.0e6, 1.0e9, 1.0e-6] {
+            let xv: Vec<f32> = (0..m * k)
+                .map(|i| (((i % 37) as f32) / 18.0 - 1.0) * magnitude)
+                .collect();
+            let x_h = Tensor::<UnfusedF32, 2>::from_data(TensorData::new(xv, [m, k]), &device)
+                .into_primitive()
+                .tensor()
+                .handle;
+            let run = |operand: DType| -> Vec<f32> {
+                let out =
+                    try_batched_matmul_with(&w, &mk(&x_h, [m, k]), 1, m, operand)
+                        .expect("batched path engages");
+                Tensor::<UnfusedF32, 3>::from_primitive(TensorPrimitive::Float(out))
+                    .into_data()
+                    .to_vec()
+                    .unwrap()
+            };
+            let wide = run(DType::F32);
+            let narrow = run(DType::F16);
+
+            assert!(
+                narrow.iter().all(|v| v.is_finite()),
+                "magnitude {magnitude:e}: narrow operands produced a non-finite value"
+            );
+            let mut worst = 0.0f32;
+            let mut sq = 0.0f64;
+            for (g, e) in narrow.iter().zip(wide.iter()) {
+                worst = worst.max((g - e).abs());
+                sq += (*e as f64) * (*e as f64);
+            }
+            let rms = (sq / wide.len() as f64).sqrt() as f32;
+            println!(
+                "range {magnitude:e}: rms {rms:.3e} worst {worst:.3e} rms-relative {:.2e}",
+                worst / rms
+            );
+            assert!(
+                worst / rms <= 1e-2,
+                "magnitude {magnitude:e}: worst delta is {:.3e} of the output RMS",
+                worst / rms
+            );
+        }
+    }
+
+    /// Where a batched call's time actually goes, at the shapes the live
+    /// pipeline runs. An instrument, not a gate — it asserts nothing and
+    /// stays `#[ignore]`d; the numbers are the product:
+    ///
+    /// ```text
+    /// cargo test -p combs-models --release cost_split -- --ignored --nocapture
+    /// ```
+    ///
+    /// Every phase forces completion with a one-element readback before
+    /// stopping its clock (wgpu ops are lazy; unforced spans measure
+    /// enqueue time). Forcing serializes, so the phase sum runs slower
+    /// than the live path — read the ratios, and take `full` as the
+    /// like-for-like total.
+    #[test]
+    #[ignore = "measurement instrument; run explicitly with --ignored"]
+    fn batched_call_cost_split() {
+        use combs_formats::QuantFormat;
+        use cubecl::server::Handle;
+        use std::time::Instant;
+
+        if crate::skip_no_gpu() {
+            return;
+        }
+        pin_device_dtypes();
+        let device: Device<UnfusedF32> = Default::default();
+        let client = <WgpuRuntime as Runtime>::client(&Default::default());
+
+        let mk = |h: &Handle, dims: [usize; 2]| {
+            CubeTensor::new_contiguous(
+                client.clone(),
+                WgpuDevice::default(),
+                Shape::from(dims),
+                h.clone(),
+                DType::F32,
+            )
+        };
+        let mk_dt = |h: &Handle, dims: [usize; 2], dt: DType| {
+            CubeTensor::new_contiguous(
+                client.clone(),
+                WgpuDevice::default(),
+                Shape::from(dims),
+                h.clone(),
+                dt,
+            )
+        };
+        // One element back is enough to prove the queue drained: submission
+        // order guarantees everything enqueued earlier finished first.
+        let force_dt = |h: &Handle, len: usize, dt: DType| {
+            let ct = CubeTensor::new_contiguous(
+                client.clone(),
+                WgpuDevice::default(),
+                Shape::from([len]),
+                h.clone(),
+                dt,
+            );
+            let t = Tensor::<UnfusedF32, 1>::from_primitive(TensorPrimitive::Float(ct));
+            let _ = t.narrow(0, 0, 1).into_data();
+        };
+        let force = |h: &Handle, len: usize| force_dt(h, len, DType::F32);
+        fn time(reps: usize, body: &mut dyn FnMut()) -> f64 {
+            body(); // warm: autotune resolves per key, and the first launch compiles
+            let t0 = Instant::now();
+            for _ in 0..reps {
+                body();
+            }
+            t0.elapsed().as_secs_f64() / reps as f64
+        }
+
+        // Shapes logged from a real generation. The encoder's projections
+        // (Q4_K_M Qwen3-4B) run once per image; the DiT's (Q8_0) run once
+        // per block per STEP, which is what the arc is about.
+        let rows: &[(&str, QuantFormat, usize, usize, usize)] = &[
+            ("enc.qkv", QuantFormat::Q4K, 512, 2560, 4096),
+            ("enc.ff", QuantFormat::Q4K, 512, 4096, 2560),
+            ("dit.single.fused 256", QuantFormat::Q8_0, 768, 3072, 27648),
+            ("dit.single.fused 512", QuantFormat::Q8_0, 1536, 3072, 27648),
+            ("dit.single.out 512", QuantFormat::Q8_0, 1536, 9216, 3072),
+        ];
+        const REPS: usize = 3;
+
+        println!(
+            "\n{:22} {:>6} {:>6} {:>6} | {:>9} {:>9} {:>9} {:>9} {:>8} {:>9} {:>9}",
+            "shape", "m", "k", "n", "dequant", "mm(perm)", "mm(cont)", "relayout", "alloc",
+            "full", "no-flush"
+        );
+        for &(label, fmt, m, k, n) in rows {
+            let data = match fmt {
+                QuantFormat::Q8_0 => synth_q8_0(n * k / 32),
+                QuantFormat::Q4K => synth_q4_k(n * k / 256),
+                _ => unreachable!("instrument covers the formats the pipeline ships"),
+            };
+            let w = QuantWeight::from_quant_tensor(&client, fmt, &data, n, k).unwrap();
+            drop(data);
+
+            let xv: Vec<f32> = (0..m * k).map(|i| ((i % 37) as f32) / 18.0 - 1.0).collect();
+            let x_h = Tensor::<UnfusedF32, 2>::from_data(TensorData::new(xv, [m, k]), &device)
+                .into_primitive()
+                .tensor()
+                .handle;
+
+            let dequant = time(
+                REPS,
+                &mut || {
+                    let h = w.dequant_device(&client).unwrap();
+                    force(&h, n * k);
+                },
+            );
+
+            // Staged once, so the matmul phases price the multiply alone.
+            let w_h = w.dequant_device(&client).unwrap();
+            force(&w_h, n * k);
+
+            let mm_perm = time(
+                REPS,
+                &mut || {
+                    let out = matmul(
+                        mk(&x_h, [m, k]),
+                        permute(mk(&w_h, [n, k]), &[1, 0]),
+                        None,
+                        MatmulStrategy::default(),
+                        DType::F32,
+                    )
+                    .expect("matmul launches");
+                    force(&out.handle, m * n);
+                },
+            );
+
+            // The same multiply with the weight already laid out [k, n]:
+            // what option (i) — a transposed dequant output — would buy.
+            let wt_h = into_contiguous(permute(mk(&w_h, [n, k]), &[1, 0])).handle;
+            force(&wt_h, n * k);
+            let mm_cont = time(
+                REPS,
+                &mut || {
+                    let out = matmul(
+                        mk(&x_h, [m, k]),
+                        mk(&wt_h, [k, n]),
+                        None,
+                        MatmulStrategy::default(),
+                        DType::F32,
+                    )
+                    .expect("matmul launches");
+                    force(&out.handle, m * n);
+                },
+            );
+
+            // What a full-weight layout copy costs, if one were happening.
+            let relayout = time(
+                REPS,
+                &mut || {
+                    let c = into_contiguous(permute(mk(&w_h, [n, k]), &[1, 0]));
+                    force(&c.handle, n * k);
+                },
+            );
+
+            // Pool churn alone: the transient is re-requested every call.
+            let alloc = time(
+                REPS,
+                &mut || {
+                    let h = client.empty(n * k * 4);
+                    std::hint::black_box(&h);
+                },
+            );
+
+            let full = time(
+                REPS,
+                &mut || {
+                    let wh = w.dequant_device(&client).unwrap();
+                    let out = matmul(
+                        mk(&x_h, [m, k]),
+                        permute(mk(&wh, [n, k]), &[1, 0]),
+                        None,
+                        MatmulStrategy::default(),
+                        DType::F32,
+                    )
+                    .expect("matmul launches");
+                    let _ = client.flush();
+                    force(&out.handle, m * n);
+                },
+            );
+
+            let no_flush = time(
+                REPS,
+                &mut || {
+                    let wh = w.dequant_device(&client).unwrap();
+                    let out = matmul(
+                        mk(&x_h, [m, k]),
+                        permute(mk(&wh, [n, k]), &[1, 0]),
+                        None,
+                        MatmulStrategy::default(),
+                        DType::F32,
+                    )
+                    .expect("matmul launches");
+                    force(&out.handle, m * n);
+                },
+            );
+
+            // Apple's GPUs have no f32 matrix acceleration — the f32
+            // kernel runs on plain ALUs. Price narrower OPERANDS with an
+            // f32 accumulator before committing to narrow dequant
+            // kernels: this is what option (ii) would buy, measured
+            // without writing a line of it.
+            let narrow = |fdt: FloatDType| -> Option<f64> {
+                let as_t = |h: &Handle, dims: [usize; 2]| {
+                    Tensor::<UnfusedF32, 2>::from_primitive(TensorPrimitive::Float(mk(h, dims)))
+                        .cast(fdt)
+                        .into_primitive()
+                        .tensor()
+                };
+                let wf = as_t(&w_h, [n, k]);
+                let xf = as_t(&x_h, [m, k]);
+                let dt = wf.dtype;
+                let (wf_h, xf_h) = (wf.handle.clone(), xf.handle.clone());
+                force_dt(&wf_h, n * k, dt);
+                force_dt(&xf_h, m * k, dt);
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    time(
+                        REPS,
+                        &mut || {
+                            let out = matmul(
+                                mk_dt(&xf_h, [m, k], dt),
+                                permute(mk_dt(&wf_h, [n, k], dt), &[1, 0]),
+                                None,
+                                MatmulStrategy::default(),
+                                DType::F32,
+                            )
+                            .expect("matmul launches");
+                            force(&out.handle, m * n);
+                        },
+                    )
+                }))
+                .ok()
+            };
+            // bf16 is deliberately absent: the WGSL compiler rejects it
+            // ("bf16 is not a valid WgpuElement"), and the failed autotune
+            // takes the compute channel down with it, poisoning every
+            // later measurement in the process. Recorded, not retried.
+            let mm_f16 = narrow(FloatDType::F16);
+
+            let ms = |s: f64| s * 1e3;
+            println!(
+                "{label:22} {m:>6} {k:>6} {n:>6} | {:>8.1}ms {:>8.1}ms {:>8.1}ms {:>8.1}ms {:>6.2}ms {:>8.1}ms {:>8.1}ms",
+                ms(dequant),
+                ms(mm_perm),
+                ms(mm_cont),
+                ms(relayout),
+                ms(alloc),
+                ms(full),
+                ms(no_flush)
+            );
+            // Bandwidth the dequant achieves writing the f32 transient —
+            // the number that says whether the kernel or the memory is the
+            // wall.
+            let written = (n * k * 4) as f64 / 1e9;
+            println!(
+                "{:22} dequant writes {written:.2} GB at {:.1} GB/s · matmul {:.2} TFLOP/s · x {:.0} MB out {:.0} MB",
+                "",
+                written / dequant,
+                2.0 * (m * k * n) as f64 / mm_perm / 1e12,
+                (m * k * 4) as f64 / 1e6,
+                (m * n * 4) as f64 / 1e6
+            );
+            let show = |t: Option<f64>| match t {
+                Some(s) => format!(
+                    "{:.1}ms ({:.2} TFLOP/s, {:.2}x)",
+                    ms(s),
+                    2.0 * (m * k * n) as f64 / s / 1e12,
+                    mm_perm / s
+                ),
+                None => "unsupported".to_string(),
+            };
+            println!(
+                "{:22} narrow operands, f32 accumulator: f16 {}",
+                "",
+                show(mm_f16)
+            );
+        }
+
+        // Narrowing has a fixed cost per call — a reduction over the
+        // activation, a scaling of it, and a scaling of the result — and
+        // a win proportional to the weight traffic it halves. At a short
+        // prompt the fixed cost wins and the narrow path is a loss. This
+        // sweep, on a text model's linear shape, is where the crossover
+        // gets measured instead of assumed.
+        {
+            let (k, n) = (2048usize, 2048usize);
+            let data = synth_q8_0(n * k / 32);
+            let w =
+                QuantWeight::from_quant_tensor(&client, QuantFormat::Q8_0, &data, n, k).unwrap();
+            drop(data);
+            println!("\nnarrow-path crossover (k {k}, n {n}):");
+            for m in [8usize, 16, 32, 64, 128, 256, 512, 1024] {
+                let xv: Vec<f32> =
+                    (0..m * k).map(|i| ((i % 37) as f32) / 18.0 - 1.0).collect();
+                let x_h =
+                    Tensor::<UnfusedF32, 2>::from_data(TensorData::new(xv, [m, k]), &device)
+                        .into_primitive()
+                        .tensor()
+                        .handle;
+                let arm = |operand: DType| {
+                    time(
+                        REPS,
+                        &mut || {
+                            let out = try_batched_matmul_with(
+                                &w,
+                                &mk(&x_h, [m, k]),
+                                1,
+                                m,
+                                operand,
+                            )
+                            .expect("batched path engages");
+                            force(&out.handle, m * n);
+                        },
+                    )
+                };
+                let wide = arm(DType::F32);
+                let narrow = arm(DType::F16);
+                println!(
+                    "  m {m:>5} | f32 {:>7.2}ms | f16 {:>7.2}ms | {:.2}x{}",
+                    wide * 1e3,
+                    narrow * 1e3,
+                    wide / narrow,
+                    if narrow < wide { "" } else { "  <- narrow loses" }
+                );
+            }
+        }
+
+        // The 256-canvas anomaly: m=768 measured SLOWER than m=1536 at the
+        // same weight. Sweep the row count at the DiT's fused shape to see
+        // where the tuned routine changes its mind.
+        let (k, n) = (3072usize, 27648usize);
+        let data = synth_q8_0(n * k / 32);
+        let w = QuantWeight::from_quant_tensor(&client, QuantFormat::Q8_0, &data, n, k).unwrap();
+        drop(data);
+        let w_h = w.dequant_device(&client).unwrap();
+        force(&w_h, n * k);
+        println!("\nrow sweep at the DiT fused shape (k {k}, n {n}):");
+        for m in [512usize, 768, 1024, 1280, 1536, 2048] {
+            let xv: Vec<f32> = (0..m * k).map(|i| ((i % 37) as f32) / 18.0 - 1.0).collect();
+            let x_h = Tensor::<UnfusedF32, 2>::from_data(TensorData::new(xv, [m, k]), &device)
+                .into_primitive()
+                .tensor()
+                .handle;
+            let t = time(
+                REPS,
+                &mut || {
+                    let out = matmul(
+                        mk(&x_h, [m, k]),
+                        permute(mk(&w_h, [n, k]), &[1, 0]),
+                        None,
+                        MatmulStrategy::default(),
+                        DType::F32,
+                    )
+                    .expect("matmul launches");
+                    force(&out.handle, m * n);
+                },
+            );
+            println!(
+                "  m {m:>5} | {:>8.1}ms | {:.2} TFLOP/s | {:>6.3}ms per row",
+                t * 1e3,
+                2.0 * (m * k * n) as f64 / t / 1e12,
+                t * 1e3 / m as f64
+            );
+        }
     }
 }
