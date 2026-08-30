@@ -247,12 +247,22 @@ impl StreamMount {
         self.window_high_water
     }
 
-    /// Close the mount and take the weights.
+    /// Close the mount, taking the weights and a source that still
+    /// answers for everything OUTSIDE the payloads.
+    ///
+    /// The second half matters: an engine needs the tokenizer, the
+    /// metadata and the sampler defaults, all of which live in the
+    /// header and none of which are weights. The header was kept, so
+    /// the source handed back is a window with nothing in it — every
+    /// payload correctly unavailable, everything else exactly as the
+    /// whole file would have said.
     ///
     /// A stream that stopped early fails here rather than producing a
     /// model with holes in it, and everything staged so far is dropped
     /// on the way out, which is what returns the device memory.
-    pub fn finish(mut self) -> Result<StagedWeights<CombsBackend>, MountError> {
+    pub fn finish(
+        mut self,
+    ) -> Result<(StagedWeights<CombsBackend>, GgufSource), MountError> {
         let tensors = self.header.as_ref().map(|h| h.tensors.len()).unwrap_or(0);
         if self.received != self.expected || self.next_tensor != tensors {
             return Err(MountError::Truncated {
@@ -270,6 +280,13 @@ impl StreamMount {
             tensors,
         })?;
         weights.seal();
-        Ok(weights)
+        let header_only = GgufSource::from_window(
+            &self.header_bytes,
+            Vec::new(),
+            self.expected,
+            self.expected,
+        )
+        .map_err(|e| MountError::Staging(e.to_string()))?;
+        Ok((weights, header_only))
     }
 }

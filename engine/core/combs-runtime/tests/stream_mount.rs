@@ -56,7 +56,7 @@ fn the_window_never_grows_past_the_largest_tensor() {
     for chunk in [1 << 20, 8 << 20] {
         let mut mount = StreamMount::new(bytes.len(), device.clone());
         feed(&mut mount, &bytes, chunk).expect("stream feeds");
-        let weights = mount.finish().expect("mount completes");
+        let (weights, _header) = mount.finish().expect("mount completes");
         drop(weights);
         // Re-measured from a fresh mount each time; `finish` consumes.
         let mut probe = StreamMount::new(bytes.len(), device.clone());

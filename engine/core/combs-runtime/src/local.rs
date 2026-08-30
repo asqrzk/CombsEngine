@@ -109,6 +109,34 @@ impl LocalEngine {
         let registry = ModelRegistry::<CombsBackend>::new();
         let pool = combs_core::BufferPool::new();
         let model = pool.pin_persistent(&device, || registry.load(source, &device))?;
+        Self::assemble(model, source, device, cache_config, &pool)
+    }
+
+    /// The same engine, from weights a stream already staged.
+    ///
+    /// `source` here answers for everything that is not a weight — the
+    /// tokenizer, the metadata, the sampler defaults — and for no
+    /// payload at all, which is correct: the payloads became the model
+    /// while they were briefly in hand and no longer exist anywhere.
+    pub fn load_staged(
+        staged: &mut combs_models::staged::StagedWeights<CombsBackend>,
+        source: &dyn ModelSource,
+        device: CombsDevice,
+        cache_config: CacheConfig,
+    ) -> Result<Self> {
+        let registry = ModelRegistry::<CombsBackend>::new();
+        let pool = combs_core::BufferPool::new();
+        let model = registry.load_staged(staged, &device)?;
+        Self::assemble(model, source, device, cache_config, &pool)
+    }
+
+    fn assemble(
+        model: Box<dyn combs_models::GenerativeModel<CombsBackend>>,
+        source: &dyn ModelSource,
+        device: CombsDevice,
+        cache_config: CacheConfig,
+        pool: &combs_core::BufferPool,
+    ) -> Result<Self> {
         // The load transients are garbage from here on; return them
         // instead of hoarding — in a browser tab this is the difference
         // between fitting and dying.

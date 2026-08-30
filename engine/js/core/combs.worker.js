@@ -29,6 +29,31 @@ import init, {
   combs_model_open,
 } from "./pkg/combs_wasm.js";
 
+/**
+ * Above this, mount per-tensor instead of buffering the whole image.
+ * Chosen well under the point where buffering actually fails so the
+ * choice is never close: the streamed road costs nothing extra, and
+ * discovering the limit at 3 GB means discovering it after the
+ * download.
+ */
+const STREAM_ABOVE_BYTES = 1_000_000_000;
+
+/**
+ * The module, initialized once. Anything that reaches into wasm goes
+ * through here first: `caps` is asked BEFORE a model is chosen, which
+ * is exactly when nothing has loaded yet, and a page that asks what the
+ * device can do should not have to mount something to find out.
+ */
+let moduleReady = null;
+async function ensureModule(wasmUrl) {
+  if (!moduleReady) {
+    moduleReady = init(wasmUrl ? { module_or_path: wasmUrl } : undefined);
+  }
+  const exports = await moduleReady;
+  wasmMemory = exports?.memory ?? wasmMemory;
+  return exports;
+}
+
 /** The one engine this worker hosts. One worker, one model, one flight. */
 let engineId = null;
 let ready = null;
@@ -77,7 +102,15 @@ if (globalThis.GPUAdapter) {
 }
 
 const post = (kind, id, payload) => self.postMessage({ kind, id, payload });
-const fail = (id, error) => post("error", id, String(error?.message ?? error));
+// A wasm trap arrives as a RuntimeError whose message is four words
+// ("memory access out of bounds") and whose stack is the only thing
+// that says where. Sending just the message makes every trap look like
+// the same trap.
+const fail = (id, error) => {
+  const message = String(error?.message ?? error);
+  const stack = String(error?.stack ?? "");
+  post("error", id, stack && !stack.startsWith(message) ? `${message}\n${stack}` : stack || message);
+};
 
 /**
  * Loads the wasm module and creates the engine.
@@ -96,10 +129,10 @@ async function load(id, payload = {}) {
     cacheKey,
     expectedLen,
     wasmUrl,
+    mountMode,
     ...config
   } = payload;
-  const exports = await init(wasmUrl ? { module_or_path: wasmUrl } : undefined);
-  wasmMemory = exports?.memory ?? wasmMemory;
+  await ensureModule(wasmUrl);
 
   // A worker hosts one engine. Creating a second without freeing the
   // first would leave hundreds of megabytes of weights and KV arenas
@@ -126,6 +159,7 @@ async function load(id, payload = {}) {
       cacheKey,
       modelUrl,
       expectedLen,
+      mountMode,
     });
   }
   engineId = created;
@@ -145,7 +179,19 @@ async function mountStreamed(id, config, source) {
   if (!Number.isFinite(expected) || expected <= 0) {
     throw new Error("mount needs `expectedLen` (or a source that knows its size)");
   }
-  const handle = await combs_model_open(JSON.stringify(config), expected, "buffer");
+  // Which road. Buffering keeps the image and hands it over whole,
+  // which is simpler and fine while it fits; past a gigabyte the image
+  // plus the weights plus the load transients stop fitting under
+  // wasm32's 4 GiB, so the bytes have to become weights as they pass
+  // and be dropped. The threshold is deliberately well below where
+  // buffering actually breaks — the streamed road is not worse, and a
+  // mount that fails at 3 GB has already spent the download.
+  //
+  // `mountMode` in the payload overrides, for measuring one road
+  // against the other on the same model.
+  const mode = source.mountMode ??
+    (expected > STREAM_ABOVE_BYTES ? "stream" : "buffer");
+  const handle = await combs_model_open(JSON.stringify(config), expected, mode);
   try {
     const reader = stream.getReader();
     let loaded = 0;
@@ -210,9 +256,13 @@ async function openModelStream({ modelBlob, cacheName, cacheKey, modelUrl }) {
  */
 async function chat(id, request) {
   if (engineId === null) throw new Error("no engine loaded");
+  // The request id crosses into wasm as a STRING. It arrives here as
+  // whatever the page numbered its messages with, and an older
+  // wasm-bindgen used to coerce that quietly; the current one reads the
+  // number as a pointer and traps on it. Convert at the boundary.
   await combs_chat_completion(
     engineId,
-    id,
+    String(id),
     JSON.stringify(request ?? {}),
     (json) => post("event", id, JSON.parse(json)),
   );
@@ -244,7 +294,7 @@ self.onmessage = async (event) => {
       case "cancel":
         // Nothing to reply to: the running request reports its own
         // cancellation through its event stream.
-        combs_cancel(id);
+        combs_cancel(String(id));
         break;
       case "stats": {
         if (engineId === null) throw new Error("no engine loaded");
@@ -255,6 +305,7 @@ self.onmessage = async (event) => {
         break;
       }
       case "caps":
+        await ensureModule(payload?.wasmUrl);
         post("metadata", id, JSON.parse(await combs_device_caps()));
         break;
       case "close":

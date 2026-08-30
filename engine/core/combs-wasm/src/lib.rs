@@ -79,7 +79,7 @@ thread_local! {
     /// that exists). `finish` REMOVES the state before doing anything
     /// else — a duplicate finish or a late append finds "no such mount"
     /// instead of a half-consumed buffer.
-    static MOUNTS: RefCell<HashMap<u32, mount::MountState>> = RefCell::new(HashMap::new());
+    static MOUNTS: RefCell<HashMap<u32, Mount>> = RefCell::new(HashMap::new());
     /// The one device this module ever creates, and its capabilities.
     /// cubecl panics on a second setup, so this is initialized once and
     /// every later caller reuses it.
@@ -178,6 +178,46 @@ fn create_engine_from_bytes(
     create_engine_from_source(config, source)
 }
 
+/// The same engine tail as [`create_engine_from_source`], from weights a
+/// stream already staged. Split rather than shared because the two
+/// differ in exactly one thing — where the model comes from — and the
+/// cache configuration below must not drift between them.
+fn create_engine_from_staged(
+    config: EngineConfigJson,
+    staged: &mut combs_models::staged::StagedWeights<combs_core::CombsBackend>,
+    header: combs_formats::GgufSource,
+) -> Result<u32, JsValue> {
+    use combs_formats::ModelSource as _;
+    let mut cache_config = combs_runtime::CacheConfig::paged(
+        config.max_seq_len.unwrap_or_else(|| {
+            combs_runtime::default_arena_len(header.metadata().max_position_embeddings)
+        }),
+    );
+    if let Some(ps) = config.page_size {
+        cache_config.page_size = ps;
+    }
+    cache_config.kind = match config.kv_cache.as_deref() {
+        None | Some("paged") => combs_runtime::CacheKind::Paged,
+        Some("contiguous") => combs_runtime::CacheKind::Contiguous,
+        Some(other) => return Err(js_err(format!("unknown kv_cache kind: {other}"))),
+    };
+    let engine = LocalEngine::load_staged(
+        staged,
+        &header,
+        combs_core::init_device(),
+        cache_config,
+    )
+    .map_err(|e| js_err(format!("engine load failed: {e}")))?;
+    let id = NEXT_ID.with(|n| {
+        let mut n = n.borrow_mut();
+        let id = *n;
+        *n += 1;
+        id
+    });
+    ENGINES.with(|m| m.borrow_mut().insert(id, engine));
+    Ok(id)
+}
+
 fn create_engine_from_source(
     config: EngineConfigJson,
     source: Box<dyn combs_formats::ModelSource>,
@@ -212,11 +252,26 @@ fn create_engine_from_source(
     Ok(id)
 }
 
+/// A mount in flight, in whichever of the two ways.
+///
+/// Buffering holds the image and hands it over whole at the end, which
+/// is the right shape up to about three gigabytes. Streaming never
+/// holds it: tensors are uploaded as their bytes pass and the bytes are
+/// dropped, which is the only shape that fits a 7B checkpoint under a
+/// tab's four gigabytes of address space.
+enum Mount {
+    Buffering(mount::MountState),
+    Streaming {
+        config_json: String,
+        mount: combs_runtime::stream_mount::StreamMount,
+    },
+}
+
 /// Opens a chunk-appended mount: validates the engine config and the
-/// declared byte length eagerly, reserves the whole buffer while the
+/// declared byte length eagerly, reserves what the mode needs while the
 /// heap is still small, and initializes the device so it overlaps the
-/// download. Mode is `"buffer"` (`"stream"` is reserved). Returns a
-/// mount handle for [`combs_model_append`] / [`combs_model_finish`].
+/// download. Mode is `"buffer"` or `"stream"`. Returns a mount handle
+/// for [`combs_model_append`] / [`combs_model_finish`].
 #[wasm_bindgen]
 pub async fn combs_model_open(
     config_json: String,
@@ -227,7 +282,29 @@ pub async fn combs_model_open(
     // Config problems must surface before gigabytes move, not after.
     let _: EngineConfigJson = serde_json::from_str(&config_json)
         .map_err(|e| js_err(format!("invalid engine config JSON: {e}")))?;
-    let state = mount::open(config_json, expected_len, &mode).map_err(js_err)?;
+    if mode == "stream" {
+        if !expected_len.is_finite() || expected_len < 1.0 || expected_len.fract() != 0.0 {
+            return Err(js_err(format!(
+                "expected_len must be a positive whole byte count, got {expected_len}"
+            )));
+        }
+        let state = Mount::Streaming {
+            config_json,
+            mount: combs_runtime::stream_mount::StreamMount::new(
+                expected_len as usize,
+                combs_core::init_device(),
+            ),
+        };
+        let id = NEXT_ID.with(|n| {
+            let mut n = n.borrow_mut();
+            let id = *n;
+            *n += 1;
+            id
+        });
+        MOUNTS.with(|m| m.borrow_mut().insert(id, state));
+        return Ok(id);
+    }
+    let state = Mount::Buffering(mount::open(config_json, expected_len, &mode).map_err(js_err)?);
     let id = NEXT_ID.with(|n| {
         let mut n = n.borrow_mut();
         let id = *n;
@@ -248,7 +325,15 @@ pub fn combs_model_append(handle: u32, chunk: &[u8]) -> Result<(), JsValue> {
         let state = m
             .get_mut(&handle)
             .ok_or_else(|| js_err(format!("no such mount: {handle}")))?;
-        mount::append(state, chunk).map_err(js_err)
+        match state {
+            Mount::Buffering(state) => mount::append(state, chunk).map_err(js_err),
+            // The streaming append does the uploading too, so this is
+            // where a mount spends most of its time — and why the
+            // worker calls it from its reader loop rather than the page.
+            Mount::Streaming { mount, .. } => {
+                mount.append(chunk).map(|_| ()).map_err(|e| js_err(e.to_string()))
+            }
+        }
     })
 }
 
@@ -261,15 +346,25 @@ pub async fn combs_model_finish(handle: u32) -> Result<u32, JsValue> {
     let state = MOUNTS
         .with(|m| m.borrow_mut().remove(&handle))
         .ok_or_else(|| js_err(format!("no such mount: {handle}")))?;
-    mount::finish_check(&state).map_err(js_err)?;
-    let config: EngineConfigJson = serde_json::from_str(&state.config_json)
-        .map_err(|e| js_err(format!("invalid engine config JSON: {e}")))?;
-    let source = combs_formats::open_model_source_segments(
-        state.into_segments(),
-        mount::SEGMENT_LEN,
-    )
-    .map_err(|e| js_err(format!("loading model: {e}")))?;
-    create_engine_from_source(config, source)
+    match state {
+        Mount::Buffering(state) => {
+            mount::finish_check(&state).map_err(js_err)?;
+            let config: EngineConfigJson = serde_json::from_str(&state.config_json)
+                .map_err(|e| js_err(format!("invalid engine config JSON: {e}")))?;
+            let source = combs_formats::open_model_source_segments(
+                state.into_segments(),
+                mount::SEGMENT_LEN,
+            )
+            .map_err(|e| js_err(format!("loading model: {e}")))?;
+            create_engine_from_source(config, source)
+        }
+        Mount::Streaming { config_json, mount } => {
+            let config: EngineConfigJson = serde_json::from_str(&config_json)
+                .map_err(|e| js_err(format!("invalid engine config JSON: {e}")))?;
+            let (mut staged, header) = mount.finish().map_err(|e| js_err(e.to_string()))?;
+            create_engine_from_staged(config, &mut staged, header)
+        }
+    }
 }
 
 /// Drops a mount and frees its buffer. Idempotent: aborting a handle
