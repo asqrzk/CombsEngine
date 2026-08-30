@@ -1031,6 +1031,83 @@ mod tests {
         }
     }
 
+    /// The same multiply, twice, in one process: bit for bit or not.
+    ///
+    /// A one-ulp run-to-run jitter has been on record since the image
+    /// pipeline was first measured, seen at a 512 canvas and never at a
+    /// 256 one — and the pipeline is now known to be bit-identical at
+    /// 256 both within a process and across two. The two canvases put
+    /// different row counts through the batched path, and different row
+    /// counts get different tuned routines: 768 rows resolve to one
+    /// kernel and 1536 to another, three times apart in throughput. If
+    /// the jitter is a kernel that accumulates in a nondeterministic
+    /// order — a split reduction, an atomic — then the shape that
+    /// engages it is the one to name, and it costs a gigabyte to ask
+    /// here rather than eleven to ask through a generation.
+    #[test]
+    fn the_same_multiply_twice_gives_the_same_bytes() {
+        use combs_formats::QuantFormat;
+        use cubecl::server::Handle;
+
+        if crate::skip_no_gpu() {
+            return;
+        }
+        pin_device_dtypes();
+        let device: Device<UnfusedF32> = Default::default();
+        let client = <WgpuRuntime as Runtime>::client(&Default::default());
+        let mk = |h: &Handle, dims: [usize; 2]| {
+            CubeTensor::new_contiguous(
+                client.clone(),
+                WgpuDevice::default(),
+                Shape::from(dims),
+                h.clone(),
+                DType::F32,
+            )
+        };
+
+        // The row counts the two canvases actually produce, either side
+        // of the point where the tuned choice changes.
+        let (k, n) = (3072usize, 4096usize);
+        let data = synth_q8_0(n * k / 32);
+        let w = QuantWeight::from_quant_tensor(&client, QuantFormat::Q8_0, &data, n, k).unwrap();
+        drop(data);
+
+        for m in [768usize, 1024, 1536] {
+            let xv: Vec<f32> = (0..m * k)
+                .map(|i| ((i % 37) as f32) / 18.0 - 1.0)
+                .collect();
+            let x_h = Tensor::<UnfusedF32, 2>::from_data(TensorData::new(xv, [m, k]), &device)
+                .into_primitive()
+                .tensor()
+                .handle;
+            let once = || -> Vec<f32> {
+                let out = try_batched_matmul_with(&w, &mk(&x_h, [m, k]), 1, m, DType::F32)
+                    .expect("batched path engages");
+                Tensor::<UnfusedF32, 3>::from_primitive(TensorPrimitive::Float(out))
+                    .into_data()
+                    .to_vec()
+                    .unwrap()
+            };
+            let a = once();
+            let b = once();
+            let differing = a
+                .iter()
+                .zip(b.iter())
+                .filter(|(x, y)| x.to_bits() != y.to_bits())
+                .count();
+            println!(
+                "m {m:>5}: {} of {} outputs differ between two identical calls",
+                differing,
+                a.len()
+            );
+            assert_eq!(
+                differing, 0,
+                "m {m}: the same multiply gave different bytes twice — the tuned \
+                 routine for this row count accumulates in a nondeterministic order"
+            );
+        }
+    }
+
     /// Range safety, which is the reason the narrow path normalizes at
     /// all. A flow-matching image run puts 60551 through these linears,
     /// against f16's largest finite value of 65504 — and an overflow
