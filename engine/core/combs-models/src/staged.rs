@@ -26,6 +26,50 @@ use crate::embed::Embedding;
 use crate::qlinear::{Linear, QuantLinearOp, try_quant_linear};
 use crate::{ModelError, Result};
 
+/// Run `f` with device allocations marked persistent, on the backends
+/// that draw the distinction.
+///
+/// A staged weight lives as long as the model; the buffers used to
+/// build it do not. Drawn from one pool those two lifetimes interleave,
+/// and a mount lays down some hundreds of long-lived blocks between
+/// transients, which is the shape that fragments an allocator. On a
+/// backend without the notion this is simply a call.
+pub(crate) fn persistent_scope<B: Backend, R: Send>(
+    device: &Device<B>,
+    f: impl FnOnce() -> R + Send,
+) -> R {
+    use std::any::Any;
+    let device_any: &dyn Any = device;
+    let Some(wgpu_device) = device_any.downcast_ref::<burn::backend::wgpu::WgpuDevice>() else {
+        return f();
+    };
+    let client =
+        <burn::backend::wgpu::WgpuRuntime as cubecl::prelude::Runtime>::client(wgpu_device);
+    let mut out: Option<R> = None;
+    let _ = client.memory_persistent_allocation(&mut out, move |slot: &mut Option<R>| {
+        *slot = Some(f());
+    });
+    // The scope runs its task unconditionally today. If that ever stops
+    // being true, a mount silently producing no weights is far worse
+    // than one that says so here.
+    out.expect("the persistent-allocation scope did not run its task")
+}
+
+/// Submit whatever device work is queued. Uploads are enqueued rather
+/// than executed, so without this the buffers behind them cannot be
+/// recycled and the queue grows with the model instead of with the
+/// window. A no-op on backends that do not queue.
+pub fn flush_device<B: Backend>(device: &Device<B>) {
+    use std::any::Any;
+    let device_any: &dyn Any = device;
+    let Some(wgpu_device) = device_any.downcast_ref::<burn::backend::wgpu::WgpuDevice>() else {
+        return;
+    };
+    let client =
+        <burn::backend::wgpu::WgpuRuntime as cubecl::prelude::Runtime>::client(wgpu_device);
+    let _ = client.flush();
+}
+
 /// A tensor already on the device, kept flat with its shape beside it.
 ///
 /// Flat because the loader asks for ranks the map cannot know in
@@ -90,6 +134,15 @@ impl<B: Backend> StagedWeights<B> {
         if self.names.iter().any(|n| n == name) {
             return Ok(());
         }
+        persistent_scope::<B, _>(device, || self.stage_inner(source, device, name))
+    }
+
+    fn stage_inner(
+        &mut self,
+        source: &dyn ModelSource,
+        device: &Device<B>,
+        name: &str,
+    ) -> Result<()> {
         // The embedding is staged as a pair: a packed table hands back
         // the tied head that shares it, one copy in VRAM rather than
         // two. Recognized by name because that pairing is the only

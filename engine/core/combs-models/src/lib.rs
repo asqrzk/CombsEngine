@@ -30,6 +30,7 @@ pub use archspec::{ArchSpec, LayerKind, NormFlavor};
 pub use kv::{CacheConfig, CacheKind, ContiguousKVCache, KVCache, PageStats, PagedKVCache};
 pub use llama::LlamaModel;
 pub use norm::rms_norm;
+pub use staged::flush_device;
 pub use qlinear::{batched_matmul_summary, quant_census, Linear, QuantLinearOp, try_quant_linear};
 pub use qmatmul::{
     Q4KWeight, Q5KWeight, Q6KWeight, Q40Weight, Q50Weight, Q80Weight, dequantize_q4_0_gpu,
