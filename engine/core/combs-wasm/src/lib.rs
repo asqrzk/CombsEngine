@@ -252,6 +252,46 @@ fn create_engine_from_source(
     Ok(id)
 }
 
+/// Creates an engine from an ONNX graph and the siblings a directory
+/// would have held: `{ config, tokenizer, tokenizer_config?,
+/// generation_config?, chat_template? }`, each a JSON string.
+///
+/// Separate from [`combs_engine_create`] because ONNX has no magic
+/// bytes to recognize it by — a graph is protobuf, and guessing at
+/// protobuf is how you load the wrong thing confidently. The caller
+/// says what it is handing over. The reader itself was already in the
+/// module; it was only ever unreachable from a browser, which has no
+/// directory to read siblings from.
+#[wasm_bindgen]
+pub async fn combs_engine_create_onnx(
+    config_json: String,
+    graph: Vec<u8>,
+    siblings_json: String,
+) -> Result<u32, JsValue> {
+    ensure_device().await.map_err(js_err)?;
+    let config: EngineConfigJson = serde_json::from_str(&config_json)
+        .map_err(|e| js_err(format!("invalid engine config JSON: {e}")))?;
+    let s: serde_json::Value = serde_json::from_str(&siblings_json)
+        .map_err(|e| js_err(format!("invalid onnx siblings JSON: {e}")))?;
+    let text = |key: &str| s.get(key).and_then(|v| v.as_str()).map(String::from);
+    let required = |key: &str| {
+        text(key).ok_or_else(|| js_err(format!("onnx siblings: {key} is required")))
+    };
+    let source = combs_formats::OnnxSource::from_parts(
+        graph,
+        combs_formats::OnnxSiblings {
+            config: required("config")?,
+            tokenizer_json: required("tokenizer")?.into_bytes(),
+            tokenizer_config: text("tokenizer_config"),
+            generation_config: text("generation_config"),
+            chat_template: text("chat_template"),
+            sidecars: std::collections::HashMap::new(),
+        },
+    )
+    .map_err(|e| js_err(format!("loading onnx model: {e}")))?;
+    create_engine_from_source(config, Box::new(source))
+}
+
 /// A mount in flight, in whichever of the two ways.
 ///
 /// Buffering holds the image and hands it over whole at the end, which

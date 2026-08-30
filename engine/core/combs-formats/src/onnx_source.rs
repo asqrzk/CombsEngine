@@ -22,13 +22,52 @@ use crate::source::{ModelSource, QuantFormat, QuantTensor, TensorDtype, TensorRe
 use crate::tokenizer::{TokenizerSource, TokenizerSpec};
 use crate::{FormatError, ModelMetadata, Result, SamplerConfig};
 
+/// The graph's bytes, however they got here. Mapped from a file
+/// natively; owned when a page handed them over, because a browser has
+/// no filesystem to map and the alternative — a second code path for
+/// reading initializers — is the one place a format adapter must not
+/// have two of.
+enum Image {
+    #[cfg(not(target_family = "wasm"))]
+    Mapped(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl std::ops::Deref for Image {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            #[cfg(not(target_family = "wasm"))]
+            Image::Mapped(m) => m,
+            Image::Owned(v) => v,
+        }
+    }
+}
+
+/// Everything an ONNX export keeps beside its graph. A directory holds
+/// these as files; a page has to hand them over, so they are named once
+/// here and both roads fill the same shape.
+pub struct OnnxSiblings {
+    /// `config.json` — required, it carries the architecture.
+    pub config: String,
+    /// `tokenizer.json` — required.
+    pub tokenizer_json: Vec<u8>,
+    pub tokenizer_config: Option<String>,
+    pub generation_config: Option<String>,
+    /// `chat_template.jinja`, for exports that moved it out of
+    /// `tokenizer_config.json`.
+    pub chat_template: Option<String>,
+    /// External-data sidecars by their manifest `location`.
+    pub sidecars: HashMap<String, Vec<u8>>,
+}
+
 pub struct OnnxSource {
     metadata: ModelMetadata,
     tokenizer: TokenizerSpec,
     model: OnnxModel,
-    image: Mmap,
+    image: Image,
     /// External-data sidecars by their manifest `location`.
-    sidecars: HashMap<String, Mmap>,
+    sidecars: HashMap<String, Image>,
     /// HF-canonical name → (initializer name, needs transpose).
     names: HashMap<String, (String, bool)>,
     /// HF-canonical name → block-quantized MatMulNBits weight.
@@ -108,10 +147,14 @@ impl OnnxSource {
     /// Open a `.onnx` graph file. Siblings are searched in the file's
     /// directory first, then one level up (the `repo/onnx/model.onnx`
     /// layout HF exports use).
+    ///
+    /// Native only: a browser has no directory to search, and reaches
+    /// the same source through [`OnnxSource::from_parts`].
+    #[cfg(not(target_family = "wasm"))]
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let file = std::fs::File::open(path)?;
-        let image = unsafe { Mmap::map(&file)? };
+        let image = Image::Mapped(unsafe { Mmap::map(&file)? });
         let model = OnnxModel::parse(&image)?;
 
         let dir = path.parent().unwrap_or(Path::new("."));
@@ -184,48 +227,129 @@ impl OnnxSource {
                             p.display()
                         ))
                     })?;
-                    sidecars.insert(location.clone(), unsafe { Mmap::map(&f)? });
+                    sidecars.insert(location.clone(), Image::Mapped(unsafe { Mmap::map(&f)? }));
                 }
             }
         }
 
-        // --- quant table -------------------------------------------------
-        // MatMulNBits weights come as `<name>.MatMul.weight_Q4` +
-        // `..._scales` initializer PAIRS addressed by the node; they
-        // surface under the canonical linear name, quantized — never
-        // as raw dense tensors.
-        let mut quants = HashMap::new();
-        for node in &model.matmul_nbits {
-            let Some(packed) = node.inputs.get(1) else { continue };
-            let Some(scales) = node.inputs.get(2) else { continue };
-            let base = packed.trim_end_matches("_Q4");
-            let Some((canonical, _)) = canonical_name(base) else { continue };
-            quants.insert(canonical, QuantEntry {
-                packed: packed.clone(),
-                scales: scales.clone(),
-                k: node.k as usize,
-                n: node.n as usize,
-                block_size: node.block_size as usize,
-                beyond_q4_0: node.inputs.len() > 3 || node.bits != 4,
-            });
-        }
-
-        // --- name table --------------------------------------------------
-        let quant_parts: std::collections::HashSet<&String> = quants
-            .values()
-            .flat_map(|q| [&q.packed, &q.scales])
-            .collect();
-        let mut names = HashMap::new();
-        for raw in model.tensors.keys() {
-            if quant_parts.contains(raw) {
-                continue;
-            }
-            if let Some((canonical, transposed)) = canonical_name(raw) {
-                names.insert(canonical, (raw.clone(), transposed));
-            }
-        }
-
+        let (names, quants) = Self::index(&model);
         Ok(Self { metadata, tokenizer, model, image, sidecars, names, quants })
+    }
+
+    /// Open a graph a page handed over, with its siblings beside it.
+    ///
+    /// The directory road and this one build the SAME source: the
+    /// quant table, the name table and the metadata are derived by the
+    /// shared tail below, so a model cannot mean one thing when read
+    /// from disk and another when read from a network.
+    pub fn from_parts(graph: Vec<u8>, siblings: OnnxSiblings) -> Result<Self> {
+        let image = Image::Owned(graph);
+        let model = OnnxModel::parse(&image)?;
+
+        let config: serde_json::Value = serde_json::from_slice(siblings.config.as_bytes())
+            .map_err(|e| FormatError::Json { context: "config.json".into(), source: e })?;
+        let generation_config = siblings
+            .generation_config
+            .as_deref()
+            .map(|raw| {
+                serde_json::from_str::<serde_json::Value>(raw).map_err(|e| FormatError::Json {
+                    context: "generation_config.json".into(),
+                    source: e,
+                })
+            })
+            .transpose()?;
+        let metadata = ModelMetadata::from_hf_config(&config, generation_config.as_ref())?;
+
+        let mut added_tokens = HashMap::new();
+        let mut chat_template = siblings.chat_template.clone();
+        let mut add_bos = None;
+        if let Some(raw) = siblings.tokenizer_config.as_deref() {
+            let tc: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+                FormatError::Json { context: "tokenizer_config.json".into(), source: e }
+            })?;
+            if let Some(map) = tc.get("added_tokens_decoder").and_then(|v| v.as_object()) {
+                for (id, entry) in map {
+                    if let (Ok(id), Some(content)) =
+                        (id.parse::<u32>(), entry.get("content").and_then(|c| c.as_str()))
+                    {
+                        added_tokens.insert(id, content.to_string());
+                    }
+                }
+            }
+            if chat_template.is_none() {
+                chat_template =
+                    tc.get("chat_template").and_then(|v| v.as_str()).map(String::from);
+            }
+            add_bos = tc.get("add_bos_token").and_then(|v| v.as_bool());
+        }
+        let tokenizer = TokenizerSpec {
+            tokenizer: TokenizerSource::Bytes(siblings.tokenizer_json),
+            added_tokens,
+            chat_template,
+            add_bos,
+        };
+
+        let mut sidecars = HashMap::new();
+        for info in model.tensors.values() {
+            if let OnnxData::External { location, .. } = &info.data {
+                if !sidecars.contains_key(location) {
+                    let bytes = siblings.sidecars.get(location).ok_or_else(|| {
+                        FormatError::MissingFile(format!(
+                            "external data {location} was not delivered with the graph"
+                        ))
+                    })?;
+                    sidecars.insert(location.clone(), Image::Owned(bytes.clone()));
+                }
+            }
+        }
+
+        let (names, quants) = Self::index(&model);
+        Ok(Self { metadata, tokenizer, model, image, sidecars, names, quants })
+    }
+
+    /// The quant table and the name table, derived from the graph
+    /// alone. Both constructors call this, which is what makes the
+    /// claim that they build the same source true rather than
+    /// intended.
+    fn index(
+        model: &OnnxModel,
+    ) -> (HashMap<String, (String, bool)>, HashMap<String, QuantEntry>) {
+        // --- quant table -------------------------------------------------
+            // MatMulNBits weights come as `<name>.MatMul.weight_Q4` +
+            // `..._scales` initializer PAIRS addressed by the node; they
+            // surface under the canonical linear name, quantized — never
+            // as raw dense tensors.
+            let mut quants = HashMap::new();
+            for node in &model.matmul_nbits {
+                let Some(packed) = node.inputs.get(1) else { continue };
+                let Some(scales) = node.inputs.get(2) else { continue };
+                let base = packed.trim_end_matches("_Q4");
+                let Some((canonical, _)) = canonical_name(base) else { continue };
+                quants.insert(canonical, QuantEntry {
+                    packed: packed.clone(),
+                    scales: scales.clone(),
+                    k: node.k as usize,
+                    n: node.n as usize,
+                    block_size: node.block_size as usize,
+                    beyond_q4_0: node.inputs.len() > 3 || node.bits != 4,
+                });
+            }
+
+            // --- name table --------------------------------------------------
+            let quant_parts: std::collections::HashSet<&String> = quants
+                .values()
+                .flat_map(|q| [&q.packed, &q.scales])
+                .collect();
+            let mut names = HashMap::new();
+            for raw in model.tensors.keys() {
+                if quant_parts.contains(raw) {
+                    continue;
+                }
+                if let Some((canonical, transposed)) = canonical_name(raw) {
+                    names.insert(canonical, (raw.clone(), transposed));
+                }
+            }
+            (names, quants)
     }
 
     /// A quant entry's scales as f32 (stored f16 or f32).
@@ -380,5 +504,96 @@ impl ModelSource for OnnxSource {
 
     fn sampler_defaults(&self) -> Option<SamplerConfig> {
         None
+    }
+}
+
+#[cfg(test)]
+mod parts_tests {
+    use super::*;
+    use crate::ModelSource;
+
+    fn cache() -> Option<PathBuf> {
+        let root = PathBuf::from(std::env::var("HOME").ok()?)
+            .join(".cache/combs/models/qwen3-0.6b-onnx");
+        root.join("onnx/model_q4f16.onnx").exists().then_some(root)
+    }
+
+    /// A graph handed over as bytes must build the same source as the
+    /// same graph read from its directory.
+    ///
+    /// This is the whole claim behind putting ONNX in a browser: the
+    /// page supplies what the filesystem supplied, and nothing else
+    /// changes. Compared on what a model is actually made of — its
+    /// metadata, every tensor name, and the bytes of the tensors
+    /// themselves, quantized and dense.
+    #[test]
+    fn bytes_and_directory_build_the_same_source() {
+        let Some(root) = cache() else {
+            eprintln!("skip: qwen3-0.6b-onnx is not in the local cache");
+            return;
+        };
+        let graph_path = root.join("onnx/model_q4f16.onnx");
+        let from_dir = OnnxSource::load(&graph_path).expect("directory road");
+
+        let read = |name: &str| std::fs::read(root.join(name)).ok();
+        let read_str = |name: &str| std::fs::read_to_string(root.join(name)).ok();
+        let from_bytes = OnnxSource::from_parts(
+            std::fs::read(&graph_path).unwrap(),
+            OnnxSiblings {
+                config: read_str("config.json").expect("config.json"),
+                tokenizer_json: read("tokenizer.json").expect("tokenizer.json"),
+                tokenizer_config: read_str("tokenizer_config.json"),
+                generation_config: read_str("generation_config.json"),
+                chat_template: read_str("chat_template.jinja"),
+                sidecars: HashMap::new(),
+            },
+        )
+        .expect("bytes road");
+
+        assert_eq!(
+            from_dir.metadata().architecture,
+            from_bytes.metadata().architecture
+        );
+        assert_eq!(from_dir.metadata().vocab_size, from_bytes.metadata().vocab_size);
+        assert_eq!(
+            from_dir.metadata().num_hidden_layers,
+            from_bytes.metadata().num_hidden_layers
+        );
+
+        let mut a = from_dir.tensor_names();
+        let mut b = from_bytes.tensor_names();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "the two roads disagree about which tensors exist");
+        assert!(!a.is_empty(), "no tensors at all — the comparison would be empty");
+
+        let mut quantized = 0;
+        let mut dense = 0;
+        for name in &a {
+            match (
+                from_dir.open_tensor_quant(name).unwrap(),
+                from_bytes.open_tensor_quant(name).unwrap(),
+            ) {
+                (Some(x), Some(y)) => {
+                    assert_eq!(x.format, y.format, "{name}: format");
+                    assert_eq!(x.shape, y.shape, "{name}: shape");
+                    assert_eq!(&*x.data, &*y.data, "{name}: packed bytes");
+                    quantized += 1;
+                }
+                (None, None) => {
+                    let x = from_dir.open_tensor(name).unwrap().load_data().unwrap();
+                    let y = from_bytes.open_tensor(name).unwrap().load_data().unwrap();
+                    assert_eq!(x.shape, y.shape, "{name}: dense shape");
+                    assert_eq!(
+                        x.to_vec::<f32>().unwrap(),
+                        y.to_vec::<f32>().unwrap(),
+                        "{name}: dense values"
+                    );
+                    dense += 1;
+                }
+                _ => panic!("{name}: the roads disagree on whether it is quantized"),
+            }
+        }
+        eprintln!("{quantized} quantized and {dense} dense tensors identical across both roads");
     }
 }

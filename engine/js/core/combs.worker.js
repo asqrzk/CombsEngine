@@ -20,6 +20,7 @@ import init, {
   combs_chat_completion,
   combs_device_caps,
   combs_engine_create,
+  combs_engine_create_onnx,
   combs_engine_destroy,
   combs_engine_metadata,
   combs_engine_stats,
@@ -283,6 +284,24 @@ self.onmessage = async (event) => {
           .catch(() => {})
           .then(() => load(id, payload));
         await ready;
+        break;
+      case "loadOnnx":
+        // ONNX arrives as a graph plus the files a directory would have
+        // held beside it. One engine per worker, so the previous one is
+        // freed before this reserves anything, exactly as `load` does.
+        await ensureModule(payload?.wasmUrl);
+        {
+          const previous = engineId;
+          engineId = null;
+          if (previous !== null) combs_engine_destroy(previous);
+          const { graph, siblings, ...config } = payload ?? {};
+          engineId = await combs_engine_create_onnx(
+            JSON.stringify(config),
+            new Uint8Array(graph),
+            JSON.stringify(siblings ?? {}),
+          );
+          post("ready", id, JSON.parse(combs_engine_metadata(engineId)));
+        }
         break;
       case "metadata":
         if (engineId === null) throw new Error("no engine loaded");
