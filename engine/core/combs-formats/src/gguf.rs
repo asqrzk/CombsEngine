@@ -39,7 +39,7 @@ use crate::{FormatError, Result};
 const GGUF_MAGIC: u32 = 0x4655_4747; // "GGUF"
 
 #[derive(Debug, Clone)]
-enum MetaValue {
+pub(crate) enum MetaValue {
     U32(u32),
     I32(i32),
     U64(u64),
@@ -52,7 +52,7 @@ enum MetaValue {
 }
 
 #[derive(Debug, Clone)]
-struct TensorInfo {
+pub(crate) struct TensorInfo {
     name: String,
     dims: Vec<usize>, // ggml order (fastest dim first)
     ggml_type: u32,
@@ -79,6 +79,16 @@ enum GgufData {
         seg_len: usize,
         total: usize,
     },
+    /// A moving view of an image that is still arriving, or has already
+    /// been consumed and dropped. Only `[base, base + buf.len())` is
+    /// readable; everything else is gone or not here yet, and asking
+    /// for it fails rather than returning the wrong bytes. This is what
+    /// lets a model be mounted without ever holding it whole.
+    Window {
+        buf: Vec<u8>,
+        base: usize,
+        total: usize,
+    },
 }
 
 impl GgufData {
@@ -88,6 +98,7 @@ impl GgufData {
             GgufData::Mmap(m) => m.len(),
             GgufData::Owned(v) => v.len(),
             GgufData::Segmented { total, .. } => *total,
+            GgufData::Window { total, .. } => *total,
         }
     }
 
@@ -103,6 +114,12 @@ impl GgufData {
             GgufData::Owned(v) => v,
             GgufData::Segmented { segments, .. } => {
                 segments.first().map(|s| s.as_slice()).unwrap_or(&[])
+            }
+            // The header lives at offset zero; once the window has moved
+            // past it there is no prefix to read and saying so is the
+            // honest answer.
+            GgufData::Window { buf, base, .. } => {
+                if *base == 0 { buf.as_slice() } else { &[] }
             }
         }
     }
@@ -138,7 +155,125 @@ impl GgufData {
                 }
                 Some(Cow::Owned(out))
             }
+            GgufData::Window { buf, base, .. } => {
+                let off = start.checked_sub(*base)?;
+                buf.get(off..off.checked_add(len)?).map(Cow::Borrowed)
+            }
         }
+    }
+}
+
+/// Everything before the tensor payloads: what a mount must hold in
+/// full before it can place a single byte of weight. Parsed apart from
+/// the rest of the file so a mount that is still arriving can ask for
+/// it and be told, honestly, that it is not all here yet.
+pub(crate) struct GgufHeader {
+    pub(crate) version: u32,
+    pub(crate) kv: HashMap<String, MetaValue>,
+    pub(crate) tensors: HashMap<String, TensorInfo>,
+    /// Offset of the first payload byte — the alignment boundary after
+    /// the info section.
+    pub(crate) data_start: usize,
+}
+
+impl GgufHeader {
+    /// Parse from a prefix of the image. `Ok(None)` means "not all here
+    /// yet, feed more"; `Err` means this will never parse however many
+    /// bytes arrive. Pass `total` when the image's eventual length is
+    /// known — it is what separates a header still in flight from a
+    /// corrupt length field claiming the file is enormous.
+    pub(crate) fn try_parse(bytes: &[u8], total: Option<usize>) -> Result<Option<Self>> {
+        let mut c = Cursor::with_limit(bytes, total);
+        macro_rules! more {
+            ($e:expr) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(err) => {
+                        return if c.exhausted { Ok(None) } else { Err(err) };
+                    }
+                }
+            };
+        }
+
+        if more!(c.u32()) != GGUF_MAGIC {
+            return Err(FormatError::Safetensors("gguf: bad magic".into()));
+        }
+        let version = more!(c.u32());
+        if !(2..=3).contains(&version) {
+            return Err(FormatError::Safetensors(format!(
+                "gguf: unsupported version {version}"
+            )));
+        }
+        let tensor_count = more!(c.u64()) as usize;
+        let kv_count = more!(c.u64()) as usize;
+
+        // Counts come off the wire before the entries they describe, so
+        // they size allocations before anything has validated them. A
+        // corrupt pair would otherwise reserve gigabytes on a header
+        // that is only a few bytes in.
+        let entry_floor = 12usize; // smallest possible kv or tensor record
+        if let Some(limit) = total {
+            let claimed = tensor_count
+                .saturating_add(kv_count)
+                .saturating_mul(entry_floor);
+            if claimed > limit {
+                return Err(FormatError::Safetensors(format!(
+                    "gguf: header claims {kv_count} metadata entries and \
+                     {tensor_count} tensors, which cannot fit in {limit} bytes"
+                )));
+            }
+        }
+
+        let mut kv = HashMap::with_capacity(kv_count.min(4096));
+        for _ in 0..kv_count {
+            let key = more!(c.string());
+            let ty = more!(c.u32());
+            let value = more!(read_meta_value(&mut c, ty));
+            kv.insert(key, value);
+        }
+
+        let mut tensors = HashMap::with_capacity(tensor_count.min(4096));
+        for _ in 0..tensor_count {
+            let name = more!(c.string());
+            let n_dims = more!(c.u32()) as usize;
+            let mut dims = Vec::with_capacity(n_dims.min(8));
+            for _ in 0..n_dims {
+                dims.push(more!(c.u64()) as usize);
+            }
+            let ggml_type = more!(c.u32());
+            let offset = more!(c.u64()) as usize;
+            tensors.insert(name.clone(), TensorInfo { name, dims, ggml_type, offset });
+        }
+
+        // Tensor data starts after the info section, aligned to 32 bytes.
+        let alignment = match kv.get("general.alignment") {
+            Some(MetaValue::U32(a)) => *a as usize,
+            _ => 32,
+        };
+        let alignment = alignment.max(1);
+        let data_start = c.pos.div_ceil(alignment) * alignment;
+
+        // Split GGUFs (llama.cpp `gguf-split` shards, `…-00001-of-0000N`)
+        // carry only a slice of the tensors; loading one would fail later
+        // with a baffling missing-tensor error and a wrong tied-head guess.
+        // Refused HERE so a streamed mount finds out before it has pulled
+        // a gigabyte rather than after.
+        if let Some(MetaValue::U32(count)) = kv.get("split.count") {
+            if *count > 1 {
+                let no = match kv.get("split.no") {
+                    Some(MetaValue::U32(n)) => *n + 1,
+                    _ => 1,
+                };
+                return Err(FormatError::Safetensors(format!(
+                    "split GGUF: this file is shard {no} of {count} — \
+                     multi-file GGUF loading is not supported yet; pull a \
+                     single-file quant or merge the shards with llama.cpp's \
+                     `llama-gguf-split --merge`"
+                )));
+            }
+        }
+
+        Ok(Some(GgufHeader { version, kv, tensors, data_start }))
     }
 }
 
@@ -176,14 +311,33 @@ pub struct GgufSource {
 struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// Set when a read ran past the end of `buf` while still inside what
+    /// the image is eventually going to be. A streaming mount has to
+    /// tell "not yet" from "never": the first means feed more bytes, the
+    /// second means the file is wrong, and an error string cannot be
+    /// asked which it was.
+    exhausted: bool,
+    /// The image's full length when it is known. A read past this is
+    /// malformed however few bytes are in hand — without it, a corrupt
+    /// string length asking for a terabyte would masquerade as a
+    /// truncated header forever.
+    limit: Option<usize>,
 }
 
 impl<'a> Cursor<'a> {
     fn new(buf: &'a [u8]) -> Self {
-        Cursor { buf, pos: 0 }
+        Cursor { buf, pos: 0, exhausted: false, limit: None }
+    }
+    fn with_limit(buf: &'a [u8], limit: Option<usize>) -> Self {
+        Cursor { buf, pos: 0, exhausted: false, limit }
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         if self.pos + n > self.buf.len() {
+            let within_image = match self.limit {
+                Some(limit) => self.pos.saturating_add(n) <= limit,
+                None => true,
+            };
+            self.exhausted = within_image;
             return Err(FormatError::Safetensors("gguf: unexpected end of file".into()));
         }
         let out = &self.buf[self.pos..self.pos + n];
@@ -362,67 +516,53 @@ impl GgufSource {
     fn parse(data: GgufData, path: Option<PathBuf>) -> Result<Self> {
         // The header reads from the contiguous head of the image; a
         // segmented image's first segment is gigabyte-scale while GGUF
-        // headers are megabytes, and overrunning it errors in Cursor.
-        let mut c = Cursor::new(data.prefix());
+        // headers are megabytes, and a header that outruns it fails
+        // loudly rather than silently.
+        let total = data.len();
+        let header = GgufHeader::try_parse(data.prefix(), Some(total))?.ok_or_else(|| {
+            FormatError::Safetensors(
+                "gguf: header runs past the bytes in hand — a truncated file, \
+                 or a header larger than the first segment"
+                    .into(),
+            )
+        })?;
+        Self::from_header(header, data, path)
+    }
 
-        if c.u32()? != GGUF_MAGIC {
-            return Err(FormatError::Safetensors("gguf: bad magic".into()));
-        }
-        let version = c.u32()?;
-        if !(2..=3).contains(&version) {
-            return Err(FormatError::Safetensors(format!(
-                "gguf: unsupported version {version}"
-            )));
-        }
-        let tensor_count = c.u64()? as usize;
-        let kv_count = c.u64()? as usize;
+    /// A source over a MOVING WINDOW of an image: `window` holds bytes
+    /// `[base, base + window.len())` of a file `total` bytes long, and
+    /// nothing else is readable. `header_bytes` must cover the header,
+    /// which a mount has in hand from the first bytes off the wire.
+    ///
+    /// Every tensor whose payload lies inside the window reads exactly
+    /// as it would from the whole file; every other tensor fails by
+    /// name. That is the whole contract, and it is what lets a model be
+    /// mounted without the file ever existing anywhere entire.
+    pub fn from_window(
+        header_bytes: &[u8],
+        window: Vec<u8>,
+        base: usize,
+        total: usize,
+    ) -> Result<Self> {
+        let header = GgufHeader::try_parse(header_bytes, Some(total))?.ok_or_else(|| {
+            FormatError::Safetensors(
+                "gguf: window given a header that is not all there".into(),
+            )
+        })?;
+        Self::from_header(header, GgufData::Window { buf: window, base, total }, None)
+    }
 
-        let mut kv = HashMap::with_capacity(kv_count);
-        for _ in 0..kv_count {
-            let key = c.string()?;
-            let ty = c.u32()?;
-            let value = read_meta_value(&mut c, ty)?;
-            kv.insert(key, value);
-        }
-
-        let mut tensors = HashMap::with_capacity(tensor_count);
-        for _ in 0..tensor_count {
-            let name = c.string()?;
-            let n_dims = c.u32()? as usize;
-            let mut dims = Vec::with_capacity(n_dims);
-            for _ in 0..n_dims {
-                dims.push(c.u64()? as usize);
-            }
-            let ggml_type = c.u32()?;
-            let offset = c.u64()? as usize;
-            tensors.insert(name.clone(), TensorInfo { name, dims, ggml_type, offset });
-        }
-
-        // Tensor data starts after the info section, aligned to 32 bytes.
-        let alignment = match kv.get("general.alignment") {
-            Some(MetaValue::U32(a)) => *a as usize,
-            _ => 32,
-        };
-        let data_start = c.pos.div_ceil(alignment) * alignment;
-
-        // Split GGUFs (llama.cpp `gguf-split` shards, `…-00001-of-0000N`)
-        // carry only a slice of the tensors; loading one would fail later
-        // with a baffling missing-tensor error and a wrong tied-head guess.
-        if let Some(MetaValue::U32(count)) = kv.get("split.count") {
-            if *count > 1 {
-                let no = match kv.get("split.no") {
-                    Some(MetaValue::U32(n)) => *n + 1,
-                    _ => 1,
-                };
-                return Err(FormatError::Safetensors(format!(
-                    "split GGUF: this file is shard {no} of {count} — \
-                     multi-file GGUF loading is not supported yet; pull a \
-                     single-file quant or merge the shards with llama.cpp's \
-                     `llama-gguf-split --merge`"
-                )));
-            }
-        }
-
+    /// Assemble a source from a header that has ALREADY been parsed and
+    /// an image that may be less than whole. The streaming mount reads
+    /// the header from the first bytes off the wire and then never has
+    /// the file entire, so the two steps have to be separable; the
+    /// whole-file path just does them back to back.
+    pub(crate) fn from_header(
+        header: GgufHeader,
+        data: GgufData,
+        path: Option<PathBuf>,
+    ) -> Result<Self> {
+        let GgufHeader { kv, tensors, data_start, .. } = header;
         let metadata = build_model_metadata(&kv)?;
         let (eos_ids, bos_id, added_tokens) = tokenizer_ids(&kv);
         // A file on disk gets the sibling-or-cached tokenizer.json (written
@@ -1387,6 +1527,87 @@ impl GgufSource {
         Some((format!("blk.{layer}.{fused}"), start, len))
     }
 
+    /// The payload bytes of one tensor. The single place a tensor's
+    /// byte range is turned into bytes, so the residency rule lives in
+    /// one spot: a windowed image answers only for what it still holds,
+    /// and a tensor asked for out of order fails here with its name on
+    /// it rather than somewhere downstream with a shape mismatch.
+    fn tensor_bytes(&self, info: &TensorInfo) -> Result<std::borrow::Cow<'_, [u8]>> {
+        let size = tensor_byte_size(info)?;
+        let start = self.data_start + info.offset;
+        self.data.slice(start, size).ok_or_else(|| {
+            FormatError::Safetensors(format!(
+                "gguf tensor {}: bytes {}..{} are not available{}",
+                info.name,
+                start,
+                start + size,
+                match &self.data {
+                    GgufData::Window { base, buf, .. } => format!(
+                        " — the mount window holds {}..{}",
+                        base,
+                        base + buf.len()
+                    ),
+                    _ => " (out of bounds)".to_string(),
+                }
+            ))
+        })
+    }
+
+    /// Which HF tensors this ggml tensor supplies — [`resolve_tensor`]
+    /// read backwards. A load driven by the file rather than by the
+    /// model walks tensors in the order the bytes arrive, so it needs
+    /// to go from the name on the wire to the names the model asked
+    /// for; a fused projection answers with all of its parts, each with
+    /// its row range. An empty result means nothing in the model wants
+    /// these bytes, which is a fact to act on and not an error.
+    pub(crate) fn hf_names_for_ggml(&self, ggml: &str) -> Vec<(String, Option<(usize, usize)>)> {
+        // Fused projections are asked about FIRST, and the order is
+        // load-bearing rather than tidy. On phi3 the fused gate+up
+        // tensor is named `ffn_up.weight`, which the forward map — which
+        // knows nothing of architectures here — happily reads as the
+        // whole `mlp.up_proj.weight`. `resolve_tensor` gets the right
+        // answer only because it tries the splitter first, so this must
+        // too, or the two describe different files.
+        let fused = self.fused_parts(ggml);
+        if !fused.is_empty() {
+            return fused;
+        }
+        let arch = self.metadata.architecture.as_str();
+        if let Some(direct) = map_tensor_name(ggml, arch) {
+            return vec![(direct, None)];
+        }
+        Vec::new()
+    }
+
+    /// The HF names living inside `ggml` when it is a fused projection.
+    /// Candidates come from `fused_slice` itself — asking each name the
+    /// splitter knows whether it lands here — so the two cannot drift.
+    fn fused_parts(&self, ggml: &str) -> Vec<(String, Option<(usize, usize)>)> {
+        let Some(rest) = ggml.strip_prefix("blk.") else {
+            return Vec::new();
+        };
+        let Some((layer, _)) = rest.split_once('.') else {
+            return Vec::new();
+        };
+        const FUSED_PARTS: [&str; 5] = [
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+        ];
+        let mut out: Vec<(String, Option<(usize, usize)>)> = FUSED_PARTS
+            .iter()
+            .filter_map(|part| {
+                let hf = format!("model.layers.{layer}.{part}");
+                let (fused, start, len) = self.fused_slice(&hf)?;
+                (fused == ggml).then_some((hf, Some((start, len))))
+            })
+            .collect();
+        out.sort_by_key(|(_, range)| range.map(|(start, _)| start).unwrap_or(0));
+        out
+    }
+
     /// Looks up the ggml tensor serving HF `name`, with the row range to
     /// slice when it lives inside a fused projection (`None` range = whole
     /// tensor).
@@ -1441,11 +1662,7 @@ impl ModelSource for GgufSource {
             .ok_or_else(|| FormatError::TensorNotFound(name.to_string()))?;
 
         let size = tensor_byte_size(info)?;
-        let start = self.data_start + info.offset;
-        let data = self
-            .data
-            .slice(start, size)
-            .ok_or_else(|| FormatError::Safetensors(format!("gguf tensor {} out of bounds", info.name)))?;
+        let data = self.tensor_bytes(info)?;
 
         // HF layout = ggml dims reversed (row-major data needs no movement).
         let mut shape: Vec<usize> = info.dims.iter().rev().copied().collect();
@@ -1579,10 +1796,7 @@ impl ModelSource for GgufSource {
             _ => return Ok(None),
         };
         let size = tensor_byte_size(info)?;
-        let start = self.data_start + info.offset;
-        let data = self.data.slice(start, size).ok_or_else(|| {
-            FormatError::Safetensors(format!("gguf tensor {} out of bounds", info.name))
-        })?;
+        let data = self.tensor_bytes(info)?;
         let mut shape: Vec<usize> = info.dims.iter().rev().copied().collect();
         // Row range of a fused projection: a contiguous packed byte range
         // (whole blocks per row), so the payload narrows in place.
@@ -1668,6 +1882,154 @@ mod depermute_tests {
         let map = rope_depermute_src_rows(16, 2);
         let recovered: Vec<Vec<u32>> = map.iter().map(|&src| ggml[src].clone()).collect();
         assert_eq!(recovered, hf, "de-permute must invert llama.cpp's layout");
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use crate::ModelSource;
+
+    fn cached(dir: &str) -> Option<std::path::PathBuf> {
+        let path = std::path::PathBuf::from(std::env::var("HOME").ok()?)
+            .join(".cache/combs/models")
+            .join(dir)
+            .join("model.gguf");
+        path.exists().then_some(path)
+    }
+
+    /// One per architecture that makes the loader do something special:
+    /// llama de-permutes Q/K, qwen3 carries per-head norms and an untied
+    /// head, gemma3 renames three norms, phi3 keeps Q/K/V and gate/up
+    /// FUSED and has to be sliced back apart.
+    const ARCHS: [&str; 4] = [
+        "smollm2-360m-instruct-gguf",
+        "qwen3-0.6b-gguf",
+        "gemma-3-1b-it-gguf",
+        "phi-3.1-mini-4k-instruct-gguf",
+    ];
+
+    /// The keystone. A source holding ONLY one tensor's bytes must
+    /// answer for that tensor exactly what the whole file answers —
+    /// same format, same shape, same bytes, through both the quantized
+    /// and the dense reader. If this holds for every tensor of every
+    /// architecture, then a mount never needs the file entire, which is
+    /// the whole of the streaming design resting on one property.
+    #[test]
+    fn a_window_of_one_tensor_answers_like_the_whole_file() {
+        let mut ran = 0;
+        for dir in ARCHS {
+            let Some(path) = cached(dir) else {
+                eprintln!("skip {dir}: not in the local cache");
+                continue;
+            };
+            let full = GgufSource::load(&path).unwrap();
+            let total = full.data.len();
+            let header_bytes = full
+                .data
+                .slice(0, full.data_start)
+                .expect("the header is always resident")
+                .into_owned();
+
+            let ggml_names: Vec<String> = full.tensors.keys().cloned().collect();
+            let mut checked = 0usize;
+            for ggml in ggml_names {
+                let info = &full.tensors[&ggml];
+                let Ok(size) = tensor_byte_size(info) else { continue };
+                let start = full.data_start + info.offset;
+                let Some(window) = full.data.slice(start, size) else { continue };
+                let win =
+                    GgufSource::from_window(&header_bytes, window.into_owned(), start, total)
+                        .unwrap();
+
+                let views = full.hf_names_for_ggml(&ggml);
+                for (hf, _range) in &views {
+                    match (
+                        full.open_tensor_quant(hf).unwrap(),
+                        win.open_tensor_quant(hf).unwrap(),
+                    ) {
+                        (Some(a), Some(b)) => {
+                            assert_eq!(a.format, b.format, "{dir} {ggml} -> {hf}: format");
+                            assert_eq!(a.shape, b.shape, "{dir} {ggml} -> {hf}: shape");
+                            assert_eq!(&*a.data, &*b.data, "{dir} {ggml} -> {hf}: packed bytes");
+                        }
+                        (None, None) => {}
+                        (a, b) => panic!(
+                            "{dir} {ggml} -> {hf}: quant path disagrees on whether it applies \
+                             (whole {}, window {})",
+                            a.is_some(),
+                            b.is_some()
+                        ),
+                    }
+                    let a = full.open_tensor(hf).unwrap().load_data().unwrap();
+                    let b = win.open_tensor(hf).unwrap().load_data().unwrap();
+                    assert_eq!(a.shape, b.shape, "{dir} {ggml} -> {hf}: dense shape");
+                    assert_eq!(
+                        a.to_vec::<f32>().unwrap(),
+                        b.to_vec::<f32>().unwrap(),
+                        "{dir} {ggml} -> {hf}: dense values"
+                    );
+                    checked += 1;
+                }
+            }
+            assert!(checked > 0, "{dir}: the reverse map named no tensors at all");
+            eprintln!("{dir}: {checked} tensor views identical through a one-tensor window");
+            ran += 1;
+        }
+        assert!(ran > 0, "no architecture was available to check");
+    }
+
+    /// Drift guard. The reverse map and the forward lookup are two
+    /// descriptions of one relation, written apart and edited apart, so
+    /// they are pinned to each other: every name the reverse map emits
+    /// must resolve back to the tensor it came from, with the same row
+    /// range, and every name the model can ask for must be produced by
+    /// exactly one tensor. A rename on one side and not the other stops
+    /// here rather than in a model that loads and answers wrongly.
+    #[test]
+    fn the_reverse_map_and_the_forward_lookup_agree() {
+        let mut ran = 0;
+        for dir in ARCHS {
+            let Some(path) = cached(dir) else { continue };
+            let src = GgufSource::load(&path).unwrap();
+
+            let mut producers: HashMap<String, Vec<String>> = HashMap::new();
+            for ggml in src.tensors.keys() {
+                for (hf, range) in src.hf_names_for_ggml(ggml) {
+                    let (back, _, back_range) = src
+                        .resolve_tensor(&hf)
+                        .unwrap_or_else(|| panic!("{dir}: {ggml} -> {hf} resolves to nothing"));
+                    assert_eq!(back, ggml, "{dir}: {hf} came from {ggml} but resolves to {back}");
+                    assert_eq!(back_range, range, "{dir}: {hf} row range disagrees");
+                    producers.entry(hf).or_default().push(ggml.clone());
+                }
+            }
+            for hf in src.tensor_names() {
+                let from = producers.get(&hf);
+                assert!(
+                    from.map(|v| v.len()) == Some(1),
+                    "{dir}: {hf} is asked for by the model but produced by {:?}",
+                    from
+                );
+            }
+            if src.metadata.architecture == "phi3" {
+                // The case the map exists for: fused projections have no
+                // forward mapping at all, so if the reverse map ever
+                // stopped emitting them nothing else would notice.
+                let fused: Vec<_> = src
+                    .tensors
+                    .keys()
+                    .filter(|k| k.ends_with("attn_qkv.weight"))
+                    .collect();
+                assert!(!fused.is_empty(), "phi3 file without a fused qkv");
+                for f in fused {
+                    let parts = src.hf_names_for_ggml(f);
+                    assert_eq!(parts.len(), 3, "{f}: expected q, k and v, got {parts:?}");
+                }
+            }
+            ran += 1;
+        }
+        assert!(ran > 0, "no architecture was available to check");
     }
 }
 
