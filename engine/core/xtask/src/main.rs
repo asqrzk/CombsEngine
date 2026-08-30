@@ -69,6 +69,11 @@ enum XCommand {
         /// host application that serves them (e.g. the platform's engine/).
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Serve in half precision. Writes to the same pkg/, so a build
+        /// made with this flag REPLACES the f32 bundle until one is made
+        /// without it — the module logs which it is on load.
+        #[arg(long)]
+        f16: bool,
     },
     /// Show the platform matrix and detected toolchains.
     Matrix,
@@ -254,7 +259,7 @@ fn build_target(ctx: &Ctx, target: &Target, force_check: bool) -> Result<PathBuf
 /// wasm-bindgen shim that knows how to pass strings and closures across
 /// the boundary. When `wasm-bindgen` is missing this says so and stops,
 /// rather than leaving a `pkg/` that looks built and imports nothing.
-fn cmd_web(ctx: &Ctx, release: bool, out_dir: Option<PathBuf>) -> Result<()> {
+fn cmd_web(ctx: &Ctx, release: bool, out_dir: Option<PathBuf>, f16: bool) -> Result<()> {
     const TRIPLE: &str = "wasm32-unknown-unknown";
 
     let mut cmd = Command::new(cargo());
@@ -263,7 +268,14 @@ fn cmd_web(ctx: &Ctx, release: bool, out_dir: Option<PathBuf>) -> Result<()> {
     if release {
         cmd.arg("--release");
     }
-    eprintln!("== web-wasm32 ({TRIPLE}): {} ==", if release { "release" } else { "debug" });
+    if f16 {
+        cmd.args(["--features", "f16"]);
+    }
+    eprintln!(
+        "== web-wasm32 ({TRIPLE}): {} {} ==",
+        if release { "release" } else { "debug" },
+        if f16 { "f16" } else { "f32" }
+    );
     run(cmd)?;
 
     let wasm = ctx
@@ -550,7 +562,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        XCommand::Web { debug, out } => cmd_web(&ctx, !debug, out),
+        XCommand::Web { debug, out, f16 } => cmd_web(&ctx, !debug, out, f16),
         XCommand::Matrix => {
             cmd_matrix();
             Ok(())

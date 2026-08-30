@@ -10,6 +10,11 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 forward-probe = []
+# Serve in half precision, the same switch the CLI carries. Kept a
+# feature rather than a runtime flag because it selects the backend
+# type: burn-fusion 0.21 panics on reduced-precision tensors, so the
+# f16 build runs unfused.
+f16 = ["combs-core/f16", "combs-runtime/f16"]
 
 [dependencies]
 wasm-bindgen = "0.2"

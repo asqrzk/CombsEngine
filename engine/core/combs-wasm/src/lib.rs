@@ -47,6 +47,21 @@ mod mount;
 #[wasm_bindgen(start)]
 pub fn start() {
     console_error_panic_hook::set_once();
+    web_sys_log(&format!(
+        "[combs-wasm] {} {}",
+        env!("CARGO_PKG_VERSION"),
+        SERVING_DTYPE
+    ));
+}
+
+/// One line to the browser console, without pulling in web-sys.
+fn web_sys_log(text: &str) {
+    #[wasm_bindgen]
+    extern "C" {
+        #[wasm_bindgen(js_namespace = console)]
+        fn log(s: &str);
+    }
+    log(text);
 }
 
 thread_local! {
@@ -537,8 +552,14 @@ async fn run_chat(
     }
 }
 
-/// The version of this module, so a page can check what it loaded.
+/// What this module is, so a page checks rather than assumes. The
+/// serving dtype is a compile-time choice that changes the backend
+/// type, and a bundle is deployed by copying files — the two ways to
+/// end up running something other than what you think you are.
 #[wasm_bindgen]
 pub fn combs_wasm_version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
+    format!("{} {}", env!("CARGO_PKG_VERSION"), SERVING_DTYPE)
 }
+
+/// The float width this module serves in, fixed at compile time.
+pub const SERVING_DTYPE: &str = if cfg!(feature = "f16") { "f16" } else { "f32" };
