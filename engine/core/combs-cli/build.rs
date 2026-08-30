@@ -6,13 +6,14 @@
 //! (`combs build-info`), from a running worker's startup log, and from
 //! `target/<profile>/build-manifest.json` beside the binary.
 //!
-//! Deliberately no `cargo:rerun-if-changed` lines: without them cargo
-//! re-runs this script whenever any file in the package changes, which
-//! keeps the manifest honest for the crate being built. The one limit
-//! worth knowing is recorded in the manifest itself
-//! (`git.dirty_as_of_build`): the working-tree state is read when this
-//! script runs, so a source edit elsewhere in the workspace can leave
-//! that flag describing an earlier moment than the compile.
+//! Cargo re-runs a directive-free build script only when a file in ITS
+//! OWN package changes, which is not enough: editing another crate in
+//! the workspace relinks this binary while leaving the stamp describing
+//! the previous one. That was caught in the act — a rebuilt binary
+//! still reporting the day before's commit and time — so the script
+//! now names what it depends on: every crate's sources, and git's HEAD
+//! and index so a commit or a staging change re-stamps too. The
+//! declaration lives in [`watched_paths`]; a new crate belongs in it.
 
 use std::process::Command;
 
@@ -48,7 +49,38 @@ fn built_at_epoch() -> u64 {
         .unwrap_or(0)
 }
 
+/// What this stamp is a statement about. Cargo watches directories
+/// recursively, so one entry per crate covers it; the git files make a
+/// commit or a staging change re-run the script even when no source
+/// moved. Paths that do not exist are emitted anyway — cargo treats a
+/// missing watched path as "changed", which errs toward re-stamping.
+fn watched_paths() -> Vec<String> {
+    let mut paths = vec![
+        "build.rs".to_string(),
+        "src".to_string(),
+        "../vendor".to_string(),
+    ];
+    let workspace = std::path::Path::new("..");
+    if let Ok(entries) = std::fs::read_dir(workspace) {
+        let mut crates: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.join("Cargo.toml").is_file())
+            .filter_map(|p| p.join("src").to_str().map(str::to_string))
+            .collect();
+        crates.sort();
+        paths.extend(crates);
+    }
+    for git_path in ["../../../.git/HEAD", "../../../.git/index"] {
+        paths.push(git_path.to_string());
+    }
+    paths
+}
+
 fn main() {
+    for path in watched_paths() {
+        println!("cargo:rerun-if-changed={path}");
+    }
     let commit = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
     let short = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
     let branch =
