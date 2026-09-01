@@ -165,17 +165,19 @@ fn batched_threshold() -> usize {
 
 /// Which matmul the batched path uses.
 ///
-/// `MatmulStrategy::Cube` is DIAGNOSTIC ONLY, and now for a known
-/// reason: it launches with cubek's DEFAULT strategy rather than one
-/// chosen for the shape, and at the widths a transformer block runs
-/// that launch reports success and writes nothing. The caller gets the
-/// output buffer exactly as it was allocated — every element zero —
-/// and because the launch returned `Ok`, nothing falls back. A
-/// conditioning of zeros, or a velocity field of zeros, is a grey
-/// image. Measured: 1,572,864 of 1,572,864 outputs zero at
-/// m 768, k 3072, n 2048, on both backends; correct at m 64, k 512,
-/// n 256. Autotune is immune because it measures its candidates, and a
-/// routine that writes nothing loses.
+/// `MatmulStrategy::Cube` is DIAGNOSTIC ONLY, and the ladder that
+/// hunted its grey images ended on a sharper fact than any width
+/// story: at a shape the process has not autotuned, EVERY untuned
+/// launch returns `Ok` having written nothing — the caller keeps the
+/// output buffer exactly as allocated, all zero — and after ONE
+/// Autotune matmul of the same shape, the identical launch is correct.
+/// The priming is per-shape (a small-shape tuned run does not help)
+/// and the zero-write repeats on every unprimed launch. Measured:
+/// 1,572,864 of 1,572,864 zero at m 768, k 3072, n 2048 cold — plain
+/// uploaded tensors, no quant path needed — and exact at m 64, k 512,
+/// n 256; the doored cells below pin it. Autotune is immune because it
+/// primes what it measures. A conditioning of zeros, or a velocity
+/// field of zeros, is a grey image.
 /// Which `k` widths the diagnostic untuned kernel is allowed to take,
 /// when the door is open. Empty = all of them.
 ///
@@ -217,8 +219,9 @@ fn matmul_strategy() -> MatmulStrategy {
         if untuned {
             eprintln!(
                 "[qmatmul] WARNING: COMBS_QMATMUL_STRATEGY=cube — diagnostic only. \
-                 At transformer-block widths this launch writes nothing and leaves \
-                 the output buffer at zero, which reaches you as a grey image."
+                 At any shape this process has not autotuned, this launch writes \
+                 nothing and leaves the output buffer at zero, which reaches you \
+                 as a grey image."
             );
         }
         untuned
@@ -378,10 +381,12 @@ fn try_batched_matmul_with(
     );
     debug_first_calls(m, k, n_out, x.dtype, operand);
     // The strategy is load-bearing for CORRECTNESS here, not only for
-    // speed: the untuned kernel turns generated images flat grey even
-    // though the two agree to 1e-3 when the same matmul runs in
-    // isolation at these shapes (see the strategy test). Diagnostic
-    // door only — the default stays on what demonstrably works.
+    // speed: at a shape this process has not autotuned, the untuned
+    // launch returns Ok having written nothing — flat grey images —
+    // and the old isolation tests missed it only because their tuned
+    // reference arm primed the shape first (see the doored cells).
+    // Diagnostic door only — the default stays on what demonstrably
+    // works.
     let out = matmul(x2, permute(w2, &[1, 0]), None, matmul_strategy_for(k), DType::F32).ok()?;
     // Undo the normalization on the f32 result, where the product has
     // room. Exact: the scale is a power of two.
@@ -764,6 +769,11 @@ mod tests {
     /// grey images. Whatever the difference is, it is not this matmul
     /// alone, and this test is the boundary of what has been ruled
     /// out.
+    ///
+    /// The strategy is passed LITERALLY here: `matmul_strategy_for` and
+    /// `operand_dtype` (the env doors) are exercised only by the
+    /// interleaved test below — the two harnesses can answer for
+    /// different kernels under identical environments, on purpose.
     #[test]
     fn matmul_strategies_must_agree_before_one_is_chosen() {
         if crate::skip_no_gpu() {
@@ -781,6 +791,11 @@ mod tests {
             (512, 2560, 1024),
             (512, 4096, 2560),
             (768, 3072, 27648),
+            // The shape the production path measured all-zero under the
+            // untuned strategy (the K6 record) — here with uploaded
+            // dense operands, which is the cell that decides whether
+            // the shape alone is the fault.
+            (768, 3072, 2048),
         ] {
         let x: Vec<f32> = (0..m * k).map(|i| ((i % 37) as f32) / 18.0 - 1.0).collect();
         let w: Vec<f32> = (0..n * k).map(|i| ((i % 53) as f32) / 26.0 - 1.0).collect();
@@ -832,56 +847,345 @@ mod tests {
         pin_device_dtypes();
         let device: Device<UnfusedF32> = Default::default();
         let client = <WgpuRuntime as Runtime>::client(&Default::default());
-        let (m, k, n) = (768usize, 2560usize, 1024usize);
+        // The second cell is the shape the production path measured
+        // all-zero under the untuned strategy; a kernel-written weight
+        // is the next variable after C1's uploaded one.
+        for (m, k, n) in [(768usize, 2560usize, 1024usize), (768, 3072, 2048)] {
+            let data = synth_q4_0(n * k / 32);
+            let w = QuantWeight::from_quant_tensor(
+                &client,
+                combs_formats::QuantFormat::Q4_0,
+                &data,
+                n,
+                k,
+            )
+            .unwrap();
+            let reference_w = combs_formats::quants::dequantize_q4_0(&data, n * k).unwrap();
 
-        let data = synth_q4_0(n * k / 32);
-        let w = QuantWeight::from_quant_tensor(
-            &client,
-            combs_formats::QuantFormat::Q4_0,
-            &data,
-            n,
-            k,
-        )
-        .unwrap();
-        let reference_w = combs_formats::quants::dequantize_q4_0(&data, n * k).unwrap();
+            let x: Vec<f32> = (0..m * k).map(|i| ((i % 37) as f32) / 18.0 - 1.0).collect();
+            let xt = Tensor::<UnfusedF32, 2>::from_data(TensorData::new(x, [m, k]), &device);
+            let wt =
+                Tensor::<UnfusedF32, 2>::from_data(TensorData::new(reference_w, [n, k]), &device);
+            let expect: Vec<f32> = xt
+                .clone()
+                .matmul(wt.transpose())
+                .into_data()
+                .to_vec()
+                .unwrap();
 
+            for (label, strategy) in [
+                ("default", MatmulStrategy::default()),
+                ("cube", MatmulStrategy::Cube),
+            ] {
+                // A fresh dequant per arm: the transient is single-use.
+                let w_h = w.dequant_device(&client).expect("dequant kernel");
+                let w2 = CubeTensor::new_contiguous(
+                    client.clone(),
+                    Default::default(),
+                    Shape::from([n, k]),
+                    w_h,
+                    DType::F32,
+                );
+                let x2 = xt.clone().into_primitive().tensor();
+                let out = matmul(x2, permute(w2, &[1, 0]), None, strategy, DType::F32)
+                    .expect("matmul launches");
+                let got: Vec<f32> =
+                    Tensor::<UnfusedF32, 2>::from_primitive(TensorPrimitive::Float(out))
+                        .into_data()
+                        .to_vec()
+                        .unwrap();
+                assert_close(&got, &expect, 1e-3);
+                let _ = label;
+            }
+        }
+    }
+
+    /// One production-path call at the failing shape under the untuned
+    /// strategy — no interleaving, no rounds; unfused backend. (The
+    /// fused twin is its own test below: folding both into one process
+    /// lets the first arm's dense reference prime the second.) The
+    /// strategy door is process-wide (a OnceLock over the env), so this
+    /// runs in its OWN process and skips loudly unless the door is
+    /// open:
+    ///
+    /// COMBS_QMATMUL_STRATEGY=cube cargo test --release -p combs-models \
+    ///   --lib -- --exact qlinear::tests::a_single_production_call_at_the_failing_shape_under_cube --nocapture
+    #[test]
+    fn a_single_production_call_at_the_failing_shape_under_cube() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        if !matches!(
+            std::env::var("COMBS_QMATMUL_STRATEGY").as_deref(),
+            Ok("cube")
+        ) {
+            eprintln!("skip: COMBS_QMATMUL_STRATEGY=cube not set (own-process cell)");
+            return;
+        }
+        pin_device_dtypes();
+        let (n_out, k, seq) = (2048usize, 3072usize, 768usize);
+        run_single_cold::<UnfusedF32>(n_out, k, seq, "unfused");
+    }
+
+    /// One cold production-path call under the door; the dense
+    /// reference runs AFTER the quant call, so nothing primes it.
+    fn run_single_cold<B: Backend>(n_out: usize, k: usize, seq: usize, label: &str)
+    where
+        CubeQuantLinear: QuantLinearOp<B>,
+    {
+        {
+            let device: Device<B> = Default::default();
+            let (quant, dense) = quant_and_dense::<B>(&device, n_out, k, FloatDType::F32);
+            let x0: Vec<f32> = (0..seq * k)
+                .map(|i| ((i % 29) as f32) / 14.0 - 1.0)
+                .collect();
+            let x = Tensor::<B, 3>::from_data(TensorData::new(x0, [1, seq, k]), &device)
+                .cast(FloatDType::F32);
+            let got: Vec<f32> = quant.forward(x.clone(), None).into_data().to_vec().unwrap();
+            let expect: Vec<f32> = dense.forward(x, None).into_data().to_vec().unwrap();
+            let mut worst = 0.0f32;
+            for (g, e) in got.iter().zip(expect.iter()) {
+                worst = worst.max((g - e).abs() / e.abs().max(1.0));
+            }
+            let zeros = got.iter().filter(|v| **v == 0.0).count();
+            println!(
+                "{label}: single call m {seq} k {k} n {n_out}: worst relative {worst:.3e}, {zeros} of {} exactly zero",
+                got.len()
+            );
+            // Pins the measured behavior — every output zero on an
+            // unprimed shape. The day this fails, the zero-write has
+            // HEALED: re-run the K6 ladder, update the record and
+            // upstream draft 5, and only then consider the door.
+            assert_eq!(
+                zeros,
+                got.len(),
+                "{label}: the cold-shape zero-write has healed (worst relative {worst:.3e})",
+            );
+        }
+    }
+
+    /// The fused backend's own cold cell. Not folded into the test
+    /// above: its unfused arm computes a dense REFERENCE — an autotuned
+    /// matmul of the same shape — which primes the process before the
+    /// fused arm launches (the tune cache is runtime-global, crossing
+    /// backend facades; measured 2026-09-02 when the folded version
+    /// came back correct on the second arm). One backend per process.
+    ///
+    /// COMBS_K6_CELL=1 cargo test --release -p combs-models --lib \
+    ///   a_single_production_call_on_the_fused -- --nocapture
+    #[test]
+    fn a_single_production_call_on_the_fused_backend_under_cube() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        if !matches!(
+            std::env::var("COMBS_QMATMUL_STRATEGY").as_deref(),
+            Ok("cube")
+        ) {
+            eprintln!("skip: COMBS_QMATMUL_STRATEGY=cube not set (own-process cell)");
+            return;
+        }
+        pin_device_dtypes();
+        let (n_out, k, seq) = (2048usize, 3072usize, 768usize);
+        run_single_cold::<FusedF32>(n_out, k, seq, "fused");
+    }
+
+    /// The discriminator the ladder left standing: every green Cube run
+    /// in this suite happens AFTER a default-strategy matmul of the same
+    /// shape in the same process (the reference arm runs first); every
+    /// zero-writing launch was shape-cold. This cell runs Cube FIRST on
+    /// uploaded operands at the failing shape — if it zeros, the fault
+    /// is in-process history (an unprimed pipeline dispatching as a
+    /// no-op); if it agrees, the production path's lhs wrapping is what
+    /// remains. "First at the shape" is unenforceable inside a threaded
+    /// suite, so this skips unless it owns the process:
+    ///
+    /// COMBS_K6_CELL=1 cargo test --release -p combs-models --lib \
+    ///   a_cube_matmul_with_no_prior_default_run -- --nocapture
+    #[test]
+    fn a_cube_matmul_with_no_prior_default_run_at_the_shape() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        if std::env::var("COMBS_K6_CELL").as_deref() != Ok("1") {
+            eprintln!("skip: COMBS_K6_CELL=1 not set (own-process cell)");
+            return;
+        }
+        pin_device_dtypes();
+        let device: Device<UnfusedF32> = Default::default();
+        let (m, k, n) = (768usize, 3072usize, 2048usize);
         let x: Vec<f32> = (0..m * k).map(|i| ((i % 37) as f32) / 18.0 - 1.0).collect();
+        let w: Vec<f32> = (0..n * k).map(|i| ((i % 53) as f32) / 26.0 - 1.0).collect();
         let xt = Tensor::<UnfusedF32, 2>::from_data(TensorData::new(x, [m, k]), &device);
-        let wt = Tensor::<UnfusedF32, 2>::from_data(
-            TensorData::new(reference_w, [n, k]),
-            &device,
-        );
-        let expect: Vec<f32> = xt
-            .clone()
-            .matmul(wt.transpose())
+        let wt = Tensor::<UnfusedF32, 2>::from_data(TensorData::new(w, [n, k]), &device);
+        let prim = |t: Tensor<UnfusedF32, 2>| t.into_primitive().tensor();
+        let out = matmul(
+            prim(xt.clone()),
+            permute(prim(wt.clone()), &[1, 0]),
+            None,
+            MatmulStrategy::Cube,
+            DType::F32,
+        )
+        .expect("matmul launches");
+        let got: Vec<f32> = Tensor::<UnfusedF32, 2>::from_primitive(TensorPrimitive::Float(out))
             .into_data()
             .to_vec()
             .unwrap();
-
-        for (label, strategy) in [
-            ("default", MatmulStrategy::default()),
-            ("cube", MatmulStrategy::Cube),
-        ] {
-            // A fresh dequant per arm: the transient is single-use.
-            let w_h = w.dequant_device(&client).expect("dequant kernel");
-            let w2 = CubeTensor::new_contiguous(
-                client.clone(),
-                Default::default(),
-                Shape::from([n, k]),
-                w_h,
-                DType::F32,
-            );
-            let x2 = xt.clone().into_primitive().tensor();
-            let out = matmul(x2, permute(w2, &[1, 0]), None, strategy, DType::F32)
-                .expect("matmul launches");
-            let got: Vec<f32> =
-                Tensor::<UnfusedF32, 2>::from_primitive(TensorPrimitive::Float(out))
-                    .into_data()
-                    .to_vec()
-                    .unwrap();
-            assert_close(&got, &expect, 1e-3);
-            let _ = label;
+        let zeros = got.iter().filter(|v| **v == 0.0).count();
+        // The reference runs AFTER, so nothing primes the cube launch.
+        let expect: Vec<f32> = xt.matmul(wt.transpose()).into_data().to_vec().unwrap();
+        let mut worst = 0.0f32;
+        for (g, e) in got.iter().zip(expect.iter()) {
+            worst = worst.max((g - e).abs() / e.abs().max(1.0));
         }
+        println!(
+            "cube-first m {m} k {k} n {n}: worst relative {worst:.3e}, {zeros} of {} exactly zero",
+            got.len()
+        );
+        // Pins the measured behavior; fails the day it heals upstream.
+        assert_eq!(
+            zeros,
+            got.len(),
+            "the cold-cube zero-write has healed (worst relative {worst:.3e}) — re-run the ladder, update the record and draft 5",
+        );
+    }
+
+    /// Refines C5 for the upstream report: is the priming per-shape or
+    /// per-process? A tuned run at a SMALL shape first, then Cube at the
+    /// failing shape. Zeros here = the priming is keyed to the shape
+    /// (a per-config cache the untuned launch cannot fill); correct
+    /// here = one tuned launch primes the whole process.
+    ///
+    /// COMBS_K6_CELL=1 cargo test --release -p combs-models --lib \
+    ///   a_small_tuned_run_does_not_prime -- --nocapture
+    #[test]
+    fn a_small_tuned_run_does_not_prime_a_cold_cube_shape() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        if std::env::var("COMBS_K6_CELL").as_deref() != Ok("1") {
+            eprintln!("skip: COMBS_K6_CELL=1 not set (own-process cell)");
+            return;
+        }
+        pin_device_dtypes();
+        let device: Device<UnfusedF32> = Default::default();
+        let prim = |t: Tensor<UnfusedF32, 2>| t.into_primitive().tensor();
+        // The tuned warm-up, at a shape the untuned kernel gets RIGHT.
+        {
+            let a = Tensor::<UnfusedF32, 2>::from_data(
+                TensorData::new(vec![1.0f32; 64 * 512], [64, 512]),
+                &device,
+            );
+            let b = Tensor::<UnfusedF32, 2>::from_data(
+                TensorData::new(vec![1.0f32; 256 * 512], [256, 512]),
+                &device,
+            );
+            let out = matmul(
+                prim(a),
+                permute(prim(b), &[1, 0]),
+                None,
+                MatmulStrategy::default(),
+                DType::F32,
+            )
+            .expect("warm-up launches");
+            let _v: Vec<f32> = Tensor::<UnfusedF32, 2>::from_primitive(TensorPrimitive::Float(out))
+                .into_data()
+                .to_vec()
+                .unwrap();
+        }
+        let (m, k, n) = (768usize, 3072usize, 2048usize);
+        let x: Vec<f32> = (0..m * k).map(|i| ((i % 37) as f32) / 18.0 - 1.0).collect();
+        let w: Vec<f32> = (0..n * k).map(|i| ((i % 53) as f32) / 26.0 - 1.0).collect();
+        let xt = Tensor::<UnfusedF32, 2>::from_data(TensorData::new(x, [m, k]), &device);
+        let wt = Tensor::<UnfusedF32, 2>::from_data(TensorData::new(w, [n, k]), &device);
+        let out = matmul(
+            prim(xt.clone()),
+            permute(prim(wt.clone()), &[1, 0]),
+            None,
+            MatmulStrategy::Cube,
+            DType::F32,
+        )
+        .expect("matmul launches");
+        let got: Vec<f32> = Tensor::<UnfusedF32, 2>::from_primitive(TensorPrimitive::Float(out))
+            .into_data()
+            .to_vec()
+            .unwrap();
+        let zeros = got.iter().filter(|v| **v == 0.0).count();
+        let expect: Vec<f32> = xt.matmul(wt.transpose()).into_data().to_vec().unwrap();
+        let mut worst = 0.0f32;
+        for (g, e) in got.iter().zip(expect.iter()) {
+            worst = worst.max((g - e).abs() / e.abs().max(1.0));
+        }
+        println!(
+            "small-primed cube m {m} k {k} n {n}: worst relative {worst:.3e}, {zeros} of {} exactly zero",
+            got.len()
+        );
+        // Pins per-shape priming; fails the day a small-shape tune
+        // starts priming this one (or the zero-write heals).
+        assert_eq!(
+            zeros,
+            got.len(),
+            "a small-shape tuned run now primes this shape (worst relative {worst:.3e}) — re-run the ladder",
+        );
+    }
+
+    /// Refines C5 the other way: does the SECOND cold Cube launch also
+    /// write nothing, or is the first launch alone the victim? Two Cube
+    /// launches back to back, no tuned run anywhere.
+    ///
+    /// COMBS_K6_CELL=1 cargo test --release -p combs-models --lib \
+    ///   a_second_cold_cube_launch -- --nocapture
+    #[test]
+    fn a_second_cold_cube_launch_at_the_shape() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        if std::env::var("COMBS_K6_CELL").as_deref() != Ok("1") {
+            eprintln!("skip: COMBS_K6_CELL=1 not set (own-process cell)");
+            return;
+        }
+        pin_device_dtypes();
+        let device: Device<UnfusedF32> = Default::default();
+        let prim = |t: Tensor<UnfusedF32, 2>| t.into_primitive().tensor();
+        let (m, k, n) = (768usize, 3072usize, 2048usize);
+        let x: Vec<f32> = (0..m * k).map(|i| ((i % 37) as f32) / 18.0 - 1.0).collect();
+        let w: Vec<f32> = (0..n * k).map(|i| ((i % 53) as f32) / 26.0 - 1.0).collect();
+        let xt = Tensor::<UnfusedF32, 2>::from_data(TensorData::new(x, [m, k]), &device);
+        let wt = Tensor::<UnfusedF32, 2>::from_data(TensorData::new(w, [n, k]), &device);
+        let launch = || -> Vec<f32> {
+            let out = matmul(
+                prim(xt.clone()),
+                permute(prim(wt.clone()), &[1, 0]),
+                None,
+                MatmulStrategy::Cube,
+                DType::F32,
+            )
+            .expect("matmul launches");
+            Tensor::<UnfusedF32, 2>::from_primitive(TensorPrimitive::Float(out))
+                .into_data()
+                .to_vec()
+                .unwrap()
+        };
+        let first = launch();
+        let second = launch();
+        let z1 = first.iter().filter(|v| **v == 0.0).count();
+        let z2 = second.iter().filter(|v| **v == 0.0).count();
+        println!(
+            "cold cube twice m {m} k {k} n {n}: first {z1} of {} zero; second {z2} of {} zero",
+            first.len(),
+            second.len()
+        );
+        // Pins that the zero-write is not first-launch-only.
+        assert_eq!(
+            z1,
+            first.len(),
+            "the FIRST cold launch wrote data — the ladder's ground truth moved"
+        );
+        assert_eq!(
+            z2,
+            second.len(),
+            "the SECOND cold launch wrote data — the zero-write became first-launch-only; re-run the ladder",
+        );
     }
 
     /// Above the batched threshold the SAME public path routes through
@@ -1080,16 +1384,13 @@ mod tests {
     /// Many quantized linears, interleaved with the ordinary tensor work
     /// a real forward does, on the fusion backend.
     ///
-    /// This is the last thing that differs. The untuned kernel ruins a
-    /// diffusion run and leaves text untouched, and everything else that
-    /// separated the two has been excluded: the model (the same
-    /// Qwen3-4B is byte-identical as text and corrupt as an encoder),
-    /// the sequence length (630 tokens, identical), the taps forward
-    /// path (matches the reference under either kernel), determinism
-    /// (six million outputs agree between two identical calls), and the
-    /// half of the pipeline (BOTH halves corrupt, differently). What is
-    /// left is that a generation puts hundreds of these calls into a
-    /// busy fusion stream, and no test did.
+    /// History note: this test was written when the busy fusion stream
+    /// was the last suspect standing. The ladder then showed the fault
+    /// needs no stream at all — a single cold Cube launch at an
+    /// un-autotuned shape writes nothing (it failed here at ROUND 0,
+    /// not after many rounds) — so under the door this now reproduces
+    /// the per-shape priming fact, and under the default it guards the
+    /// shipping path.
     ///
     /// Run under `COMBS_QMATMUL_STRATEGY=cube` to ask the question this
     /// exists for; under the default it guards the shipping path.
