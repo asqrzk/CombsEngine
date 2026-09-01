@@ -48,7 +48,15 @@ const STREAM_ABOVE_BYTES = 1_000_000_000;
 let moduleReady = null;
 async function ensureModule(wasmUrl) {
   if (!moduleReady) {
-    moduleReady = init(wasmUrl ? { module_or_path: wasmUrl } : undefined);
+    // A rejected init is forgotten so the next call retries: one flaky
+    // wasm fetch must not brick every later load on this worker. The
+    // ready chain below learned the same lesson for loads; this is the
+    // rung beneath it.
+    moduleReady = init(wasmUrl ? { module_or_path: wasmUrl } : undefined)
+      .catch((error) => {
+        moduleReady = null;
+        throw error;
+      });
   }
   const exports = await moduleReady;
   wasmMemory = exports?.memory ?? wasmMemory;
@@ -131,6 +139,9 @@ async function load(id, payload = {}) {
     expectedLen,
     wasmUrl,
     mountMode,
+    // Destructured OUT of the engine config: the watchdog bound is the
+    // mount's business, not the engine's.
+    stallMs,
     ...config
   } = payload;
   await ensureModule(wasmUrl);
@@ -161,10 +172,30 @@ async function load(id, payload = {}) {
       modelUrl,
       expectedLen,
       mountMode,
+      stallMs,
     });
   }
   engineId = created;
   post("ready", id, JSON.parse(combs_engine_metadata(created)));
+}
+
+/**
+ * Creates an engine from an ONNX graph and its sibling files. One
+ * engine per worker, so the previous one is freed before this reserves
+ * anything, exactly as `load` does.
+ */
+async function loadOnnx(id, payload = {}) {
+  await ensureModule(payload?.wasmUrl);
+  const previous = engineId;
+  engineId = null;
+  if (previous !== null) combs_engine_destroy(previous);
+  const { graph, siblings, ...config } = payload ?? {};
+  engineId = await combs_engine_create_onnx(
+    JSON.stringify(config),
+    new Uint8Array(graph),
+    JSON.stringify(siblings ?? {}),
+  );
+  post("ready", id, JSON.parse(combs_engine_metadata(engineId)));
 }
 
 /**
@@ -193,12 +224,28 @@ async function mountStreamed(id, config, source) {
   const mode = source.mountMode ??
     (expected > STREAM_ABOVE_BYTES ? "stream" : "buffer");
   const handle = await combs_model_open(JSON.stringify(config), expected, mode);
+  const reader = stream.getReader();
+  // A source that stops delivering without closing would otherwise hold
+  // the mount (and every queued load behind it) forever. The watchdog
+  // bounds silence, not duration: a slow network that keeps trickling
+  // never trips it.
+  const stallMs = Number(source.stallMs ?? 60_000);
   try {
-    const reader = stream.getReader();
     let loaded = 0;
     let lastProgress = 0;
     for (;;) {
-      const { done, value } = await reader.read();
+      let stalled;
+      const { done, value } = await Promise.race([
+        reader.read(),
+        new Promise((resolve) => {
+          stalled = setTimeout(() => resolve({ stalled: true }), stallMs);
+        }),
+      ]).finally(() => clearTimeout(stalled));
+      if (value === undefined && done === undefined) {
+        throw new Error(
+          `model stream stalled: no bytes for ${stallMs} ms at ${loaded}/${expected}`,
+        );
+      }
       if (done) break;
       combs_model_append(handle, value);
       loaded += value.byteLength;
@@ -216,8 +263,15 @@ async function mountStreamed(id, config, source) {
     }
     return await combs_model_finish(handle);
   } catch (error) {
-    // Idempotent: frees the partial buffer even if finish consumed the
-    // handle before failing further down.
+    // Stop the source first so no more bytes chase a dying mount and
+    // the download actually ends, then free the partial buffer.
+    // Abort is idempotent even if finish consumed the handle before
+    // failing further down.
+    try {
+      await reader.cancel();
+    } catch {
+      // A reader past its end (or already errored) has nothing to cancel.
+    }
     combs_model_abort(handle);
     throw error;
   }
@@ -287,21 +341,13 @@ self.onmessage = async (event) => {
         break;
       case "loadOnnx":
         // ONNX arrives as a graph plus the files a directory would have
-        // held beside it. One engine per worker, so the previous one is
-        // freed before this reserves anything, exactly as `load` does.
-        await ensureModule(payload?.wasmUrl);
-        {
-          const previous = engineId;
-          engineId = null;
-          if (previous !== null) combs_engine_destroy(previous);
-          const { graph, siblings, ...config } = payload ?? {};
-          engineId = await combs_engine_create_onnx(
-            JSON.stringify(config),
-            new Uint8Array(graph),
-            JSON.stringify(siblings ?? {}),
-          );
-          post("ready", id, JSON.parse(combs_engine_metadata(engineId)));
-        }
+        // held beside it. Serialized through the same settled chain as
+        // `load`: racing a streamed mount for the single engine slot
+        // would strand whichever engine lost the overwrite.
+        ready = (ready ?? Promise.resolve())
+          .catch(() => {})
+          .then(() => loadOnnx(id, payload));
+        await ready;
         break;
       case "metadata":
         if (engineId === null) throw new Error("no engine loaded");
@@ -328,9 +374,17 @@ self.onmessage = async (event) => {
         post("metadata", id, JSON.parse(await combs_device_caps()));
         break;
       case "close":
-        if (engineId !== null) combs_engine_destroy(engineId);
-        engineId = null;
-        post("done", id, null);
+        // Chained like load/loadOnnx: a close overtaking an in-flight
+        // load would report success while the load re-installed the
+        // engine behind it.
+        ready = (ready ?? Promise.resolve())
+          .catch(() => {})
+          .then(() => {
+            if (engineId !== null) combs_engine_destroy(engineId);
+            engineId = null;
+            post("done", id, null);
+          });
+        await ready;
         break;
       default:
         throw new Error(`unknown request kind: ${kind}`);
