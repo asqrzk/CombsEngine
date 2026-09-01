@@ -258,6 +258,24 @@ fn operand_dtype() -> DType {
     )
 }
 
+/// Row padding for the tuned kernel's row-count pathology, measured on
+/// this build: ms/row holds ~0.20 from m 640 through 1024 and drops to
+/// ~0.10 at 1088, so a prompt-shaped call inside the window is faster
+/// padded to 1088 and sliced (768 rows: 156 -> 110 ms). Padding changes
+/// which tuned kernel runs — accumulation order with it — so this is a
+/// DOOR, off by default; the platform opens it for the image worker
+/// alone, where the parity rule is max-delta, not byte identity.
+fn pad_rows_target(m: usize) -> Option<usize> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on =
+        *ON.get_or_init(|| matches!(std::env::var("COMBS_QMATMUL_PAD_ROWS").as_deref(), Ok("1")));
+    if on && (640..1088).contains(&m) {
+        Some(1088)
+    } else {
+        None
+    }
+}
+
 /// One line describing what the batched path will actually do, so a run
 /// records its configuration instead of leaving it to be assumed.
 pub fn batched_matmul_summary() -> String {
@@ -343,6 +361,18 @@ fn try_batched_matmul_with(
         x.handle.clone(),
         DType::F32,
     );
+    // Zero rows through a matmul contribute nothing to the real rows;
+    // the pad only moves the launch out of the slow row-count band.
+    let (x2, m_run) = match pad_rows_target(m) {
+        None => (x2, m),
+        Some(target) => {
+            let xt = Tensor::<InnerF32, 2>::from_primitive(TensorPrimitive::Float(x2));
+            let padded = Tensor::<InnerF32, 2>::zeros([target, k], &xt.device())
+                .slice_assign([0..m, 0..k], xt);
+            (padded.into_primitive().tensor(), target)
+        }
+    };
+    let m = m_run;
     // Both operands must share a dtype for the matmul to bind them, so
     // narrowing the weight means narrowing the activation too — and the
     // activation is the one with a range problem. Measured on a
@@ -410,6 +440,18 @@ fn try_batched_matmul_with(
     // across a step's 25 block linears and the peak walks into
     // machine-killing territory on unified memory (the 2026-08-28 OOM).
     let _ = x.client.flush();
+    // Padded rows end here: take the real rows contiguously before the
+    // caller reads the output as [batch, seq, n_out].
+    let out = if m_run != batch * seq {
+        let ot = Tensor::<InnerF32, 2>::from_primitive(TensorPrimitive::Float(out));
+        into_contiguous(
+            ot.slice([0..batch * seq, 0..n_out])
+                .into_primitive()
+                .tensor(),
+        )
+    } else {
+        out
+    };
     Some(CubeTensor::new_contiguous(
         x.client.clone(),
         x.device.clone(),
@@ -1635,6 +1677,119 @@ mod tests {
                 "magnitude {magnitude:e}: worst delta is {:.3e} of the output RMS",
                 worst / rms
             );
+        }
+    }
+
+    /// The pad door, judged against dense at the window's edges and its
+    /// center. Own-process (the door is a OnceLock over the env):
+    ///
+    /// COMBS_QMATMUL_PAD_ROWS=1 cargo test --release -p combs-models \
+    ///   --lib a_padded_call_agrees_with_dense -- --nocapture
+    #[test]
+    fn a_padded_call_agrees_with_dense() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        if !matches!(std::env::var("COMBS_QMATMUL_PAD_ROWS").as_deref(), Ok("1")) {
+            eprintln!("skip: COMBS_QMATMUL_PAD_ROWS=1 not set (own-process cell)");
+            return;
+        }
+        pin_device_dtypes();
+        fn run<B: Backend>(n_out: usize, k: usize, seq: usize, label: &str)
+        where
+            CubeQuantLinear: QuantLinearOp<B>,
+        {
+            let device: Device<B> = Default::default();
+            let (quant, dense) = quant_and_dense::<B>(&device, n_out, k, FloatDType::F32);
+            let x0: Vec<f32> = (0..seq * k)
+                .map(|i| ((i % 31) as f32) / 15.0 - 1.0)
+                .collect();
+            let x = Tensor::<B, 3>::from_data(TensorData::new(x0, [1, seq, k]), &device)
+                .cast(FloatDType::F32);
+            let got: Vec<f32> = quant.forward(x.clone(), None).into_data().to_vec().unwrap();
+            let expect: Vec<f32> = dense.forward(x, None).into_data().to_vec().unwrap();
+            assert_eq!(
+                got.len(),
+                expect.len(),
+                "{label}: padded rows leaked into the output"
+            );
+            let mut worst = 0.0f32;
+            for (g, e) in got.iter().zip(expect.iter()) {
+                worst = worst.max((g - e).abs() / e.abs().max(1.0));
+            }
+            println!("{label}: m {seq} worst relative {worst:.3e}");
+            assert!(
+                worst <= 1e-3,
+                "{label}: padded call drifted {worst:.3e} from dense"
+            );
+        }
+        for (m, label) in [
+            (640usize, "edge-low"),
+            (768, "center"),
+            (1024, "edge-high"),
+            (1088, "outside"),
+        ] {
+            run::<UnfusedF32>(512, 1024, m, label);
+            run::<FusedF32>(512, 1024, m, label);
+        }
+    }
+
+    /// The row-count pathology, swept: ms and ms/row for the production
+    /// batched path at the DiT single.fused shape, across the window the
+    /// pad decision needs. An instrument, not a gate (§65 measured
+    /// m 768 at 0.244 ms/row against m 1024 at 0.094):
+    ///
+    /// ```text
+    /// cargo test -p combs-models --release row_pad_window_sweep -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement instrument; run explicitly with --ignored"]
+    fn row_pad_window_sweep() {
+        use combs_formats::QuantFormat;
+        use std::time::Instant;
+
+        if crate::skip_no_gpu() {
+            return;
+        }
+        pin_device_dtypes();
+        let device: Device<UnfusedF32> = Default::default();
+        let client = <WgpuRuntime as Runtime>::client(&Default::default());
+        let (k, n) = (3072usize, 27648usize);
+        let data = synth_q8_0(n * k / 32);
+        let w = QuantWeight::from_quant_tensor(&client, QuantFormat::Q8_0, &data, n, k).unwrap();
+        drop(data);
+
+        println!("\n{:>6} {:>10} {:>10}", "m", "ms", "ms/row");
+        for m in [640usize, 704, 768, 832, 896, 960, 1024, 1088, 1536] {
+            let xv: Vec<f32> = (0..m * k).map(|i| ((i % 37) as f32) / 18.0 - 1.0).collect();
+            let x_h = Tensor::<UnfusedF32, 2>::from_data(TensorData::new(xv, [m, k]), &device)
+                .into_primitive()
+                .tensor()
+                .handle;
+            let mk = |h: &cubecl::server::Handle| {
+                CubeTensor::new_contiguous(
+                    client.clone(),
+                    WgpuDevice::default(),
+                    Shape::from([m, k]),
+                    h.clone(),
+                    DType::F32,
+                )
+            };
+            let run = || {
+                let out = try_batched_matmul_with(&w, &mk(&x_h), 1, m, DType::F32)
+                    .expect("batched path engages");
+                // One element back proves the queue drained.
+                let t = Tensor::<UnfusedF32, 3>::from_primitive(TensorPrimitive::Float(out));
+                let _ = t.narrow(2, 0, 1).narrow(1, 0, 1).into_data();
+            };
+            run(); // warm: autotune resolves per shape, first launch compiles
+            let t0 = Instant::now();
+            const REPS: usize = 3;
+            for _ in 0..REPS {
+                run();
+            }
+            let ms = t0.elapsed().as_secs_f64() * 1e3 / REPS as f64;
+            println!("{m:>6} {ms:>10.2} {:>10.4}", ms / m as f64);
         }
     }
 
