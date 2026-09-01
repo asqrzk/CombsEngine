@@ -102,8 +102,15 @@ pub struct StreamMount {
     expected: u64,
     received: u64,
 
+    /// Accumulates only while `phase` is `Header`; emptied at the
+    /// transition, when the source below takes over.
     header_bytes: Vec<u8>,
     header: Option<GgufHeaderInfo>,
+    /// Built once, at the header, over an empty window; each drain swaps
+    /// the window in and back out. Carries the metadata and the
+    /// synthesized tokenizer for the mount's lifetime and is what
+    /// `finish` hands back.
+    source: Option<GgufSource>,
 
     /// Bytes `[base, base + window.len())` — everything arrived and not
     /// yet consumed.
@@ -127,6 +134,7 @@ impl StreamMount {
             received: 0,
             header_bytes: Vec::new(),
             header: None,
+            source: None,
             window: Vec::new(),
             base: 0,
             next_tensor: 0,
@@ -172,12 +180,26 @@ impl StreamMount {
                             header.data_start
                         )));
                     }
-                    // Payload that arrived behind the header in the same
-                    // chunk opens the window.
-                    self.base = header.data_start;
                     let split = header.data_start as usize;
-                    self.window = self.header_bytes[split..].to_vec();
-                    self.header_bytes.truncate(split);
+                    let mut header_bytes = std::mem::take(&mut self.header_bytes);
+                    // Payload that arrived behind the header in the same
+                    // chunk opens the window; no copy, the Vec is split.
+                    self.window = header_bytes.split_off(split);
+                    // Metadata and tokenizer are read here, before any
+                    // payload: a file whose header cannot make a model is
+                    // refused at the header, not after its embedding (a
+                    // 7B's first tensor is hundreds of MB) has been pulled.
+                    let source = GgufSource::from_window(
+                        &header_bytes,
+                        Vec::new(),
+                        header.data_start,
+                        self.expected,
+                    )
+                    .map_err(|e| MountError::BadHeader(e.to_string()))?;
+                    // The raw header ends here — nothing reads it again.
+                    drop(header_bytes);
+                    self.base = header.data_start;
+                    self.source = Some(source);
                     self.header = Some(header);
                     self.phase = Phase::Body;
                 }
@@ -195,13 +217,13 @@ impl StreamMount {
     /// bytes behind it. Runs after each append rather than at the end,
     /// which is what keeps the window from growing into the file.
     fn drain_complete_tensors(&mut self) -> Result<(), MountError> {
-        let Some(header) = self.header.clone() else {
+        let (Some(header), Some(source)) = (self.header.as_ref(), self.source.as_mut()) else {
             return Ok(());
         };
-        let end = self.base + self.window.len() as u64;
         if self.next_tensor >= header.tensors.len() {
             return Ok(());
         }
+        let end = self.base + self.window.len() as u64;
         let (_, first_start, first_size) = &header.tensors[self.next_tensor];
         if first_start + first_size > end {
             return Ok(());
@@ -212,16 +234,14 @@ impl StreamMount {
         // the moment the widest tensor is resident, would have two
         // copies of it live at once — which is most of the difference
         // between a mount that fits a tab and one that does not.
-        let buf = std::mem::take(&mut self.window);
-        let source =
-            GgufSource::from_window(&self.header_bytes, buf, self.base, self.expected)
-                .map_err(|e| MountError::Staging(e.to_string()))?;
+        source.swap_window(std::mem::take(&mut self.window), self.base);
+        let source: &GgufSource = source;
 
         let mut consumed_to = self.base;
         let mut staged_bytes = 0u64;
         let mut failure = None;
         while self.next_tensor < header.tensors.len() {
-            let (name, start, size) = header.tensors[self.next_tensor].clone();
+            let (name, start, size) = &header.tensors[self.next_tensor];
             if start + size > end {
                 break;
             }
@@ -233,10 +253,10 @@ impl StreamMount {
             // already knows where that is worth doing and where it is
             // still unproven (it declines on wasm, deliberately).
             let mut hit = None;
-            for (hf, _range) in source.hf_names_for_ggml(&name) {
+            for (hf, _range) in source.hf_names_for_ggml(name) {
                 if let Err(e) = self
                     .pool
-                    .pin_persistent(&self.device, || weights.stage(&source, &self.device, &hf))
+                    .pin_persistent(&self.device, || weights.stage(source, &self.device, &hf))
                 {
                     hit = Some(MountError::Staging(format!("{name} -> {hf}: {e}")));
                     break;
@@ -248,13 +268,16 @@ impl StreamMount {
             }
             self.next_tensor += 1;
             consumed_to = start + size;
-            staged_bytes += size;
+            staged_bytes += *size;
         }
 
-        // Reclaimed before any early return, so a staging failure does
-        // not also lose the window.
-        self.window = source
-            .into_window_buf()
+        // Taken back before any early return, so a staging failure does
+        // not also lose the window. The source keeps reading from the
+        // consumed offset; the bytes behind it are dropped below.
+        self.window = self
+            .source
+            .as_mut()
+            .and_then(|s| s.swap_window(Vec::new(), consumed_to))
             .expect("the source was built over a window");
         if let Some(e) = failure {
             return Err(e);
@@ -295,10 +318,11 @@ impl StreamMount {
     ///
     /// The second half matters: an engine needs the tokenizer, the
     /// metadata and the sampler defaults, all of which live in the
-    /// header and none of which are weights. The header was kept, so
-    /// the source handed back is a window with nothing in it — every
-    /// payload correctly unavailable, everything else exactly as the
-    /// whole file would have said.
+    /// header and none of which are weights. The source built at the
+    /// header answered for every payload as it passed; it goes back
+    /// over an empty window at the file's end, so every payload is
+    /// unavailable by construction and everything the header says reads
+    /// as the whole file would.
     ///
     /// A stream that stopped early fails here rather than producing a
     /// model with holes in it, and everything staged so far is dropped
@@ -316,20 +340,17 @@ impl StreamMount {
             });
         }
         combs_models::flush_device::<CombsBackend>(&self.device);
-        let mut weights = self.staged.take().ok_or(MountError::Truncated {
-            received: self.received,
-            expected: self.expected,
-            staged: 0,
-            tensors,
-        })?;
+        let (Some(mut weights), Some(mut source)) = (self.staged.take(), self.source.take())
+        else {
+            return Err(MountError::Truncated {
+                received: self.received,
+                expected: self.expected,
+                staged: 0,
+                tensors,
+            });
+        };
         weights.seal();
-        let header_only = GgufSource::from_window(
-            &self.header_bytes,
-            Vec::new(),
-            self.expected,
-            self.expected,
-        )
-        .map_err(|e| MountError::Staging(e.to_string()))?;
-        Ok((weights, header_only))
+        drop(source.swap_window(Vec::new(), self.expected));
+        Ok((weights, source))
     }
 }

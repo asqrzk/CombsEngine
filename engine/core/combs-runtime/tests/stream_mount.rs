@@ -445,3 +445,58 @@ fn the_cost_of_feeding_a_7b_in_64_kib_chunks() {
     );
     drop(weights);
 }
+
+/// A file whose header cannot make a model is refused at the header.
+/// Metadata and tokenizer both live there, and a 7B's first tensor is
+/// its embedding: learning after it has been pulled is the wrong time.
+/// The key is renamed to one of the same length so every offset in the
+/// header still holds and the only wrong thing is the thing under test.
+#[test]
+fn a_header_without_a_tokenizer_fails_before_any_payload_is_pulled() {
+    let Some(path) = cached("smollm2-360m-instruct-gguf") else {
+        eprintln!("skip: smollm2-360m-instruct-gguf is not in the local cache");
+        return;
+    };
+    let bytes = std::fs::read(&path).unwrap();
+    let len = bytes.len() as u64;
+    let data_start = read_gguf_header(&bytes, Some(len))
+        .unwrap()
+        .unwrap()
+        .data_start as usize;
+    let mut head = bytes[..data_start].to_vec();
+
+    // GGUF keys are u64-length-prefixed; matching the prefix too pins
+    // the key itself rather than a token or template that mentions it.
+    let key = b"tokenizer.ggml.tokens";
+    let mut needle = (key.len() as u64).to_le_bytes().to_vec();
+    needle.extend_from_slice(key);
+    let hits: Vec<usize> = head
+        .windows(needle.len())
+        .enumerate()
+        .filter(|(_, w)| *w == needle.as_slice())
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected exactly one tokenizer.ggml.tokens key"
+    );
+    let last = hits[0] + needle.len() - 1;
+    assert_eq!(head[last], b's');
+    head[last] = b'z';
+
+    let device = combs_core::init_device();
+    let mut mount = StreamMount::new(len, device);
+    match mount.append(&head) {
+        Err(MountError::BadHeader(why)) => {
+            assert!(why.contains("tokenizer.ggml.tokens"), "{why}")
+        }
+        other => panic!("expected a bad header at the header, got {other:?}"),
+    }
+    let p = mount.progress();
+    assert_eq!(
+        p.received, data_start as u64,
+        "the refusal came after payload"
+    );
+    assert_eq!(p.tensors_staged, 0);
+}

@@ -632,15 +632,24 @@ impl GgufSource {
         Self::from_header(header, GgufData::Window { buf: window, base, total }, None)
     }
 
-    /// Take the window's buffer back.
+    /// Hand the window a new buffer and take the old one back; the
+    /// window then reads `[base, base + buf.len())`. `None`, with nothing
+    /// changed, when this source is not a window.
     ///
     /// A mount hands its window in to read from and wants it back to
     /// keep filling — copying it in and out would cost the whole model
     /// in memcpy and, worse, double the live bytes at the moment the
     /// largest tensor is resident.
-    pub fn into_window_buf(self) -> Option<Vec<u8>> {
-        match self.data {
-            GgufData::Window { buf, .. } => Some(buf),
+    pub fn swap_window(&mut self, buf: Vec<u8>, base: u64) -> Option<Vec<u8>> {
+        match &mut self.data {
+            GgufData::Window {
+                buf: held,
+                base: held_base,
+                ..
+            } => {
+                *held_base = base;
+                Some(std::mem::replace(held, buf))
+            }
             _ => None,
         }
     }
