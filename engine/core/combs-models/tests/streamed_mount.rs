@@ -211,13 +211,12 @@ fn a_short_header_says_not_yet_and_never_lies() {
         .expect("whole file is enough");
     let end = full.data_start as usize;
 
-    // `data_start` is the ALIGNMENT boundary after the info section, so
-    // its last bytes are padding the parser never reads and a prefix a
-    // few bytes short of it parses fine. The alignment is 32 by default
-    // and the file may declare its own, so the last prefix checked here
-    // stops well clear of it — asserting `end - 1` says not-yet would be
-    // asserting something untrue about padding.
-    for n in [0usize, 1, 4, 8, 24, end / 4, end / 2, end - 64] {
+    // `data_start` is the ALIGNMENT boundary after the info section. The
+    // parser reads none of the padding, but a mount files the next byte
+    // off the wire at `data_start`, so a prefix that stops inside the
+    // padding is still short — in this file by up to 24 bytes — and
+    // `end - 1` is the sharpest such prefix.
+    for n in [0usize, 1, 4, 8, 24, end / 4, end / 2, end - 64, end - 1] {
         let got = read_gguf_header(&bytes[..n], Some(total as u64));
         assert!(
             matches!(got, Ok(None)),

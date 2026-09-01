@@ -159,13 +159,23 @@ impl StreamMount {
                     ) {
                         return Err(MountError::Unsupported(header.architecture));
                     }
-                    // The header may have arrived with payload behind it
-                    // in the same chunk; that payload opens the window.
+                    // `read_gguf_header` answers `Some` only once
+                    // `data_start` bytes are in hand, padding included,
+                    // which is what makes the split below exact. Checked
+                    // rather than assumed: a header that parsed short
+                    // would file every payload byte early and nothing
+                    // downstream could tell.
+                    if (self.header_bytes.len() as u64) < header.data_start {
+                        return Err(MountError::BadHeader(format!(
+                            "header parsed from {} bytes but its data section starts at {}",
+                            self.header_bytes.len(),
+                            header.data_start
+                        )));
+                    }
+                    // Payload that arrived behind the header in the same
+                    // chunk opens the window.
                     self.base = header.data_start;
-                    // The header may have arrived with payload behind it in
-                    // the same chunk; `data_start` fits usize here because
-                    // those bytes are in hand.
-                    let split = (header.data_start as usize).min(self.header_bytes.len());
+                    let split = header.data_start as usize;
                     self.window = self.header_bytes[split..].to_vec();
                     self.header_bytes.truncate(split);
                     self.header = Some(header);

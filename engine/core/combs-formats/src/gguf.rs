@@ -195,6 +195,11 @@ impl GgufHeader {
     /// bytes arrive. Pass `total` when the image's eventual length is
     /// known — it is what separates a header still in flight from a
     /// corrupt length field claiming the file is enormous.
+    ///
+    /// `Ok(Some)` only once `data_start` bytes are in hand, the alignment
+    /// padding included: a mount files the next byte off the wire at
+    /// `data_start`, so a prefix that stops inside the padding is not a
+    /// header it can steer by.
     pub(crate) fn try_parse(bytes: &[u8], total: Option<u64>) -> Result<Option<Self>> {
         let mut c = Cursor::with_limit(bytes, total);
         macro_rules! more {
@@ -286,6 +291,23 @@ impl GgufHeader {
             }
         }
 
+        // `data_start` is the alignment boundary after the info section,
+        // not its end: the bytes between are padding this parser never
+        // reads. A mount files the first byte after the header at
+        // `data_start`, so a prefix that ends inside the padding is a
+        // header it cannot steer by — every tensor would land the width
+        // of the padding early. Measured on nine cached files the gap is
+        // 12 to 28 bytes and never zero.
+        let have = bytes.len() as u64;
+        if have < data_start {
+            return match total {
+                Some(t) if t < data_start => Err(FormatError::Safetensors(format!(
+                    "gguf: tensor data starts at byte {data_start} but the file is {t} bytes"
+                ))),
+                _ => Ok(None),
+            };
+        }
+
         Ok(Some(GgufHeader { version, kv, tensors, data_start }))
     }
 }
@@ -309,7 +331,8 @@ pub struct GgufHeaderInfo {
 /// Read a GGUF header from a prefix of the file. `Ok(None)` means the
 /// header is not all here yet — feed more and ask again; `Err` means it
 /// will never parse. `total` is the file's eventual length when known,
-/// which is what separates the two.
+/// which is what separates the two. `Some` arrives only once `data_start`
+/// bytes are in hand, the alignment padding included.
 pub fn read_gguf_header(bytes: &[u8], total: Option<u64>) -> Result<Option<GgufHeaderInfo>> {
     let Some(header) = GgufHeader::try_parse(bytes, total)? else {
         return Ok(None);
@@ -1973,6 +1996,9 @@ mod wide_offset_tests {
         out.extend_from_slice(&elements.to_le_bytes());
         out.extend_from_slice(&GGML_F32.to_le_bytes());
         out.extend_from_slice(&offset.to_le_bytes());
+        // Padded to the 32-byte boundary: a header ends at `data_start`,
+        // not at the last info byte.
+        out.resize(out.len().div_ceil(32) * 32, 0);
         out
     }
 
