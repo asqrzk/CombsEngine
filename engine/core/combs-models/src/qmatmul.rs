@@ -162,9 +162,7 @@ fn cube_count_tiled(n_out: u32, m: u32) -> CubeCount {
 /// (runtime A/B comparisons and triage); checked once per process.
 fn tiled_enabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    !*DISABLED.get_or_init(|| {
-        matches!(std::env::var("COMBS_NO_TILED_MATMUL").as_deref(), Ok("1"))
-    })
+    !*DISABLED.get_or_init(|| matches!(std::env::var("COMBS_NO_TILED_MATMUL").as_deref(), Ok("1")))
 }
 
 /// Runs the dequant-only kernel over a raw Q4_0 block stream. Exists for
@@ -936,6 +934,540 @@ fn i8_at(words: &Array<u32>, idx: usize) -> i32 {
     (i32::cast_from(byte_at(words, idx)) << 24) >> 24
 }
 
+/// Little-endian u32 assembled from four bytes of a word-packed stream,
+/// starting at any (unaligned) byte offset. The staging repack reads
+/// GGUF blocks of 18–210 bytes, none word-aligned, so every output word
+/// crosses word boundaries somewhere.
+#[cube]
+fn word_at(words: &Array<u32>, byte: usize) -> u32 {
+    byte_at(words, byte)
+        | (byte_at(words, byte + 1) << 8)
+        | (byte_at(words, byte + 2) << 16)
+        | (byte_at(words, byte + 3) << 24)
+}
+
+/// Exact f16 → f32 widen from the raw bits, no float arithmetic that
+/// could round: normals and subnormals become integer-valued floats
+/// times a power of two (both exact in f32); inf/NaN map bitwise with
+/// the mantissa shifted into place, which is the same widening
+/// `half::f16::to_f32` performs on the host.
+#[cube]
+fn f16_bits_to_f32(h: u32) -> f32 {
+    let sign = h & 0x8000;
+    let exp = (h >> 10) & 0x1F;
+    let mant = h & 0x3FF;
+    // Normal: (1024 + mant) · 2^(exp − 25). Subnormal: mant · 2^−24 —
+    // whose power constant is written `(exp + 103)` because exp is zero
+    // on that arm, keeping every binding runtime-typed (a cube `mut`
+    // initialized from a bare literal cannot take a runtime value later).
+    let mut base = 1024 + mant;
+    let mut pow_bits = (exp + 102) << 23;
+    if exp == 0 {
+        base = mant;
+        pow_bits = (exp + 103) << 23;
+    }
+    let mut out = f32::cast_from(base) * f32::reinterpret(pow_bits);
+    if sign != 0 {
+        out = -out;
+    }
+    if exp == 31 {
+        out = f32::reinterpret((sign << 16) | 0x7F80_0000 | (mant << 13));
+    }
+    out
+}
+
+/// Staging repack on the device: one thread per 18-byte Q4_0 block,
+/// writing its four packed words and one widened scale — the same
+/// layout `repack_q4_0` builds on the host, without the host copy.
+#[cube(launch_unchecked)]
+fn repack_q4_0_kernel(
+    raw: &Array<u32>,
+    qs: &mut Array<u32>,
+    d: &mut Array<f32>,
+    block0: usize,
+    n_blocks: usize,
+) {
+    if ABSOLUTE_POS < n_blocks {
+        let base = ABSOLUTE_POS * 18;
+        let out = block0 + ABSOLUTE_POS;
+        d[out] = f16_bits_to_f32(byte_at(raw, base) | (byte_at(raw, base + 1) << 8));
+        for w in 0..4 {
+            qs[out * 4 + w] = word_at(raw, base + 2 + 4 * w);
+        }
+    }
+}
+
+/// Q5_0: 22-byte block → 4 packed words, one high-bit word, one scale.
+#[cube(launch_unchecked)]
+fn repack_q5_0_kernel(
+    raw: &Array<u32>,
+    qs: &mut Array<u32>,
+    qh: &mut Array<u32>,
+    d: &mut Array<f32>,
+    block0: usize,
+    n_blocks: usize,
+) {
+    if ABSOLUTE_POS < n_blocks {
+        let base = ABSOLUTE_POS * 22;
+        let out = block0 + ABSOLUTE_POS;
+        d[out] = f16_bits_to_f32(byte_at(raw, base) | (byte_at(raw, base + 1) << 8));
+        qh[out] = word_at(raw, base + 2);
+        for w in 0..4 {
+            qs[out * 4 + w] = word_at(raw, base + 6 + 4 * w);
+        }
+    }
+}
+
+/// Q8_0: 34-byte block → 8 packed words, one scale.
+#[cube(launch_unchecked)]
+fn repack_q8_0_kernel(
+    raw: &Array<u32>,
+    qs: &mut Array<u32>,
+    d: &mut Array<f32>,
+    block0: usize,
+    n_blocks: usize,
+) {
+    if ABSOLUTE_POS < n_blocks {
+        let base = ABSOLUTE_POS * 34;
+        let out = block0 + ABSOLUTE_POS;
+        d[out] = f16_bits_to_f32(byte_at(raw, base) | (byte_at(raw, base + 1) << 8));
+        for w in 0..8 {
+            qs[out * 8 + w] = word_at(raw, base + 2 + 4 * w);
+        }
+    }
+}
+
+/// Q4_K: 144-byte superblock → 32 quant words, 2 widened scales, 3
+/// packed scale words.
+#[cube(launch_unchecked)]
+fn repack_q4_k_kernel(
+    raw: &Array<u32>,
+    qs: &mut Array<u32>,
+    dd: &mut Array<f32>,
+    scales: &mut Array<u32>,
+    block0: usize,
+    n_sb: usize,
+) {
+    if ABSOLUTE_POS < n_sb {
+        let base = ABSOLUTE_POS * 144;
+        let out = block0 + ABSOLUTE_POS;
+        dd[out * 2] = f16_bits_to_f32(byte_at(raw, base) | (byte_at(raw, base + 1) << 8));
+        dd[out * 2 + 1] = f16_bits_to_f32(byte_at(raw, base + 2) | (byte_at(raw, base + 3) << 8));
+        for w in 0..3 {
+            scales[out * 3 + w] = word_at(raw, base + 4 + 4 * w);
+        }
+        for w in 0..32 {
+            qs[out * 32 + w] = word_at(raw, base + 16 + 4 * w);
+        }
+    }
+}
+
+/// Q5_K: 176-byte superblock → 32 quant words, 8 high-bit words, 2
+/// widened scales, 3 packed scale words.
+#[cube(launch_unchecked)]
+fn repack_q5_k_kernel(
+    raw: &Array<u32>,
+    qs: &mut Array<u32>,
+    qh: &mut Array<u32>,
+    dd: &mut Array<f32>,
+    scales: &mut Array<u32>,
+    block0: usize,
+    n_sb: usize,
+) {
+    if ABSOLUTE_POS < n_sb {
+        let base = ABSOLUTE_POS * 176;
+        let out = block0 + ABSOLUTE_POS;
+        dd[out * 2] = f16_bits_to_f32(byte_at(raw, base) | (byte_at(raw, base + 1) << 8));
+        dd[out * 2 + 1] = f16_bits_to_f32(byte_at(raw, base + 2) | (byte_at(raw, base + 3) << 8));
+        for w in 0..3 {
+            scales[out * 3 + w] = word_at(raw, base + 4 + 4 * w);
+        }
+        for w in 0..8 {
+            qh[out * 8 + w] = word_at(raw, base + 16 + 4 * w);
+        }
+        for w in 0..32 {
+            qs[out * 32 + w] = word_at(raw, base + 48 + 4 * w);
+        }
+    }
+}
+
+/// Q6_K: 210-byte superblock → 32 low words, 16 high words, 4 scale
+/// words, one widened scale.
+#[cube(launch_unchecked)]
+fn repack_q6_k_kernel(
+    raw: &Array<u32>,
+    ql: &mut Array<u32>,
+    qh: &mut Array<u32>,
+    sc: &mut Array<u32>,
+    d: &mut Array<f32>,
+    block0: usize,
+    n_sb: usize,
+) {
+    if ABSOLUTE_POS < n_sb {
+        let base = ABSOLUTE_POS * 210;
+        let out = block0 + ABSOLUTE_POS;
+        for w in 0..32 {
+            ql[out * 32 + w] = word_at(raw, base + 4 * w);
+        }
+        for w in 0..16 {
+            qh[out * 16 + w] = word_at(raw, base + 128 + 4 * w);
+        }
+        for w in 0..4 {
+            sc[out * 4 + w] = word_at(raw, base + 192 + 4 * w);
+        }
+        d[out] = f16_bits_to_f32(byte_at(raw, base + 208) | (byte_at(raw, base + 209) << 8));
+    }
+}
+
+/// Whether staging repacks on the device. In a tab the answer is
+/// always yes — the host copy is exactly what the 4 GiB ceiling cannot
+/// afford; natively the door opens with `COMBS_STAGE_REPACK=device`
+/// until the identity sweep blesses a default flip.
+pub(crate) fn stage_repack_device() -> bool {
+    if cfg!(target_family = "wasm") {
+        return true;
+    }
+    matches!(std::env::var("COMBS_STAGE_REPACK").as_deref(), Ok("device"))
+}
+
+/// Flush after each device repack: the raw upload's staging copy is
+/// enqueued, not executed, and without a submit several tensors' copies
+/// stack in the queue inside one drain — measured as the difference
+/// between a mount that fits its gate and one that does not.
+fn flush_repack<R: Runtime>(client: &ComputeClient<R>) {
+    let _ = client.flush();
+}
+
+/// Slab size for the raw upload. One contiguous copy of a whole tensor
+/// is exactly what a 4 GiB arena cannot afford — the first tab
+/// measurement of a whole-tensor upload cost 413 MB of high-water over
+/// the host path, an allocation-shape effect, not a volume one. Slabs
+/// keep every host allocation bounded and let each staging copy be
+/// released (flushed) before the next.
+fn repack_slab_bytes() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("COMBS_REPACK_SLAB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(64 << 20)
+    })
+}
+
+/// Uploads a raw GGUF block stream in block-aligned slabs, each
+/// word-padded so a kernel can read it as `Array<u32>`; yields
+/// `(handle, first block, blocks in slab)` per slab.
+fn upload_slabs<R: Runtime>(
+    client: &ComputeClient<R>,
+    data: &[u8],
+    block_bytes: usize,
+) -> Vec<(Handle, usize, usize)> {
+    let blocks_per_slab = (repack_slab_bytes() / block_bytes).max(1);
+    let slab_bytes = blocks_per_slab * block_bytes;
+    data.chunks(slab_bytes)
+        .enumerate()
+        .map(|(i, chunk)| {
+            let h = if chunk.len() % 4 == 0 {
+                client.create_from_slice(chunk)
+            } else {
+                let mut padded = Vec::with_capacity(chunk.len() + 3);
+                padded.extend_from_slice(chunk);
+                padded.resize(chunk.len().div_ceil(4) * 4, 0);
+                client.create_from_slice(&padded)
+            };
+            (h, i * blocks_per_slab, chunk.len() / block_bytes)
+        })
+        .collect()
+}
+
+macro_rules! device_shape_check {
+    ($data:expr, $n_out:expr, $k:expr, $blk:expr, $blk_bytes:expr, $what:expr) => {
+        if $k == 0 || $k % $blk != 0 || $data.len() != $n_out * $k / $blk * $blk_bytes {
+            return Err(ModelError::BadShape {
+                tensor: $what.into(),
+                expected: vec![$n_out, $k],
+                got: vec![$data.len()],
+            });
+        }
+    };
+}
+
+impl<R: Runtime> Q40Weight<R> {
+    /// [`Self::from_gguf_bytes`] with the repack on the device: the raw
+    /// blocks go up once and the SoA layout is written by a kernel, so
+    /// the host never holds a second copy of the tensor.
+    pub fn from_gguf_bytes_device(
+        client: &ComputeClient<R>,
+        data: &[u8],
+        n_out: usize,
+        k: usize,
+    ) -> Result<Self> {
+        device_shape_check!(data, n_out, k, Q4_0_BLOCK, Q4_0_BLOCK_BYTES, "q4_0 weight");
+        let n_blocks = data.len() / Q4_0_BLOCK_BYTES;
+        let qs = client.empty(n_blocks * 4 * 4);
+        let d = client.empty(n_blocks * 4);
+        for (raw, block0, nblk) in upload_slabs(client, data, Q4_0_BLOCK_BYTES) {
+            let raw_words = (nblk * Q4_0_BLOCK_BYTES).div_ceil(4);
+            unsafe {
+                repack_q4_0_kernel::launch_unchecked::<R>(
+                    client,
+                    cube_count_capped(nblk as u32),
+                    CubeDim::new_1d(CUBE_DIM),
+                    ArrayArg::from_raw_parts(raw, raw_words),
+                    ArrayArg::from_raw_parts(qs.clone(), n_blocks * 4),
+                    ArrayArg::from_raw_parts(d.clone(), n_blocks),
+                    block0,
+                    nblk,
+                );
+            }
+            // Release this slab's staging copy before the next uploads.
+            flush_repack(client);
+        }
+        Ok(Q40Weight {
+            qs,
+            d,
+            n_out,
+            k,
+            _runtime: PhantomData,
+        })
+    }
+}
+
+impl<R: Runtime> Q50Weight<R> {
+    /// Device-side twin of [`Self::from_gguf_bytes`]; see `Q40Weight`.
+    pub fn from_gguf_bytes_device(
+        client: &ComputeClient<R>,
+        data: &[u8],
+        n_out: usize,
+        k: usize,
+    ) -> Result<Self> {
+        device_shape_check!(data, n_out, k, Q4_0_BLOCK, Q5_0_BLOCK_BYTES, "q5_0 weight");
+        let n_blocks = data.len() / Q5_0_BLOCK_BYTES;
+        let qs = client.empty(n_blocks * 4 * 4);
+        let qh = client.empty(n_blocks * 4);
+        let d = client.empty(n_blocks * 4);
+        for (raw, block0, nblk) in upload_slabs(client, data, Q5_0_BLOCK_BYTES) {
+            let raw_words = (nblk * Q5_0_BLOCK_BYTES).div_ceil(4);
+            unsafe {
+                repack_q5_0_kernel::launch_unchecked::<R>(
+                    client,
+                    cube_count_capped(nblk as u32),
+                    CubeDim::new_1d(CUBE_DIM),
+                    ArrayArg::from_raw_parts(raw, raw_words),
+                    ArrayArg::from_raw_parts(qs.clone(), n_blocks * 4),
+                    ArrayArg::from_raw_parts(qh.clone(), n_blocks),
+                    ArrayArg::from_raw_parts(d.clone(), n_blocks),
+                    block0,
+                    nblk,
+                );
+            }
+            // Release this slab's staging copy before the next uploads.
+            flush_repack(client);
+        }
+        Ok(Q50Weight {
+            qs,
+            qh,
+            d,
+            n_out,
+            k,
+            _runtime: PhantomData,
+        })
+    }
+}
+
+impl<R: Runtime> Q80Weight<R> {
+    /// Device-side twin of [`Self::from_gguf_bytes`]; see `Q40Weight`.
+    pub fn from_gguf_bytes_device(
+        client: &ComputeClient<R>,
+        data: &[u8],
+        n_out: usize,
+        k: usize,
+    ) -> Result<Self> {
+        device_shape_check!(data, n_out, k, Q4_0_BLOCK, Q8_0_BLOCK_BYTES, "q8_0 weight");
+        let n_blocks = data.len() / Q8_0_BLOCK_BYTES;
+        let qs = client.empty(n_blocks * 8 * 4);
+        let d = client.empty(n_blocks * 4);
+        for (raw, block0, nblk) in upload_slabs(client, data, Q8_0_BLOCK_BYTES) {
+            let raw_words = (nblk * Q8_0_BLOCK_BYTES).div_ceil(4);
+            unsafe {
+                repack_q8_0_kernel::launch_unchecked::<R>(
+                    client,
+                    cube_count_capped(nblk as u32),
+                    CubeDim::new_1d(CUBE_DIM),
+                    ArrayArg::from_raw_parts(raw, raw_words),
+                    ArrayArg::from_raw_parts(qs.clone(), n_blocks * 8),
+                    ArrayArg::from_raw_parts(d.clone(), n_blocks),
+                    block0,
+                    nblk,
+                );
+            }
+            // Release this slab's staging copy before the next uploads.
+            flush_repack(client);
+        }
+        Ok(Q80Weight {
+            qs,
+            d,
+            n_out,
+            k,
+            _runtime: PhantomData,
+        })
+    }
+}
+
+impl<R: Runtime> Q4KWeight<R> {
+    /// Device-side twin of [`Self::from_gguf_bytes`]; see `Q40Weight`.
+    pub fn from_gguf_bytes_device(
+        client: &ComputeClient<R>,
+        data: &[u8],
+        n_out: usize,
+        k: usize,
+    ) -> Result<Self> {
+        device_shape_check!(
+            data,
+            n_out,
+            k,
+            K_SUPERBLOCK,
+            Q4_K_BLOCK_BYTES,
+            "q4_k weight"
+        );
+        let n_sb = data.len() / Q4_K_BLOCK_BYTES;
+        let qs = client.empty(n_sb * 32 * 4);
+        let dd = client.empty(n_sb * 2 * 4);
+        let scales = client.empty(n_sb * 3 * 4);
+        for (raw, block0, nblk) in upload_slabs(client, data, Q4_K_BLOCK_BYTES) {
+            let raw_words = (nblk * Q4_K_BLOCK_BYTES).div_ceil(4);
+            unsafe {
+                repack_q4_k_kernel::launch_unchecked::<R>(
+                    client,
+                    cube_count_capped(nblk as u32),
+                    CubeDim::new_1d(CUBE_DIM),
+                    ArrayArg::from_raw_parts(raw, raw_words),
+                    ArrayArg::from_raw_parts(qs.clone(), n_sb * 32),
+                    ArrayArg::from_raw_parts(dd.clone(), n_sb * 2),
+                    ArrayArg::from_raw_parts(scales.clone(), n_sb * 3),
+                    block0,
+                    nblk,
+                );
+            }
+            // Release this slab's staging copy before the next uploads.
+            flush_repack(client);
+        }
+        Ok(Q4KWeight {
+            qs,
+            dd,
+            scales,
+            n_out,
+            k,
+            _runtime: PhantomData,
+        })
+    }
+}
+
+impl<R: Runtime> Q5KWeight<R> {
+    /// Device-side twin of [`Self::from_gguf_bytes`]; see `Q40Weight`.
+    pub fn from_gguf_bytes_device(
+        client: &ComputeClient<R>,
+        data: &[u8],
+        n_out: usize,
+        k: usize,
+    ) -> Result<Self> {
+        device_shape_check!(
+            data,
+            n_out,
+            k,
+            K_SUPERBLOCK,
+            Q5_K_BLOCK_BYTES,
+            "q5_k weight"
+        );
+        let n_sb = data.len() / Q5_K_BLOCK_BYTES;
+        let qs = client.empty(n_sb * 32 * 4);
+        let qh = client.empty(n_sb * 8 * 4);
+        let dd = client.empty(n_sb * 2 * 4);
+        let scales = client.empty(n_sb * 3 * 4);
+        for (raw, block0, nblk) in upload_slabs(client, data, Q5_K_BLOCK_BYTES) {
+            let raw_words = (nblk * Q5_K_BLOCK_BYTES).div_ceil(4);
+            unsafe {
+                repack_q5_k_kernel::launch_unchecked::<R>(
+                    client,
+                    cube_count_capped(nblk as u32),
+                    CubeDim::new_1d(CUBE_DIM),
+                    ArrayArg::from_raw_parts(raw, raw_words),
+                    ArrayArg::from_raw_parts(qs.clone(), n_sb * 32),
+                    ArrayArg::from_raw_parts(qh.clone(), n_sb * 8),
+                    ArrayArg::from_raw_parts(dd.clone(), n_sb * 2),
+                    ArrayArg::from_raw_parts(scales.clone(), n_sb * 3),
+                    block0,
+                    nblk,
+                );
+            }
+            // Release this slab's staging copy before the next uploads.
+            flush_repack(client);
+        }
+        Ok(Q5KWeight {
+            qs,
+            qh,
+            dd,
+            scales,
+            n_out,
+            k,
+            _runtime: PhantomData,
+        })
+    }
+}
+
+impl<R: Runtime> Q6KWeight<R> {
+    /// Device-side twin of [`Self::from_gguf_bytes`]; see `Q40Weight`.
+    pub fn from_gguf_bytes_device(
+        client: &ComputeClient<R>,
+        data: &[u8],
+        n_out: usize,
+        k: usize,
+    ) -> Result<Self> {
+        device_shape_check!(
+            data,
+            n_out,
+            k,
+            K_SUPERBLOCK,
+            Q6_K_BLOCK_BYTES,
+            "q6_k weight"
+        );
+        let n_sb = data.len() / Q6_K_BLOCK_BYTES;
+        let ql = client.empty(n_sb * 32 * 4);
+        let qh = client.empty(n_sb * 16 * 4);
+        let sc = client.empty(n_sb * 4 * 4);
+        let d = client.empty(n_sb * 4);
+        for (raw, block0, nblk) in upload_slabs(client, data, Q6_K_BLOCK_BYTES) {
+            let raw_words = (nblk * Q6_K_BLOCK_BYTES).div_ceil(4);
+            unsafe {
+                repack_q6_k_kernel::launch_unchecked::<R>(
+                    client,
+                    cube_count_capped(nblk as u32),
+                    CubeDim::new_1d(CUBE_DIM),
+                    ArrayArg::from_raw_parts(raw, raw_words),
+                    ArrayArg::from_raw_parts(ql.clone(), n_sb * 32),
+                    ArrayArg::from_raw_parts(qh.clone(), n_sb * 16),
+                    ArrayArg::from_raw_parts(sc.clone(), n_sb * 4),
+                    ArrayArg::from_raw_parts(d.clone(), n_sb),
+                    block0,
+                    nblk,
+                );
+            }
+            // Release this slab's staging copy before the next uploads.
+            flush_repack(client);
+        }
+        Ok(Q6KWeight {
+            ql,
+            qh,
+            sc,
+            d,
+            n_out,
+            k,
+            _runtime: PhantomData,
+        })
+    }
+}
+
 /// ggml `get_scale_min_k4`, scale half: 6-bit scale of sub-block `j` from
 /// the 12 packed bytes starting at `base` (top 2 bits of bytes 0..4 carry
 /// the high bits of sub-blocks 4..8).
@@ -1465,9 +1997,9 @@ fn q6_k_matmul_kernel(
                             if t >= 2 {
                                 nib = ql_byte >> 4;
                             }
-                            let hi =
-                                (byte_at(qh, sb * 64 + half * 32 + l) >> (u32::cast_from(t) * 2))
-                                    & 3;
+                            let hi = (byte_at(qh, sb * 64 + half * 32 + l)
+                                >> (u32::cast_from(t) * 2))
+                                & 3;
                             let q = i32::cast_from(nib | (hi << 4)) - 32;
                             sum += f32::cast_from(q) * x[x_base + half * 128 + t * 32 + l];
                         }
@@ -2051,13 +2583,50 @@ impl QuantWeight {
         k: usize,
     ) -> Result<Self> {
         use combs_formats::QuantFormat;
+        // The device path exists for the streamed mount: the host repack
+        // briefly holds a full second copy of the widest tensor, which is
+        // most of what stood between the in-tab peak and its gate.
+        if stage_repack_device() {
+            return Ok(match format {
+                QuantFormat::Q4_0 => {
+                    QuantWeight::Q40(Q40Weight::from_gguf_bytes_device(client, data, n_out, k)?)
+                }
+                QuantFormat::Q5_0 => {
+                    QuantWeight::Q50(Q50Weight::from_gguf_bytes_device(client, data, n_out, k)?)
+                }
+                QuantFormat::Q8_0 => {
+                    QuantWeight::Q80(Q80Weight::from_gguf_bytes_device(client, data, n_out, k)?)
+                }
+                QuantFormat::Q4K => {
+                    QuantWeight::Q4K(Q4KWeight::from_gguf_bytes_device(client, data, n_out, k)?)
+                }
+                QuantFormat::Q5K => {
+                    QuantWeight::Q5K(Q5KWeight::from_gguf_bytes_device(client, data, n_out, k)?)
+                }
+                QuantFormat::Q6K => {
+                    QuantWeight::Q6K(Q6KWeight::from_gguf_bytes_device(client, data, n_out, k)?)
+                }
+            });
+        }
         Ok(match format {
-            QuantFormat::Q4_0 => QuantWeight::Q40(Q40Weight::from_gguf_bytes(client, data, n_out, k)?),
-            QuantFormat::Q5_0 => QuantWeight::Q50(Q50Weight::from_gguf_bytes(client, data, n_out, k)?),
-            QuantFormat::Q8_0 => QuantWeight::Q80(Q80Weight::from_gguf_bytes(client, data, n_out, k)?),
-            QuantFormat::Q4K => QuantWeight::Q4K(Q4KWeight::from_gguf_bytes(client, data, n_out, k)?),
-            QuantFormat::Q5K => QuantWeight::Q5K(Q5KWeight::from_gguf_bytes(client, data, n_out, k)?),
-            QuantFormat::Q6K => QuantWeight::Q6K(Q6KWeight::from_gguf_bytes(client, data, n_out, k)?),
+            QuantFormat::Q4_0 => {
+                QuantWeight::Q40(Q40Weight::from_gguf_bytes(client, data, n_out, k)?)
+            }
+            QuantFormat::Q5_0 => {
+                QuantWeight::Q50(Q50Weight::from_gguf_bytes(client, data, n_out, k)?)
+            }
+            QuantFormat::Q8_0 => {
+                QuantWeight::Q80(Q80Weight::from_gguf_bytes(client, data, n_out, k)?)
+            }
+            QuantFormat::Q4K => {
+                QuantWeight::Q4K(Q4KWeight::from_gguf_bytes(client, data, n_out, k)?)
+            }
+            QuantFormat::Q5K => {
+                QuantWeight::Q5K(Q5KWeight::from_gguf_bytes(client, data, n_out, k)?)
+            }
+            QuantFormat::Q6K => {
+                QuantWeight::Q6K(Q6KWeight::from_gguf_bytes(client, data, n_out, k)?)
+            }
         })
     }
 
@@ -2271,12 +2840,307 @@ mod tests {
             assert_eq!(got.len(), expect.len());
             for (i, (g, e)) in got.iter().zip(expect.iter()).enumerate() {
                 let tol = 1e-4 * e.abs().max(1.0);
-                assert!(
-                    (g - e).abs() <= tol,
-                    "m={m} out[{i}]: got {g}, expect {e}"
-                );
+                assert!((g - e).abs() <= tol, "m={m} out[{i}]: got {g}, expect {e}");
             }
         }
+    }
+
+    /// The staging repack, host vs device: a permutation plus an exact
+    /// widen, so every output buffer must be BYTE-identical. LCG quant
+    /// bytes exercise every bit pattern; the widen has its own cell
+    /// below for the corners valid scales never produce.
+    fn assert_bytes_eq(label: &str, host: &[u8], device: &[u8]) {
+        assert_eq!(host.len(), device.len(), "{label}: length");
+        if host != device {
+            let i = host
+                .iter()
+                .zip(device.iter())
+                .position(|(a, b)| a != b)
+                .unwrap();
+            panic!(
+                "{label}: first byte diff at {i}: host {} device {}",
+                host[i], device[i]
+            );
+        }
+    }
+
+    #[test]
+    fn device_repack_matches_host_q4_0() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let data = synth_q4_0(67);
+        let (qs, d) = repack_q4_0(&data).unwrap();
+        let device = Default::default();
+        let client = WgpuRuntime::client(&device);
+        let w = Q40Weight::<WgpuRuntime>::from_gguf_bytes_device(&client, &data, 67, 32).unwrap();
+        assert_bytes_eq(
+            "q4_0 qs",
+            u32::as_bytes(&qs),
+            &client.read_one_unchecked(w.qs.clone()),
+        );
+        assert_bytes_eq(
+            "q4_0 d",
+            f32::as_bytes(&d),
+            &client.read_one_unchecked(w.d.clone()),
+        );
+    }
+
+    #[test]
+    fn device_repack_matches_host_q5_0() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let data = synth_q5_0(53);
+        let (qs, qh, d) = repack_q5_0(&data).unwrap();
+        let device = Default::default();
+        let client = WgpuRuntime::client(&device);
+        let w = Q50Weight::<WgpuRuntime>::from_gguf_bytes_device(&client, &data, 53, 32).unwrap();
+        assert_bytes_eq(
+            "q5_0 qs",
+            u32::as_bytes(&qs),
+            &client.read_one_unchecked(w.qs.clone()),
+        );
+        assert_bytes_eq(
+            "q5_0 qh",
+            u32::as_bytes(&qh),
+            &client.read_one_unchecked(w.qh.clone()),
+        );
+        assert_bytes_eq(
+            "q5_0 d",
+            f32::as_bytes(&d),
+            &client.read_one_unchecked(w.d.clone()),
+        );
+    }
+
+    #[test]
+    fn device_repack_matches_host_q8_0() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let data = synth_q8_0(41);
+        let (qs, d) = repack_q8_0(&data).unwrap();
+        let device = Default::default();
+        let client = WgpuRuntime::client(&device);
+        let w = Q80Weight::<WgpuRuntime>::from_gguf_bytes_device(&client, &data, 41, 32).unwrap();
+        assert_bytes_eq(
+            "q8_0 qs",
+            u32::as_bytes(&qs),
+            &client.read_one_unchecked(w.qs.clone()),
+        );
+        assert_bytes_eq(
+            "q8_0 d",
+            f32::as_bytes(&d),
+            &client.read_one_unchecked(w.d.clone()),
+        );
+    }
+
+    #[test]
+    fn device_repack_matches_host_q4_k() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let data = synth_q4_k(19);
+        let (qs, dd, scales) = repack_q4_k(&data).unwrap();
+        let device = Default::default();
+        let client = WgpuRuntime::client(&device);
+        let w = Q4KWeight::<WgpuRuntime>::from_gguf_bytes_device(&client, &data, 19, 256).unwrap();
+        assert_bytes_eq(
+            "q4_k qs",
+            u32::as_bytes(&qs),
+            &client.read_one_unchecked(w.qs.clone()),
+        );
+        assert_bytes_eq(
+            "q4_k dd",
+            f32::as_bytes(&dd),
+            &client.read_one_unchecked(w.dd.clone()),
+        );
+        assert_bytes_eq(
+            "q4_k scales",
+            u32::as_bytes(&scales),
+            &client.read_one_unchecked(w.scales.clone()),
+        );
+    }
+
+    #[test]
+    fn device_repack_matches_host_q5_k() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let data = synth_q5_k(17);
+        let (qs, qh, dd, scales) = repack_q5_k(&data).unwrap();
+        let device = Default::default();
+        let client = WgpuRuntime::client(&device);
+        let w = Q5KWeight::<WgpuRuntime>::from_gguf_bytes_device(&client, &data, 17, 256).unwrap();
+        assert_bytes_eq(
+            "q5_k qs",
+            u32::as_bytes(&qs),
+            &client.read_one_unchecked(w.qs.clone()),
+        );
+        assert_bytes_eq(
+            "q5_k qh",
+            u32::as_bytes(&qh),
+            &client.read_one_unchecked(w.qh.clone()),
+        );
+        assert_bytes_eq(
+            "q5_k dd",
+            f32::as_bytes(&dd),
+            &client.read_one_unchecked(w.dd.clone()),
+        );
+        assert_bytes_eq(
+            "q5_k scales",
+            u32::as_bytes(&scales),
+            &client.read_one_unchecked(w.scales.clone()),
+        );
+    }
+
+    #[test]
+    fn device_repack_matches_host_q6_k() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let data = synth_q6_k(13);
+        let (ql, qh, sc, d) = repack_q6_k(&data).unwrap();
+        let device = Default::default();
+        let client = WgpuRuntime::client(&device);
+        let w = Q6KWeight::<WgpuRuntime>::from_gguf_bytes_device(&client, &data, 13, 256).unwrap();
+        assert_bytes_eq(
+            "q6_k ql",
+            u32::as_bytes(&ql),
+            &client.read_one_unchecked(w.ql.clone()),
+        );
+        assert_bytes_eq(
+            "q6_k qh",
+            u32::as_bytes(&qh),
+            &client.read_one_unchecked(w.qh.clone()),
+        );
+        assert_bytes_eq(
+            "q6_k sc",
+            u32::as_bytes(&sc),
+            &client.read_one_unchecked(w.sc.clone()),
+        );
+        assert_bytes_eq(
+            "q6_k d",
+            f32::as_bytes(&d),
+            &client.read_one_unchecked(w.d.clone()),
+        );
+    }
+
+    /// The widen alone, over raw LCG bit patterns — the corners a valid
+    /// scale never produces (subnormals, infinities, NaNs) plus a pinned
+    /// set. Q4_0 blocks are built whose SCALE bytes are the LCG stream,
+    /// so the device path widens exactly those bits.
+    #[test]
+    fn device_f16_widen_matches_host_on_every_bit_pattern_class() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let mut patterns: Vec<u16> = vec![
+            0x0000, 0x8000, // ±0
+            0x0001, 0x8001, // smallest subnormals
+            0x03FF, 0x83FF, // largest subnormals
+            0x0400, 0x8400, // smallest normals
+            0x7BFF, 0xFBFF, // largest finite
+            0x7C00, 0xFC00, // ±inf
+            0x7C01, 0x7E00, 0xFE00, // NaNs
+            0x3C00, 0xBC00, // ±1
+        ];
+        let mut s = 0xC0FFEEu32;
+        for _ in 0..1024 {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            patterns.push((s >> 16) as u16);
+        }
+        let n_blocks = patterns.len();
+        let mut data = Vec::with_capacity(n_blocks * Q4_0_BLOCK_BYTES);
+        for bits in &patterns {
+            data.extend_from_slice(&bits.to_le_bytes());
+            data.extend_from_slice(&[0u8; 16]);
+        }
+        let (_, host_d) = repack_q4_0(&data).unwrap();
+        let device = Default::default();
+        let client = WgpuRuntime::client(&device);
+        let w =
+            Q40Weight::<WgpuRuntime>::from_gguf_bytes_device(&client, &data, n_blocks, 32).unwrap();
+        let dev_bytes = client.read_one_unchecked(w.d.clone());
+        let dev_d: &[f32] = f32::from_bytes(&dev_bytes);
+        for (i, (h, g)) in host_d.iter().zip(dev_d.iter()).enumerate() {
+            let same_bits = h.to_bits() == g.to_bits();
+            let both_nan = h.is_nan() && g.is_nan();
+            assert!(
+                same_bits || both_nan,
+                "widen bits {:#06x}: host {h} ({:#010x}) device {g} ({:#010x})",
+                patterns[i],
+                h.to_bits(),
+                g.to_bits()
+            );
+        }
+    }
+
+    /// The slab seams, forced: with COMBS_REPACK_SLAB tiny (a OnceLock,
+    /// so this cell owns its process), every tensor crosses many slab
+    /// boundaries including a partial tail — and every byte must still
+    /// land where the host repack puts it.
+    ///
+    /// COMBS_REPACK_SLAB=1024 cargo test --release -p combs-models \
+    ///   --lib device_repack_matches_host_under_tiny_slabs -- --nocapture
+    #[test]
+    fn device_repack_matches_host_under_tiny_slabs() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let ok = std::env::var("COMBS_REPACK_SLAB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .is_some_and(|n| n <= 4096);
+        if !ok {
+            eprintln!("skip: COMBS_REPACK_SLAB not set tiny (own-process cell)");
+            return;
+        }
+        let device = Default::default();
+        let client = WgpuRuntime::client(&device);
+        {
+            let data = synth_q4_0(301); // 301 x 18 B: many slabs, partial tail
+            let (qs, d) = repack_q4_0(&data).unwrap();
+            let w =
+                Q40Weight::<WgpuRuntime>::from_gguf_bytes_device(&client, &data, 301, 32).unwrap();
+            assert_bytes_eq(
+                "slab q4_0 qs",
+                u32::as_bytes(&qs),
+                &client.read_one_unchecked(w.qs.clone()),
+            );
+            assert_bytes_eq(
+                "slab q4_0 d",
+                f32::as_bytes(&d),
+                &client.read_one_unchecked(w.d.clone()),
+            );
+        }
+        {
+            let data = synth_q6_k(23); // 23 x 210 B: misaligned slab tails
+            let (ql, qh, sc, d) = repack_q6_k(&data).unwrap();
+            let w =
+                Q6KWeight::<WgpuRuntime>::from_gguf_bytes_device(&client, &data, 23, 256).unwrap();
+            assert_bytes_eq(
+                "slab q6_k ql",
+                u32::as_bytes(&ql),
+                &client.read_one_unchecked(w.ql.clone()),
+            );
+            assert_bytes_eq(
+                "slab q6_k qh",
+                u32::as_bytes(&qh),
+                &client.read_one_unchecked(w.qh.clone()),
+            );
+            assert_bytes_eq(
+                "slab q6_k sc",
+                u32::as_bytes(&sc),
+                &client.read_one_unchecked(w.sc.clone()),
+            );
+            assert_bytes_eq(
+                "slab q6_k d",
+                f32::as_bytes(&d),
+                &client.read_one_unchecked(w.d.clone()),
+            );
+        }
+        println!("tiny-slab parity: q4_0 + q6_k byte-identical across slab seams");
     }
 
     /// Deterministic pseudo-random byte stream for K-quant payloads.
@@ -2538,7 +3402,13 @@ mod tests {
         }
         let device = Default::default();
         let client = WgpuRuntime::client(&device);
-        let check = |got: &[f32], cube: &[f32], x: &[f32], dense: &[f32], n_out: usize, k: usize, what: &str| {
+        let check = |got: &[f32],
+                     cube: &[f32],
+                     x: &[f32],
+                     dense: &[f32],
+                     n_out: usize,
+                     k: usize,
+                     what: &str| {
             for r in 0..n_out {
                 let expect: f32 = (0..k).map(|c| x[c] * dense[r * k + c]).sum();
                 let tol = 1e-3 * expect.abs().max(1.0);
@@ -2556,7 +3426,9 @@ mod tests {
             }
         };
         let mk_x = |k: usize| -> Vec<f32> {
-            (0..k).map(|i| ((i as f32 * 0.311).sin() * 1.4) - 0.1).collect()
+            (0..k)
+                .map(|i| ((i as f32 * 0.311).sin() * 1.4) - 0.1)
+                .collect()
         };
 
         for (n_out, k) in [(37usize, 64usize), (1024, 1024), (211, 1152)] {
@@ -2696,37 +3568,61 @@ mod tests {
         let w = Q40Weight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
         let expect = combs_formats::quants::dequantize_q4_0(&data, n).unwrap();
         assert_eq!(read(w.dequant_device::<f32>(&client), n), expect, "q4_0");
-        assert_narrowed(&read_f16(w.dequant_device::<F16>(&client), n), &expect, "q4_0");
+        assert_narrowed(
+            &read_f16(w.dequant_device::<F16>(&client), n),
+            &expect,
+            "q4_0",
+        );
 
         let data = synth_q5_0(blk);
         let w = Q50Weight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
         let expect = combs_formats::quants::dequantize_q5_0(&data, n).unwrap();
         assert_eq!(read(w.dequant_device::<f32>(&client), n), expect, "q5_0");
-        assert_narrowed(&read_f16(w.dequant_device::<F16>(&client), n), &expect, "q5_0");
+        assert_narrowed(
+            &read_f16(w.dequant_device::<F16>(&client), n),
+            &expect,
+            "q5_0",
+        );
 
         let data = synth_q8_0(blk);
         let w = Q80Weight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
         let expect = combs_formats::quants::dequantize_q8_0(&data, n).unwrap();
         assert_eq!(read(w.dequant_device::<f32>(&client), n), expect, "q8_0");
-        assert_narrowed(&read_f16(w.dequant_device::<F16>(&client), n), &expect, "q8_0");
+        assert_narrowed(
+            &read_f16(w.dequant_device::<F16>(&client), n),
+            &expect,
+            "q8_0",
+        );
 
         let data = synth_q4_k(sb);
         let w = Q4KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
         let expect = combs_formats::quants::dequantize_q4_k(&data, n).unwrap();
         assert_eq!(read(w.dequant_device::<f32>(&client), n), expect, "q4_k");
-        assert_narrowed(&read_f16(w.dequant_device::<F16>(&client), n), &expect, "q4_k");
+        assert_narrowed(
+            &read_f16(w.dequant_device::<F16>(&client), n),
+            &expect,
+            "q4_k",
+        );
 
         let data = synth_q5_k(sb);
         let w = Q5KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
         let expect = combs_formats::quants::dequantize_q5_k(&data, n).unwrap();
         assert_eq!(read(w.dequant_device::<f32>(&client), n), expect, "q5_k");
-        assert_narrowed(&read_f16(w.dequant_device::<F16>(&client), n), &expect, "q5_k");
+        assert_narrowed(
+            &read_f16(w.dequant_device::<F16>(&client), n),
+            &expect,
+            "q5_k",
+        );
 
         let data = synth_q6_k(sb);
         let w = Q6KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
         let expect = combs_formats::quants::dequantize_q6_k(&data, n).unwrap();
         assert_eq!(read(w.dequant_device::<f32>(&client), n), expect, "q6_k");
-        assert_narrowed(&read_f16(w.dequant_device::<F16>(&client), n), &expect, "q6_k");
+        assert_narrowed(
+            &read_f16(w.dequant_device::<F16>(&client), n),
+            &expect,
+            "q6_k",
+        );
     }
 
     #[test]
@@ -2776,9 +3672,19 @@ mod tests {
                 .map(|i| ((i * 7 % 13) as f32 - 6.0) / 8.0)
                 .collect();
             let got5 = q5.matmul_host(&client, &x, m).unwrap();
-            assert_close(&got5, &ref_matmul(&x, &w5, m, k, n_out), 1e-3, &format!("q5_0 m={m}"));
+            assert_close(
+                &got5,
+                &ref_matmul(&x, &w5, m, k, n_out),
+                1e-3,
+                &format!("q5_0 m={m}"),
+            );
             let got8 = q8.matmul_host(&client, &x, m).unwrap();
-            assert_close(&got8, &ref_matmul(&x, &w8, m, k, n_out), 1e-3, &format!("q8_0 m={m}"));
+            assert_close(
+                &got8,
+                &ref_matmul(&x, &w8, m, k, n_out),
+                1e-3,
+                &format!("q8_0 m={m}"),
+            );
         }
     }
 
@@ -2819,11 +3725,7 @@ mod tests {
     /// and demands **bit-identical** outputs (`to_bits`, not a tolerance):
     /// the tiled kernels change only the activation load path, never the
     /// accumulation order.
-    fn assert_tiled_bit_identical(
-        untiled: &[f32],
-        tiled: &[f32],
-        label: &str,
-    ) {
+    fn assert_tiled_bit_identical(untiled: &[f32], tiled: &[f32], label: &str) {
         assert_eq!(untiled.len(), tiled.len(), "{label}: length mismatch");
         for (i, (u, t)) in untiled.iter().zip(tiled.iter()).enumerate() {
             assert_eq!(
