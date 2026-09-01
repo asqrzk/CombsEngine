@@ -350,20 +350,26 @@ fn try_batched_matmul_with(
     // 60551, against f16's largest finite value of 65504. An 8% margin,
     // on a quantity that moves with prompt, seed, canvas and step, and
     // whose overflow is Inf rather than a small error. So the operands
-    // are normalized first: divide by a power of two that brings the
-    // largest magnitude to 1, and multiply the f32 result back by the
-    // same. A power of two only moves exponents, so the scaling is
-    // exact both ways and the sole remaining error is still the f16
-    // store. The scale is computed and applied ON DEVICE — reading it
-    // back would sync the queue once per linear, which costs far more
-    // than it saves.
+    // are normalized first: divide by a scale that brings the largest
+    // magnitude near 1, and multiply the f32 result back by the same.
+    // The SAME scale tensor divides and multiplies back, so its own
+    // error cancels identically — exp(k*ln2) is not exactly 2^k (LN_2
+    // rounds, the product rounds, WGSL exp is only bounded), and it
+    // does not need to be. What remains is two f32 roundings, ~1.2e-7
+    // relative: four orders under the f16 store (2^-11), which stays
+    // the sole error that matters. The scale is computed and applied
+    // ON DEVICE — reading it back would sync the queue once per
+    // linear, which costs far more than it saves.
     let (x2, scale) = match operand {
         DType::F32 => (x2, None),
         dt => {
             let xt = Tensor::<InnerF32, 2>::from_primitive(TensorPrimitive::Float(x2));
             let ln2 = core::f32::consts::LN_2;
             let amax = xt.clone().abs().max().clamp_min(f32::MIN_POSITIVE);
-            let exponent = (amax.log() / ln2).ceil();
+            // Unbounded, an amax at or past 2^127 makes the scale Inf
+            // and every output NaN; bounded, the narrow path degrades
+            // to the same Inf the wide path already produces there.
+            let exponent = (amax.log() / ln2).ceil().clamp_max(127.0);
             let scale = (exponent * ln2).exp().reshape([1, 1]);
             let normalized = xt.div(scale.clone().expand([m, k])).cast(FloatDType::F16);
             (
@@ -389,7 +395,7 @@ fn try_batched_matmul_with(
     // works.
     let out = matmul(x2, permute(w2, &[1, 0]), None, matmul_strategy_for(k), DType::F32).ok()?;
     // Undo the normalization on the f32 result, where the product has
-    // room. Exact: the scale is a power of two.
+    // room. The same scale cancels; see the note at the divide above.
     let out = match scale {
         None => out,
         Some(scale) => {
@@ -1565,7 +1571,7 @@ mod tests {
         let data = synth_q8_0(n * k / 32);
         let w = QuantWeight::from_quant_tensor(&client, QuantFormat::Q8_0, &data, n, k).unwrap();
 
-        for magnitude in [6.0e4f32, 6.5e4, 1.0e6, 1.0e9, 1.0e-6] {
+        for magnitude in [6.0e4f32, 6.5e4, 1.0e6, 1.0e9, 1.0e-6, 3.0e38] {
             let xv: Vec<f32> = (0..m * k)
                 .map(|i| (((i % 37) as f32) / 18.0 - 1.0) * magnitude)
                 .collect();
@@ -1585,6 +1591,30 @@ mod tests {
             let wide = run(DType::F32);
             let narrow = run(DType::F16);
 
+            if !wide.iter().all(|v| v.is_finite()) {
+                // Past ~2^127 the WIDE path's own intermediates
+                // overflow (products at 3e38 sum past f32::MAX before
+                // any cancellation) — measured: wide Inf at index 0
+                // while narrow, summing at the normalized scale,
+                // stays finite. So wide's finiteness is no standard
+                // to hold narrow to; the one thing the clamp
+                // guarantees is NO NaN. Unclamped, the scale itself
+                // was Inf and every output was NaN (x/Inf = 0,
+                // 0 * Inf); clamped, the scale is finite and a finite
+                // sum times a finite scale is never NaN.
+                let n_nan = narrow.iter().filter(|v| v.is_nan()).count();
+                let n_inf = narrow.iter().filter(|v| v.is_infinite()).count();
+                let w_inf = wide.iter().filter(|v| !v.is_finite()).count();
+                println!(
+                    "range {magnitude:e}: wide non-finite {w_inf} of {}, narrow inf {n_inf}, narrow NaN {n_nan}",
+                    wide.len()
+                );
+                assert_eq!(
+                    n_nan, 0,
+                    "magnitude {magnitude:e}: the clamp's guarantee is no NaN; found {n_nan}"
+                );
+                continue;
+            }
             assert!(
                 narrow.iter().all(|v| v.is_finite()),
                 "magnitude {magnitude:e}: narrow operands produced a non-finite value"
