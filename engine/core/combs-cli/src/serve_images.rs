@@ -188,6 +188,7 @@ pub fn cmd_serve_images(
         let model_id = model_id.clone();
         let lora_info = lora_info.clone();
         let fixed_sampler = fixed_sampler.clone();
+        let device = device.clone();
         let preflight = preflight.clone();
         let provenance_config = provenance_config.clone();
         std::thread::spawn(move || {
@@ -285,6 +286,21 @@ pub fn cmd_serve_images(
                             },
                             "lora": lora_info,
                             "load": {"ms": load_ms, "open_ms": open_ms, "weights_ms": weights_ms},
+                            // The allocator's own numbers — the V6-0b
+                            // budget protocol. A DOOR, off by default:
+                            // gpu_memory blocks on the compute stream,
+                            // so a monitor polling stats every 2 s
+                            // would sync the DiT queue mid-generation.
+                            // Open it deliberately when weighing a run.
+                            "gpu": if matches!(
+                                std::env::var("COMBS_IMAGE_STATS_GPU").as_deref(),
+                                Ok("1")
+                            ) {
+                                serde_json::to_value(combs_core::gpu_memory(&device))
+                                    .unwrap_or(Value::Null)
+                            } else {
+                                Value::Null
+                            },
                         }),
                     )
                 }
