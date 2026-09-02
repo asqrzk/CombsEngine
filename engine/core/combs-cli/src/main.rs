@@ -210,6 +210,13 @@ enum Command {
         /// Prompt tokens per prefill call (0 = single-shot; default 512).
         #[arg(long)]
         prefill_chunk_size: Option<usize>,
+        /// Size the KV arena from what the machine can hand out: arena =
+        /// min(model positional max, (available - weight file bytes -
+        /// 2 GiB headroom) / bytes per KV token), clamped 4096..=131072.
+        /// Ignored when --context-size names a number (an explicit size
+        /// is the operator's word). No probe on this platform = default.
+        #[arg(long, conflicts_with = "context_size")]
+        kv_auto: bool,
         /// LoRA/adapter safetensors file (or cached adapter id) fused into
         /// the weights at load time.
         #[arg(long)]
@@ -311,11 +318,21 @@ fn main() -> Result<()> {
             context_size,
             page_size,
             prefill_chunk_size,
+            kv_auto,
             lora,
             lora_scale,
         } => {
             let lora = lora.map(|l| resolve_lora_arg(&l)).transpose()?;
-            cmd_serve(model, port, context_size, page_size, prefill_chunk_size, lora, lora_scale)
+            cmd_serve(
+                model,
+                port,
+                context_size,
+                page_size,
+                prefill_chunk_size,
+                kv_auto,
+                lora,
+                lora_scale,
+            )
         }
         Command::Perplexity { model, file, text, chunk, max_tokens } => {
             cmd_perplexity(model, file, text, chunk, max_tokens)
@@ -330,6 +347,25 @@ fn main() -> Result<()> {
             ChewMode::KvCacheUi(args) => chew::chew("kv-cache-ui", args),
             ChewMode::DebateKvUi(args) => chew::chew("debate-kv-ui", args),
         },
+    }
+}
+
+#[cfg(test)]
+mod kv_auto_tests {
+    /// The formula, checked at one worked example: qwen2.5-7B-class
+    /// geometry (4 kv heads x 128 dim, all-global 28 layers... kept
+    /// synthetic and small here) under a known budget.
+    #[test]
+    fn the_auto_arena_divides_the_budget_by_the_per_token_cost() {
+        // 8 kv heads x 64 dim, f32 (32 bytes/8 = 4 B/value), x2 (k+v),
+        // 4 global layers -> per_token = 8*64*4*2*4 = 16384 B.
+        // budget 1 GiB -> 65536 tokens; clamp keeps it; positional max
+        // 32768 caps it at 32768.
+        let per_token: u64 = 8 * 64 * (4 * 8) / 8 * 2 * 4;
+        assert_eq!(per_token, 16_384);
+        let tokens = ((1u64 << 30) / per_token) as usize;
+        assert_eq!(tokens, 65_536);
+        assert_eq!(tokens.clamp(4096, 131_072).min(32_768), 32_768);
     }
 }
 
@@ -387,12 +423,66 @@ fn cmd_transcribe(model: PathBuf, file: PathBuf, language: String) -> Result<()>
     Ok(())
 }
 
+/// The auto arena, from measured parts: what the host reports as
+/// available (fit's probe — the same one image preflight trusts), minus
+/// the weight FILE bytes (the honest pre-load stand-in for resident
+/// weights: gguf packed bytes stay packed; a safetensors f32 file is
+/// its resident size on the f32 build) and the standing 2 GiB headroom,
+/// divided by the model's own bytes-per-KV-token. Clamped 4096..=131072
+/// and never above the positional maximum.
+fn auto_arena_len(
+    meta: &combs_formats::ModelMetadata,
+    weight_file_bytes: u64,
+    quantize_kv: bool,
+) -> Option<usize> {
+    let available = crate::fit::available_memory_bytes()?;
+    let elem_bytes: u64 = if cfg!(feature = "f16") { 2 } else { 4 };
+    let per_value_x8 = if quantize_kv { 9 } else { elem_bytes * 8 };
+    let globals = (0..meta.num_hidden_layers)
+        .filter(|&i| meta.attention_pattern.is_global_layer(i))
+        .count()
+        .max(1);
+    let per_token = (meta.num_key_value_heads as u64 * meta.head_dim as u64 * per_value_x8 / 8)
+        * 2
+        * globals as u64;
+    if per_token == 0 {
+        return None;
+    }
+    let budget = available
+        .saturating_sub(weight_file_bytes)
+        .saturating_sub(crate::fit::DEFAULT_HEADROOM_BYTES);
+    let tokens = (budget / per_token) as usize;
+    Some(
+        tokens
+            .clamp(4096, 131_072)
+            .min(meta.max_position_embeddings.max(4096)),
+    )
+}
+
+/// Bytes on disk for a model path: the file itself, or a directory's
+/// files summed (one level — checkpoint layouts are flat).
+fn model_disk_bytes(path: &std::path::Path) -> u64 {
+    if path.is_file() {
+        return std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    }
+    std::fs::read_dir(path)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| e.metadata().ok())
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
 fn cmd_serve(
     model: PathBuf,
     port: u16,
     context_size: Option<usize>,
     page_size: Option<usize>,
     prefill_chunk_size: Option<usize>,
+    kv_auto: bool,
     lora: Option<PathBuf>,
     lora_scale: f32,
 ) -> Result<()> {
@@ -501,6 +591,30 @@ fn cmd_serve(
         std::process::abort();
     }));
 
+    let context_size = match (context_size, kv_auto) {
+        (Some(n), _) => Some(n),
+        (None, true) => {
+            let quantize_kv = matches!(std::env::var("COMBS_KV_QUANT").as_deref(), Ok("1"));
+            let auto = auto_arena_len(source.metadata(), model_disk_bytes(&model), quantize_kv);
+            match auto {
+                Some(n) => {
+                    eprintln!(
+                        "combs serve: --kv-auto sized the arena at {n} tokens \
+                         (available memory minus weights and headroom)"
+                    );
+                    Some(n)
+                }
+                None => {
+                    eprintln!(
+                        "combs serve: --kv-auto has no memory probe on this platform — \
+                         using the default arena"
+                    );
+                    None
+                }
+            }
+        }
+        (None, false) => None,
+    };
     let engine = if context_size.is_some() || page_size.is_some() {
         let arena = context_size.unwrap_or_else(|| {
             combs_runtime::default_arena_len(source.metadata().max_position_embeddings)
