@@ -382,7 +382,18 @@ impl<B: Backend, VB: Backend> DiffusionModel<B> for Flux2KleinPipeline<B, VB> {
         }
 
         prof_reset();
-        let image = self.decode_tokens(latent, grid_h, grid_w);
+        // V6's go/no-go door: measure the DiT's own ceiling with the
+        // decode skipped. The zeros carry the decode's exact pixel
+        // shape (unpatchify doubles the grid, the autoencoder scales
+        // by eight), so every caller downstream behaves normally.
+        // Diagnostic only — a black image is the honest output of a
+        // run that deliberately never decoded.
+        let image = if std::env::var("COMBS_KLEIN_SKIP_DECODE").as_deref() == Ok("1") {
+            eprintln!("[klein] COMBS_KLEIN_SKIP_DECODE=1 — decode skipped, black image");
+            Tensor::zeros([1, 3, grid_h * 16, grid_w * 16], &self.device)
+        } else {
+            self.decode_tokens(latent, grid_h, grid_w)
+        };
         prof_mark("decode", &image);
         prof_report("decode");
         Ok((image, noise.effective_seed()))
