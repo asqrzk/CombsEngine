@@ -1451,9 +1451,29 @@ impl ChannelReader {
 impl Read for ChannelReader {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         while self.buf.is_empty() {
-            match self.rx.recv() {
+            // Client-disconnect detection is bounded by how often the
+            // socket is WRITTEN: measured 2026-08-14, an abort after
+            // ~24 KiB was noticed, one after ~400 B ran to completion —
+            // the OS buffer swallowed the silence. During idle decode
+            // gaps this comment tick (SSE spec: lines starting with a
+            // colon are ignored by clients) forces a write every 100 ms,
+            // so a closed peer errors within about one interval; tiny_http
+            // then drops the response, the channel closes, and the next
+            // send_chunk flips the engine's cancel flag. Measured on the
+            // first cut: a 250 ms tick detected a 100-byte abort in
+            // ~1.9 s wall (the first write after the peer's FIN still
+            // succeeds and only provokes the RST the SECOND one trips
+            // over — so detection spans about two ticks plus teardown);
+            // 100 ms buys the bar back at ~10 idle writes/s, a few
+            // hundred SSE comment bytes. TCP_NODELAY is
+            // not reachable through tiny_http's API — not taken, and the
+            // tick bounds the latency on its own.
+            match self.rx.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(chunk) => self.buf.extend(chunk.as_bytes()),
-                Err(_) => return Ok(0), // channel closed: EOF
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.buf.extend(b": keepalive\n\n");
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(0), // EOF
             }
         }
         let n = out.len().min(self.buf.len());
