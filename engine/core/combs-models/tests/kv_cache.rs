@@ -40,6 +40,10 @@ fn assert_close(a: Tensor<B, 4>, b: Tensor<B, 4>, ctx: &str) {
     let b: Vec<f32> = b.into_data().to_vec().unwrap();
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
         assert!(
+            x.is_finite() && y.is_finite(),
+            "{ctx}: non-finite at flat index {i}: {x} vs {y}"
+        );
+        assert!(
             (x - y).abs() < 1e-4,
             "{ctx}: mismatch at flat index {i}: {x} vs {y}"
         );

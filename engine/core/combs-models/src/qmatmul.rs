@@ -3194,6 +3194,14 @@ mod tests {
     fn assert_close(got: &[f32], expect: &[f32], rel: f32, what: &str) {
         assert_eq!(got.len(), expect.len(), "{what}: length");
         for (i, (g, e)) in got.iter().zip(expect.iter()).enumerate() {
+            // Finite first: a NaN passes every |diff| <= tol comparison
+            // backwards (all comparisons on NaN are false, but so is the
+            // assert's), and an Inf-vs-Inf diff is NaN — name the index
+            // before the tolerance can lie about it.
+            assert!(
+                g.is_finite() && e.is_finite(),
+                "{what}[{i}]: non-finite (got {g}, expect {e})"
+            );
             let tol = rel * e.abs().max(1.0);
             assert!((g - e).abs() <= tol, "{what}[{i}]: got {g}, expect {e}");
         }

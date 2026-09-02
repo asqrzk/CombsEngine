@@ -1092,6 +1092,10 @@ mod tests {
         let bv: Vec<f32> = b.into_data().to_vec().unwrap();
         assert_eq!(av.len(), bv.len(), "{what}: shape");
         for (i, (x, y)) in av.iter().zip(bv.iter()).enumerate() {
+            assert!(
+                x.is_finite() && y.is_finite(),
+                "{what}[{i}]: non-finite ({x} vs {y})"
+            );
             assert!((x - y).abs() < 1e-5, "{what}[{i}]: {x} vs {y}");
         }
     }

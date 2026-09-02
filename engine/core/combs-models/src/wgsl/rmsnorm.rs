@@ -232,6 +232,14 @@ mod tests {
     fn assert_close(got: &[f32], expect: &[f32], rel: f32, what: &str) {
         assert_eq!(got.len(), expect.len(), "{what}: length");
         for (i, (g, e)) in got.iter().zip(expect).enumerate() {
+            // Finite first: a NaN passes every |diff| <= tol comparison
+            // backwards (all comparisons on NaN are false, but so is the
+            // assert's), and an Inf-vs-Inf diff is NaN — name the index
+            // before the tolerance can lie about it.
+            assert!(
+                g.is_finite() && e.is_finite(),
+                "{what}[{i}]: non-finite (got {g}, expect {e})"
+            );
             let tol = rel * e.abs().max(1.0);
             assert!((g - e).abs() <= tol, "{what}[{i}]: got {g}, expect {e}");
         }
@@ -240,6 +248,41 @@ mod tests {
     /// Harmony vs the burn reference across every decode-relevant width,
     /// ragged included, on both wgpu backends and both flavors. Tiny
     /// buffers — safe in a shared test process.
+    /// H3c's contract on the helper itself: a NaN names its index
+    /// instead of sliding under the tolerance. CPU-only.
+    #[test]
+    #[should_panic(expected = "non-finite")]
+    fn assert_close_names_the_first_non_finite_index() {
+        assert_close(&[1.0, f32::NAN, 3.0], &[1.0, 2.0, 3.0], 1e-4, "probe");
+    }
+
+    /// eps = 1.0 conditions the mean-square (the rsqrt argument sits
+    /// near 1 instead of near float dust), so backends should agree far
+    /// tighter than the real-eps tolerance — this is the arm expected
+    /// to hold unchanged on Vulkan when the pod runs (H3e).
+    #[test]
+    fn wgsl_rms_norm_conditioned_at_unit_eps_agrees_tightly() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        for &n in &[64usize, 896, 1024, 3072] {
+            let rows = 3usize;
+            let xs = signal(rows * n, 0.3);
+            let ws = signal(n, 7.7);
+            let expect = reference(&xs, &ws, rows, n, 1.0, 0.0);
+            let device = Default::default();
+            let x: Tensor<UnfusedF32, 2> =
+                Tensor::from_data(TensorData::new(xs.clone(), [rows, n]), &device);
+            let w: Tensor<UnfusedF32, 1> =
+                Tensor::from_data(TensorData::new(ws.clone(), [n]), &device);
+            let got = rms_norm_unfused(x, w, 1.0, 0.0)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
+            assert_close(&got, &expect, 1e-6, &format!("conditioned n={n}"));
+        }
+    }
+
     #[test]
     fn wgsl_rms_norm_matches_the_reference_across_widths_and_flavors() {
         if crate::skip_no_gpu() {
