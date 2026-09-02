@@ -31,8 +31,8 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use combs_runtime::{
     ChatRequestJson, EngineConfigJson, EngineMetadataJson, LocalEngine, ResolvedChat, StatsJson,
@@ -221,15 +221,16 @@ fn create_engine_from_staged(
     header: combs_formats::GgufSource,
 ) -> Result<u32, JsValue> {
     use combs_formats::ModelSource as _;
-    let mut cache_config = combs_runtime::CacheConfig::paged(
-        {
-            validate_arena(config.max_seq_len, header.metadata().max_position_embeddings)
-                .map_err(js_err)?;
-            config.max_seq_len.unwrap_or_else(|| {
-                combs_runtime::default_arena_len(header.metadata().max_position_embeddings)
-            })
-        },
-    );
+    let mut cache_config = combs_runtime::CacheConfig::paged({
+        validate_arena(
+            config.max_seq_len,
+            header.metadata().max_position_embeddings,
+        )
+        .map_err(js_err)?;
+        config.max_seq_len.unwrap_or_else(|| {
+            combs_runtime::default_arena_len(header.metadata().max_position_embeddings)
+        })
+    });
     if let Some(ps) = config.page_size {
         cache_config.page_size = ps;
     }
@@ -238,13 +239,8 @@ fn create_engine_from_staged(
         Some("contiguous") => combs_runtime::CacheKind::Contiguous,
         Some(other) => return Err(js_err(format!("unknown kv_cache kind: {other}"))),
     };
-    let engine = LocalEngine::load_staged(
-        staged,
-        &header,
-        combs_core::init_device(),
-        cache_config,
-    )
-    .map_err(|e| js_err(format!("engine load failed: {e}")))?;
+    let engine = LocalEngine::load_staged(staged, &header, combs_core::init_device(), cache_config)
+        .map_err(|e| js_err(format!("engine load failed: {e}")))?;
     let id = NEXT_ID.with(|n| {
         let mut n = n.borrow_mut();
         let id = *n;
@@ -259,16 +255,16 @@ fn create_engine_from_source(
     config: EngineConfigJson,
     source: Box<dyn combs_formats::ModelSource>,
 ) -> Result<u32, JsValue> {
-
-    let mut cache_config = combs_runtime::CacheConfig::paged(
-        {
-            validate_arena(config.max_seq_len, source.metadata().max_position_embeddings)
-                .map_err(js_err)?;
-            config.max_seq_len.unwrap_or_else(|| {
-                combs_runtime::default_arena_len(source.metadata().max_position_embeddings)
-            })
-        },
-    );
+    let mut cache_config = combs_runtime::CacheConfig::paged({
+        validate_arena(
+            config.max_seq_len,
+            source.metadata().max_position_embeddings,
+        )
+        .map_err(js_err)?;
+        config.max_seq_len.unwrap_or_else(|| {
+            combs_runtime::default_arena_len(source.metadata().max_position_embeddings)
+        })
+    });
     if let Some(ps) = config.page_size {
         cache_config.page_size = ps;
     }
@@ -278,8 +274,9 @@ fn create_engine_from_source(
         Some(other) => return Err(js_err(format!("unknown kv_cache kind: {other}"))),
     };
 
-    let engine = LocalEngine::load_with_cache_config(&source, combs_core::init_device(), cache_config)
-        .map_err(|e| js_err(format!("engine load failed: {e}")))?;
+    let engine =
+        LocalEngine::load_with_cache_config(&source, combs_core::init_device(), cache_config)
+            .map_err(|e| js_err(format!("engine load failed: {e}")))?;
 
     let id = NEXT_ID.with(|n| {
         let mut n = n.borrow_mut();
@@ -313,9 +310,8 @@ pub async fn combs_engine_create_onnx(
     let s: serde_json::Value = serde_json::from_str(&siblings_json)
         .map_err(|e| js_err(format!("invalid onnx siblings JSON: {e}")))?;
     let text = |key: &str| s.get(key).and_then(|v| v.as_str()).map(String::from);
-    let required = |key: &str| {
-        text(key).ok_or_else(|| js_err(format!("onnx siblings: {key} is required")))
-    };
+    let required =
+        |key: &str| text(key).ok_or_else(|| js_err(format!("onnx siblings: {key} is required")));
     let source = combs_formats::OnnxSource::from_parts(
         graph,
         combs_formats::OnnxSiblings {
@@ -409,9 +405,10 @@ pub fn combs_model_append(handle: u32, chunk: &[u8]) -> Result<(), JsValue> {
             // The streaming append does the uploading too, so this is
             // where a mount spends most of its time — and why the
             // worker calls it from its reader loop rather than the page.
-            Mount::Streaming { mount, .. } => {
-                mount.append(chunk).map(|_| ()).map_err(|e| js_err(e.to_string()))
-            }
+            Mount::Streaming { mount, .. } => mount
+                .append(chunk)
+                .map(|_| ())
+                .map_err(|e| js_err(e.to_string())),
         }
     })
 }
@@ -592,9 +589,12 @@ pub async fn combs_chat_completion(
     let engine = ENGINES.with(|m| m.borrow_mut().remove(&engine_id));
     let Some(engine) = engine else {
         let msg = "no such engine, or a request is already running on it".to_string();
-        emit(&on_event, &StreamEvent::Error {
-            message: msg.clone(),
-        });
+        emit(
+            &on_event,
+            &StreamEvent::Error {
+                message: msg.clone(),
+            },
+        );
         return Err(js_err(msg));
     };
     let mut guard = RequestGuard {
@@ -608,9 +608,12 @@ pub async fn combs_chat_completion(
     match result {
         Ok(()) => Ok(()),
         Err(message) => {
-            emit(&on_event, &StreamEvent::Error {
-                message: message.clone(),
-            });
+            emit(
+                &on_event,
+                &StreamEvent::Error {
+                    message: message.clone(),
+                },
+            );
             Err(js_err(message))
         }
     }
@@ -641,17 +644,20 @@ async fn run_chat(
     let mut parser = ToolCallParser::new(parser_style);
     let mut tool_calls: Vec<serde_json::Value> = Vec::new();
     let push_text = |text: &str,
-                         token_id: u32,
-                         logprob: Option<f32>,
-                         parser: &mut ToolCallParser,
-                         calls: &mut Vec<serde_json::Value>| {
+                     token_id: u32,
+                     logprob: Option<f32>,
+                     parser: &mut ToolCallParser,
+                     calls: &mut Vec<serde_json::Value>| {
         for ev in parser.push(text) {
             match ev {
-                ToolEvent::Content(text) => emit(on_event, &StreamEvent::Delta {
-                    text,
-                    token_id,
-                    logprob,
-                }),
+                ToolEvent::Content(text) => emit(
+                    on_event,
+                    &StreamEvent::Delta {
+                        text,
+                        token_id,
+                        logprob,
+                    },
+                ),
                 ToolEvent::Call(c) => calls.push(serde_json::json!({
                     "id": c.id,
                     "type": "function",
@@ -677,11 +683,14 @@ async fn run_chat(
                 }
                 for ev in parser.finish() {
                     match ev {
-                        ToolEvent::Content(text) => emit(on_event, &StreamEvent::Delta {
-                            text,
-                            token_id: 0,
-                            logprob: None,
-                        }),
+                        ToolEvent::Content(text) => emit(
+                            on_event,
+                            &StreamEvent::Delta {
+                                text,
+                                token_id: 0,
+                                logprob: None,
+                            },
+                        ),
                         ToolEvent::Call(c) => tool_calls.push(serde_json::json!({
                             "id": c.id,
                             "type": "function",
@@ -695,11 +704,14 @@ async fn run_chat(
                 }
                 let reason =
                     combs_runtime::finish_reason(&stats, config.max_tokens, tool_calls.len());
-                emit(on_event, &StreamEvent::Done {
-                    finish_reason: reason.into(),
-                    tool_calls,
-                    stats: StatsJson::from(&*stats),
-                });
+                emit(
+                    on_event,
+                    &StreamEvent::Done {
+                        finish_reason: reason.into(),
+                        tool_calls,
+                        stats: StatsJson::from(&*stats),
+                    },
+                );
                 return Ok(());
             }
             Err(combs_runtime::EngineError::Cancelled) => {
@@ -707,18 +719,24 @@ async fn run_chat(
                 // already arrived stays on screen.
                 for ev in parser.finish() {
                     if let ToolEvent::Content(text) = ev {
-                        emit(on_event, &StreamEvent::Delta {
-                            text,
-                            token_id: 0,
-                            logprob: None,
-                        });
+                        emit(
+                            on_event,
+                            &StreamEvent::Delta {
+                                text,
+                                token_id: 0,
+                                logprob: None,
+                            },
+                        );
                     }
                 }
-                emit(on_event, &StreamEvent::Done {
-                    finish_reason: "cancelled".into(),
-                    tool_calls: Vec::new(),
-                    stats: StatsJson::default(),
-                });
+                emit(
+                    on_event,
+                    &StreamEvent::Done {
+                        finish_reason: "cancelled".into(),
+                        tool_calls: Vec::new(),
+                        stats: StatsJson::default(),
+                    },
+                );
                 return Ok(());
             }
             Err(e) => return Err(e.to_string()),

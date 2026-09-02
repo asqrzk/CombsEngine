@@ -83,16 +83,23 @@ async fn run_case(
     let kv = signal(n_kv * total * d, 41.0);
     let vv = signal(n_kv * total * d, 77.0);
     let expect = reference(
-        &qv, &kv, &vv, n_q, n_kv, seq, total, d, pos, scale as f32, window,
+        &qv,
+        &kv,
+        &vv,
+        n_q,
+        n_kv,
+        seq,
+        total,
+        d,
+        pos,
+        scale as f32,
+        window,
     );
 
     let device = Default::default();
-    let q: Tensor<FB, 4> =
-        Tensor::from_data(TensorData::new(qv, [1, n_q, seq, d]), &device);
-    let k: Tensor<FB, 4> =
-        Tensor::from_data(TensorData::new(kv, [1, n_kv, total, d]), &device);
-    let v: Tensor<FB, 4> =
-        Tensor::from_data(TensorData::new(vv, [1, n_kv, total, d]), &device);
+    let q: Tensor<FB, 4> = Tensor::from_data(TensorData::new(qv, [1, n_q, seq, d]), &device);
+    let k: Tensor<FB, 4> = Tensor::from_data(TensorData::new(kv, [1, n_kv, total, d]), &device);
+    let v: Tensor<FB, 4> = Tensor::from_data(TensorData::new(vv, [1, n_kv, total, d]), &device);
     let out = attend(q, k, v, pos, scale, window);
     let data = out
         .into_data_async()
@@ -127,8 +134,8 @@ async fn run_case(
 /// a silent zero-writing launch — cannot pass this.
 async fn run_batched_case(name: &str, m: usize, k: usize, n: usize) -> Result<(), String> {
     use burn::tensor::TensorPrimitive;
-    use combs_formats::QuantFormat;
     use combs_formats::quants::{dequantize_q8_0, quantize_q8_0};
+    use combs_formats::QuantFormat;
 
     let wf = signal(n * k, 9.1);
     let packed = quantize_q8_0(&wf).map_err(|e| format!("{name}: quantize: {e:?}"))?;
@@ -149,14 +156,9 @@ async fn run_batched_case(name: &str, m: usize, k: usize, n: usize) -> Result<()
 
     let device = Default::default();
     let client = <burn::backend::wgpu::WgpuRuntime as cubecl::prelude::Runtime>::client(&device);
-    let w = crate::qmatmul::QuantWeight::from_quant_tensor(
-        &client,
-        QuantFormat::Q8_0,
-        &packed,
-        n,
-        k,
-    )
-    .map_err(|e| format!("{name}: weight build: {e:?}"))?;
+    let w =
+        crate::qmatmul::QuantWeight::from_quant_tensor(&client, QuantFormat::Q8_0, &packed, n, k)
+            .map_err(|e| format!("{name}: weight build: {e:?}"))?;
     let x: Tensor<crate::qlinear::UnfusedF32, 2> =
         Tensor::from_data(TensorData::new(xv, [m, k]), &device);
     let xt = x.into_primitive().tensor();
@@ -214,7 +216,17 @@ pub async fn forward_probe_report() -> Result<(), String> {
     let d = 256usize;
     let flash_scale = 1.0 / (d as f64).sqrt();
     // Sliding-layer prefill: window masking forces the manual composite.
-    run_case("manual-attend seq=8 window=5", 4, 1, 8, 40, d, 0.11, Some(5)).await?;
+    run_case(
+        "manual-attend seq=8 window=5",
+        4,
+        1,
+        8,
+        40,
+        d,
+        0.11,
+        Some(5),
+    )
+    .await?;
     run_case(
         "manual-attend seq=32 window=512",
         4,
@@ -232,8 +244,17 @@ pub async fn forward_probe_report() -> Result<(), String> {
     run_case("flash seq=32 d=256", 4, 1, 32, 300, d, flash_scale, None).await?;
     // The proven-in-browser geometry as a control: if THIS fails, the
     // harness (not the kernels) is suspect.
-    run_case("flash seq=8 d=128 control", 4, 2, 8, 40, 128, 1.0 / (128f64).sqrt(), None)
-        .await?;
+    run_case(
+        "flash seq=8 d=128 control",
+        4,
+        2,
+        8,
+        40,
+        128,
+        1.0 / (128f64).sqrt(),
+        None,
+    )
+    .await?;
     // The batched quant path: prompt-shaped, plus one block-shaped cell.
     run_batched_case("batched m=64 k=512 n=256", 64, 512, 256).await?;
     run_batched_case("batched m=16 k=256 n=2048", 16, 256, 2048).await?;

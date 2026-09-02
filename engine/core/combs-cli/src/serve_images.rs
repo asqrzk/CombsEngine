@@ -286,12 +286,18 @@ pub fn cmd_serve_images(
                             },
                             "lora": lora_info,
                             "load": {"ms": load_ms, "open_ms": open_ms, "weights_ms": weights_ms},
-                            // The allocator's own numbers — the V6-0b
-                            // budget protocol. A DOOR, off by default:
-                            // gpu_memory blocks on the compute stream,
-                            // so a monitor polling stats every 2 s
-                            // would sync the DiT queue mid-generation.
-                            // Open it deliberately when weighing a run.
+                            // A DOOR, off by default: gpu_memory
+                            // blocks on the compute stream, so a
+                            // polling monitor must not pay it. MEASURED
+                            // 2026-09-03: on this build the image
+                            // pipeline runs the FUSED backend, whose
+                            // allocations the plain WgpuRuntime client
+                            // does not see — the field reads zeros here
+                            // (the unfused text serve reads real bytes
+                            // through the same call). It stays for the
+                            // build where the query can reach fusion's
+                            // pool; until then footprint(1) is the
+                            // image-budget judge (§74).
                             "gpu": if matches!(
                                 std::env::var("COMBS_IMAGE_STATS_GPU").as_deref(),
                                 Ok("1")
