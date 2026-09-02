@@ -418,7 +418,11 @@ pub unsafe extern "C" fn combs_chat_completion(
             }
             Err(e) => {
                 let msg = e.to_string();
-                let cancelled = msg.contains("cancelled") || msg.contains("canceled");
+                // Typed, not textual: a stop string or model output that
+                // happens to contain the word "cancelled" must never turn
+                // a finished stream into a cancelled one. The enum is the
+                // only authority on what a cancellation is.
+                let cancelled = matches!(e, combs_runtime::EngineError::Cancelled);
                 if cancelled {
                     emit(
                         cb,
