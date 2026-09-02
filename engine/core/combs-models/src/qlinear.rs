@@ -258,6 +258,24 @@ fn operand_dtype() -> DType {
     )
 }
 
+/// The narrow door's weight-size floor, swept on this build (§72h):
+/// narrow wins every row count at 8192x3072 (1.30-2.41x) and
+/// 27648x3072 (1.36-2.41x), but LOSES at 2048x2048 for m <= 256
+/// (0.64-0.82x) — so the loss region is not "small m", it is specific
+/// (weight, m) cells where autotune picks a different kernel. One
+/// conservative floor in weight ELEMENTS (the matmul's traffic is
+/// n*k at the operand width — format-independent, unlike packed bytes)
+/// keeps every doored cell at least as fast as wide, at the recorded
+/// price of forfeiting 1024x1024's small-m wins (up to 2.53x) and
+/// 2048x2048's m >= 512 wins (1.10-1.50x). Applied only at the
+/// production entry; the explicit-width entry stays ungated so a
+/// single process can still measure both widths at any shape.
+const NARROW_MIN_WEIGHT_ELEMS: usize = 8 << 20;
+
+fn narrow_pays_for(n_out: usize, k: usize) -> bool {
+    n_out.saturating_mul(k) >= NARROW_MIN_WEIGHT_ELEMS
+}
+
 /// Row padding for the tuned kernel's row-count pathology, measured on
 /// this build: ms/row holds ~0.20 from m 640 through 1024 and drops to
 /// ~0.10 at 1088, so a prompt-shaped call inside the window is faster
@@ -329,7 +347,11 @@ fn try_batched_matmul(
     batch: usize,
     seq: usize,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    try_batched_matmul_with(w, x, batch, seq, operand_dtype())
+    let operand = match operand_dtype() {
+        DType::F16 if !narrow_pays_for(w.n_out(), w.k()) => DType::F32,
+        dt => dt,
+    };
+    try_batched_matmul_with(w, x, batch, seq, operand)
 }
 
 /// The batched path with its operand width named rather than read from
@@ -1731,6 +1753,96 @@ mod tests {
         ] {
             run::<UnfusedF32>(512, 1024, m, label);
             run::<FusedF32>(512, 1024, m, label);
+        }
+    }
+
+    /// The four swept weights, classified as the sweep measured them:
+    /// both weights that ever lost stay shut; both that always won open.
+    #[test]
+    fn the_narrow_door_stays_shut_below_the_weight_size_floor() {
+        assert!(!narrow_pays_for(1024, 1024));
+        assert!(!narrow_pays_for(2048, 2048));
+        assert!(narrow_pays_for(8192, 3072));
+        assert!(narrow_pays_for(27648, 3072));
+        // A 7B's own tensors fall on both sides: kv projections stay
+        // wide, attention q and the MLP walls narrow.
+        assert!(!narrow_pays_for(512, 3584));
+        assert!(narrow_pays_for(18944, 3584));
+    }
+
+    /// K7h: where the narrow operands stop paying. The narrow path
+    /// costs a fixed per-call overhead (reduce, scale, scale back) and
+    /// wins in proportion to the weight traffic it halves — so it loses
+    /// on small weights. Both widths through the explicit-width entry
+    /// point, per (weight, m):
+    ///
+    /// ```text
+    /// cargo test -p combs-models --release narrow_threshold_sweep -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement instrument; run explicitly with --ignored"]
+    fn narrow_threshold_sweep() {
+        use combs_formats::QuantFormat;
+        use std::time::Instant;
+
+        if crate::skip_no_gpu() {
+            return;
+        }
+        pin_device_dtypes();
+        let device: Device<UnfusedF32> = Default::default();
+        let client = <WgpuRuntime as Runtime>::client(&Default::default());
+        println!(
+            "\n{:>12} {:>6} {:>10} {:>10} {:>8}",
+            "weight", "m", "wide ms", "narrow ms", "ratio"
+        );
+        for (n, k) in [
+            (1024usize, 1024usize),
+            (2048, 2048),
+            (8192, 3072),
+            (27648, 3072),
+        ] {
+            let data = synth_q8_0(n * k / 32);
+            let w =
+                QuantWeight::from_quant_tensor(&client, QuantFormat::Q8_0, &data, n, k).unwrap();
+            drop(data);
+            for m in [64usize, 256, 512, 1088, 1536] {
+                let xv: Vec<f32> = (0..m * k).map(|i| ((i % 37) as f32) / 18.0 - 1.0).collect();
+                let x_h = Tensor::<UnfusedF32, 2>::from_data(TensorData::new(xv, [m, k]), &device)
+                    .into_primitive()
+                    .tensor()
+                    .handle;
+                let mk = |h: &cubecl::server::Handle| {
+                    CubeTensor::new_contiguous(
+                        client.clone(),
+                        WgpuDevice::default(),
+                        Shape::from([m, k]),
+                        h.clone(),
+                        DType::F32,
+                    )
+                };
+                let run = |dt: DType| {
+                    let out = try_batched_matmul_with(&w, &mk(&x_h), 1, m, dt)
+                        .expect("batched path engages");
+                    let t = Tensor::<UnfusedF32, 3>::from_primitive(TensorPrimitive::Float(out));
+                    let _ = t.narrow(2, 0, 1).narrow(1, 0, 1).into_data();
+                };
+                let timed = |dt: DType| {
+                    run(dt);
+                    let t0 = Instant::now();
+                    for _ in 0..3 {
+                        run(dt);
+                    }
+                    t0.elapsed().as_secs_f64() * 1e3 / 3.0
+                };
+                let wide = timed(DType::F32);
+                let narrow = timed(DType::F16);
+                println!(
+                    "{:>7}x{:<5} {m:>6} {wide:>10.2} {narrow:>10.2} {:>8.2}",
+                    n,
+                    k,
+                    wide / narrow
+                );
+            }
         }
     }
 
