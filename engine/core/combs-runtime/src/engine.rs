@@ -634,6 +634,20 @@ impl Engine {
             .map_err(|_| EngineError::WorkerGone("worker dropped the reply".to_string()))
     }
 
+    /// Drains the worker and joins it: sends Shutdown, waits for the
+    /// thread, then syncs the backend so queued GPU work lands before
+    /// the caller proceeds (a serve process exiting, a test ending).
+    /// Idempotent — the second call finds no worker and returns. After
+    /// shutdown every request surface answers `WorkerGone`.
+    pub fn shutdown(&self) {
+        let handle = self.worker.lock().ok().and_then(|mut guard| guard.take());
+        if let Some(handle) = handle {
+            let _ = self.tx.send(Command::Shutdown);
+            let _ = handle.join();
+            let _ = CombsBackend::sync(&self.device);
+        }
+    }
+
     /// Whether the model exposes hidden states for `/v1/embeddings`.
     pub fn supports_embeddings(&self) -> bool {
         self.supports_embeddings
@@ -919,13 +933,13 @@ impl crate::request::ChatHost for Engine {
 #[cfg(not(target_family = "wasm"))]
 impl Drop for Engine {
     fn drop(&mut self) {
-        let _ = self.tx.send(Command::Shutdown);
-        if let Some(handle) = self
-            .worker
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.take())
-        {
+        // A shutdown() beforehand leaves nothing to do. Never assert in
+        // Drop — say what happened and join, so an early-exit path (a
+        // panic unwinding, a test ending without shutdown) still leaves
+        // no detached worker behind.
+        if let Some(handle) = self.worker.lock().ok().and_then(|mut guard| guard.take()) {
+            eprintln!("combs: engine dropped without shutdown; joining the worker");
+            let _ = self.tx.send(Command::Shutdown);
             let _ = handle.join();
         }
     }

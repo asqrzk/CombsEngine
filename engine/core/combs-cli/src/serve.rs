@@ -66,6 +66,53 @@ pub fn serve(
     combs_core::provenance::startup("text", &provenance_config);
     eprintln!("combs serve: listening on http://{addr} (model: {model_id})");
 
+    // Ctrl-C / SIGTERM must drain the engine, not just die: the worker
+    // thread holds GPU state, and a mid-decode kill leaves the device
+    // queue untidy. Signal handlers may only do async-signal-safe work,
+    // so the handler writes one byte to a pipe (unix self-pipe pattern)
+    // and a plain thread turns that byte into `server.unblock()`, which
+    // ends `incoming_requests` cleanly. Non-unix targets keep the old
+    // behavior (process exit) — recorded, not hidden.
+    let server = std::sync::Arc::new(server);
+    #[cfg(unix)]
+    {
+        static SHUTDOWN_PIPE_W: std::sync::atomic::AtomicI32 =
+            std::sync::atomic::AtomicI32::new(-1);
+        extern "C" fn on_signal(_sig: libc::c_int) {
+            let fd = SHUTDOWN_PIPE_W.load(Ordering::Relaxed);
+            if fd >= 0 {
+                unsafe {
+                    libc::write(fd, b"x".as_ptr() as *const libc::c_void, 1);
+                }
+            }
+        }
+        let mut fds = [0i32; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
+            SHUTDOWN_PIPE_W.store(fds[1], Ordering::Relaxed);
+            // A fn ITEM cannot cast straight to usize — bind the fn
+            // pointer first, then cast the pointer.
+            let handler: extern "C" fn(libc::c_int) = on_signal;
+            unsafe {
+                libc::signal(libc::SIGINT, handler as libc::sighandler_t);
+                libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
+            }
+            let server = server.clone();
+            std::thread::spawn(move || {
+                let mut byte = [0u8; 1];
+                let read_fd = fds[0];
+                loop {
+                    let n =
+                        unsafe { libc::read(read_fd, byte.as_mut_ptr() as *mut libc::c_void, 1) };
+                    if n != -1 {
+                        break;
+                    }
+                }
+                eprintln!("combs serve: signal received — closing the listener");
+                server.unblock();
+            });
+        }
+    }
+
     for mut request in server.incoming_requests() {
         let engine = engine.clone();
         let model_id = model_id.clone();
@@ -126,6 +173,11 @@ pub fn serve(
             let _ = request.respond(response);
         });
     }
+    // The listener is closed (signal above, or the OS): drain the engine
+    // before returning so the process exits with the worker joined and
+    // the device queue synced.
+    eprintln!("combs serve: shutting down — draining the engine");
+    engine.shutdown();
     Ok(())
 }
 

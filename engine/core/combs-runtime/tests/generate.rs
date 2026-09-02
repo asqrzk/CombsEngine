@@ -109,6 +109,61 @@ fn cancel_flag_stops_generation_between_tokens() {
 
 #[test]
 #[ignore = "requires a local model directory (COMBS_TEST_MODEL)"]
+fn an_engine_shuts_down_and_its_worker_is_joined() {
+    let engine = load_engine();
+    let tokens = engine.encode("The capital of France is").unwrap();
+    let mut text = String::new();
+    engine
+        .generate(
+            &tokens,
+            &GenerationConfig {
+                max_tokens: 4,
+                ..Default::default()
+            },
+            |_id, piece, _lp| text.push_str(piece),
+        )
+        .expect("a turn before shutdown");
+    assert!(!text.is_empty());
+    engine.shutdown();
+    // The worker is gone: the next request says so instead of hanging.
+    let after = engine.generate(
+        &tokens,
+        &GenerationConfig {
+            max_tokens: 4,
+            ..Default::default()
+        },
+        |_id, _piece, _lp| {},
+    );
+    assert!(
+        matches!(after, Err(combs_runtime::EngineError::WorkerGone(_))),
+        "expected WorkerGone after shutdown, got {after:?}"
+    );
+    // Idempotent: a second shutdown finds nothing and returns.
+    engine.shutdown();
+}
+
+#[test]
+#[ignore = "requires a local model directory (COMBS_TEST_MODEL)"]
+fn a_dropped_engine_still_joins() {
+    // No shutdown on purpose: Drop must send Shutdown, join, and come
+    // back — a hang here is the failure this test exists to catch.
+    let engine = load_engine();
+    let tokens = engine.encode("Water is").unwrap();
+    engine
+        .generate(
+            &tokens,
+            &GenerationConfig {
+                max_tokens: 2,
+                ..Default::default()
+            },
+            |_id, _piece, _lp| {},
+        )
+        .expect("one turn");
+    drop(engine);
+}
+
+#[test]
+#[ignore = "requires a local model directory (COMBS_TEST_MODEL)"]
 fn concurrent_generates_queue_single_flight() {
     use std::sync::Arc;
 
