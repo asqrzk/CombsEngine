@@ -1,6 +1,6 @@
 {
   "name": "@combs-edge/combs-client",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Official JavaScript client for Combs Engine (OpenAI-compatible `combs serve` API). Zero deps; browser, Node, Deno and Bun.",
   "license": "MIT",
   "type": "module",

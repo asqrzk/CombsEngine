@@ -1,6 +1,6 @@
 [package]
 name = "combs-graphkit-ffi"
-version = "0.2.2"
+version = "0.2.3"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -17,6 +17,6 @@ default = []
 gpu = ["combs-graphkit/gpu"]
 
 [dependencies]
-combs-graphkit = { path = "../combs-graphkit", version = "0.2.2" }
+combs-graphkit = { path = "../combs-graphkit", version = "0.2.3" }
 serde.workspace = true
 serde_json.workspace = true

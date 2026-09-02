@@ -26,10 +26,10 @@ engine = [
 ]
 
 [dependencies]
-combs-mesh = { path = "../combs-mesh", version = "0.2.2" }
+combs-mesh = { path = "../combs-mesh", version = "0.2.3" }
 combs-core = { workspace = true, optional = true }
-combs-formats = { path = "../combs-formats", version = "0.2.2", optional = true }
-combs-runtime = { path = "../combs-runtime", version = "0.2.2", optional = true }
+combs-formats = { path = "../combs-formats", version = "0.2.3", optional = true }
+combs-runtime = { path = "../combs-runtime", version = "0.2.3", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 base64.workspace = true

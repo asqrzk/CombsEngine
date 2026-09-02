@@ -7,7 +7,7 @@ description = "Diffusion model runtime for Combs Engine (Burn-native)"
 
 [dependencies]
 burn.workspace = true
-combs-formats = { path = "../combs-formats", version = "0.2.2" }
+combs-formats = { path = "../combs-formats", version = "0.2.3" }
 combs-models = { path = "../combs-models", version = "0.2.3" }
 minijinja.workspace = true
 minijinja-contrib.workspace = true

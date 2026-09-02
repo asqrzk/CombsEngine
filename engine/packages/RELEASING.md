@@ -27,7 +27,7 @@ because the npm/PyPI wrappers download its assets at install time).
 | `Engine/Packages/npm/combs-client/package.json` | `version` |
 | `Engine/Packages/npm/combs-zerotrust/package.json` | `version` |
 | `Engine/Packages/pypi/combs-engine/pyproject.toml` | `version` + `src/combs_engine/__init__.py` |
-| `Engine/Js/<pkg>/deno.json` (all nine, incl. `mesh`) | `version` |
+| `engine/js/<pkg>/deno.json` (all ten, incl. `mesh` and `memory`) | `version` |
 
 > `combs-zerotrust` is dual-published: source of truth is
 > `Engine/Js/zerotrust/mod.js` — before publishing, copy it over
@@ -102,7 +102,7 @@ deno publish --allow-slow-types   # interactive terminal: opens the browser once
 `--allow-slow-types` is currently required (three public-API functions
 lack explicit return types); drop the flag once those are fixed. Run
 `deno publish --dry-run --allow-slow-types` first — it validates all
-nine packages without auth.
+ten packages without auth.
 
 (One-time: create the `combs` scope at https://jsr.io/new — then users can
 `deno add @combs/core @combs/graph ...` or `npx jsr add @combs/core`.)
