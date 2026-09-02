@@ -16,6 +16,7 @@
  */
 
 import init, {
+  combs_batched_probe,
   combs_cancel,
   combs_chat_completion,
   combs_device_caps,
@@ -372,6 +373,12 @@ self.onmessage = async (event) => {
       case "caps":
         await ensureModule(payload?.wasmUrl);
         post("metadata", id, JSON.parse(await combs_device_caps()));
+        break;
+      case "probe":
+        // The batched-matmul value canary (K4): "ok" or a message
+        // naming the first wrong value. Needs no engine loaded.
+        await ensureModule(payload?.wasmUrl);
+        post("metadata", id, { batched: await combs_batched_probe() });
         break;
       case "close":
         // Chained like load/loadOnnx: a close overtaking an in-flight

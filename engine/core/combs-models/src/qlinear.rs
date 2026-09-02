@@ -341,6 +341,18 @@ fn debug_first_calls(m: usize, k: usize, n: usize, x_dtype: DType, operand: DTyp
 /// buffer that dies with the call), FLOPs handed to the tuned matmul.
 /// `None` below the threshold or for formats without a dequant kernel —
 /// the caller falls through to the fused kernels.
+/// Probe-only door into the batched path (forward_probe's value
+/// canary): same entry the production forward takes, made visible to
+/// the sibling module without widening the public API.
+pub(crate) fn probe_batched_matmul(
+    w: &QuantWeight,
+    x: &CubeTensor<WgpuRuntime>,
+    batch: usize,
+    seq: usize,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_batched_matmul(w, x, batch, seq)
+}
+
 fn try_batched_matmul(
     w: &QuantWeight,
     x: &CubeTensor<WgpuRuntime>,

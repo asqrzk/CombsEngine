@@ -131,6 +131,20 @@ pub async fn combs_wgsl_probe() -> Result<String, JsValue> {
         .map_err(js_err)
 }
 
+/// Value-checks the batched quant matmul — the path every paste takes
+/// in a tab — against a host reference on THIS browser's compiler.
+/// Always compiled: §70's class (a valid launch that writes nothing)
+/// is exactly what only a value probe can catch, and the batched
+/// path's types already ship in the bundle.
+#[wasm_bindgen]
+pub async fn combs_batched_probe() -> Result<String, JsValue> {
+    ensure_device().await.map_err(js_err)?;
+    combs_models::batched_probe_report()
+        .await
+        .map(|()| "ok".to_string())
+        .map_err(js_err)
+}
+
 /// Value-checks the burn-composed forward paths (manual masked
 /// attention, flash attention at head_dim 256) against a host reference
 /// on THIS browser's compiler — the paths only GeluTanh-family models
@@ -155,6 +169,25 @@ pub async fn combs_forward_probe() -> Result<String, JsValue> {
 /// `model_bytes` must be the complete GGUF image: its tensor offsets are
 /// absolute within the file, so a partial buffer is not a smaller model but
 /// a wrong one. Returns an engine id for the calls below.
+/// An explicit arena size must be one the model can actually use: the
+/// f5 trap gate found both 0 and 50,000,000 loading without complaint —
+/// a zero arena holds no prompt, and positions past the model's
+/// positional maximum are unaddressable, so both failures deferred to
+/// mid-chat instead of surfacing at load.
+fn validate_arena(explicit: Option<usize>, positional_max: usize) -> Result<(), String> {
+    if let Some(n) = explicit {
+        if n == 0 {
+            return Err("max_seq_len 0: a zero-token arena holds no prompt".to_string());
+        }
+        if n > positional_max {
+            return Err(format!(
+                "max_seq_len {n} exceeds the model's positional maximum {positional_max}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[wasm_bindgen]
 pub async fn combs_engine_create(
     config_json: String,
@@ -189,9 +222,13 @@ fn create_engine_from_staged(
 ) -> Result<u32, JsValue> {
     use combs_formats::ModelSource as _;
     let mut cache_config = combs_runtime::CacheConfig::paged(
-        config.max_seq_len.unwrap_or_else(|| {
-            combs_runtime::default_arena_len(header.metadata().max_position_embeddings)
-        }),
+        {
+            validate_arena(config.max_seq_len, header.metadata().max_position_embeddings)
+                .map_err(js_err)?;
+            config.max_seq_len.unwrap_or_else(|| {
+                combs_runtime::default_arena_len(header.metadata().max_position_embeddings)
+            })
+        },
     );
     if let Some(ps) = config.page_size {
         cache_config.page_size = ps;
@@ -224,11 +261,13 @@ fn create_engine_from_source(
 ) -> Result<u32, JsValue> {
 
     let mut cache_config = combs_runtime::CacheConfig::paged(
-        config
-            .max_seq_len
-            .unwrap_or_else(|| {
+        {
+            validate_arena(config.max_seq_len, source.metadata().max_position_embeddings)
+                .map_err(js_err)?;
+            config.max_seq_len.unwrap_or_else(|| {
                 combs_runtime::default_arena_len(source.metadata().max_position_embeddings)
-            }),
+            })
+        },
     );
     if let Some(ps) = config.page_size {
         cache_config.page_size = ps;

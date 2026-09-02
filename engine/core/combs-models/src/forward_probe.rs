@@ -121,6 +121,93 @@ async fn run_case(
     Ok(())
 }
 
+/// The batched quant-matmul value canary (K4): the path every paste
+/// takes in a tab (device dequant transient + tuned matmul at m >= 8),
+/// checked against the host dequant + naive matmul. §70's class —
+/// a silent zero-writing launch — cannot pass this.
+async fn run_batched_case(name: &str, m: usize, k: usize, n: usize) -> Result<(), String> {
+    use burn::tensor::TensorPrimitive;
+    use combs_formats::QuantFormat;
+    use combs_formats::quants::{dequantize_q8_0, quantize_q8_0};
+
+    let wf = signal(n * k, 9.1);
+    let packed = quantize_q8_0(&wf).map_err(|e| format!("{name}: quantize: {e:?}"))?;
+    let wref = dequantize_q8_0(&packed, n * k).map_err(|e| format!("{name}: dequant: {e:?}"))?;
+    let xv = signal(m * k, 4.7);
+    // Host reference on the DEQUANTIZED weight — the same values the
+    // device transient holds, so the comparison isolates the matmul.
+    let mut expect = vec![0.0f32; m * n];
+    for r in 0..m {
+        for c in 0..n {
+            let mut acc = 0.0f32;
+            for i in 0..k {
+                acc += xv[r * k + i] * wref[c * k + i];
+            }
+            expect[r * n + c] = acc;
+        }
+    }
+
+    let device = Default::default();
+    let client = <burn::backend::wgpu::WgpuRuntime as cubecl::prelude::Runtime>::client(&device);
+    let w = crate::qmatmul::QuantWeight::from_quant_tensor(
+        &client,
+        QuantFormat::Q8_0,
+        &packed,
+        n,
+        k,
+    )
+    .map_err(|e| format!("{name}: weight build: {e:?}"))?;
+    let x: Tensor<crate::qlinear::UnfusedF32, 2> =
+        Tensor::from_data(TensorData::new(xv, [m, k]), &device);
+    let xt = x.into_primitive().tensor();
+    let out = crate::qlinear::probe_batched_matmul(&w, &xt, 1, m)
+        .ok_or_else(|| format!("{name}: batched path declined (below threshold?)"))?;
+    let t: Tensor<crate::qlinear::UnfusedF32, 3> =
+        Tensor::from_primitive(TensorPrimitive::Float(out));
+    let data = t
+        .into_data_async()
+        .await
+        .map_err(|e| format!("{name}: readback failed: {e:?}"))?
+        .to_vec::<f32>()
+        .map_err(|e| format!("{name}: conversion failed: {e:?}"))?;
+    let mut zeros = 0usize;
+    let mut worst = (0usize, 0.0f32, 0.0f32, 0.0f32);
+    for (i, (g, e)) in data.iter().zip(&expect).enumerate() {
+        if *g == 0.0 && e.abs() > 1e-3 {
+            zeros += 1;
+        }
+        let rel = (g - e).abs() / e.abs().max(1.0);
+        if !g.is_finite() || rel > worst.1 {
+            worst = (i, rel, *g, *e);
+            if !g.is_finite() {
+                break;
+            }
+        }
+    }
+    if zeros > 0 {
+        return Err(format!(
+            "{name}: {zeros} outputs are zero where the reference is not —              the silent no-op class §70 named"
+        ));
+    }
+    if !worst.2.is_finite() || worst.1 > 1e-3 {
+        return Err(format!(
+            "{name}: worst at [{}]: got {}, expected {} (rel {})",
+            worst.0, worst.2, worst.3, worst.1
+        ));
+    }
+    Ok(())
+}
+
+/// The always-on batched canary (K4): two cells, slim enough to ship —
+/// the batched path's own types are already in the bundle, so this
+/// monomorphizes almost nothing new (unlike the burn attention canaries
+/// behind `forward-probe`).
+pub async fn batched_probe_report() -> Result<(), String> {
+    run_batched_case("batched m=64 k=512 n=256", 64, 512, 256).await?;
+    run_batched_case("batched m=16 k=256 n=2048", 16, 256, 2048).await?;
+    Ok(())
+}
+
 /// Runs the burn-path canaries on the current device; `Err` names the
 /// first path whose values diverge from the host reference.
 pub async fn forward_probe_report() -> Result<(), String> {
@@ -147,5 +234,8 @@ pub async fn forward_probe_report() -> Result<(), String> {
     // harness (not the kernels) is suspect.
     run_case("flash seq=8 d=128 control", 4, 2, 8, 40, 128, 1.0 / (128f64).sqrt(), None)
         .await?;
+    // The batched quant path: prompt-shaped, plus one block-shaped cell.
+    run_batched_case("batched m=64 k=512 n=256", 64, 512, 256).await?;
+    run_batched_case("batched m=16 k=256 n=2048", 16, 256, 2048).await?;
     Ok(())
 }
