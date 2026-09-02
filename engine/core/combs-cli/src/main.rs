@@ -103,6 +103,17 @@ enum Command {
     },
     /// Print wgpu device information.
     Devices,
+    /// Read a model's static capabilities from its header — no weights
+    /// loaded, no GPU touched. GGUF only (a directory model's identity
+    /// is its config.json, already readable).
+    Inspect {
+        /// Path to the .gguf file (or a preset id in the cache).
+        #[arg(long)]
+        model: PathBuf,
+        /// Emit JSON instead of the human lines.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print how this binary was built (version, commit, features,
     /// serving dtype) — the manifest compiled in at build time.
     BuildInfo {
@@ -309,6 +320,7 @@ fn main() -> Result<()> {
         Command::Perplexity { model, file, text, chunk, max_tokens } => {
             cmd_perplexity(model, file, text, chunk, max_tokens)
         }
+        Command::Inspect { model, json } => cmd_inspect(model, json),
         Command::Chew(cmd) => match cmd.mode {
             ChewMode::ChatUi(args) => chew::chew("chat-ui", args),
             ChewMode::DebateUi(args) => chew::chew("debate-ui", args),
@@ -558,6 +570,75 @@ fn cmd_serve(
 /// tensor decision is logged by `COMBS_DEBUG_QUANT`). The dense arm skips
 /// byte accounting for quantized-but-unsupported formats rather than
 /// paying a second CPU dequantization at startup.
+/// `combs inspect` — static capabilities from the GGUF header: what the
+/// platform's picker needs to classify a file WITHOUT mounting it
+/// (architecture, sizes, template affordances, quant formats, padding).
+fn cmd_inspect(model: PathBuf, as_json: bool) -> Result<()> {
+    let path = resolve_model_arg(&model)?;
+    anyhow::ensure!(
+        path.extension().map(|e| e == "gguf").unwrap_or(false),
+        "inspect reads GGUF headers; {} is not a .gguf file",
+        path.display()
+    );
+    let bytes = std::fs::read(&path)?;
+    let total = bytes.len() as u64;
+    let header = combs_formats::read_gguf_header(&bytes, Some(total))?
+        .ok_or_else(|| anyhow::anyhow!("header truncated: not a complete gguf"))?;
+    let source = combs_formats::GgufSource::from_bytes(bytes)?;
+    let meta = source.metadata().clone();
+    let spec = source.tokenizer()?;
+    let template = spec.chat_template.as_deref().unwrap_or("");
+    let weights = weights_report(&source);
+    let report = serde_json::json!({
+        "file": path.display().to_string(),
+        "bytes": total,
+        "architecture": meta.architecture,
+        "context_length": meta.max_position_embeddings,
+        "vocab_size": meta.vocab_size,
+        "layers": meta.num_hidden_layers,
+        "hidden_size": meta.hidden_size,
+        "tensor_count": header.tensors.len(),
+        // data_start includes the alignment padding a streamed mount
+        // must hold before placing a single weight byte (the M1
+        // lesson); the padding's own width is header-internal and not
+        // reported rather than mis-derived.
+        "data_start": header.data_start,
+        "template": {
+            "present": !template.is_empty(),
+            "tools": template.contains("tool"),
+            "thinking": template.contains("think"),
+        },
+        "add_bos": spec.add_bos,
+        "weights": weights,
+    });
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "{} — {} | ctx {} | vocab {} | {} tensors | template: {}{}{}",
+            path.file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            report["architecture"].as_str().unwrap_or("?"),
+            report["context_length"],
+            report["vocab_size"],
+            report["tensor_count"],
+            if template.is_empty() { "none" } else { "yes" },
+            if report["template"]["tools"].as_bool().unwrap_or(false) {
+                " +tools"
+            } else {
+                ""
+            },
+            if report["template"]["thinking"].as_bool().unwrap_or(false) {
+                " +thinking"
+            } else {
+                ""
+            },
+        );
+    }
+    Ok(())
+}
+
 fn weights_report(source: &dyn combs_formats::ModelSource) -> serde_json::Value {
     use std::collections::BTreeMap;
     let mut by_format: BTreeMap<&'static str, (u64, u64)> = BTreeMap::new();
