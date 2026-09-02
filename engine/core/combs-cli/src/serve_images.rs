@@ -187,6 +187,7 @@ pub fn cmd_serve_images(
         let preview = preview.clone();
         let model_id = model_id.clone();
         let lora_info = lora_info.clone();
+        let fixed_sampler = fixed_sampler.clone();
         let preflight = preflight.clone();
         let provenance_config = provenance_config.clone();
         std::thread::spawn(move || {
@@ -198,6 +199,28 @@ pub fn cmd_serve_images(
             }
             let response = match (method.as_str(), url.as_str()) {
                 ("GET", "/health") => json_response(200, json!({"status": "ok"})),
+                // Identity without the pipeline mutex: everything here
+                // was resolved at load, so a running generation never
+                // blocks the platform's capability merge (CP-3).
+                ("GET", "/v1/model/info") => json_response(
+                    200,
+                    json!({
+                        "model": model_id,
+                        "kind": "diffusion",
+                        "dtype": crate::build_info::SERVING_DTYPE,
+                        "lora": lora_info,
+                        "fixed_sampler": fixed_sampler,
+                        // The measured working-set curve when one exists
+                        // for THIS pipeline — the platform sizes canvas
+                        // offers from it; null means unmeasured, not
+                        // unlimited.
+                        "working_set": preflight.working_set.as_ref().map(|ws| json!({
+                            "fixed_bytes": ws.fixed_bytes,
+                            "bytes_per_pixel": ws.bytes_per_pixel,
+                            "measured_max_pixels": ws.measured_max_pixels,
+                        })),
+                    }),
+                ),
                 ("GET", "/v1/stats") => {
                     use std::sync::atomic::Ordering::Relaxed;
                     let gen_total = stats.total_steps.load(Relaxed);

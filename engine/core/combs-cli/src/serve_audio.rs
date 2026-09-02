@@ -95,6 +95,21 @@ pub fn cmd_serve_audio(
                 ("GET", "/health") => {
                     let _ = request.respond(json_response(200, json!({"status": "ok"})));
                 }
+                ("GET", "/v1/model/info") => {
+                    let _ = request.respond(json_response(
+                        200,
+                        json!({
+                            "model": model_id,
+                            "kind": "tts",
+                            // Kokoro synthesizes 24 kHz mono WAV; the rate
+                            // is the model's, not a server option.
+                            "sample_rate_hz": 24000,
+                            "voices": voices.len(),
+                            "default_voice": "af_heart",
+                            "transcribe": stt.is_some(),
+                        }),
+                    ));
+                }
                 ("GET", "/v1/stats") => {
                     use std::sync::atomic::Ordering::Relaxed;
                     let _ = request.respond(json_response(
