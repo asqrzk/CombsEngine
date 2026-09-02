@@ -152,6 +152,11 @@ impl<'a> TensorReader<'a> {
         }
     }
 
+    /// Stored byte length — the Cow's length, no decode, no copy.
+    pub fn byte_len(&self) -> usize {
+        self.data.len()
+    }
+
     /// Creates a reader over owned (already-decoded) f32 bytes.
     pub fn owned(name: String, shape: Vec<usize>, data: Vec<u8>) -> Self {
         TensorReader {

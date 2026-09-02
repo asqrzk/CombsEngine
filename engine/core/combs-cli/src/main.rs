@@ -562,6 +562,7 @@ fn weights_report(source: &dyn combs_formats::ModelSource) -> serde_json::Value 
     use std::collections::BTreeMap;
     let mut by_format: BTreeMap<&'static str, (u64, u64)> = BTreeMap::new();
     let mut other_count = 0u64;
+    let mut dense_bytes = 0u64;
     for name in source.tensor_names() {
         match source.open_tensor_quant(&name) {
             Ok(Some(qt)) => {
@@ -577,7 +578,16 @@ fn weights_report(source: &dyn combs_formats::ModelSource) -> serde_json::Value 
                 e.0 += 1;
                 e.1 += qt.data.len() as u64;
             }
-            _ => other_count += 1,
+            _ => {
+                other_count += 1;
+                // Dense (or kernel-less) tensors: size from shape x dtype,
+                // never by materializing — open_tensor would dequantize a
+                // kernel-less quant format and report the WRONG (widened)
+                // byte count, besides paying for the decode.
+                if let Ok(reader) = source.open_tensor(&name) {
+                    dense_bytes += reader.byte_len() as u64;
+                }
+            }
         }
     }
     let packed_total: u64 = by_format.values().map(|(_, b)| b).sum();
@@ -588,6 +598,10 @@ fn weights_report(source: &dyn combs_formats::ModelSource) -> serde_json::Value 
             .collect::<serde_json::Map<String, serde_json::Value>>(),
         "packed_bytes_total": packed_total,
         "dense_tensors": other_count,
+        "dense_bytes_total": dense_bytes,
+        // The number the platform reads: every tensor accounted, packed
+        // or dense — safetensors models stop reporting zero (EG-4).
+        "total_bytes": packed_total + dense_bytes,
     })
 }
 
