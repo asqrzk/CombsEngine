@@ -11,6 +11,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Runners are not GPU machines (software Vulkan on ubuntu; wedging
+  # paravirtual Metal on macos-14). GPU tiers run locally and on real
+  # hardware; CI gates the CPU truth.
+  COMBS_TEST_NO_GPU: "1" 
 
 jobs:
   rust:

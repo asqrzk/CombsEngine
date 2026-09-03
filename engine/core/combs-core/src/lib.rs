@@ -207,6 +207,16 @@ pub fn gpu_available() -> bool {
     // `::wgpu` is the raw crate — the bare name resolves to this
     // module's `burn::backend::wgpu` re-export.
     *AVAILABLE.get_or_init(|| {
+        // CI runners are not GPU machines: ubuntu's software Vulkan
+        // fails kernels and macos-14's paravirtual Metal wedges the
+        // queue (a 3.5-hour hung job where 25 minutes was normal).
+        // The GPU tiers are proven locally and on real hardware; CI's
+        // job is the CPU truth. The door makes that explicit instead
+        // of relying on what adapters a runner image happens to grow.
+        if matches!(std::env::var("COMBS_TEST_NO_GPU").as_deref(), Ok("1")) {
+            eprintln!("COMBS_TEST_NO_GPU=1 — GPU tests skip by policy");
+            return false;
+        }
         let instance = ::wgpu::Instance::default();
         let adapters =
             cubecl::future::block_on(instance.enumerate_adapters(::wgpu::Backends::all()));

@@ -559,11 +559,24 @@ mod tests {
     /// footprint in a plausible range, and free memory under total.
     #[test]
     fn live_probes_return_plausible_numbers() {
-        let footprint = process_footprint_bytes().expect("footprint probe");
-        assert!(footprint > 1024 * 1024, "implausibly small: {footprint}");
-        assert!(footprint < 64 * GB, "implausibly large: {footprint}");
-        let available = available_memory_bytes().expect("available probe");
-        assert!(available > 0);
-        assert!(available < 1024 * GB);
+        // The probes' own contract is "None where we have no probe we
+        // trust" — the footprint probe has no Linux arm at all, so an
+        // expect() here failed every ubuntu CI run by construction
+        // (born on macOS, where proc_pid_rusage answers). Each probe
+        // is judged only where it exists.
+        match process_footprint_bytes() {
+            Some(footprint) => {
+                assert!(footprint > 1024 * 1024, "implausibly small: {footprint}");
+                assert!(footprint < 64 * GB, "implausibly large: {footprint}");
+            }
+            None => eprintln!("skip: no trusted footprint probe on this platform"),
+        }
+        match available_memory_bytes() {
+            Some(available) => {
+                assert!(available > 0);
+                assert!(available < 1024 * GB);
+            }
+            None => eprintln!("skip: no trusted available-memory probe on this platform"),
+        }
     }
 }
