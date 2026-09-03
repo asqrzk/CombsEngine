@@ -144,7 +144,7 @@ Four layers. Compute lives exclusively in **L0** — every layer above is thin o
   - 🌗 dark/light themes, responsive, chat & multi-agent debate & roleplay views
 - **Android** — JNI bridge + Kotlin `CombsEngine` API.
 - **iOS** — Swift wrapper over the C ABI.
-- **Web** — `combs-wasm` skeleton + `WorkerEngine` transport (WebGPU enablement in progress).
+- **Web** — `combs-wasm` runs full models in a browser tab over WebGPU: streamed GGUF mount (no whole-file buffering), an always-on batched-matmul value canary, and a worker transport. Measured: a 4.7 GB Qwen2.5-Coder-7B mounts in ~3 s at a 1.49 GB linear-memory peak and chats, gated headless in CI-style runs.
 
 ## Performance
 
@@ -176,7 +176,7 @@ Model presets **must** use instruction-tuned variants (e.g. `SmolLM2-135M-Instru
 | Linux / Windows x86_64 | `libcombs_ffi.so` / `.dll` | ✅ built natively by CI release workflow |
 | iOS arm64 | `libcombs_ffi.a` | ✅ builds (from macOS via `xtask`) |
 | Android arm64 | `libcombs_ffi.so` | ✅ builds (NDK, from macOS via `xtask`) |
-| Web (wasm32) | — | 🚧 skeleton, checks clean |
+| Web (wasm32) | `combs_wasm` module (34 MB) | ✅ 7B mounts + chats in a tab (streamed, suite-gated) |
 
 Run `cargo xtask matrix` for live detection of your local toolchains.
 
