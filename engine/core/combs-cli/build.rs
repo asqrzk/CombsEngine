@@ -15,6 +15,9 @@
 //! and index so a commit or a staging change re-stamps too. The
 //! declaration lives in [`watched_paths`]; a new crate belongs in it.
 
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 // Same formatter the binary logs with — one implementation, so a
@@ -78,13 +81,14 @@ fn watched_paths() -> Vec<String> {
 }
 
 fn main() {
+    embed_template();
+
     for path in watched_paths() {
         println!("cargo:rerun-if-changed={path}");
     }
     let commit = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
     let short = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    let branch =
-        git(&["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|| "unknown".into());
     // Any tracked modification, staged or not, makes this build
     // unreproducible from the commit alone — the flag says so plainly.
     let dirty = git(&["status", "--porcelain", "--untracked-files=no"])
@@ -121,7 +125,10 @@ fn main() {
         println!("cargo:rustc-env={key}={value}");
     }
     println!("cargo:rustc-env=COMBS_BUILD_AT={built_at}");
-    println!("cargo:rustc-env=COMBS_BUILD_AT_RFC3339={}", rfc3339(built_at));
+    println!(
+        "cargo:rustc-env=COMBS_BUILD_AT_RFC3339={}",
+        rfc3339(built_at)
+    );
 
     // A sidecar beside the artifact, for anyone holding the directory
     // rather than the binary (a pod's deploy step, an archived build).
@@ -168,6 +175,72 @@ fn main() {
                 dirty = dirty,
             );
             let _ = std::fs::write(dir.join("build-manifest.json"), json);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// The UI template embed — the OTHER half of this build script, restored.
+// The build-manifest rewrite replaced this file wholesale and dropped
+// it; chew.rs still includes $OUT_DIR/template_manifest.rs, so every
+// fresh fingerprint (CI clones, a toolchain change) failed to compile
+// combs-cli while stale local OUT_DIRs papered over the hole for weeks.
+// Both halves now live here and neither may replace the other again.
+
+const SKIP_DIRS: &[&str] = &["node_modules", "dist", ".svelte-kit", ".vite", "data"];
+/// Runtime secrets/state the proxy creates — never embed these in a binary.
+const SKIP_FILES: &[&str] = &[
+    "master.key",
+    "permissions.json",
+    "manifest.json",
+    "authn.json",
+    "package-lock.json",
+];
+
+fn embed_template() {
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let vendored = manifest.join("vendor/ui-template");
+    let repo = manifest.join("../../ui/template");
+    let root = if vendored.is_dir() { vendored } else { repo };
+    assert!(root.is_dir(), "UI template not found at {}", root.display());
+
+    let mut entries: Vec<(String, PathBuf)> = Vec::new();
+    collect(&root, &root, &mut entries);
+    entries.sort();
+
+    let mut code = String::from(
+        "/// (relative path, contents) for every file in the embedded UI template.\n\
+         pub static TEMPLATE_FILES: &[(&str, &[u8])] = &[\n",
+    );
+    for (rel, abs) in &entries {
+        println!("cargo:rerun-if-changed={}", abs.display());
+        // Forward slashes work in include_bytes! on every platform.
+        let abs_fwd = abs.display().to_string().replace('\\', "/");
+        code.push_str(&format!("    ({rel:?}, include_bytes!(\"{abs_fwd}\")),\n"));
+    }
+    code.push_str("];\n");
+
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("template_manifest.rs");
+    fs::write(out, code).unwrap();
+}
+
+fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
+    for entry in fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if entry.file_type().unwrap().is_dir() {
+            if !SKIP_DIRS.contains(&name.as_str()) {
+                collect(root, &path, out);
+            }
+        } else if !SKIP_FILES.contains(&name.as_str()) {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .display()
+                .to_string()
+                .replace('\\', "/");
+            out.push((rel, path));
         }
     }
 }
