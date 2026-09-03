@@ -32,7 +32,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Workspace tests
-        run: cargo test --release --workspace
+        # --no-fail-fast: a red run enumerates every failure at once
+        # instead of peeling them one push per round-trip (learned on
+        # 0.2.3's walk: two same-class failures cost two rounds).
+        run: cargo test --release --workspace --no-fail-fast
 
       - name: Mesh wasm32 checks
         run: |

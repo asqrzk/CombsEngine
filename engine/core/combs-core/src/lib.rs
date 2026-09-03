@@ -210,7 +210,20 @@ pub fn gpu_available() -> bool {
         let instance = ::wgpu::Instance::default();
         let adapters =
             cubecl::future::block_on(instance.enumerate_adapters(::wgpu::Backends::all()));
-        !adapters.is_empty()
+        // Presence is not capability: CI runners grew a software Vulkan
+        // (llvmpipe-class), and a Cpu-type adapter turned every guarded
+        // GPU test loose on a rasterizer — the same trap the pod
+        // provisioning hard-fails on. A software adapter is "no GPU"
+        // for everything this gate protects.
+        let real = adapters
+            .iter()
+            .any(|a| a.get_info().device_type != ::wgpu::DeviceType::Cpu);
+        if !real && !adapters.is_empty() {
+            eprintln!(
+                "wgpu adapters present but all software (llvmpipe-class) — treating as no GPU"
+            );
+        }
+        real
     })
 }
 
