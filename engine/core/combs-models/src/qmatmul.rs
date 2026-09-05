@@ -573,6 +573,84 @@ fn q8_0_matmul_tiled_kernel(
     }
 }
 
+/// The D4/K7 spike: a WEIGHT-staging tile matmul for the batched
+/// regime. The fused kernels above stage the ACTIVATION tile and
+/// re-read the packed weight once per output row — right for decode,
+/// fatal for prompt-shaped calls (the batched road exists because of
+/// it). This kernel inverts the staging: one cube owns a 16-column
+/// tile, dequantizes a 16x256 weight tile into shared memory ONCE per
+/// k-tile, and walks every activation row against it — packed weight
+/// bytes are read once per launch instead of once per row.
+/// Accumulation runs k-tile-major with a running global accumulate
+/// (each (row, col) cell owned by exactly one thread; first tile
+/// writes, later tiles add), so outputs are NOT bit-identical to the
+/// naive kernel — parity is the 1e-3 class, with a zero-count guard
+/// for the §70 launch-that-writes-nothing failure.
+#[cube(launch_unchecked)]
+fn q8_0_qmm_wtile_kernel(
+    x: &Array<f32>,
+    qs: &Array<u32>,
+    d: &Array<f32>,
+    out: &mut Array<f32>,
+    m: usize,
+    k: usize,
+    n_out: usize,
+) {
+    // 16 columns x 256 k-values = 4096 f32 = 16 KiB shared.
+    let mut wtile = SharedMemory::<f32>::new(4096usize);
+    let unit = UNIT_POS as usize;
+    let col_in_tile = unit % 16;
+    let row_lane = unit / 16;
+    let tile_col0 = (CUBE_POS_X as usize) * 16;
+    let col = tile_col0 + col_in_tile;
+    let blocks_per_row = k / 32;
+    let n_ktiles = (k + 255) / 256;
+    let rows_per_lane = (m + 15) / 16;
+    for t in 0..n_ktiles {
+        let k0 = t * 256;
+        // Stage: each thread dequantizes 16 values, coalesced by unit.
+        // Out-of-range cells stage 0.0 so the barrier stays uniform.
+        for i in 0..16usize {
+            let idx = i * 256 + unit;
+            let c = tile_col0 + idx / 256;
+            let kk = k0 + idx % 256;
+            let mut v = 0.0f32;
+            if c < n_out && kk < k {
+                let block = c * blocks_per_row + kk / 32;
+                let j = kk % 32;
+                let word = qs[block * 8 + j / 4];
+                let byte = (word >> (u32::cast_from(j % 4) * 8)) & 0xFF;
+                let q = (i32::cast_from(byte) << 24) >> 24;
+                v = f32::cast_from(q) * d[block];
+            }
+            wtile[idx] = v;
+        }
+        sync_cube();
+        if col < n_out {
+            for rc in 0..rows_per_lane {
+                let row = rc * 16 + row_lane;
+                if row < m {
+                    let mut acc = 0.0f32;
+                    let mut kk_end = 256usize;
+                    if k - k0 < 256 {
+                        kk_end = k - k0;
+                    }
+                    for kk in 0..kk_end {
+                        acc += x[row * k + k0 + kk] * wtile[col_in_tile * 256 + kk];
+                    }
+                    let o = row * n_out + col;
+                    if t == 0 {
+                        out[o] = acc;
+                    } else {
+                        out[o] += acc;
+                    }
+                }
+            }
+        }
+        sync_cube();
+    }
+}
+
 /// Runs the Q5_0 dequant-only kernel (validation/debugging path).
 pub fn dequantize_q5_0_gpu<R: Runtime>(client: &ComputeClient<R>, data: &[u8]) -> Result<Vec<f32>> {
     let (qs, qh, d) = repack_q5_0(data)?;
@@ -833,6 +911,35 @@ impl<R: Runtime> Q80Weight<R> {
                     self.n_out,
                 );
             }
+        }
+        out_h
+    }
+
+    /// The D4/K7 spike launch: weight-staging tile matmul. One cube
+    /// per 16-column tile; rows and k-tiles walk inside the kernel.
+    /// Spike-only door — no production route calls this yet.
+    pub(crate) fn matmul_device_wtile(
+        &self,
+        client: &ComputeClient<R>,
+        x: Handle,
+        m: usize,
+    ) -> Handle {
+        let out_len = m * self.n_out;
+        let out_h = client.empty(out_len * core::mem::size_of::<f32>());
+        let n_blocks = self.n_out * self.k / Q4_0_BLOCK;
+        unsafe {
+            q8_0_qmm_wtile_kernel::launch_unchecked::<R>(
+                client,
+                CubeCount::Static((self.n_out as u32).div_ceil(16).max(1), 1, 1),
+                CubeDim::new_1d(CUBE_DIM),
+                ArrayArg::from_raw_parts(x, m * self.k),
+                ArrayArg::from_raw_parts(self.qs.clone(), n_blocks * 8),
+                ArrayArg::from_raw_parts(self.d.clone(), n_blocks),
+                ArrayArg::from_raw_parts(out_h.clone(), out_len),
+                m,
+                self.k,
+                self.n_out,
+            );
         }
         out_h
     }
@@ -3772,6 +3879,99 @@ mod tests {
             let ti = f32::from_bytes(&client.read_one_unchecked(ti_h)).to_vec();
             assert_tiled_bit_identical(&un, &ti, &format!("q8_0 m={m}"));
         }
+    }
+
+    /// The D4/K7 spike's parity cell: the weight-staging kernel vs the
+    /// naive fused kernel. Accumulation order differs (k-tile-major
+    /// with a running global accumulate), so the bound is the 1e-3
+    /// reordering class, and a zero-count guards the §70 failure mode
+    /// (a launch that returns Ok having written nothing).
+    #[test]
+    fn wtile_q8_0_matmul_matches_the_naive_kernel_closely() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let (n_out, k) = (300, 320);
+        let n_blocks = n_out * k / Q4_0_BLOCK;
+        let data = synth_q8_0(n_blocks);
+        let device = Default::default();
+        let client = WgpuRuntime::client(&device);
+        let w = Q80Weight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
+        for m in [2usize, 17, 768] {
+            let x: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 11 % 29) as f32 - 14.0) / 16.0)
+                .collect();
+            let x_h = client.create_from_slice(f32::as_bytes(&x));
+            let naive_h = w.matmul_device_with(&client, x_h.clone(), m, false);
+            let wtile_h = w.matmul_device_wtile(&client, x_h, m);
+            let naive = f32::from_bytes(&client.read_one_unchecked(naive_h)).to_vec();
+            let wt = f32::from_bytes(&client.read_one_unchecked(wtile_h)).to_vec();
+            assert_eq!(naive.len(), wt.len(), "m={m}: length");
+            let mut zeros = 0usize;
+            for (i, (a, b)) in naive.iter().zip(wt.iter()).enumerate() {
+                if *b == 0.0 {
+                    zeros += 1;
+                }
+                let denom = a.abs().max(1.0);
+                assert!(
+                    (a - b).abs() / denom < 1e-3,
+                    "m={m} out[{i}]: naive {a} vs wtile {b}"
+                );
+            }
+            assert!(
+                zeros < wt.len() / 2,
+                "m={m}: {zeros}/{} zeros — the §70 wrote-nothing signature",
+                wt.len()
+            );
+        }
+    }
+
+    /// The spike's timing arm (COMBS_WTILE_BENCH=1): the three fused
+    /// kernels at a klein-shaped cell (m=768, k=3072, n_out=3072).
+    /// Wall-clocks a read-back-bounded loop — coarse, but the roads
+    /// differ by the design margin or they don't. Not a gate.
+    #[test]
+    fn wtile_bench_at_the_klein_shape() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        if !matches!(std::env::var("COMBS_WTILE_BENCH").as_deref(), Ok("1")) {
+            return;
+        }
+        let (m, k, n_out) = (768usize, 3072usize, 3072usize);
+        let n_blocks = n_out * k / Q4_0_BLOCK;
+        let data = synth_q8_0(n_blocks);
+        let device = Default::default();
+        let client = WgpuRuntime::client(&device);
+        let w = Q80Weight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
+        let x: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 13 % 31) as f32 - 15.0) / 16.0)
+            .collect();
+        let x_h = client.create_from_slice(f32::as_bytes(&x));
+        let time = |label: &str, f: &dyn Fn() -> Handle| {
+            // warm once, then five timed reps, read back each to bound.
+            let _ = f32::from_bytes(&client.read_one_unchecked(f())).len();
+            let t0 = std::time::Instant::now();
+            for _ in 0..5 {
+                let _ = f32::from_bytes(&client.read_one_unchecked(f())).len();
+            }
+            eprintln!(
+                "[wtile-bench] {label}: {:.1} ms/rep",
+                t0.elapsed().as_secs_f64() * 200.0
+            );
+        };
+        time("naive fused (per-row weight reads)", &|| {
+            w.matmul_device_with(&client, x_h.clone(), m, false)
+        });
+        time("x-tiled fused (activation staged)", &|| {
+            w.matmul_device_with(&client, x_h.clone(), m, true)
+        });
+        time("wtile (weight staged, this spike)", &|| {
+            w.matmul_device_wtile(&client, x_h.clone(), m)
+        });
+        time("dequant alone (the batched road's traffic)", &|| {
+            w.dequant_device::<f32>(&client)
+        });
     }
 
     /// Q4_K tiled-vs-untiled bit identity (superblock-aligned k by
