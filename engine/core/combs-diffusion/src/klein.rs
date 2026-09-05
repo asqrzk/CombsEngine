@@ -300,11 +300,21 @@ impl<B: Backend, VB: Backend> DiffusionModel<B> for Flux2KleinPipeline<B, VB> {
     /// Per-step previews cost ~207 MB on top (measured, same series) —
     /// inside the caller's headroom, so the curve stays preview-free
     /// rather than pretending to know the cadence.
+    ///
+    /// 768x768 measured 2026-09-05 (one whole-image run, fox seed 42,
+    /// 4 steps, phys_footprint sampled at 0.3 s): peak 13.0 GB against
+    /// 7.35 GB resident at load — a 5.66 GB delta, 9,600 bytes/pixel,
+    /// within 1.2% of the linear term above. The curve held, so the
+    /// measured boundary moves to 768x768 and the extrapolation
+    /// inflation now starts past it. Same run: VAE decode was 154 s of
+    /// the 226 s wall (up2 alone 95 s) versus 13 s at 512x512 — a
+    /// speed cliff, not a memory one; the tiled-decode arc addresses
+    /// time, the budget fits whole.
     fn working_set(&self) -> Option<WorkingSet> {
         Some(WorkingSet {
             fixed_bytes: 1_280_311_296,
             bytes_per_pixel: 9_712,
-            measured_max_pixels: 512 * 512,
+            measured_max_pixels: 768 * 768,
         })
     }
 

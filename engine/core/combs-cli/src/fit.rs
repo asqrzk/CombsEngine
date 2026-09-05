@@ -109,14 +109,10 @@ pub struct ImageDelta {
 
 /// Predicted working-set growth for a canvas of `pixels` output pixels
 /// under a pipeline's own measured curve.
-pub fn estimate_image_delta(
-    model: &combs_diffusion::WorkingSet,
-    pixels: u64,
-) -> ImageDelta {
+pub fn estimate_image_delta(model: &combs_diffusion::WorkingSet, pixels: u64) -> ImageDelta {
     let measured = pixels.min(model.measured_max_pixels);
     let excess = pixels.saturating_sub(model.measured_max_pixels);
-    let inflated_excess =
-        excess.saturating_mul(EXTRAPOLATION_SAFETY.0) / EXTRAPOLATION_SAFETY.1;
+    let inflated_excess = excess.saturating_mul(EXTRAPOLATION_SAFETY.0) / EXTRAPOLATION_SAFETY.1;
     let variable = model
         .bytes_per_pixel
         .saturating_mul(measured.saturating_add(inflated_excess));
@@ -156,17 +152,16 @@ pub fn check_image_fit(
     // Growth this process has already proven it can hold counts against
     // the request — but only for a canvas it has actually served at
     // least this large. Scaling up is priced as if the pool were cold.
-    let already_held = if pixels <= inputs.largest_completed_pixels {
-        inputs.current_footprint
-    } else {
-        inputs.resident_at_load.max(
-            inputs
-                .current_footprint
-                .min(inputs.resident_at_load.saturating_add(
+    let already_held =
+        if pixels <= inputs.largest_completed_pixels {
+            inputs.current_footprint
+        } else {
+            inputs.resident_at_load.max(inputs.current_footprint.min(
+                inputs.resident_at_load.saturating_add(
                     estimate_image_delta(model, inputs.largest_completed_pixels).bytes,
-                )),
-        )
-    };
+                ),
+            ))
+        };
     let additional = estimated_peak.saturating_sub(already_held);
     // Never ask for more cushion than the growth being requested: a run
     // that allocates nothing new introduces no new risk to absorb.
@@ -234,8 +229,7 @@ pub fn image_refusal(ctx: &PreflightContext, width: u32, height: u32) -> Option<
             current_footprint,
             largest_completed_pixels: ctx.largest_completed_pixels,
             available,
-            headroom: env_mb("COMBS_IMAGE_PREFLIGHT_HEADROOM_MB")
-                .unwrap_or(DEFAULT_HEADROOM_BYTES),
+            headroom: env_mb("COMBS_IMAGE_PREFLIGHT_HEADROOM_MB").unwrap_or(DEFAULT_HEADROOM_BYTES),
         },
     )
     .err()
@@ -247,7 +241,11 @@ pub fn preflight_disabled() -> bool {
 }
 
 fn env_mb(key: &str) -> Option<u64> {
-    std::env::var(key).ok()?.parse::<u64>().ok().map(|mb| mb * 1024 * 1024)
+    std::env::var(key)
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .map(|mb| mb * 1024 * 1024)
 }
 
 /// Memory the machine can hand out, or `None` where we have no probe we
@@ -277,15 +275,17 @@ pub fn available_memory_bytes() -> Option<u64> {
     }
     let page = unsafe { libc::vm_page_size } as u64;
     Some(
-        (stats.free_count as u64 + stats.speculative_count as u64
-            + stats.inactive_count as u64)
+        (stats.free_count as u64 + stats.speculative_count as u64 + stats.inactive_count as u64)
             * page,
     )
 }
 
 #[cfg(target_os = "linux")]
 pub fn available_memory_bytes() -> Option<u64> {
-    parse_kb_field(&std::fs::read_to_string("/proc/meminfo").ok()?, "MemAvailable:")
+    parse_kb_field(
+        &std::fs::read_to_string("/proc/meminfo").ok()?,
+        "MemAvailable:",
+    )
 }
 
 /// Pull a `kB`-suffixed field out of a /proc table. Kept off the
@@ -338,7 +338,11 @@ mod tests {
     use super::*;
 
     fn row(name: &str, elements: u64, packed: Option<(u64, usize)>) -> FitRow {
-        FitRow { name: name.into(), elements, packed }
+        FitRow {
+            name: name.into(),
+            elements,
+            packed,
+        }
     }
 
     #[test]
@@ -383,8 +387,12 @@ mod tests {
         // A Q6_K token_embd is packed rank-2 but LOADS dense — the
         // walk passes packed: None for embeds, so the dense size
         // drives the refusal.
-        let report = fit_report(vec![row("model.embed_tokens.weight", 152_064 * 3_584, None)])
-            .unwrap();
+        let report = fit_report(vec![row(
+            "model.embed_tokens.weight",
+            152_064 * 3_584,
+            None,
+        )])
+        .unwrap();
         assert!(check_fit(&report, 2_147_483_647, "llvmpipe", "Cpu").is_err());
     }
 
@@ -397,7 +405,11 @@ mod tests {
     const GB: u64 = 1024 * MB;
     const RESIDENT: u64 = 8_445 * MB;
 
-    /// klein's own curve, as the pipeline reports it (§62's series).
+    /// klein's curve as it stood at §62, FROZEN for these arithmetic
+    /// cells (the live pipeline's measured boundary moved to 768x768
+    /// on 2026-09-05 — klein.rs carries the evidence; these cells keep
+    /// the frozen curve so the boundary/extrapolation arithmetic they
+    /// prove stays exercised).
     fn klein() -> combs_diffusion::WorkingSet {
         combs_diffusion::WorkingSet {
             fixed_bytes: 1_280_311_296,
@@ -429,16 +441,27 @@ mod tests {
     #[test]
     fn delta_model_reproduces_the_measured_runs() {
         let small = estimate_image_delta(&klein(), 256 * 256);
-        assert!(small.bytes.abs_diff(1_828 * MB) < MB, "256px: {} MB", small.bytes / MB);
+        assert!(
+            small.bytes.abs_diff(1_828 * MB) < MB,
+            "256px: {} MB",
+            small.bytes / MB
+        );
         assert!(!small.extrapolated);
         let large = estimate_image_delta(&klein(), 512 * 512);
-        assert!(large.bytes.abs_diff(3_649 * MB) < MB, "512px: {} MB", large.bytes / MB);
+        assert!(
+            large.bytes.abs_diff(3_649 * MB) < MB,
+            "512px: {} MB",
+            large.bytes / MB
+        );
         assert!(!large.extrapolated);
     }
 
-    /// 768px tripped a 12 GB guard on an 18 GB machine (§62), so the
-    /// curve must price it above what that machine can lend — this is
-    /// the case the estimate exists to refuse.
+    /// 768px tripped a 12 GB guard on an 18 GB machine (§62), so THIS
+    /// frozen curve must price it above what that machine could lend —
+    /// the case the estimate exists to refuse. (The 2026-09-05
+    /// whole-image run then measured 768px at a 13.0 GB peak and it
+    /// FIT; the live boundary moved past this canvas. The cell stays:
+    /// it proves the refusal arithmetic, not the current boundary.)
     #[test]
     fn a_canvas_that_did_not_fit_is_priced_as_not_fitting() {
         let delta = estimate_image_delta(&klein(), 768 * 768);
@@ -456,7 +479,11 @@ mod tests {
         let at = estimate_image_delta(&klein(), 512 * 512).bytes;
         let just_past = estimate_image_delta(&klein(), 512 * 512 + 1);
         assert!(just_past.extrapolated);
-        assert!(just_past.bytes - at < 16 * 1024, "jumped {} bytes", just_past.bytes - at);
+        assert!(
+            just_past.bytes - at < 16 * 1024,
+            "jumped {} bytes",
+            just_past.bytes - at
+        );
         let big = estimate_image_delta(&klein(), 1024 * 1024);
         let straight = klein().fixed_bytes + klein().bytes_per_pixel * 1024 * 1024;
         assert!(big.bytes > straight, "extrapolation must be cautious");
@@ -503,12 +530,16 @@ mod tests {
             &klein(),
             &inputs(512, 512, warm_from_256, 256 * 256, 1500 * MB),
         );
-        assert!(up.is_err(), "scaling up on a small pool must not be waved through");
-        // …while repeating the smaller shape stays allowed.
         assert!(
-            check_image_fit(&klein(), &inputs(256, 256, warm_from_256, 256 * 256, 100 * MB))
-                .is_ok()
+            up.is_err(),
+            "scaling up on a small pool must not be waved through"
         );
+        // …while repeating the smaller shape stays allowed.
+        assert!(check_image_fit(
+            &klein(),
+            &inputs(256, 256, warm_from_256, 256 * 256, 100 * MB)
+        )
+        .is_ok());
     }
 
     #[test]
@@ -548,11 +579,21 @@ mod tests {
 
     #[test]
     fn proc_tables_parse_kb_fields() {
-        let meminfo = "MemTotal:       32000000 kB\nMemFree:  100 kB\nMemAvailable:   12345678 kB\n";
-        assert_eq!(parse_kb_field(meminfo, "MemAvailable:"), Some(12_345_678 * 1024));
-        assert_eq!(parse_kb_field("VmRSS:\t  4096 kB\n", "VmRSS:"), Some(4 * MB));
+        let meminfo =
+            "MemTotal:       32000000 kB\nMemFree:  100 kB\nMemAvailable:   12345678 kB\n";
+        assert_eq!(
+            parse_kb_field(meminfo, "MemAvailable:"),
+            Some(12_345_678 * 1024)
+        );
+        assert_eq!(
+            parse_kb_field("VmRSS:\t  4096 kB\n", "VmRSS:"),
+            Some(4 * MB)
+        );
         assert_eq!(parse_kb_field(meminfo, "Nope:"), None);
-        assert_eq!(parse_kb_field("MemAvailable:   what kB\n", "MemAvailable:"), None);
+        assert_eq!(
+            parse_kb_field("MemAvailable:   what kB\n", "MemAvailable:"),
+            None
+        );
     }
 
     /// The live probes must agree with reality on this machine: a
