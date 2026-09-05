@@ -20,9 +20,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// Same formatter the binary logs with — one implementation, so a
-// build stamp and a runtime line can never disagree about the time.
-include!("../combs-core/src/timefmt.rs");
+// Same formatter the binary logs with. This is a committed COPY of
+// combs-core/src/timefmt.rs, not an include across crates: a packaged
+// crate's tarball cannot reach a sibling crate's source, so the old
+// `include!("../combs-core/src/timefmt.rs")` failed `cargo publish`'s
+// verify build (caught 2026-09-05, the first combs-cli publish). The
+// one-implementation guarantee is now an enforced invariant instead of
+// a shared path: xtask's `the_cli_build_stamp_formatter_matches_combs_core`
+// fails the workspace tests the moment the two files differ by a byte.
+include!("build/timefmt.rs");
 
 fn git(args: &[&str]) -> Option<String> {
     let out = Command::new("git").args(args).output().ok()?;

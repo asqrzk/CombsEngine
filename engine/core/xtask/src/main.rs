@@ -26,7 +26,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 
 #[derive(clap::Parser)]
@@ -119,8 +119,7 @@ fn android_ndk() -> Option<PathBuf> {
         .or_else(|_| std::env::var("ANDROID_SDK_ROOT"))
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                .join("Library/Android/sdk")
+            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Library/Android/sdk")
         });
     let ndk_dir = home.join("ndk");
     let mut versions: Vec<PathBuf> = std::fs::read_dir(&ndk_dir)
@@ -176,12 +175,7 @@ const TARGETS: &[Target] = &[
         full_build: |_| android_linker().is_some(),
         env: |_| {
             android_linker()
-                .map(|l| {
-                    vec![(
-                        "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER".to_string(),
-                        l,
-                    )]
-                })
+                .map(|l| vec![("CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER".to_string(), l)])
                 .unwrap_or_default()
         },
     },
@@ -249,7 +243,14 @@ fn build_target(ctx: &Ctx, target: &Target, force_check: bool) -> Result<PathBuf
     // combs-mesh-ffi ships in the same dist/ dirs. Its `engine` feature is
     // deliberately OFF here (inference-free artifact by default; enable with
     // `--features combs-mesh-ffi/engine` for an inference-capable build).
-    cmd.args(["-p", "combs-ffi", "-p", "combs-mesh-ffi", "--target", target.triple]);
+    cmd.args([
+        "-p",
+        "combs-ffi",
+        "-p",
+        "combs-mesh-ffi",
+        "--target",
+        target.triple,
+    ]);
     for (k, v) in (target.env)(ctx) {
         cmd.env(k, v);
     }
@@ -310,9 +311,16 @@ fn cmd_gates(ctx: &Ctx, quick: bool, strict: bool) -> Result<()> {
     eprintln!("== fmt ==");
     let (fmt_ok, fmt_out) = output(&["fmt", "--check"]);
     if !fmt_ok {
-        let n = fmt_out.lines().filter(|l| l.starts_with("Diff in ")).count();
+        let n = fmt_out
+            .lines()
+            .filter(|l| l.starts_with("Diff in "))
+            .count();
         eprintln!("   {n} formatting differences");
-        if strict { failed.push("fmt".into()) } else { debt.push(format!("fmt: {n}")) }
+        if strict {
+            failed.push("fmt".into())
+        } else {
+            debt.push(format!("fmt: {n}"))
+        }
     }
 
     eprintln!("== clippy ==");
@@ -323,7 +331,11 @@ fn cmd_gates(ctx: &Ctx, quick: bool, strict: bool) -> Result<()> {
         .count();
     if n > 0 {
         eprintln!("   {n} lint findings");
-        if strict { failed.push("clippy".into()) } else { debt.push(format!("clippy: {n}")) }
+        if strict {
+            failed.push("clippy".into())
+        } else {
+            debt.push(format!("clippy: {n}"))
+        }
     }
 
     let mut tier = |name: &str, args: &[&str]| {
@@ -334,18 +346,30 @@ fn cmd_gates(ctx: &Ctx, quick: bool, strict: bool) -> Result<()> {
             failed.push(name.to_string());
         }
     };
-    tier("core", &["test", "--release", "-p", "combs-core", "-p", "combs-media"]);
+    tier(
+        "core",
+        &["test", "--release", "-p", "combs-core", "-p", "combs-media"],
+    );
     if !quick {
         // These need a GPU adapter and take minutes; a machine without
         // one skips their GPU cases rather than failing them.
         tier("formats", &["test", "--release", "-p", "combs-formats"]);
-        tier("models", &["test", "--release", "-p", "combs-models", "--lib"]);
+        tier(
+            "models",
+            &["test", "--release", "-p", "combs-models", "--lib"],
+        );
         tier("runtime", &["test", "--release", "-p", "combs-runtime"]);
-        tier("diffusion", &["test", "--release", "-p", "combs-diffusion", "--lib"]);
+        tier(
+            "diffusion",
+            &["test", "--release", "-p", "combs-diffusion", "--lib"],
+        );
     }
 
     if !debt.is_empty() {
-        eprintln!("\nstanding debt (not failing; --strict makes it): {}", debt.join(", "));
+        eprintln!(
+            "\nstanding debt (not failing; --strict makes it): {}",
+            debt.join(", ")
+        );
     }
     if failed.is_empty() {
         eprintln!("all gates passed");
@@ -388,8 +412,7 @@ fn cmd_web(ctx: &Ctx, release: bool, out_dir: Option<PathBuf>, f16: bool) -> Res
     check_wasm_max_memory(&wasm)?;
 
     let out = ctx.root.join("../js/core/pkg");
-    let mut bindgen_args =
-        vec!["--target", "web", "--out-name", "combs_wasm"];
+    let mut bindgen_args = vec!["--target", "web", "--out-name", "combs_wasm"];
     if release {
         // The name section is 7.7 MB of function names a release visitor
         // never sees; debug builds keep it so stack traces stay readable.
@@ -441,7 +464,9 @@ fn cmd_web(ctx: &Ctx, release: bool, out_dir: Option<PathBuf>, f16: bool) -> Res
                         eprintln!("wasm-opt -Oz -> {:.1} MB", bytes as f64 / 1e6);
                     }
                     Ok(s) => eprintln!("wasm-opt failed ({s}); shipping unoptimized"),
-                    Err(_) => eprintln!("wasm-opt not found; shipping unoptimized (brew install binaryen)"),
+                    Err(_) => eprintln!(
+                        "wasm-opt not found; shipping unoptimized (brew install binaryen)"
+                    ),
                 }
             }
             if let Some(dest) = out_dir {
@@ -475,12 +500,17 @@ fn cmd_web(ctx: &Ctx, release: bool, out_dir: Option<PathBuf>, f16: bool) -> Res
 fn check_wasm_max_memory(path: &std::path::Path) -> Result<()> {
     const WANT_PAGES: u64 = 65536;
     let bytes = std::fs::read(path)?;
-    anyhow::ensure!(bytes.len() > 8 && &bytes[0..4] == b"\0asm", "not a wasm module");
+    anyhow::ensure!(
+        bytes.len() > 8 && &bytes[0..4] == b"\0asm",
+        "not a wasm module"
+    );
     let mut pos = 8usize; // magic + version
     let varint = |bytes: &[u8], pos: &mut usize| -> Result<u64> {
         let mut out = 0u64;
         for shift in (0..64).step_by(7) {
-            let b = *bytes.get(*pos).ok_or_else(|| anyhow::anyhow!("truncated wasm"))?;
+            let b = *bytes
+                .get(*pos)
+                .ok_or_else(|| anyhow::anyhow!("truncated wasm"))?;
             *pos += 1;
             out |= u64::from(b & 0x7f) << shift;
             if b & 0x80 == 0 {
@@ -501,7 +531,11 @@ fn check_wasm_max_memory(path: &std::path::Path) -> Result<()> {
             anyhow::ensure!(count >= 1, "wasm module declares no memory");
             let flags = varint(&bytes, &mut p)?;
             let min = varint(&bytes, &mut p)?;
-            let max = if flags & 1 == 1 { Some(varint(&bytes, &mut p)?) } else { None };
+            let max = if flags & 1 == 1 {
+                Some(varint(&bytes, &mut p)?)
+            } else {
+                None
+            };
             match max {
                 Some(m) if m == WANT_PAGES => {
                     eprintln!("memory: min {min} pages, max {m} pages (4 GiB ceiling ok)");
@@ -548,7 +582,10 @@ fn cmd_matrix() {
         } else {
             "cargo check (no cross linker on this host)"
         };
-        println!("  {:<15} {:<26} -> {:<20} [{}]", t.name, t.triple, t.artifact, mode);
+        println!(
+            "  {:<15} {:<26} -> {:<20} [{}]",
+            t.name, t.triple, t.artifact, mode
+        );
     }
     println!(
         "  {:<15} {:<26} -> {:<20} [{}]",
@@ -665,5 +702,22 @@ fn main() -> Result<()> {
             Ok(())
         }
         XCommand::Bundle => cmd_bundle(&ctx),
+    }
+}
+
+#[cfg(test)]
+mod build_support {
+    /// combs-cli's build script stamps times with a committed copy of
+    /// combs-core's formatter (a packaged tarball cannot include across
+    /// crates). One implementation stays the law: this fails the
+    /// workspace tests the moment the copy drifts by a byte.
+    #[test]
+    fn the_cli_build_stamp_formatter_matches_combs_core() {
+        let original = include_str!("../../combs-core/src/timefmt.rs");
+        let copy = include_str!("../../combs-cli/build/timefmt.rs");
+        assert_eq!(
+            original, copy,
+            "combs-cli/build/timefmt.rs has drifted from combs-core/src/timefmt.rs — re-copy it"
+        );
     }
 }
