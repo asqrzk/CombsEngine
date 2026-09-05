@@ -54,6 +54,27 @@ pub fn start() {
     ));
 }
 
+/// Linear-memory size right now, from the wasm page counter — the
+/// same number the worker's stats report as wasm_memory_bytes.
+#[cfg(target_family = "wasm")]
+fn linear_memory_bytes() -> u64 {
+    (core::arch::wasm32::memory_size(0) as u64) * 65_536
+}
+#[cfg(not(target_family = "wasm"))]
+fn linear_memory_bytes() -> u64 {
+    0
+}
+
+/// D13's attribution marks: one console line per finish-phase seam,
+/// with the linear-memory reading. Cheap (four lines per mount), so
+/// always on — the f4 harness reads them from the page console.
+fn mem_mark(stage: &str) {
+    web_sys_log(&format!(
+        "[combs-mem] {stage}: {} MB",
+        linear_memory_bytes() / (1024 * 1024)
+    ));
+}
+
 /// One line to the browser console, without pulling in web-sys.
 fn web_sys_log(text: &str) {
     #[wasm_bindgen]
@@ -435,10 +456,14 @@ pub async fn combs_model_finish(handle: u32) -> Result<u32, JsValue> {
             create_engine_from_source(config, source)
         }
         Mount::Streaming { config_json, mount } => {
+            mem_mark("finish-entry");
             let config: EngineConfigJson = serde_json::from_str(&config_json)
                 .map_err(|e| js_err(format!("invalid engine config JSON: {e}")))?;
             let (mut staged, header) = mount.finish().map_err(|e| js_err(e.to_string()))?;
-            create_engine_from_staged(config, &mut staged, header)
+            mem_mark("weights-sealed");
+            let out = create_engine_from_staged(config, &mut staged, header);
+            mem_mark("engine-built");
+            out
         }
     }
 }
