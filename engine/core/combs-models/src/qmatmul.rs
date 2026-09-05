@@ -1121,13 +1121,15 @@ fn repack_q6_k_kernel(
 
 /// Whether staging repacks on the device. In a tab the answer is
 /// always yes — the host copy is exactly what the 4 GiB ceiling cannot
-/// afford; natively the door opens with `COMBS_STAGE_REPACK=device`
-/// until the identity sweep blesses a default flip.
+/// afford. Native default flipped to device 2026-09-05 (measured 1216
+/// vs 1766 MB RSS and 3.0 vs 4.2 s on the 7B mount; the L4 identity
+/// sweep on the flipped build is the blessing this commit rides).
+/// `COMBS_STAGE_REPACK=host` restores the host repack as the door.
 pub(crate) fn stage_repack_device() -> bool {
     if cfg!(target_family = "wasm") {
         return true;
     }
-    matches!(std::env::var("COMBS_STAGE_REPACK").as_deref(), Ok("device"))
+    !matches!(std::env::var("COMBS_STAGE_REPACK").as_deref(), Ok("host"))
 }
 
 /// Flush after each device repack: the raw upload's staging copy is
