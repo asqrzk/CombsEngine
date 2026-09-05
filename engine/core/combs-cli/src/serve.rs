@@ -227,7 +227,13 @@ fn stats_response(
         200,
         json!({
             "object": "engine.stats",
-            "build": crate::build_info::manifest(),
+            // Named build_manifest because a second "build" key (runtime
+            // env flags, further down) used to SHADOW this one — JSON
+            // keeps the last duplicate key, so consumers reading .build
+            // got flags and the manifest was unreachable. The flags key
+            // keeps the short name (the platform reads .build.dtype and
+            // .build.kv_env); the identity lives here.
+            "build_manifest": crate::build_info::manifest(),
             "model": model_id,
             "architecture": &meta.architecture,
             "uptime_s": counters.started.elapsed().as_secs(),
@@ -488,7 +494,10 @@ fn clear_sessions_response(engine: &Arc<Engine>, path: &str) -> HttpResponse {
         .filter(|s| !s.is_empty())
         .map(|s| if s == "(anonymous)" { "" } else { s });
     match engine.clear_sessions(id) {
-        Ok(cleared) => json_response(200, json!({ "object": "sessions.cleared", "cleared": cleared })),
+        Ok(cleared) => json_response(
+            200,
+            json!({ "object": "sessions.cleared", "cleared": cleared }),
+        ),
         Err(e) => json_response(500, error_json("engine_error", &e.to_string())),
     }
 }
