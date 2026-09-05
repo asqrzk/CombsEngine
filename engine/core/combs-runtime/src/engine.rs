@@ -23,10 +23,10 @@ use native_driver_imports::*;
 #[cfg(not(target_family = "wasm"))]
 mod native_driver_imports {
     pub(super) use std::sync::atomic::AtomicBool;
-    pub(super) use std::sync::{Arc, Mutex, mpsc};
+    pub(super) use std::sync::{mpsc, Arc, Mutex};
     pub(super) use std::thread::JoinHandle;
 
-    pub(super) use burn::tensor::{Tensor, TensorData, backend::Backend as _};
+    pub(super) use burn::tensor::{backend::Backend as _, Tensor, TensorData};
     pub(super) use combs_core::{BufferPool, CombsBackend, CombsDevice};
     pub(super) use combs_formats::{ModelMetadata, ModelSource};
     pub(super) use combs_media::PixelBatch;
@@ -35,7 +35,7 @@ mod native_driver_imports {
 
     pub(super) use crate::constraint::TokenByteTable;
     pub(super) use crate::sampler::TokenLogprobs;
-    pub(super) use crate::step::{self, MAX_SESSIONS, SessionSet, Submitted, begin_generation};
+    pub(super) use crate::step::{self, begin_generation, SessionSet, Submitted, MAX_SESSIONS};
 }
 
 /// Parameters for one generation call.
@@ -480,7 +480,10 @@ impl Engine {
                 ("kv_quant", cache_config.quantize_kv.to_string()),
                 ("weights_mb", (weight_bytes >> 20).to_string()),
                 ("kv_mb", (kv_bytes >> 20).to_string()),
-                ("largest_tensor", format!("{} ({} MB)", largest.0, largest.1 >> 20)),
+                (
+                    "largest_tensor",
+                    format!("{} ({} MB)", largest.0, largest.1 >> 20),
+                ),
             ],
         );
         let model = pool.pin_persistent(&device, || registry.load(source, &device))?;
@@ -961,8 +964,7 @@ fn estimate_weight_bytes(source: &dyn ModelSource, elem_bytes: u64) -> (u64, (St
         let dense_embed = name.contains("embed_tokens") || name.contains("token_embd");
         let bytes = match source.open_tensor_quant(&name) {
             Ok(Some(qt)) => {
-                let packs = !dense_embed
-                    || matches!(qt.format, combs_formats::QuantFormat::Q8_0);
+                let packs = !dense_embed || matches!(qt.format, combs_formats::QuantFormat::Q8_0);
                 if packs {
                     qt.data.len() as u64
                 } else {
@@ -970,9 +972,7 @@ fn estimate_weight_bytes(source: &dyn ModelSource, elem_bytes: u64) -> (u64, (St
                 }
             }
             _ => match source.open_tensor(&name) {
-                Ok(reader) => {
-                    reader.shape().iter().product::<usize>() as u64 * elem_bytes
-                }
+                Ok(reader) => reader.shape().iter().product::<usize>() as u64 * elem_bytes,
                 Err(_) => continue,
             },
         };
@@ -1028,7 +1028,10 @@ fn worker_loop(
                         "engine",
                         "kv.evict",
                         &[
-                            ("evicted", (sessions.evictions - evictions_before).to_string()),
+                            (
+                                "evicted",
+                                (sessions.evictions - evictions_before).to_string(),
+                            ),
                             ("evictions_total", sessions.evictions.to_string()),
                         ],
                     );
@@ -1246,7 +1249,11 @@ fn run_perplexity(
 
         // Targets for positions offset..offset+len are tokens shifted by
         // one; the sequence-final position has none.
-        let n_score = if offset + len == tokens.len() { len - 1 } else { len };
+        let n_score = if offset + len == tokens.len() {
+            len - 1
+        } else {
+            len
+        };
         if n_score == 0 {
             break;
         }
@@ -1313,7 +1320,10 @@ fn detect_pooling(dir: Option<&std::path::Path>) -> Pooling {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
         return Pooling::Last;
     };
-    if v.get("pooling_mode_mean_tokens").and_then(serde_json::Value::as_bool) == Some(true) {
+    if v.get("pooling_mode_mean_tokens")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
         return Pooling::Mean;
     }
     Pooling::Last
@@ -1433,18 +1443,25 @@ fn run_generation(
             break;
         }
         match active.submit(model, device) {
-            Submitted::Logits(t) => match step::readback_logits(t) {
-                Ok(row) => {
-                    if active.sample_row(row).is_err() {
-                        // Unreachable: past the first token, sample_row
-                        // records its failure instead of returning it.
-                        break;
-                    }
-                }
-                Err(e) => {
+            Submitted::Logits(t) => match active.try_sample_on_device(&t) {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
                     active.fail(e);
                     break;
                 }
+                None => match step::readback_logits(t) {
+                    Ok(row) => {
+                        if active.sample_row(row).is_err() {
+                            // Unreachable: past the first token, sample_row
+                            // records its failure instead of returning it.
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        active.fail(e);
+                        break;
+                    }
+                },
             },
             Submitted::Ready => continue,
             Submitted::Done => break,
@@ -1453,7 +1470,6 @@ fn run_generation(
 
     active.finish(tokenizer, sessions, &mut emit)
 }
-
 
 /// Merges `generation_config.json` sampler defaults over the built-in
 /// defaults. `None` fields keep the built-in default (greedy, no filters).

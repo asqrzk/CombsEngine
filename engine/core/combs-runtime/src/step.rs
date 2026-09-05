@@ -21,20 +21,20 @@
 //! worker thread; [`crate::LocalEngine`] drives it with an awaited one on
 //! the caller's task. Same code decides what a token means in both.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use burn::tensor::{Tensor, TensorData};
 use combs_core::{CombsBackend, CombsDevice};
 use combs_media::PixelBatch;
-use combs_models::{CacheConfig, CacheKind, GenerativeModel, KVCache, pixels_to_tensor};
+use combs_models::{pixels_to_tensor, CacheConfig, CacheKind, GenerativeModel, KVCache};
 use tokenizers::Tokenizer;
 
 use crate::constraint::{ConstraintState, TokenByteTable};
 use crate::detok::IncrementalDetokenizer;
-use crate::engine::{GenerationConfig, GenerationStats, check_context_len};
-use crate::sampler::{Sampler, TokenLogprobs, sampler_from_params_exempting};
+use crate::engine::{check_context_len, GenerationConfig, GenerationStats};
+use crate::sampler::{sampler_from_params_exempting, Sampler, TokenLogprobs};
 use crate::stop::StopDetector;
 use crate::time::Instant;
 use crate::{EngineError, Result};
@@ -119,7 +119,10 @@ impl SessionSet {
                 combs_core::provenance::event(
                     "engine",
                     "kv.session.evict",
-                    &[("session", oldest.clone()), ("live", self.map.len().to_string())],
+                    &[
+                        ("session", oldest.clone()),
+                        ("live", self.map.len().to_string()),
+                    ],
                 );
                 self.map.remove(&oldest);
                 self.evictions += 1;
@@ -202,6 +205,13 @@ pub(crate) struct ActiveGeneration {
     /// missing one costs one re-prefill.
     poisoned: bool,
 
+    /// True when the request's sampling is raw argmax (no penalties,
+    /// bias, logprobs, or constraint) AND the COMBS_GPU_SAMPLE door is
+    /// open: each decode step samples on the device and reads back one
+    /// int instead of the vocab row. Think-guard masking is a per-step
+    /// condition checked at the call site.
+    device_sample: bool,
+
     prompt_tokens: Vec<u32>,
     lcp: usize,
     reuse: bool,
@@ -268,9 +278,13 @@ pub(crate) fn begin_generation(
     let constraint = match &config.constraint {
         Some(spec) => {
             let schema = spec.compile().map_err(EngineError::Constraint)?;
-            let table = token_table
-                .get_or_insert_with(|| Arc::new(TokenByteTable::build(tokenizer)));
-            Some(ConstraintState::new(schema, table.clone(), eos_for_constraint))
+            let table =
+                token_table.get_or_insert_with(|| Arc::new(TokenByteTable::build(tokenizer)));
+            Some(ConstraintState::new(
+                schema,
+                table.clone(),
+                eos_for_constraint,
+            ))
         }
         None => None,
     };
@@ -385,7 +399,10 @@ pub(crate) fn begin_generation(
         active: spec_enabled()
             && constraint.is_none()
             && config.sampling.temperature <= 0.0
-            && config.sampling.repetition_penalty.map_or(true, |v| v == 1.0)
+            && config
+                .sampling
+                .repetition_penalty
+                .map_or(true, |v| v == 1.0)
             && config.sampling.frequency_penalty.map_or(true, |v| v == 0.0)
             && config.sampling.presence_penalty.map_or(true, |v| v == 0.0)
             && config.sampling.logit_bias.is_none()
@@ -398,9 +415,21 @@ pub(crate) fn begin_generation(
         cooldown: 0,
     };
 
+    let device_sample = gpu_sample_enabled()
+        && constraint.is_none()
+        && config.sampling.temperature <= 0.0
+        && config
+            .sampling
+            .repetition_penalty
+            .map_or(true, |v| v == 1.0)
+        && config.sampling.frequency_penalty.map_or(true, |v| v == 0.0)
+        && config.sampling.presence_penalty.map_or(true, |v| v == 0.0)
+        && config.sampling.logit_bias.is_none()
+        && config.sampling.logprobs.is_none();
     let active = ActiveGeneration {
         cache,
         sampler,
+        device_sample,
         stop,
         constraint,
         think_guard,
@@ -432,6 +461,56 @@ pub(crate) fn begin_generation(
 }
 
 impl ActiveGeneration {
+    /// D11's device road: when the request is raw argmax and no
+    /// think-guard mask is live this step, sample on the device and
+    /// read back ONE int instead of the vocab row. Returns None when
+    /// the host road must run (the caller falls through unchanged).
+    /// The trace's read_back mark wraps the int readback, so the §73
+    /// split measures the win honestly.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn try_sample_on_device(
+        &mut self,
+        logits: &Tensor<CombsBackend, 2>,
+    ) -> Option<Result<()>> {
+        if !self.device_sample {
+            return None;
+        }
+        if self.think_guard.as_ref().is_some_and(|g| g.depth > 0) {
+            return None;
+        }
+        let traced = self.started;
+        if traced {
+            self.trace.read_back();
+        }
+        let picked = logits
+            .clone()
+            .argmax(1)
+            .into_data()
+            .to_vec::<i32>()
+            .map_err(|e| EngineError::Readback(format!("device argmax: {e:?}")));
+        let token = match picked {
+            Ok(v) => v.first().copied().unwrap_or(0) as u32,
+            Err(e) => {
+                if !self.started {
+                    return Some(Err(e));
+                }
+                self.fail(e);
+                return Some(Ok(()));
+            }
+        };
+        self.next = token;
+        self.next_logprobs = None;
+        if !self.started {
+            self.started = true;
+            self.ttft = self.t_start.elapsed();
+            self.t_decode = Instant::now();
+        }
+        if traced {
+            self.trace.sampled();
+        }
+        Some(Ok(()))
+    }
+
     /// Masks and samples one logits row into `next`.
     ///
     /// A constraint dead end here is returned as an error only before the
@@ -521,7 +600,12 @@ impl ActiveGeneration {
         // Emit the piece, truncating at a stop string if one completes.
         match self.stop.push_text(&piece) {
             Some(cut) => {
-                if cut > 0 && !emit(self.next, piece[..cut].to_string(), self.next_logprobs.take())
+                if cut > 0
+                    && !emit(
+                        self.next,
+                        piece[..cut].to_string(),
+                        self.next_logprobs.take(),
+                    )
                 {
                     self.loop_error = Some(EngineError::Cancelled); // caller hung up
                 }
@@ -588,7 +672,9 @@ impl ActiveGeneration {
             return Some(Submitted::Ready);
         }
         let draft = (self.spec.active && self.spec.cooldown == 0)
-            .then(|| crate::spec::propose(&self.history, SPEC_DRAFT, SPEC_MIN_NGRAM, SPEC_MAX_NGRAM))
+            .then(|| {
+                crate::spec::propose(&self.history, SPEC_DRAFT, SPEC_MIN_NGRAM, SPEC_MAX_NGRAM)
+            })
             .flatten()?;
 
         // Feed [next, draft…] in one pass; row i's argmax is the model's
@@ -751,6 +837,17 @@ fn req_eos_ids(model: &dyn GenerativeModel<CombsBackend>, config: &GenerationCon
         .chain(config.stop_token_ids.iter())
         .copied()
         .collect()
+}
+
+/// D11 phase 1: sample greedy tokens on the device (`COMBS_GPU_SAMPLE=1`).
+/// The full-row readback is 81% of a 7B decode step (§73); when the
+/// sampler is raw argmax the row never needs to leave the GPU — burn's
+/// own argmax reduction runs on any backend (fused included) and the
+/// readback shrinks to one int. Off by default until the L4 sweep
+/// blesses a flip.
+pub(crate) fn gpu_sample_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("COMBS_GPU_SAMPLE").as_deref(), Ok("1")))
 }
 
 /// Reads a `[1, vocab]` logits row back to the host (one copy per step).
