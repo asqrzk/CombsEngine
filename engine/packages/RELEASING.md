@@ -116,15 +116,35 @@ reads `CARGO_REGISTRY_TOKEN` from the environment:
 ```bash
 cd Engine/Core
 for c in combs-core combs-formats combs-media combs-models \
-         combs-runtime combs-ffi combs-mesh combs-mesh-ffi; do
+         combs-runtime combs-diffusion combs-ffi combs-mesh combs-mesh-ffi; do
   cargo publish -p $c || break
 done
 ```
 
-`combs-cli` is NOT published: its `build.rs` needs the UI template
-vendored into the crate (`vendor/ui-template`) and the staging tooling
-does not exist yet. Rust users get the binary from the GitHub Release
-or `npm install -g combs-engine` instead.
+(`combs-diffusion` publishes after `combs-runtime`; it was missing from
+this list until 0.2.3, which blocked `combs-cli` — the CLI depends on it.)
+
+`combs-cli` publishes LAST, with a transient staging step: its
+`build.rs` embeds the UI template, so copy the template source into the
+crate first (the embed's own skip lists as excludes), publish, then
+remove the stage:
+
+```bash
+CLI=engine/core/combs-cli
+rsync -a --exclude node_modules --exclude dist --exclude .svelte-kit \
+  --exclude .vite --exclude data --exclude master.key \
+  --exclude permissions.json --exclude manifest.json \
+  --exclude authn.json --exclude package-lock.json \
+  engine/ui/template/ $CLI/vendor/ui-template/
+cargo publish -p combs-cli --allow-dirty   # vendor/ is untracked
+rm -rf $CLI/vendor
+```
+
+The build script prefers `vendor/ui-template` over `../../ui/template`
+when it exists, and stamps times with its own committed copy of the
+formatter (`build/timefmt.rs`) — a tarball cannot include across
+crates; xtask's identity test keeps that copy byte-equal to
+combs-core's.
 
 ## If the release workflow fails
 
