@@ -149,6 +149,13 @@ macOS Gatekeeper may quarantine a downloaded binary; clear it with
 Prerequisites: Rust (stable, via rustup) and git — §1. No other system
 packages: CI builds all three OSes from exactly these steps.
 
+One-command variant — the crate on crates.io vendors the UI template,
+so no clone is needed:
+
+```bash
+cargo install combs-cli    # installs the `combs` binary
+```
+
 ```bash
 git clone https://github.com/asqrzk/CombsEngine.git
 cd CombsEngine/engine/core

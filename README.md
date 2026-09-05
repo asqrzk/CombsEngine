@@ -21,7 +21,8 @@ Combs Engine runs large language models **on-device** with a single Rust core co
 | **npm** (zero-trust crypto) | `@combs-edge/combs-zerotrust` | `npm i @combs-edge/combs-zerotrust` |
 | **npm** (CombsMesh emoji FFI lib) | `@combs-edge/combs-mesh` | `npm i @combs-edge/combs-mesh` |
 | **PyPI** (CLI wrapper) | `combs-engine` | `pip install combs-engine` |
-| **crates.io** (Rust core) | `combs-runtime`, `combs-ffi`, `combs-mesh`, … | `cargo add combs-mesh` |
+| **crates.io** (CLI binary, built from source) | `combs-cli` | `cargo install combs-cli` |
+| **crates.io** (Rust core) | `combs-runtime`, `combs-diffusion`, `combs-ffi`, `combs-mesh`, … | `cargo add combs-mesh` |
 | **JSR** (Deno/TS framework) | `@combs/core`, `@combs/graph`, `@combs/agents`, `@combs/mesh`, … | `deno add @combs/core` |
 | **GitHub Releases** | prebuilt binaries per platform | [releases](https://github.com/asqrzk/CombsEngine/releases) |
 
