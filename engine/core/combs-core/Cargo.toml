@@ -7,6 +7,9 @@ description = "Combs Engine core: backend aliases, device helpers, memory facade
 
 [features]
 f16 = []
+# Pure-Rust CPU backend: the floor under a machine whose GPU stack
+# cannot be trusted. Mutually exclusive with the wgpu path.
+cpu = []
 
 [dependencies]
 burn.workspace = true

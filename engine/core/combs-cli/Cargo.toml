@@ -10,6 +10,7 @@ name = "combs"
 path = "src/main.rs"
 
 [features]
+cpu = ["combs-core/cpu", "combs-models/cpu"]
 f16 = ["combs-core/f16", "combs-runtime/f16"]
 
 [dev-dependencies]

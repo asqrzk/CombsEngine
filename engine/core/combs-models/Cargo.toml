@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Combs Engine model architecture registry (Llama family)"
 
+[features]
+cpu = ["combs-core/cpu"]
+
 [dependencies]
 burn.workspace = true
 # Direct access to burn's backend internals for the quantized linear seam

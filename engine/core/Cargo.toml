@@ -24,7 +24,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/asqrzk/CombsEngine"
 
 [workspace.dependencies]
-burn = { version = "0.21.0", default-features = false, features = ["wgpu", "fusion", "std"] }
+burn = { version = "0.21.0", default-features = false, features = ["wgpu", "fusion", "std", "ndarray"] }
 combs-core = { version = "0.2.3", path = "combs-core" }
 combs-formats = { version = "0.2.3", path = "combs-formats" }
 combs-media = { version = "0.2.3", path = "combs-media" }

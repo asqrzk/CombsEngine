@@ -6,6 +6,7 @@ license.workspace = true
 description = "Combs Engine generation runtime (engine, sampler, tokenizer)"
 
 [features]
+cpu = ["combs-core/cpu", "combs-models/cpu"]
 f16 = []
 
 [dependencies]

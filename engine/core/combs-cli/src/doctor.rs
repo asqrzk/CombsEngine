@@ -112,6 +112,31 @@ pub fn run(args: DoctorArgs) -> Result<()> {
     let mut device_json = json!(null);
 
     // --- device -----------------------------------------------------
+    // On the CPU floor there is no adapter to enumerate, and asking wgpu
+    // anyway would report a GPU this build never touches — which is how
+    // a doctor comes to say "trusted" about hardware it is not using.
+    #[cfg(feature = "cpu")]
+    {
+        checks.push(Check {
+            name: "device",
+            status: Status::Pass,
+            detail: "cpu backend (ndarray) — this build computes on the CPU by design".into(),
+            ms: 0,
+        });
+        device_json = json!({ "name": "cpu (ndarray)", "backend": "cpu", "device_type": "Cpu" });
+        for name in ["wgsl", "batched"] {
+            checks.push(Check {
+                name,
+                status: Status::Skip,
+                detail: "not run: these probe a GPU compiler, and this build has none".into(),
+                ms: 0,
+            });
+        }
+        return finish(args, checks, device_json);
+    }
+
+    #[cfg(not(feature = "cpu"))]
+    {
     // `device_caps` is what primes the runtime, and cubecl 0.10 panics
     // on a second init in one process — so this runs once and every
     // later check shares the default device it primed.
@@ -181,6 +206,17 @@ pub fn run(args: DoctorArgs) -> Result<()> {
         }
     }
 
+    }
+
+    #[cfg(not(feature = "cpu"))]
+    return finish(args, checks, device_json);
+}
+
+/// Everything after the device and canary checks: the end-to-end run,
+/// then the report. Shared so the CPU floor and the wgpu build cannot
+/// drift into printing different shapes.
+fn finish(args: DoctorArgs, mut checks: Vec<Check>, device_json: Value) -> Result<()> {
+    let device_ok = !checks.iter().any(|c| c.name == "device" && c.status == Status::Fail);
     // --- end to end --------------------------------------------------
     match (&args.model, args.skip_e2e, device_ok) {
         (Some(model), false, true) => {

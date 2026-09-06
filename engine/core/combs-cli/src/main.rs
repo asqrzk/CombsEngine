@@ -18,11 +18,16 @@ mod chew;
 mod doctor;
 mod fit;
 mod generate_audio;
+// Image generation is pinned to the wgpu f32 backend by design (SD-1.5
+// collapses to black under f16), so it has no meaning on the CPU floor
+// and is compiled out rather than offered and refused.
+#[cfg(not(feature = "cpu"))]
 mod generate_image;
 mod http;
 mod pull;
 mod serve;
 mod serve_audio;
+#[cfg(not(feature = "cpu"))]
 mod serve_images;
 
 #[derive(Parser)]
@@ -137,11 +142,13 @@ enum Command {
         input: PathBuf,
     },
     /// Generate an image with a local Stable Diffusion checkpoint.
+    #[cfg(not(feature = "cpu"))]
     GenerateImage(generate_image::GenerateImageArgs),
     /// Generate speech (WAV) with a local Kokoro ONNX TTS checkpoint.
     GenerateAudio(generate_audio::GenerateAudioArgs),
     /// Start a persistent image-generation worker (loads the diffusion
     /// pipeline once, serves OpenAI-style /v1/images/generations).
+    #[cfg(not(feature = "cpu"))]
     ServeImages {
         /// Path to the Diffusers checkpoint (unet/, vae/, text_encoder/).
         #[arg(long)]
@@ -269,8 +276,10 @@ impl Command {
             Command::BuildInfo { .. } => "build-info",
             Command::Pull { .. } => "pull",
             Command::Convert { .. } => "convert",
+            #[cfg(not(feature = "cpu"))]
             Command::GenerateImage(_) => "generate-image",
             Command::GenerateAudio(_) => "generate-audio",
+            #[cfg(not(feature = "cpu"))]
             Command::ServeImages { .. } => "serve-images",
             Command::ServeAudio { .. } => "serve-audio",
             Command::Transcribe { .. } => "transcribe",
@@ -309,8 +318,10 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Convert { .. } => not_yet("convert", "model repackaging"),
+        #[cfg(not(feature = "cpu"))]
         Command::GenerateImage(args) => generate_image::cmd_generate_image(args),
         Command::GenerateAudio(args) => generate_audio::cmd_generate_audio(args),
+        #[cfg(not(feature = "cpu"))]
         Command::ServeImages { model, port, lora, lora_scale, preview_every, llm, vae } => {
             let lora = lora.map(|l| resolve_lora_arg(&l)).transpose()?;
             serve_images::cmd_serve_images(model, port, lora, lora_scale, preview_every, llm, vae)

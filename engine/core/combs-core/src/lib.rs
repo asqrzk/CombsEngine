@@ -40,8 +40,26 @@ use burn::backend::wgpu::{
 /// 0.21 panics on reduced-precision tensors, so we bypass the fusion layer
 /// for f16 while keeping f32 fused. bf16 is unavailable (cubecl's matmul has
 /// no bf16 path on Metal/wgpu).
-#[cfg(not(feature = "f16"))]
+#[cfg(all(not(feature = "f16"), not(feature = "cpu")))]
 pub type CombsBackend = burn::backend::Wgpu<f32, i32, u32>;
+
+/// The CPU floor (`--features cpu`): burn's pure-Rust ndarray backend.
+///
+/// It exists to answer `combs doctor`'s "no trusted GPU" verdict — a
+/// machine whose Vulkan stack hands back a rasterizer, or has no GPU at
+/// all, still runs. Quantized weights take the portable dense path
+/// automatically: `try_quant_linear` dispatches on a TypeId allowlist
+/// this backend is deliberately not in, so the weight arrives
+/// dequantized from `open_tensor` and burn's matmul carries it.
+///
+/// This is reach, not speed. ndarray needs no system BLAS, which is the
+/// point: the fallback cannot itself fail to build on the machine that
+/// most needs it.
+#[cfg(feature = "cpu")]
+pub type CombsBackend = burn::backend::NdArray<f32, i32, i8>;
+
+#[cfg(all(feature = "cpu", feature = "f16"))]
+compile_error!("features `cpu` and `f16` are mutually exclusive: f16 is a wgpu backend");
 
 /// Always-f32 backend on the same wgpu runtime. The diffusion pipeline is
 /// pinned to it in every build: SD-1.5's UNet/VAE collapse to black output
@@ -57,7 +75,11 @@ pub type CombsBackend = burn::backend::wgpu::CubeBackend<
 >;
 
 /// The default device handle type.
+#[cfg(not(feature = "cpu"))]
 pub type CombsDevice = WgpuDevice;
+/// The CPU floor's device handle.
+#[cfg(feature = "cpu")]
+pub type CombsDevice = burn::backend::ndarray::NdArrayDevice;
 
 /// The one device context this process holds: the device handle, the
 /// retained [`WgpuSetup`] (adapter, device, queue — the doorway for any
@@ -192,7 +214,15 @@ async fn context_async() -> &'static DeviceContext {
 /// on the first capability query, which retains the setup — see
 /// [`DeviceContext`]), so call order never becomes a correctness rule.
 pub fn init_device() -> CombsDevice {
-    WgpuDevice::default()
+    #[cfg(not(feature = "cpu"))]
+    {
+        WgpuDevice::default()
+    }
+    // The CPU floor has one device and no setup to retain.
+    #[cfg(feature = "cpu")]
+    {
+        CombsDevice::default()
+    }
 }
 
 /// True when wgpu can see at least one adapter. Cached after the first
@@ -374,7 +404,14 @@ pub struct GpuMemory {
 /// Samples the GPU allocator. `memory_usage()` is `submit_blocking` on the
 /// compute stream — call from the engine worker between generations (or
 /// rate-limited), not from request threads during a long prefill.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "cpu"))]
+pub fn gpu_memory(_device: &CombsDevice) -> Option<GpuMemory> {
+    // No GPU allocator exists on the CPU floor. Reporting nothing is the
+    // honest answer; reporting zeros would read as an idle GPU.
+    None
+}
+
+#[cfg(all(not(target_family = "wasm"), not(feature = "cpu")))]
 pub fn gpu_memory(device: &CombsDevice) -> Option<GpuMemory> {
     let client =
         <burn::backend::wgpu::WgpuRuntime as cubecl::prelude::Runtime>::client(device);
@@ -484,11 +521,21 @@ impl BufferPool {
         if !door {
             return task();
         }
-        let client =
-            <burn::backend::wgpu::WgpuRuntime as cubecl::prelude::Runtime>::client(device);
-        match client.memory_persistent_allocation((), |_| task()) {
-            Ok(out) => out,
-            Err(e) => panic!("persistent-mode load failed to submit: {e:?}"),
+        // The CPU floor has no pool to hold allocations persistent in;
+        // the task simply runs.
+        #[cfg(feature = "cpu")]
+        {
+            let _ = device;
+            return task();
+        }
+        #[cfg(not(feature = "cpu"))]
+        {
+            let client =
+                <burn::backend::wgpu::WgpuRuntime as cubecl::prelude::Runtime>::client(device);
+            match client.memory_persistent_allocation((), |_| task()) {
+                Ok(out) => out,
+                Err(e) => panic!("persistent-mode load failed to submit: {e:?}"),
+            }
         }
     }
 
@@ -496,8 +543,15 @@ impl BufferPool {
     /// submit, safe on every target. The allocator decides what is
     /// actually beneficial to free; persistent allocations are exempt.
     pub fn cleanup(&self, device: &CombsDevice) {
-        let client =
-            <burn::backend::wgpu::WgpuRuntime as cubecl::prelude::Runtime>::client(device);
-        client.memory_cleanup();
+        #[cfg(feature = "cpu")]
+        {
+            let _ = device; // nothing pooled, nothing to release
+        }
+        #[cfg(not(feature = "cpu"))]
+        {
+            let client =
+                <burn::backend::wgpu::WgpuRuntime as cubecl::prelude::Runtime>::client(device);
+            client.memory_cleanup();
+        }
     }
 }
