@@ -15,6 +15,7 @@ use combs_runtime::{Engine, GenerationConfig};
 
 mod build_info;
 mod chew;
+mod doctor;
 mod fit;
 mod generate_audio;
 mod generate_image;
@@ -103,6 +104,10 @@ enum Command {
     },
     /// Print wgpu device information.
     Devices,
+    /// Answer whether this machine's stack can be trusted: device,
+    /// value canaries, and optionally a generation — with a nonzero
+    /// exit when any of them refuses.
+    Doctor(doctor::DoctorArgs),
     /// Read a model's static capabilities from its header — no weights
     /// loaded, no GPU touched. GGUF only (a directory model's identity
     /// is its config.json, already readable).
@@ -260,6 +265,7 @@ impl Command {
         match self {
             Command::Run(_) => "run",
             Command::Devices => "devices",
+            Command::Doctor(_) => "doctor",
             Command::BuildInfo { .. } => "build-info",
             Command::Pull { .. } => "pull",
             Command::Convert { .. } => "convert",
@@ -288,6 +294,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Run(args) => cmd_run(args),
         Command::Devices => cmd_devices(),
+        Command::Doctor(args) => doctor::run(args),
         Command::BuildInfo { json } => {
             if json {
                 println!("{:#}", build_info::manifest());
@@ -391,7 +398,7 @@ fn resolve_lora_arg(arg: &std::path::Path) -> Result<PathBuf> {
     )
 }
 
-fn resolve_model_arg(model: &PathBuf) -> Result<PathBuf> {
+pub(crate) fn resolve_model_arg(model: &PathBuf) -> Result<PathBuf> {
     if model.exists() {
         return Ok(model.clone());
     }
