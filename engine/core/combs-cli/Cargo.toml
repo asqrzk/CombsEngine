@@ -1,6 +1,6 @@
 [package]
 name = "combs-cli"
-version = "0.2.3"
+version = "0.2.4"
 edition.workspace = true
 license.workspace = true
 description = "Combs Engine CLI (`combs` binary)"
@@ -19,12 +19,12 @@ burn = { version = "0.21.0", default-features = false, features = ["ndarray", "s
 [dependencies]
 burn.workspace = true
 cubecl = { version = "0.10.0", default-features = false, features = ["wgpu", "std"] }
-combs-core = { path = "../combs-core", version = "0.2.3" }
-combs-formats = { path = "../combs-formats", version = "0.2.3" }
-combs-media = { path = "../combs-media", version = "0.2.3" }
-combs-models = { path = "../combs-models", version = "0.2.3" }
-combs-runtime = { path = "../combs-runtime", version = "0.2.3" }
-combs-diffusion = { path = "../combs-diffusion", version = "0.2.3" }
+combs-core = { path = "../combs-core", version = "0.2.4" }
+combs-formats = { path = "../combs-formats", version = "0.2.4" }
+combs-media = { path = "../combs-media", version = "0.2.4" }
+combs-models = { path = "../combs-models", version = "0.2.4" }
+combs-runtime = { path = "../combs-runtime", version = "0.2.4" }
+combs-diffusion = { path = "../combs-diffusion", version = "0.2.4" }
 base64.workspace = true
 image.workspace = true
 clap.workspace = true

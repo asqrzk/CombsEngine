@@ -1,6 +1,6 @@
 {
   "name": "@combs/observe",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "exports": "./mod.ts",
   "imports": {},
   "license": "MIT"

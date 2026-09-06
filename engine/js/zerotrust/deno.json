@@ -1,6 +1,6 @@
 {
   "name": "@combs/zerotrust",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "exports": "./mod.js",
   "license": "MIT"
 }
