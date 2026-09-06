@@ -23,6 +23,7 @@ mod stop;
 mod time;
 mod template;
 mod toolcall;
+pub mod budget;
 pub mod stream_mount;
 // Speech transcription reads checkpoints off disk and syncs the device on
 // every window; neither exists in a browser, so it stays native-only until
