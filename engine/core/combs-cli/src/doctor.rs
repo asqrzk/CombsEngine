@@ -137,6 +137,34 @@ pub fn run(args: DoctorArgs) -> Result<()> {
 
     #[cfg(not(feature = "cpu"))]
     {
+    // Ask whether there is an adapter AT ALL before touching the
+    // runtime. Measured on arm64 Linux in a container with no GPU:
+    // `device_caps` panicked twice — "No possible adapter available"
+    // inside cubecl, then "an adapter exists" in our own expect — so
+    // the one machine doctor exists to diagnose was the one machine it
+    // died on. `gpu_available` enumerates without initializing, which
+    // is why it can answer here.
+    if !combs_core::gpu_available() {
+        checks.push(Check {
+            name: "device",
+            status: Status::Fail,
+            detail: concat!(
+                "no GPU adapter is visible to wgpu on this machine — nothing to run on. ",
+                "A build with --features cpu will serve here; this one will not.",
+            )
+            .into(),
+            ms: 0,
+        });
+        for name in ["wgsl", "batched"] {
+            checks.push(Check {
+                name,
+                status: Status::Skip,
+                detail: "not run: there is no device to probe".into(),
+                ms: 0,
+            });
+        }
+        return finish(args, checks, json!({ "name": "none", "backend": "none" }));
+    }
     // `device_caps` is what primes the runtime, and cubecl 0.10 panics
     // on a second init in one process — so this runs once and every
     // later check shares the default device it primed.
