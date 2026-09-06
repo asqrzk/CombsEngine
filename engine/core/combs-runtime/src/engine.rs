@@ -1412,7 +1412,17 @@ fn run_generation(
     sessions: &mut SessionSet,
     token_table: &mut Option<Arc<TokenByteTable>>,
 ) -> Result<GenerationStats> {
-    let (mut active, logits) = begin_generation(
+    // "Every unit of work" was the record-depth promise, and until
+    // 2026-09-06 the only turn the engine emitted was the mount — a
+    // chat left no trace at turn depth. One guard here covers every
+    // driver of the worker thread (serve, run, streaming included);
+    // the Drop half reports a request that unwound as "abandoned".
+    let turn = combs_core::provenance::turn(
+        "engine",
+        "generate",
+        &[("max_tokens", req.config.max_tokens.to_string())],
+    );
+    let begun = begin_generation(
         model,
         tokenizer,
         device,
@@ -1424,7 +1434,14 @@ fn run_generation(
         req.cancel.clone(),
         sessions,
         token_table,
-    )?;
+    );
+    let (mut active, logits) = match begun {
+        Ok(v) => v,
+        Err(e) => {
+            turn.failed(&e.to_string());
+            return Err(e);
+        }
+    };
 
     // A send failure is the caller hanging up mid-stream, which the loop
     // treats as a cancel.
@@ -1468,7 +1485,16 @@ fn run_generation(
         }
     }
 
-    active.finish(tokenizer, sessions, &mut emit)
+    let result = active.finish(tokenizer, sessions, &mut emit);
+    match &result {
+        Ok(stats) => turn.ok(&[
+            ("prompt_tokens", stats.prompt_tokens.to_string()),
+            ("cached_tokens", stats.cached_tokens.to_string()),
+            ("generated_tokens", stats.generated_tokens.to_string()),
+        ]),
+        Err(e) => turn.failed(&e.to_string()),
+    }
+    result
 }
 
 /// Merges `generation_config.json` sampler defaults over the built-in
