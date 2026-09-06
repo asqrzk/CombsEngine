@@ -27,8 +27,8 @@ const MAX_FILES_CEILING = 50000;
 const MAX_FILE_BYTES = 512 * 1024;
 const READ_BYTES = 64 * 1024;
 const STRUCTURAL_TYPES = ["repo", "module", "file", "doc-section"];
-const SOURCE_EXT = /\.(ts|js|tsx|jsx|rs|md|py)$/;
-const ANCHOR_FILES = new Set(["deno.json", "Cargo.toml", "package.json", "pyproject.toml"]);
+const SOURCE_EXT = /\.(ts|js|tsx|jsx|rs|md|py|go)$/;
+const ANCHOR_FILES = new Set(["deno.json", "Cargo.toml", "package.json", "pyproject.toml", "go.mod"]);
 
 async function listFiles(
   repoPath: string,
@@ -50,7 +50,7 @@ async function listFiles(
   }
   const files: string[] = [];
   let skipped = 0;
-  const EXCLUDE = new Set([".git", "node_modules", "target", "dist", ".cache", ".venv", "venv", "__pycache__"]);
+  const EXCLUDE = new Set([".git", "node_modules", "target", "dist", ".cache", ".venv", "venv", "__pycache__", "vendor"]);
   async function walk(dir: string, rel: string): Promise<void> {
     if (files.length >= maxFiles) return;
     for await (const e of Deno.readDir(dir)) {
@@ -192,6 +192,55 @@ function resolveRelative(fromFile: string, spec: string, fileSet: Set<string>): 
   ];
   for (const c of candidates) if (fileSet.has(c)) return c;
   return null;
+}
+
+/**
+ * Go imports name a PACKAGE — a directory — not a file, which is the one
+ * way this language differs from the others here. So an import resolves
+ * to the package's direct `.go` children, capped, with tests left out:
+ * a test file is about the package rather than part of its surface.
+ *
+ * Only imports of the repository's OWN module path can resolve; the
+ * module path comes from `go.mod`, and without it nothing is claimed.
+ */
+function goEdges(
+  fromFile: string,
+  text: string,
+  packageFiles: Map<string, string[]>,
+  modulePath: string | null,
+): string[] {
+  if (!modulePath) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  let inBlock = false;
+  const take = (spec: string) => {
+    if (!spec.startsWith(modulePath)) return;
+    const rel = spec.slice(modulePath.length).replace(/^\//, "");
+    if (!rel || rel === fromFile) return;
+    for (const target of packageFiles.get(rel) ?? []) {
+      if (target === fromFile || seen.has(target)) continue;
+      seen.add(target);
+      out.push(target);
+    }
+  };
+  for (const raw of text.split("\n")) {
+    if (/^\s*import\s*\(/.test(raw)) {
+      inBlock = true;
+      continue;
+    }
+    if (inBlock) {
+      if (/^\s*\)/.test(raw)) {
+        inBlock = false;
+        continue;
+      }
+      const m = raw.match(/^\s*(?:[\w.]+\s+)?"([^"]+)"/);
+      if (m) take(m[1]);
+      continue;
+    }
+    const single = raw.match(/^\s*import\s+(?:[\w.]+\s+)?"([^"]+)"/);
+    if (single) take(single[1]);
+  }
+  return out;
 }
 
 function pyEdges(fromFile: string, text: string, fileSet: Set<string>): string[] {
@@ -347,6 +396,30 @@ export async function graphify(
     rels.push({ from: parent, to: n, relType: "contains" });
   }
 
+  // Go needs two things the other languages do not: the module path
+  // (imports of our own code are absolute, prefixed by it) and a
+  // directory index (an import names a package, not a file). Both are
+  // computed once, and only when the repository actually holds Go.
+  let goModule: string | null = null;
+  const goPackages = new Map<string, string[]>();
+  if (files.some((f) => f.endsWith(".go"))) {
+    const modFile = files.find((f) => f === "go.mod");
+    if (modFile) {
+      const modText = await readHead(`${clean}/${modFile}`);
+      goModule = modText?.match(/^\s*module\s+(\S+)/m)?.[1] ?? null;
+    }
+    for (const f of files) {
+      if (!f.endsWith(".go") || f.endsWith("_test.go")) continue;
+      const dir = f.includes("/") ? f.slice(0, f.lastIndexOf("/")) : "";
+      const bucket = goPackages.get(dir);
+      if (bucket) {
+        if (bucket.length < 6) bucket.push(f);
+      } else {
+        goPackages.set(dir, [f]);
+      }
+    }
+  }
+
   let fileCount = 0;
   let skippedFiles = skipped;
   for (const f of files) {
@@ -379,6 +452,10 @@ export async function graphify(
       }
     } else if (f.endsWith(".py")) {
       for (const target of pyEdges(f, text, fileSet)) {
+        rels.push({ from: n, to: name(target), relType: "imports" });
+      }
+    } else if (f.endsWith(".go")) {
+      for (const target of goEdges(f, text, goPackages, goModule)) {
         rels.push({ from: n, to: name(target), relType: "imports" });
       }
     } else if (f.endsWith(".md")) {

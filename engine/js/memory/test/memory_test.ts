@@ -427,3 +427,66 @@ Deno.test("sanitize strips bidi, tag, and zero-width poison at every write door"
   assertEquals(await store.deleteEntities(["p/cl\u200Bean"]), 1);
   store.close();
 });
+
+Deno.test("graphify reads go: package imports resolve to files, vendor and tests stay out", async () => {
+  const store = await tempStore();
+  const dir = await Deno.makeTempDir({ prefix: "graphify-go" });
+  await Deno.mkdir(`${dir}/internal/config`, { recursive: true });
+  await Deno.mkdir(`${dir}/cmd/tool`, { recursive: true });
+  await Deno.mkdir(`${dir}/vendor/github.com/other/dep`, { recursive: true });
+
+  await Deno.writeTextFile(`${dir}/go.mod`, "module github.com/Fixture/widget\n\ngo 1.22\n");
+  await Deno.writeTextFile(
+    `${dir}/internal/config/config.go`,
+    "// Package config loads the widget's settings.\npackage config\n\ntype Config struct{}\n",
+  );
+  await Deno.writeTextFile(
+    `${dir}/internal/config/loader.go`,
+    "package config\n\nfunc Load() *Config { return &Config{} }\n",
+  );
+  // A test file is ABOUT the package, not part of its surface.
+  await Deno.writeTextFile(
+    `${dir}/internal/config/config_test.go`,
+    "package config\n\nfunc TestNothing() {}\n",
+  );
+  // Grouped import block, one own-module path and two foreign ones.
+  await Deno.writeTextFile(
+    `${dir}/cmd/tool/main.go`,
+    'package main\n\nimport (\n\t"fmt"\n\t"github.com/Fixture/widget/internal/config"\n\t"github.com/other/dep"\n)\n\nfunc main() { fmt.Println(config.Load()) }\n',
+  );
+  await Deno.writeTextFile(
+    `${dir}/vendor/github.com/other/dep/dep.go`,
+    "package dep\n\nfunc Thing() {}\n",
+  );
+
+  const res = await graphify(store, dir, { project: "widget" });
+
+  const main = await store.getEntity("widget/cmd/tool/main.go");
+  assert(main, "main.go was not ingested — go is not in SOURCE_EXT");
+  const imports = main!.out.filter((r) => r.relType === "imports").map((r) => r.to);
+  assert(
+    imports.includes("widget/internal/config/config.go") &&
+      imports.includes("widget/internal/config/loader.go"),
+    `a go import names a package, so BOTH files are edges: ${imports.join(", ")}`,
+  );
+  assert(
+    !imports.some((i) => i.includes("_test.go")),
+    `a test file is not part of the package's surface: ${imports.join(", ")}`,
+  );
+  assert(
+    !imports.some((i) => i.includes("fmt") || i.includes("other/dep")),
+    `only the repository's own module resolves: ${imports.join(", ")}`,
+  );
+
+  // Vendored third-party code is not the project.
+  assert(
+    !(await store.getEntity("widget/vendor/github.com/other/dep/dep.go")),
+    "vendored code was ingested",
+  );
+
+  // The doc line comes from the package comment, not the package clause.
+  const cfg = await store.getEntity("widget/internal/config/config.go");
+  assert(cfg, "config.go missing");
+  assert(res.files >= 4, `files: ${res.files}`);
+  store.close();
+});
