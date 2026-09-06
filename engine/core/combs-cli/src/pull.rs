@@ -31,6 +31,7 @@ pub const PRESETS: &[(&str, &str, &str)] = &[
     ("gemma-3-1b-gguf", "ggml-org/gemma-3-1b-it-GGUF", "gemma-3-1b-it-gguf"),
     ("smolvlm-256m", "HuggingFaceTB/SmolVLM-256M-Instruct", "smolvlm-256m"),
     ("sd-1.5", "runwayml/stable-diffusion-v1-5", "stable-diffusion-v1-5"),
+    ("flux2-klein", "black-forest-labs/FLUX.2-klein-4B", "flux2-klein-4b"),
     ("kokoro-82m", "onnx-community/Kokoro-82M-v1.0-ONNX", "kokoro-82m"),
     ("whisper-base", "openai/whisper-base", "whisper-base"),
     ("whisper-small", "openai/whisper-small", "whisper-small"),
@@ -121,10 +122,16 @@ pub fn cached_tts_dir(source: &str) -> Option<PathBuf> {
 pub fn cached_diffusion_dir(source: &str) -> Option<PathBuf> {
     let (id, _) = resolve_repo(source);
     let dir = cache_root().ok()?.join(id);
-    if dir.join("unet").is_dir()
+    // Two supported layouts: the sd trio, and the recipe pipelines'
+    // transformer form (flux2-klein: transformer/ + vae/, the LLM
+    // riding separately).
+    let sd_trio = dir.join("unet").is_dir()
         && dir.join("vae").is_dir()
-        && dir.join("text_encoder").is_dir()
-    {
+        && dir.join("text_encoder").is_dir();
+    let recipe = dir.join("model_index.json").is_file()
+        && dir.join("transformer").is_dir()
+        && dir.join("vae").is_dir();
+    if sd_trio || recipe {
         Some(dir)
     } else {
         None
@@ -433,6 +440,35 @@ fn pull_diffusion(repo: &str, dir: &PathBuf, tree: &[TreeEntry]) -> Result<()> {
 
     // Model metadata used for architecture detection.
     download_required(repo, dir, "model_index.json")?;
+
+    // Recipe pipelines (flux2-klein): transformer + vae, single
+    // full-precision weights per component, and the tokenizer files
+    // the qwen3 encoder reads. The LLM gguf is its own pull.
+    if paths.iter().any(|p| p.starts_with("transformer/")) {
+        for comp in ["transformer", "vae"] {
+            download_required(repo, dir, &format!("{comp}/config.json"))?;
+            download_required(
+                repo,
+                dir,
+                &format!("{comp}/diffusion_pytorch_model.safetensors"),
+            )?;
+        }
+        for f in [
+            "added_tokens.json",
+            "chat_template.jinja",
+            "merges.txt",
+            "special_tokens_map.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "vocab.json",
+        ] {
+            let path = format!("tokenizer/{f}");
+            if paths.contains(path.as_str()) {
+                download_required(repo, dir, &path)?;
+            }
+        }
+        return Ok(());
+    }
 
     // Component dirs we currently support.
     let components = ["unet", "vae", "text_encoder"];
