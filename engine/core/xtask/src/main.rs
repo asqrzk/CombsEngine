@@ -12,6 +12,7 @@
 //! | android-arm64   | aarch64-linux-android     | libcombs_ffi.so       | full (needs NDK) |
 //! | windows-x86_64  | x86_64-pc-windows-msvc    | combs_ffi.dll         | check (needs MSVC to link) |
 //! | linux-x86_64    | x86_64-unknown-linux-gnu  | libcombs_ffi.so       | check (needs a cross linker) |
+//! | linux-aarch64   | aarch64-unknown-linux-gnu | libcombs_ffi.so       | check (needs a cross linker) |
 //!
 //! `xtask target <name>` runs a full build when the toolchain is available,
 //! otherwise a `cargo check` (type/borrow verification without linking).
@@ -53,7 +54,8 @@ enum XCommand {
     /// Build (or check) one cross-compilation target.
     Target {
         /// Target name: macos-arm64 | macos-x86_64 | ios-arm64 |
-        /// android-arm64 | windows-x86_64 | linux-x86_64 | web-wasm32
+        /// android-arm64 | windows-x86_64 | linux-x86_64 | linux-aarch64 |
+        /// web-wasm32
         name: String,
         /// Force cargo check even when a full build is possible.
         #[arg(long)]
@@ -191,6 +193,19 @@ const TARGETS: &[Target] = &[
     Target {
         name: "linux-x86_64",
         triple: "x86_64-unknown-linux-gnu",
+        artifact: "libcombs_ffi.so",
+        mesh_artifact: "libcombsmesh_ffi.so",
+        // No cross linker on this host: check only.
+        full_build: |_| false,
+        env: |_| vec![],
+    },
+    Target {
+        // ARM Linux — Graviton, Ampere, an arm64 runner, a Pi. Distinct
+        // from android-arm64 above: that targets aarch64-linux-android,
+        // a different triple with a different libc, and it does not
+        // cover a GNU userland.
+        name: "linux-aarch64",
+        triple: "aarch64-unknown-linux-gnu",
         artifact: "libcombs_ffi.so",
         mesh_artifact: "libcombsmesh_ffi.so",
         // No cross linker on this host: check only.
