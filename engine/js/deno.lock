@@ -1,11 +1,40 @@
 {
   "version": "5",
   "specifiers": {
+    "jsr:@combs/agents@0.2": "0.2.3",
+    "jsr:@combs/core@0.2": "0.2.3",
+    "jsr:@combs/graph@0.2": "0.2.3",
+    "jsr:@combs/observe@0.2": "0.2.3",
+    "jsr:@combs/telemetry@0.2": "0.2.3",
+    "jsr:@combs/zerotrust@0.2": "0.2.2",
     "jsr:@std/assert@*": "1.0.19",
     "jsr:@std/assert@1": "1.0.19",
     "jsr:@std/internal@^1.0.12": "1.0.14"
   },
   "jsr": {
+    "@combs/agents@0.2.3": {
+      "integrity": "ea98dd98cae2529ffd68f0652b15786c2fc7403266222acee50badc470c2a311",
+      "dependencies": [
+        "jsr:@combs/core",
+        "jsr:@combs/graph",
+        "jsr:@combs/telemetry"
+      ]
+    },
+    "@combs/core@0.2.3": {
+      "integrity": "423601c19ec50cd0cd59b20ef3193bf2b0cc5d880ca346767b26d07f88e5c170"
+    },
+    "@combs/graph@0.2.3": {
+      "integrity": "d2aa9585016fda2ebcf60c0bf8cf6bbde6160e19b50e6e7c50b8672a43b0aed6"
+    },
+    "@combs/observe@0.2.3": {
+      "integrity": "c1443178d6ea7d54d1440fc9868306f940490c474ff7634bb83d9ce8259b27f9"
+    },
+    "@combs/telemetry@0.2.3": {
+      "integrity": "12cde5c9f58be0934c1054e294ced13303ef50580803c81336accb38a3322517"
+    },
+    "@combs/zerotrust@0.2.2": {
+      "integrity": "c95cb8a0b93f6407447bd108115e838686d83628a9a5b84c7416b1d63f0d9748"
+    },
     "@std/assert@1.0.19": {
       "integrity": "eaada96ee120cb980bc47e040f82814d786fe8162ecc53c91d8df60b8755991e",
       "dependencies": [
