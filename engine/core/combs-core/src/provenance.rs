@@ -78,6 +78,40 @@ pub fn enabled(required: Level) -> bool {
     level() >= required
 }
 
+/// A record as an installed sink receives it: the same data `emit`
+/// renders, borrowed for the duration of the call.
+pub struct Record<'a> {
+    pub role: &'a str,
+    pub kind: &'a str,
+    pub fields: Fields<'a>,
+    /// The registered build manifest JSON, when this record carries one.
+    pub build_manifest: Option<&'a str>,
+}
+
+type SinkFn = dyn Fn(&Record<'_>) + Send + Sync;
+
+fn sink_slot() -> &'static RwLock<Option<Box<SinkFn>>> {
+    static S: OnceLock<RwLock<Option<Box<SinkFn>>>> = OnceLock::new();
+    S.get_or_init(|| RwLock::new(None))
+}
+
+/// Route every record to `sink` instead of stderr, for hosts that link
+/// the engine in-process: a supervising process tees stderr, but a
+/// process cannot portably intercept its own. Level gating is
+/// unchanged — the sink sees exactly what stderr would have carried.
+pub fn set_sink(sink: Box<SinkFn>) {
+    if let Ok(mut slot) = sink_slot().write() {
+        *slot = Some(sink);
+    }
+}
+
+/// Remove the sink; records return to stderr.
+pub fn clear_sink() {
+    if let Ok(mut slot) = sink_slot().write() {
+        *slot = None;
+    }
+}
+
 fn json_format() -> bool {
     static J: OnceLock<bool> = OnceLock::new();
     *J.get_or_init(|| std::env::var("COMBS_PROVENANCE_FORMAT").as_deref() == Ok("json"))
@@ -144,6 +178,12 @@ fn now_rfc3339() -> String {
 /// format, level and stream stay one decision rather than a convention
 /// each call site has to remember.
 fn emit(role: &str, kind: &str, fields: Fields<'_>, build: Option<&str>) {
+    if let Ok(slot) = sink_slot().read() {
+        if let Some(sink) = slot.as_ref() {
+            sink(&Record { role, kind, fields, build_manifest: build });
+            return;
+        }
+    }
     let at = now_rfc3339();
     if json_format() {
         let mut line = format!(
@@ -307,6 +347,41 @@ mod tests {
         t.close("done", &[]);
         assert!(t.closed);
         std::mem::forget(t);
+    }
+
+    /// An installed sink receives the records stderr would have
+    /// carried — and only while installed. Exercised through `emit`
+    /// directly: level gating lives in the callers and is env-cached,
+    /// and other tests emit concurrently, so the assertion filters by
+    /// this test's own role and drives the exit point itself.
+    #[test]
+    fn an_installed_sink_receives_records() {
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<(String, Vec<(String, String)>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let tap = seen.clone();
+        set_sink(Box::new(move |r| {
+            if r.role == "test-sink" {
+                tap.lock().unwrap().push((
+                    r.kind.to_string(),
+                    r.fields.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+                ));
+            }
+        }));
+        emit("test-sink", "config", &[("door", "open".to_string())], None);
+        emit(
+            "test-sink",
+            "turn.end",
+            &[("outcome", "done".to_string())],
+            Some("{\"v\":1}"),
+        );
+        clear_sink();
+        emit("test-sink", "config", &[("after", "clear".to_string())], None);
+        let got = seen.lock().unwrap();
+        assert_eq!(got.len(), 2, "records: {got:?}");
+        assert_eq!(got[0].0, "config");
+        assert!(got[0].1.iter().any(|(k, v)| k == "door" && v == "open"));
+        assert_eq!(got[1].0, "turn.end");
     }
 
     #[test]
