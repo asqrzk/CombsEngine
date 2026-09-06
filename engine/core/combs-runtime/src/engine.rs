@@ -987,7 +987,11 @@ fn estimate_weight_bytes(source: &dyn ModelSource, elem_bytes: u64) -> (u64, (St
 /// The device's storage-binding ceiling, when the platform can answer.
 #[cfg(not(target_family = "wasm"))]
 fn binding_limit(device: &CombsDevice) -> Option<u64> {
-    Some(combs_core::device_caps(device).max_storage_buffer_binding_size)
+    // Zero is cpu_caps' honest "no device buffers exist" — a backend
+    // with no bindings has no binding LIMIT, and reading zero as a cap
+    // refused every model on the cpu floor (found by the app's smoke).
+    let cap = combs_core::device_caps(device).max_storage_buffer_binding_size;
+    (cap > 0).then_some(cap)
 }
 
 /// Worker-thread loop: executes queued requests serially until shutdown.
