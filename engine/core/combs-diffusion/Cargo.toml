@@ -1,14 +1,14 @@
 [package]
 name = "combs-diffusion"
-version = "0.2.4"
+version = "0.2.5"
 edition.workspace = true
 license.workspace = true
 description = "Diffusion model runtime for Combs Engine (Burn-native)"
 
 [dependencies]
 burn.workspace = true
-combs-formats = { path = "../combs-formats", version = "0.2.4" }
-combs-models = { path = "../combs-models", version = "0.2.4" }
+combs-formats = { path = "../combs-formats", version = "0.2.5" }
+combs-models = { path = "../combs-models", version = "0.2.5" }
 minijinja.workspace = true
 minijinja-contrib.workspace = true
 serde_json.workspace = true
