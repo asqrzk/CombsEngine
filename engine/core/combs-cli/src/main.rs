@@ -823,6 +823,9 @@ fn cmd_devices() -> Result<()> {
     // ONE runtime-priming probe per process: a second init_setup call
     // panics in cubecl 0.10 ("Service already initialized").
     let caps = combs_core::device_caps(&device);
+    #[cfg(feature = "cpu")]
+    println!("compute device:");
+    #[cfg(not(feature = "cpu"))]
     println!("wgpu device:");
     println!("  name:        {}", caps.name);
     println!("  backend:     {}", caps.backend);

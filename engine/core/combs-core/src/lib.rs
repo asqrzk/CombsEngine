@@ -336,15 +336,52 @@ pub struct DeviceCaps {
 /// from the retained context thereafter — callable as often as anyone
 /// likes, where it used to panic on the second call.
 #[cfg(not(target_family = "wasm"))]
+/// What the CPU floor reports about itself.
+///
+/// It reports the CPU because that is what computes. Asking wgpu on a
+/// cpu build would describe an adapter this process never uses, and
+/// every consumer of `device_caps` — the stats route included — would
+/// repeat it as fact.
+#[cfg(feature = "cpu")]
+fn cpu_caps() -> DeviceCaps {
+    DeviceCaps {
+        name: "cpu (ndarray)".to_string(),
+        backend: "cpu".to_string(),
+        device_type: "Cpu".to_string(),
+        driver: "burn ndarray, pure Rust".to_string(),
+        // No device buffers exist; zero is the honest answer, and a
+        // planner reading these must not conclude a GPU is present.
+        max_storage_buffer_binding_size: 0,
+        max_buffer_size: 0,
+        max_compute_workgroup_size_x: 0,
+        max_compute_invocations_per_workgroup: 0,
+        features: String::new(),
+        subgroup_min_size: 0,
+        subgroup_max_size: 0,
+    }
+}
+
 pub fn device_caps(device: &CombsDevice) -> DeviceCaps {
     let _ = device; // one device per process; the context holds it
-    context().caps.clone()
+    #[cfg(feature = "cpu")]
+    {
+        return cpu_caps();
+    }
+    #[cfg(not(feature = "cpu"))]
+    {
+        context().caps.clone()
+    }
 }
 
 /// [`device_caps`] for callers that can await — the only form available in
 /// a browser, and identical in result natively.
 pub async fn device_caps_async(device: &CombsDevice) -> DeviceCaps {
     let _ = device;
+    #[cfg(feature = "cpu")]
+    {
+        return cpu_caps();
+    }
+    #[allow(unreachable_code)]
     context_async().await.caps.clone()
 }
 
