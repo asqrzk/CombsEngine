@@ -559,10 +559,13 @@ fn cmd_serve(
     // Refuse before the first enqueue: an oversize buffer can only fail
     // as a panic on cubecl's own compute threads once load starts.
     // COMBS_FIT_LIMIT overrides the adapter cap (diagnostics/tests).
+    // The ONE budget authority: absence of a binding limit (cpu) is
+    // the absence of this check, not a cap of zero — the second call
+    // site the zero-misread was hiding in (the first was Engine::load).
     let fit_limit = std::env::var("COMBS_FIT_LIMIT")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(caps.max_storage_buffer_binding_size);
+        .or_else(|| combs_runtime::budget::device_budget(&device).binding_limit);
     // Packed size counts ONLY where the quant-kernel path truly takes
     // it: linears. Embeddings ALWAYS dequantize dense (load_weight, not
     // try_quant_linear) — the worst case is a packed rank-2 embed that
@@ -596,7 +599,7 @@ fn cmd_serve(
             packed: None,
         })
     });
-    if let Some(report) = fit::fit_report(fit_rows) {
+    if let (Some(fit_limit), Some(report)) = (fit_limit, fit::fit_report(fit_rows)) {
         if let Err(msg) = fit::check_fit(&report, fit_limit, &caps.name, &caps.device_type) {
             anyhow::bail!("{msg}");
         }
