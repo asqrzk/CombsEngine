@@ -34,6 +34,12 @@ jobs:
           - { os: ubuntu-22.04, platform: linux, arch: x86_64 } # oldest runner = glibc floor 2.35; binaries must run on 22.04 hosts
           - { os: ubuntu-22.04-arm, platform: linux, arch: aarch64 } # 22.04 on ARM too: the two linux binaries must share one glibc floor
           - { os: windows-latest, platform: windows, arch: x86_64 }
+          # The CPU floor, for machines whose GPU stack cannot be trusted:
+          # a container with no adapter, an ICD-less pod, a rasterizer.
+          # Linux only — that is where doctor actually refuses. macOS
+          # always has Metal and Windows all but always has something.
+          - { os: ubuntu-22.04, platform: linux, arch: x86_64, variant: cpu }
+          - { os: ubuntu-22.04-arm, platform: linux, arch: aarch64, variant: cpu }
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -54,7 +60,14 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('engine/core/Cargo.lock') }}
 
       - name: Build CLI + FFI libraries
+        if: matrix.variant == ''
         run: cargo build --release -p combs-cli -p combs-ffi -p combs-mesh-ffi
+
+      - name: Build the CPU-floor CLI
+        if: matrix.variant == 'cpu'
+        # The CLI alone: the FFI crates carry no `cpu` feature, and a
+        # fallback binary is there to serve text, not to be linked.
+        run: cargo build --release -p combs-cli --features cpu
 
       - name: Resolve version
         id: ver
@@ -73,7 +86,7 @@ jobs:
         run: |
           set -e
           V="${{ steps.ver.outputs.version }}"
-          NAME="combs-${V}-${{ matrix.platform }}-${{ matrix.arch }}"
+          NAME="combs-${V}-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.variant && '-' }}${{ matrix.variant }}"
           STAGE="stage/$NAME"
           mkdir -p "$STAGE"
           cp target/release/combs "$STAGE/"
@@ -115,7 +128,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: combs-${{ matrix.platform }}-${{ matrix.arch }}
+          name: combs-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.variant && '-' }}${{ matrix.variant }}
           path: engine/artifacts/
 
   release:
