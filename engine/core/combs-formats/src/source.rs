@@ -140,6 +140,15 @@ pub struct TensorReader<'a> {
     data: std::borrow::Cow<'a, [u8]>,
 }
 
+
+/// The half-width load door: on by default on f16 backends, opt-out
+/// with COMBS_LOAD_F16=0 (diagnostics, or an A/B against the widened
+/// road). Read once per process, the house way.
+fn load_f16_door() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("COMBS_LOAD_F16").as_deref(), Ok("0")))
+}
+
 impl<'a> TensorReader<'a> {
     /// Creates a reader from raw parts. `data` must be
     /// `shape.iter().product::<usize>() * dtype.size()` little-endian bytes.
@@ -273,12 +282,67 @@ impl<'a> TensorReader<'a> {
         Ok(TensorData::new(values, self.shape.clone()))
     }
 
+    /// Halves the host copy on f16 backends: float dtypes convert to
+    /// f16 host-side - the same rounding `from_data` applies at upload,
+    /// so the logits cannot move - and a dense weight rides one
+    /// half-width buffer instead of a double-width one. Integer and
+    /// bool tensors keep the exact f32 road (they are tiny).
+    fn load_data_half(&self) -> Result<TensorData> {
+        let values: Vec<half::f16> = match self.dtype {
+            TensorDtype::F64 => self
+                .data
+                .chunks_exact(8)
+                .map(|c| {
+                    half::f16::from_f64(f64::from_le_bytes([
+                        c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
+                    ]))
+                })
+                .collect(),
+            TensorDtype::F32 => self
+                .data
+                .chunks_exact(4)
+                .map(|c| half::f16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                .collect(),
+            TensorDtype::F16 => self
+                .data
+                .chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]))
+                .collect(),
+            TensorDtype::BF16 => self
+                .data
+                .chunks_exact(2)
+                .map(|c| half::f16::from_f32(half::bf16::from_le_bytes([c[0], c[1]]).to_f32()))
+                .collect(),
+            _ => return self.load_data(),
+        };
+        if values.len() != self.num_elements() {
+            return Err(FormatError::Safetensors(format!(
+                "tensor {}: expected {} elements, got {} (dtype {})",
+                self.name,
+                self.num_elements(),
+                values.len(),
+                self.dtype
+            )));
+        }
+        Ok(TensorData::new(values, self.shape.clone()))
+    }
+
     /// Loads the tensor onto a backend device as an f32 tensor of rank `D`.
     pub fn load_to_tensor<B: Backend, const D: usize>(
         &self,
         device: &Device<B>,
     ) -> Result<Tensor<B, D>> {
-        let data = self.load_data()?;
+        // On an f16 backend the half-width host road is the default -
+        // measured byte-identical greedy decode against the widened
+        // road in the landing chain itself; COMBS_LOAD_F16=0 restores
+        // the old double-width copy.
+        let half_backend = core::any::TypeId::of::<B::FloatElem>()
+            == core::any::TypeId::of::<half::f16>();
+        let data = if half_backend && load_f16_door() {
+            self.load_data_half()?
+        } else {
+            self.load_data()?
+        };
         if self.shape.len() != D {
             return Err(FormatError::Safetensors(format!(
                 "tensor {}: expected rank {D}, got {}",
