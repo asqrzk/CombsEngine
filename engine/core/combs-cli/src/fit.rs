@@ -687,7 +687,30 @@ pub fn llm_gate(
         available: env_mb("COMBS_LLM_PREFLIGHT_FREE_MB").or_else(available_memory_bytes),
         headroom: env_mb("COMBS_LLM_PREFLIGHT_HEADROOM_MB").unwrap_or(DEFAULT_HEADROOM_BYTES),
     };
-    check_llm_fit(model_id, &inputs)
+    let verdict = check_llm_fit(model_id, &inputs);
+    // The refusal reaches the timeline as a CAUSE, not only stderr —
+    // a platform watching its worker die deserves the numbers.
+    let mb = |b: u64| (b / (1024 * 1024)).to_string();
+    match &verdict {
+        Err(_) => combs_core::provenance::event(
+            "engine",
+            "fit.refused",
+            &[
+                ("dense_mb", mb(inputs.dense_bytes)),
+                ("packed_mb", mb(inputs.packed_bytes)),
+                ("kv_mb", mb(inputs.kv_bytes)),
+                ("headroom_mb", mb(inputs.headroom)),
+                ("available_mb", inputs.available.map(mb).unwrap_or_default()),
+            ],
+        ),
+        Ok(Some(why)) => combs_core::provenance::event(
+            "engine",
+            "fit.standdown",
+            &[("why", why.clone())],
+        ),
+        Ok(None) => {}
+    }
+    verdict
 }
 
 #[cfg(test)]
