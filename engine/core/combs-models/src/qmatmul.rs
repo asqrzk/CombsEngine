@@ -2776,7 +2776,7 @@ impl QuantWeight {
     }
 
     /// Row gather (embedding lookup) off the packed table, when this
-    /// format has a gather kernel. Q8_0 only in the first landing — other
+    /// format has a gather kernel. Q8_0, Q4_K and Q6_K today — other
     /// formats return `None` and the caller keeps its dense table, per
     /// the fallback discipline.
     pub fn gather_rows_device(
@@ -2806,7 +2806,7 @@ impl QuantWeight {
     /// choice: `f32` reproduces the CPU reference bit for bit, `f16`
     /// halves both the transient and the traffic the multiply that
     /// follows has to move, which is where the time actually goes
-    /// (`notes/proposed/narrow-operand-matmul.md`). The arithmetic is
+    /// (the narrow-operand measurement, registry §65). The arithmetic is
     /// identical either way — only the final store narrows. (`Option`
     /// stays in the signature: a future format without a dequant kernel
     /// falls back safely.)
