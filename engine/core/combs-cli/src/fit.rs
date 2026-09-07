@@ -621,3 +621,109 @@ mod tests {
         }
     }
 }
+
+// ── the llm host gate ────────────────────────────────────────────────
+
+/// Host working-set inputs for `combs serve`. `available: None` means
+/// the probe is absent and the gate STANDS DOWN BY NAME — never a cap
+/// of zero, never silence (the budget authority's law, third side).
+/// A true reading — zero included — is compared exactly as read.
+pub struct LlmFitInputs {
+    pub dense_bytes: u64,
+    pub packed_bytes: u64,
+    pub kv_bytes: u64,
+    pub available: Option<u64>,
+    pub headroom: u64,
+}
+
+/// Pure over its inputs so the thresholds are testable without a
+/// machine to match. Ok(None) = fits; Ok(Some(why)) = gate stood
+/// down and says why; Err = refusal, worded to act on.
+pub fn check_llm_fit(model_id: &str, i: &LlmFitInputs) -> Result<Option<String>, String> {
+    let Some(available) = i.available else {
+        return Ok(Some(
+            "host memory unreadable on this platform — the llm fit gate stands down".into(),
+        ));
+    };
+    let need = i.dense_bytes + i.packed_bytes + i.kv_bytes;
+    let total = need.saturating_add(i.headroom);
+    if total <= available {
+        return Ok(None);
+    }
+    let mb = |b: u64| b / (1024 * 1024);
+    Err(format!(
+        "not enough memory to serve {model_id}: about {} MB of weights on this \
+         machine ({} MB packed, {} MB widened dense at load) plus {} MB of KV \
+         arena and {} MB headroom = {} MB, but only {} MB is available — \
+         reduce --context-size, choose a smaller quant, or close other \
+         applications (COMBS_LLM_PREFLIGHT=0 overrides)",
+        mb(i.dense_bytes + i.packed_bytes),
+        mb(i.packed_bytes),
+        mb(i.dense_bytes),
+        mb(i.kv_bytes),
+        mb(i.headroom),
+        mb(total),
+        mb(available),
+    ))
+}
+
+/// The doored assembly serve calls — born 2026-09-07, the night a
+/// 14b's measured 20.9 GiB working set swap-starved an 18 GB host to
+/// a hard crash. Default ON; `COMBS_LLM_PREFLIGHT=0` opens the old
+/// door; `_FREE_MB`/`_HEADROOM_MB` override the probe for tests.
+pub fn llm_gate(
+    model_id: &str,
+    dense_bytes: u64,
+    packed_bytes: u64,
+    kv_bytes: u64,
+) -> Result<Option<String>, String> {
+    if matches!(std::env::var("COMBS_LLM_PREFLIGHT").as_deref(), Ok("0")) {
+        return Ok(Some("llm fit gate opened by COMBS_LLM_PREFLIGHT=0".into()));
+    }
+    let inputs = LlmFitInputs {
+        dense_bytes,
+        packed_bytes,
+        kv_bytes,
+        available: env_mb("COMBS_LLM_PREFLIGHT_FREE_MB").or_else(available_memory_bytes),
+        headroom: env_mb("COMBS_LLM_PREFLIGHT_HEADROOM_MB").unwrap_or(DEFAULT_HEADROOM_BYTES),
+    };
+    check_llm_fit(model_id, &inputs)
+}
+
+#[cfg(test)]
+mod llm_gate_tests {
+    use super::*;
+
+    fn inputs(available: Option<u64>) -> LlmFitInputs {
+        LlmFitInputs {
+            dense_bytes: 3 << 30,
+            packed_bytes: 8 << 30,
+            kv_bytes: 1 << 30,
+            available,
+            headroom: 2 << 30,
+        }
+    }
+
+    #[test]
+    fn over_refuses_with_the_numbers() {
+        let err = check_llm_fit("m", &inputs(Some(10 << 30))).unwrap_err();
+        assert!(err.contains("only 10240 MB is available"), "{err}");
+        assert!(err.contains("widened dense"), "{err}");
+    }
+
+    #[test]
+    fn under_passes() {
+        assert!(check_llm_fit("m", &inputs(Some(20 << 30))).unwrap().is_none());
+    }
+
+    #[test]
+    fn absent_probe_stands_down_by_name_never_zero() {
+        let note = check_llm_fit("m", &inputs(None)).unwrap().unwrap();
+        assert!(note.contains("stands down"), "{note}");
+    }
+
+    #[test]
+    fn a_true_zero_reading_refuses() {
+        assert!(check_llm_fit("m", &inputs(Some(0))).is_err());
+    }
+}

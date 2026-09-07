@@ -598,6 +598,14 @@ fn cmd_serve(
             elements: reader.num_elements() as u64,
             packed: None,
         })
+    }).collect::<Vec<_>>();
+    // Host working-set sums for the llm gate: packed rides at its
+    // file bytes, everything else at its widened dense size.
+    let (host_dense, host_packed) = fit_rows.iter().fold((0u64, 0u64), |(d, p), r| {
+        match r.packed {
+            Some((bytes, _)) => (d, p + bytes),
+            None => (d + r.device_bytes(), p),
+        }
     });
     if let (Some(fit_limit), Some(report)) = (fit_limit, fit::fit_report(fit_rows)) {
         if let Err(msg) = fit::check_fit(&report, fit_limit, &caps.name, &caps.device_type) {
@@ -636,6 +644,37 @@ fn cmd_serve(
         }
         (None, false) => None,
     };
+    {
+        // Refuse to serve a model this HOST cannot hold — before any
+        // byte uploads, before the pager can own the machine.
+        let arena_tokens = context_size.unwrap_or_else(|| {
+            combs_runtime::default_arena_len(source.metadata().max_position_embeddings)
+        });
+        let quantize_kv = matches!(std::env::var("COMBS_KV_QUANT").as_deref(), Ok("1"));
+        let meta = source.metadata();
+        let elem_bytes: u64 = if cfg!(feature = "f16") { 2 } else { 4 };
+        let per_value_x8 = if quantize_kv { 9 } else { elem_bytes * 8 };
+        let globals = (0..meta.num_hidden_layers)
+            .filter(|&i| meta.attention_pattern.is_global_layer(i))
+            .count()
+            .max(1);
+        let kv_bytes = (meta.num_key_value_heads as u64 * meta.head_dim as u64
+            * per_value_x8
+            / 8)
+            * 2
+            * globals as u64
+            * arena_tokens as u64;
+        match fit::llm_gate(
+            &model.display().to_string(),
+            host_dense,
+            host_packed,
+            kv_bytes,
+        ) {
+            Ok(None) => {}
+            Ok(Some(why)) => eprintln!("combs serve: {why}"),
+            Err(msg) => anyhow::bail!("{msg}"),
+        }
+    }
     let engine = if context_size.is_some() || page_size.is_some() {
         let arena = context_size.unwrap_or_else(|| {
             combs_runtime::default_arena_len(source.metadata().max_position_embeddings)
