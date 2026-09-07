@@ -284,8 +284,8 @@ pub fn try_quant_embedding<B: Backend>(
         return Ok(None);
     };
     if !w.supports_gather() {
-        // No gather kernel for this format yet (Q8_0 only in the first
-        // landing) — the dense path is correct, just bigger.
+        // No gather kernel for this format (Q8_0/Q4_K/Q6_K ride
+        // packed today) — the dense path is correct, just bigger.
         debug_embed(name, "no gather kernel for this format; dense");
         return Ok(None);
     }

@@ -566,12 +566,16 @@ fn cmd_serve(
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .or_else(|| combs_runtime::budget::device_budget(&device).binding_limit);
-    // Packed size counts ONLY where the quant-kernel path truly takes
-    // it: linears. Embeddings ALWAYS dequantize dense (load_weight, not
-    // try_quant_linear) — the worst case is a packed rank-2 embed that
-    // materializes at elements×4. Unsure → dense.
+    // Packed size counts where the quant-kernel path truly takes it:
+    // linears through try_quant_linear, and EMBEDDINGS through the
+    // gather road (Q8_0/Q4_K/Q6_K packed table + gather kernel + tied
+    // gemv head; probed live 2026-09-07 — the old always-dense story
+    // over-priced a 14b by ~2.7 GB). Unsure → dense.
     let no_quant_kernels =
         matches!(std::env::var("COMBS_NO_QUANT_KERNELS").as_deref(), Ok(v) if v != "0");
+    let packed_embed_open = !no_quant_kernels
+        && !matches!(std::env::var("COMBS_PACKED_EMBED").as_deref(), Ok("0"))
+        && cfg!(not(feature = "cpu"));
     let fit_rows = source.tensor_names().into_iter().filter_map(|name| {
         if let Ok(Some(qt)) = source.open_tensor_quant(&name) {
             let elements: u64 = qt.shape.iter().map(|&d| d as u64).product();
@@ -582,10 +586,17 @@ fn cmd_serve(
                 _ => 256,
             };
             let k = qt.shape.last().copied().unwrap_or(0);
-            let eligible = !no_quant_kernels
-                && qt.shape.len() == 2
-                && k % block == 0
-                && !name.contains("embed");
+            let gatherable = matches!(
+                qt.format,
+                combs_formats::QuantFormat::Q8_0
+                    | combs_formats::QuantFormat::Q4K
+                    | combs_formats::QuantFormat::Q6K
+            );
+            let eligible = if name.contains("embed") {
+                packed_embed_open && gatherable && qt.shape.len() == 2
+            } else {
+                !no_quant_kernels && qt.shape.len() == 2 && k % block == 0
+            };
             return Some(fit::FitRow {
                 name,
                 elements,
@@ -600,11 +611,14 @@ fn cmd_serve(
         })
     }).collect::<Vec<_>>();
     // Host working-set sums for the llm gate: packed rides at its
-    // file bytes, everything else at its widened dense size.
+    // file bytes; dense rides at the width this BUILD actually seats
+    // it (f16 halves the resident — the ×4 device_bytes stays for the
+    // binding check, where over-refusing beats holes).
+    let host_dense_elem: u64 = if cfg!(feature = "f16") { 2 } else { 4 };
     let (host_dense, host_packed) = fit_rows.iter().fold((0u64, 0u64), |(d, p), r| {
         match r.packed {
             Some((bytes, _)) => (d, p + bytes),
-            None => (d + r.device_bytes(), p),
+            None => (d + r.elements * host_dense_elem, p),
         }
     });
     if let (Some(fit_limit), Some(report)) = (fit_limit, fit::fit_report(fit_rows)) {
