@@ -64,6 +64,24 @@ pub(crate) struct SessionState {
     pub(crate) history: Vec<u32>,
     pub(crate) cache: Box<dyn KVCache<CombsBackend>>,
     pub(crate) last_used: u64,
+    /// Wall-clock milliseconds of the last use — the idle janitor's
+    /// clock. Zero on wasm (no reliable clock, and no janitor).
+    pub(crate) last_used_ms: u64,
+}
+
+/// Milliseconds since the epoch; zero where no clock serves (wasm).
+pub(crate) fn now_ms() -> u64 {
+    #[cfg(target_family = "wasm")]
+    {
+        0
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
 }
 
 /// The session table: named rolling sessions with LRU eviction. The
@@ -108,6 +126,7 @@ impl SessionSet {
     pub(crate) fn put(&mut self, key: String, mut session: SessionState) {
         self.tick += 1;
         session.last_used = self.tick;
+        session.last_used_ms = now_ms();
         self.map.insert(key, session);
         if self.map.len() > MAX_SESSIONS {
             if let Some(oldest) = self
@@ -804,6 +823,7 @@ impl ActiveGeneration {
             sessions.put(
                 self.session_key,
                 SessionState {
+                    last_used_ms: 0,
                     history: hist,
                     cache: self.cache,
                     last_used: 0,

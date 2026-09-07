@@ -113,6 +113,46 @@ pub fn serve(
         }
     }
 
+    // The idle-KV janitor: once in a while, sessions nobody has
+    // touched hand their arena pages back — kv.session.idle_evict on
+    // the record, pool cleanup riding the existing per-id clear road.
+    // COMBS_KV_IDLE_SWEEP_S=<secs> arms it (0/absent = off until the
+    // battery blesses a default).
+    if let Some(idle_s) = std::env::var("COMBS_KV_IDLE_SWEEP_S")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+    {
+        let engine = engine.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(idle_s.min(60).max(1)));
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let sessions = engine.stats_snapshot().sessions;
+            for s in sessions {
+                if s.last_used_ms == 0 || now.saturating_sub(s.last_used_ms) < idle_s * 1000 {
+                    continue;
+                }
+                let id = if s.id == "(anonymous)" { String::new() } else { s.id.clone() };
+                if engine.clear_sessions(Some(&id)).unwrap_or(0) > 0 {
+                    combs_core::provenance::event(
+                        "engine",
+                        "kv.session.idle_evict",
+                        &[
+                            ("session", s.id.clone()),
+                            (
+                                "idle_s",
+                                (now.saturating_sub(s.last_used_ms) / 1000).to_string(),
+                            ),
+                        ],
+                    );
+                }
+            }
+        });
+    }
+
     for mut request in server.incoming_requests() {
         let engine = engine.clone();
         let model_id = model_id.clone();

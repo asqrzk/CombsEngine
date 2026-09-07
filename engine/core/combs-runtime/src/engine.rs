@@ -343,6 +343,8 @@ pub struct SessionInfo {
     pub history_len: usize,
     /// Page-table state of the session's cache, when paged.
     pub pages: Option<combs_models::PageStats>,
+    /// Wall-clock ms of last use (zero on wasm) — the janitor's clock.
+    pub last_used_ms: u64,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -1346,6 +1348,7 @@ fn session_infos(sessions: &SessionSet) -> Vec<SessionInfo> {
             },
             history_len: s.history.len(),
             pages: s.cache.page_stats(),
+            last_used_ms: s.last_used_ms,
         })
         .collect()
 }

@@ -424,6 +424,7 @@ impl LocalEngine {
                 },
                 history_len: s.history.len(),
                 pages: s.cache.page_stats(),
+                last_used_ms: s.last_used_ms,
             })
             .collect()
     }
