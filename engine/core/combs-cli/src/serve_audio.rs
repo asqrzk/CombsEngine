@@ -309,14 +309,25 @@ fn handle_transcription(
 
     stats.requests_total.fetch_add(1, Relaxed);
     let start = std::time::Instant::now();
-    let result = engine.lock().unwrap().transcribe_wav(&wav);
+    let result = engine.lock().unwrap().transcribe(&wav);
     match result {
-        Ok(text) => {
+        Ok(heard) => {
             stats
                 .last_duration_ms
                 .store(start.elapsed().as_millis() as u64, Relaxed);
-            stats.last_bytes.store(text.len() as u64, Relaxed);
-            let _ = request.respond(json_response(200, json!({ "text": text })));
+            stats.last_bytes.store(heard.text.len() as u64, Relaxed);
+            // the words, and what the gates refused: a caller can tell
+            // "nothing was said" from "nothing was heard"
+            let _ = request.respond(json_response(
+                200,
+                json!({
+                    "text": heard.text,
+                    "windows": heard.windows,
+                    "silent_windows": heard.silent_windows,
+                    "no_speech_prob": heard.no_speech_prob,
+                    "avg_logprob": heard.avg_logprob,
+                }),
+            ));
         }
         Err(e) => {
             stats.errors_total.fetch_add(1, Relaxed);

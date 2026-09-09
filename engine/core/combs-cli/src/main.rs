@@ -433,11 +433,18 @@ fn cmd_transcribe(model: PathBuf, file: PathBuf, language: String) -> Result<()>
         .map_err(|e| anyhow::anyhow!("loading speech model: {e}"))?;
     let wav = std::fs::read(&file)?;
     let start = std::time::Instant::now();
-    let text = engine
-        .transcribe_wav(&wav)
+    let heard = engine
+        .transcribe(&wav)
         .map_err(|e| anyhow::anyhow!("transcribing: {e}"))?;
-    eprintln!("transcribed in {:.2} s", start.elapsed().as_secs_f64());
-    println!("{text}");
+    eprintln!(
+        "transcribed in {:.2} s — {} window(s), {} silent, no-speech {:.2}, avg logprob {:.2}",
+        start.elapsed().as_secs_f64(),
+        heard.windows,
+        heard.silent_windows,
+        heard.no_speech_prob,
+        heard.avg_logprob
+    );
+    println!("{}", heard.text);
     Ok(())
 }
 

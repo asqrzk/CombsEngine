@@ -60,7 +60,7 @@ pub use toolcall::{
     ChatMessage, ToolCall, ToolCallParser, ToolCallStyle, ToolEvent, ToolFunction,
 };
 #[cfg(not(target_family = "wasm"))]
-pub use transcribe::SpeechEngine;
+pub use transcribe::{SpeechEngine, TranscribeGates, Transcript};
 
 /// Errors produced by the runtime.
 #[derive(Debug, thiserror::Error)]
