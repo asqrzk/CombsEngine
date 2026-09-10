@@ -625,6 +625,15 @@ fn usage_json(stats: &GenerationStats, session_id: Option<&str>) -> Value {
             "decode_tok_s": stats.decode_tokens_per_second(),
             "total_ms": stats.total_time.as_secs_f64() * 1000.0,
         },
+        // the measured cost of a token on this backend: dispatches are
+        // what the per-dispatch ceiling is computed from, submits are what
+        // reaches the driver (cubecl batches by CUBECL_WGPU_MAX_TASKS)
+        "dispatch": {
+            "per_token": stats.dispatches_per_token(),
+            "submits_per_token": stats.submits_per_token(),
+            "decode_total": stats.dispatches,
+            "prefill_total": stats.prefill_dispatches,
+        },
         "cache": {
             "pages_used": stats.cache_pages_used,
             "cached_tokens": stats.cached_tokens,

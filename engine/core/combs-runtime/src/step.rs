@@ -241,6 +241,11 @@ pub(crate) struct ActiveGeneration {
     t_decode: Instant,
     ttft: Duration,
     trace: DecodeTrace,
+    /// (dispatches, submits) before prefill, and again when prefill ends —
+    /// the two marks that let a generation report what a token really cost
+    /// in dispatches instead of an arithmetic guess.
+    gpu_start: (u64, u64),
+    gpu_decode: (u64, u64),
 
     /// Prompt-lookup speculation state. Native only: it needs a blocking
     /// readback of the verification rows, and it is a throughput trick for
@@ -377,6 +382,7 @@ pub(crate) fn begin_generation(
     let stop = StopDetector::new(eos_ids, config.stop_strings.clone());
 
     let t_start = Instant::now();
+    let gpu_start = combs_core::gpu_counters();
 
     // --- chunked prefill of the suffix (prompt[lcp..]) ---------------------
     let chunk = if config.prefill_chunk_size == 0 {
@@ -474,6 +480,8 @@ pub(crate) fn begin_generation(
         t_decode: t_start,
         ttft: Duration::ZERO,
         trace: DecodeTrace::from_env(),
+        gpu_start,
+        gpu_decode: gpu_start,
         #[cfg(not(target_family = "wasm"))]
         spec,
     };
@@ -524,6 +532,7 @@ impl ActiveGeneration {
             self.started = true;
             self.ttft = self.t_start.elapsed();
             self.t_decode = Instant::now();
+            self.gpu_decode = combs_core::gpu_counters();
         }
         if traced {
             self.trace.sampled();
@@ -575,6 +584,7 @@ impl ActiveGeneration {
             self.started = true;
             self.ttft = self.t_start.elapsed();
             self.t_decode = Instant::now();
+            self.gpu_decode = combs_core::gpu_counters();
         }
         if traced {
             self.trace.sampled();
@@ -832,7 +842,11 @@ impl ActiveGeneration {
             );
         }
 
-        self.trace.report();
+        let (d_now, s_now) = combs_core::gpu_counters();
+        let dispatches = d_now.saturating_sub(self.gpu_decode.0);
+        let submits = s_now.saturating_sub(self.gpu_decode.1);
+        let prefill_dispatches = self.gpu_decode.0.saturating_sub(self.gpu_start.0);
+        self.trace.report(dispatches, submits, self.generated, prefill_dispatches);
         let stats = GenerationStats {
             prompt_tokens: self.prompt_tokens.len(),
             generated_tokens: self.generated,
@@ -841,6 +855,9 @@ impl ActiveGeneration {
             total_time: self.t_start.elapsed(),
             cache_pages_used,
             cached_tokens: self.lcp,
+            dispatches,
+            submits,
+            prefill_dispatches,
         };
         match self.loop_error {
             Some(e) => Err(e),
@@ -976,13 +993,14 @@ impl DecodeTrace {
         }
     }
 
-    fn report(&self) {
+    fn report(&self, dispatches: u64, submits: u64, generated: usize, prefill_dispatches: u64) {
         if !self.enabled || self.steps == 0 {
             return;
         }
         let total = self.submit + self.readback + self.sample;
         let per = |d: Duration| d.as_secs_f64() * 1e3 / self.steps as f64;
         let pct = |d: Duration| 100.0 * d.as_secs_f64() / total.as_secs_f64().max(f64::EPSILON);
+        let n = generated.max(1) as f64;
         eprintln!(
             "[trace] decode: {} steps, {:.2} ms/step — submit {:.2} ms ({:.0}%), readback {:.2} ms ({:.0}%), sample {:.3} ms ({:.0}%)",
             self.steps,
@@ -993,6 +1011,22 @@ impl DecodeTrace {
             pct(self.readback),
             per(self.sample),
             pct(self.sample),
+        );
+        // the measured ceiling: what a token costs the driver, and what
+        // one dispatch would have to cost to explain the wall time
+        let per_tok = dispatches as f64 / n;
+        let us = if per_tok > 0.0 {
+            per(total) * 1e3 / per_tok
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[trace] decode: {:.0} dispatches/token, {:.1} submits/token ({} decode, {} prefill) — {:.1} us/dispatch implied",
+            per_tok,
+            submits as f64 / n,
+            dispatches,
+            prefill_dispatches,
+            us,
         );
     }
 }

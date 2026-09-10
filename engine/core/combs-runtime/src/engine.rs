@@ -155,6 +155,16 @@ pub struct GenerationStats {
     /// Prompt tokens served from the previous session's KV cache instead of
     /// being re-prefilled (rolling-session prefix reuse; 0 on a cold start).
     pub cached_tokens: usize,
+    /// GPU dispatches the DECODE loop cost (prefill excluded), measured.
+    /// Zero on the cpu floor and in a browser build.
+    pub dispatches: u64,
+    /// `queue.submit` calls the decode loop cost. cubecl batches dispatches
+    /// into a submit every `CUBECL_WGPU_MAX_TASKS` (default 32), so this is
+    /// the count that meets the driver.
+    pub submits: u64,
+    /// GPU dispatches prefill cost, measured — the whole prompt, not per
+    /// token.
+    pub prefill_dispatches: u64,
 }
 
 impl GenerationStats {
@@ -167,6 +177,25 @@ impl GenerationStats {
             return 0.0;
         }
         self.prompt_tokens as f64 / self.ttft.as_secs_f64()
+    }
+
+    /// GPU dispatches per generated token (0 when nothing decoded or the
+    /// backend dispatches nothing). The number the per-dispatch ceiling is
+    /// computed from: dispatches × per-dispatch overhead is the floor a
+    /// token cannot beat.
+    pub fn dispatches_per_token(&self) -> f64 {
+        if self.generated_tokens == 0 {
+            return 0.0;
+        }
+        self.dispatches as f64 / self.generated_tokens as f64
+    }
+
+    /// Queue submits per generated token.
+    pub fn submits_per_token(&self) -> f64 {
+        if self.generated_tokens == 0 {
+            return 0.0;
+        }
+        self.submits as f64 / self.generated_tokens as f64
     }
 
     /// Decode throughput in tokens/second (0 if nothing decoded).
@@ -1547,10 +1576,22 @@ mod tests {
             total_time: Duration::from_millis(2200),
             cache_pages_used: 7,
             cached_tokens: 42,
+            dispatches: 5_640,
+            submits: 180,
+            prefill_dispatches: 900,
         };
         assert_eq!(stats.prefill_tokens_per_second(), 500.0);
         assert_eq!(stats.tokens_per_second(), 5.0);
         assert_eq!(stats.decode_tokens_per_second(), 5.0);
+        // the measured ceiling: 512 dispatches a token, 16 submits
+        assert!((stats.dispatches_per_token() - 512.7272727272727).abs() < 1e-9);
+        assert!((stats.submits_per_token() - 16.363636363636363).abs() < 1e-9);
+        let idle = GenerationStats {
+            generated_tokens: 0,
+            ..stats
+        };
+        assert_eq!(idle.dispatches_per_token(), 0.0);
+        assert_eq!(idle.submits_per_token(), 0.0);
     }
 
     #[test]

@@ -485,6 +485,7 @@ impl WgpuStream {
 
         // This will _first_ fire off all pending write_buffer work.
         let index = self.queue.submit([tasks_encoder.finish()]);
+        crate::meter::count_submit();
 
         self.submission_load
             .regulate(&self.device, self.tasks_count, index);
@@ -563,6 +564,7 @@ impl WgpuStream {
         });
 
         self.tasks_count += 1;
+        crate::meter::count_dispatch();
 
         let group_layout = pipeline.get_bind_group_layout(0);
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {

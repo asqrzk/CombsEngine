@@ -9,6 +9,7 @@ mod compute;
 mod device;
 mod element;
 mod graphics;
+pub mod meter;
 mod runtime;
 
 pub use compiler::base::*;

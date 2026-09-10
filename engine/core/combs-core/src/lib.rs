@@ -74,6 +74,19 @@ pub type CombsBackend = burn::backend::wgpu::CubeBackend<
     u32,
 >;
 
+/// GPU dispatches and queue submits since the process began, measured
+/// at the source (the vendored wgpu stream, `cubecl::wgpu::meter`).
+///
+/// A decode step's cost is per-dispatch long before it is bandwidth, and
+/// until now the dispatch count per token was derived on paper — an op
+/// count times a published microsecond. This reads the real number.
+/// Both counters are monotone and process-wide; the engine is
+/// single-flight, so a difference across a step is that step's cost.
+/// Zero on the cpu floor, which dispatches nothing.
+pub fn gpu_counters() -> (u64, u64) {
+    cubecl::wgpu::meter::counts()
+}
+
 /// The default device handle type.
 #[cfg(not(feature = "cpu"))]
 pub type CombsDevice = WgpuDevice;
@@ -108,6 +121,25 @@ static CONTEXT: std::sync::OnceLock<DeviceContext> = std::sync::OnceLock::new();
 /// restores cubecl's sub-slice pools; `=exclusive` names the default
 /// explicitly. The wasm build has no environment and takes cubecl's
 /// wasm default, which is already exclusive pages.
+///
+/// It is also where SUBMIT GRANULARITY is chosen. cubecl batches
+/// dispatches into a `queue.submit` every `tasks_max` (its default 32);
+/// the decode step ends in a blocking readback, so the whole token's
+/// dispatches must reach the driver before the GPU can finish — batching
+/// them coarsely serializes CPU encode against GPU execute instead of
+/// overlapping the two. Measured on this desk (MEASUREMENTS §90, the
+/// dispatch meter), qwen3-0.6b decode against `tasks_max`:
+///
+/// ```text
+///   4 → 87   8 → 103   16 → 106   24 → 94   32 → 83   48 → 74
+///  64 → 39  128 → 36  1024 → 28  tok/s
+/// ```
+///
+/// 16 is the peak: +27% over cubecl's 32 on the small seat, and within
+/// noise on the 4b (30.2 vs 30.0) and the 7b (19.5 vs 19.4), whose
+/// dispatches are long enough that the CPU stays ahead either way. So
+/// the house default is 16, and `CUBECL_WGPU_MAX_TASKS` still overrides
+/// it (cubecl reads that env itself, so a value there wins).
 fn combs_runtime_options() -> RuntimeOptions {
     #[cfg(not(target_family = "wasm"))]
     if matches!(
@@ -118,9 +150,18 @@ fn combs_runtime_options() -> RuntimeOptions {
     }
     RuntimeOptions {
         memory_config: MemoryConfiguration::ExclusivePages,
+        // the person's own value wins: cubecl parses the env into its
+        // default, so only replace it when the env said nothing
+        tasks_max: match std::env::var("CUBECL_WGPU_MAX_TASKS") {
+            Ok(_) => RuntimeOptions::default().tasks_max,
+            Err(_) => SUBMIT_TASKS,
+        },
         ..RuntimeOptions::default()
     }
 }
+
+/// Dispatches per `queue.submit` — the measured peak, see above.
+pub const SUBMIT_TASKS: usize = 16;
 
 #[cfg(not(target_family = "wasm"))]
 fn context() -> &'static DeviceContext {
