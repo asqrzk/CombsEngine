@@ -33,6 +33,7 @@
 //!   kit names the command; the person runs it.
 
 mod doors;
+mod ops;
 mod machine;
 mod record;
 
@@ -67,6 +68,24 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// What this engine can do, where, and WHY NOT — each row with its
+    /// reason and a pointer to the evidence.
+    Ops {
+        /// Only rows whose platform or backend contains this word.
+        #[arg(long)]
+        r#where: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Answer one operation. Exit 0 when it works, 1 when it does not,
+    /// 2 when the name is unknown — a question we did not understand is
+    /// never answered "no".
+    Can {
+        /// The operation id, as `combs-kit ops` lists them.
+        op: String,
+        #[arg(long)]
+        r#where: Option<String>,
+    },
 }
 
 fn main() {
@@ -83,6 +102,18 @@ fn main() {
     let code = match cli.command {
         Command::System { json, out } => cmd_system(json, out.as_deref()),
         Command::Doors { json } => cmd_doors(json),
+        Command::Ops { r#where, json } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&ops::as_json()).unwrap_or_default()
+                );
+            } else {
+                ops::print_all(r#where.as_deref());
+            }
+            0
+        }
+        Command::Can { op, r#where } => ops::answer(&op, r#where.as_deref()),
     };
     std::process::exit(code);
 }
