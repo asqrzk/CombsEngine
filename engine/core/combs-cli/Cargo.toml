@@ -12,6 +12,7 @@ path = "src/main.rs"
 [features]
 cpu = ["combs-core/cpu", "combs-models/cpu"]
 f16 = ["combs-core/f16", "combs-runtime/f16"]
+f16-fusion = ["f16", "combs-core/f16-fusion", "combs-runtime/f16-fusion"]
 
 [dev-dependencies]
 burn = { version = "0.21.0", default-features = false, features = ["ndarray", "std"] }

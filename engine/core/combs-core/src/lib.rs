@@ -31,15 +31,26 @@ use burn::backend::wgpu::{
 /// (`Fusion<CubeBackend<WgpuRuntime, f32, i32, u32>>`).
 ///
 /// `--features f16` switches to an **unfused f16** backend, which ~halves
-/// weight + KV + activation memory (e.g. a 3B model drops from ~12 GB to
-/// ~6 GB) and is typically faster. The numerically sensitive reductions
-/// (RMS/LayerNorm, attention scores + softmax, gelu) run in f32 regardless
-/// of backend (see `combs-models::precision`), so f16 output stays coherent.
+/// weight + KV + activation memory on a DENSE model (a packed-quantized
+/// seat keeps its bytes either way, so f16 buys it ~20 MB). The
+/// numerically sensitive reductions (RMS/LayerNorm, attention scores +
+/// softmax, gelu) run in f32 regardless of backend (see
+/// `combs-models::precision`), so f16 output stays coherent.
 ///
-/// Note: f16 uses the **unfused** `CubeBackend` type directly — burn-fusion
-/// 0.21 panics on reduced-precision tensors, so we bypass the fusion layer
-/// for f16 while keeping f32 fused. bf16 is unavailable (cubecl's matmul has
-/// no bf16 path on Metal/wgpu).
+/// It is NOT faster here: without fusion it pays 1.3-4.2x the dispatches
+/// per token and runs that much slower on every seat measured
+/// (MEASUREMENTS §90). The road back is the seam, not the fusion layer —
+/// the `try_*` doors that refuse f16 today.
+///
+/// Note: f16 uses the **unfused** `CubeBackend` type directly because
+/// burn-fusion 0.21 cannot carry it. Measured, not assumed
+/// (MEASUREMENTS §91, UPSTREAM-ISSUES #6): the fused reduce's autotune
+/// launch plan resolves a global argument that was never registered
+/// (`resolve_arg`, len 1 index 1) and the failure then desynchronises
+/// burn-fusion's queue, so the worker dies before the first token.
+/// `--features f16,f16-fusion` builds that road on purpose and is the
+/// repro. bf16 is unavailable (cubecl's matmul has no bf16 path on
+/// Metal/wgpu).
 #[cfg(all(not(feature = "f16"), not(feature = "cpu")))]
 pub type CombsBackend = burn::backend::Wgpu<f32, i32, u32>;
 
@@ -66,13 +77,27 @@ compile_error!("features `cpu` and `f16` are mutually exclusive: f16 is a wgpu b
 /// under f16 (range, not rounding), so image generation computes in f32
 /// regardless of the text stack's dtype.
 pub type CombsBackendF32 = burn::backend::Wgpu<f32, i32, u32>;
-#[cfg(feature = "f16")]
+#[cfg(all(feature = "f16", not(feature = "f16-fusion")))]
 pub type CombsBackend = burn::backend::wgpu::CubeBackend<
     burn::backend::wgpu::WgpuRuntime,
     burn::tensor::f16,
     i32,
     u32,
 >;
+
+/// The question the 2026-08-10 note never answered: does burn-fusion
+/// actually refuse f16?
+///
+/// That note ("verified: bf16 and f16 both crash fused") carries no
+/// backtrace, no repro and no test, and nothing in this tree has ever
+/// constructed a fused f16 backend — while the resolved
+/// burn-cubecl-fusion 0.21.0 lists `FloatKind::F16` as a first-class
+/// fused type. `--features f16,f16-fusion` builds the backend the note
+/// claims panics, so the claim can be measured instead of inherited.
+/// Everything downstream dispatches on TypeId allowlists this alias is
+/// deliberately not in yet, so the only thing that changes is fusion.
+#[cfg(all(feature = "f16", feature = "f16-fusion"))]
+pub type CombsBackend = burn::backend::Wgpu<burn::tensor::f16, i32, u32>;
 
 /// GPU dispatches and queue submits since the process began, measured
 /// at the source (the vendored wgpu stream, `cubecl::wgpu::meter`).

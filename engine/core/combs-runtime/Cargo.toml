@@ -8,6 +8,7 @@ description = "Combs Engine generation runtime (engine, sampler, tokenizer)"
 [features]
 cpu = ["combs-core/cpu", "combs-models/cpu"]
 f16 = []
+f16-fusion = ["f16", "combs-core/f16-fusion"]
 
 [dependencies]
 burn.workspace = true

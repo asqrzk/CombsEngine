@@ -7,6 +7,10 @@ description = "Combs Engine core: backend aliases, device helpers, memory facade
 
 [features]
 f16 = []
+# The fused f16 backend: `--features f16,f16-fusion` swaps the bare
+# CubeBackend alias for `Wgpu<f16>`, so the 2026-08-10 "fusion panics on
+# reduced precision" note can be measured rather than inherited.
+f16-fusion = ["f16"]
 # Pure-Rust CPU backend: the floor under a machine whose GPU stack
 # cannot be trusted. Mutually exclusive with the wgpu path.
 cpu = []
