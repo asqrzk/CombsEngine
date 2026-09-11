@@ -29,7 +29,22 @@ fn a_token_costs_measurable_dispatches() {
     let (before, _) = combs_core::gpu_counters();
     println!("[meter] load cost {before} dispatches");
 
-    let tokens = engine.encode("Count to five.").expect("encode");
+    // COMBS_TEST_PROMPT_TOKENS makes the prompt long enough to price
+    // PREFILL as well as decode — the two halves answer to different
+    // masters (prefill is batched matmul and likes narrow operands;
+    // decode is many small ops and wants fusion), so a build verdict
+    // taken on one of them is half a verdict.
+    let want: usize = std::env::var("COMBS_TEST_PROMPT_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let prompt = if want > 0 {
+        let unit = "the ledger records every seat and every measured number for this estate. ";
+        unit.repeat(want / 12 + 2)
+    } else {
+        "Count to five.".to_string()
+    };
+    let tokens = engine.encode(&prompt).expect("encode");
     let config = GenerationConfig {
         max_tokens: 16,
         sampling: SamplingParams {
@@ -42,6 +57,11 @@ fn a_token_costs_measurable_dispatches() {
         .generate(&tokens, &config, |_, _, _| {})
         .expect("generate");
 
+    println!(
+        "[meter] prefill {:.1} tok/s, ttft {:.0} ms",
+        stats.prefill_tokens_per_second(),
+        stats.ttft.as_secs_f64() * 1000.0
+    );
     println!(
         "[meter] {} prompt tokens, {} generated — prefill {} dispatches; decode {} dispatches, {} submits",
         stats.prompt_tokens, stats.generated_tokens, stats.prefill_dispatches, stats.dispatches, stats.submits
