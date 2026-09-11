@@ -6,13 +6,14 @@
 //! the same kernel with `flavor = 1.0` — the add happens in-register
 //! instead of materializing a shifted weight tensor per call.
 //!
-//! Fallback discipline as everywhere: any refusal — doors, foreign
-//! backend, f16 arenas, a row count past the dispatch limit — returns
-//! `None` and the caller runs the burn reference unchanged.
+//! Fallback discipline as everywhere: any refusal — doors, a foreign
+//! backend, a row count past the dispatch limit — returns `None` and
+//! the caller runs the burn reference unchanged. Both wgpu element
+//! types are served: f16 activations cast around the f32 launch.
 
 use std::any::{Any, TypeId};
 
-use burn::backend::wgpu::{CubeTensor, WgpuRuntime};
+use burn::backend::wgpu::{CubeBackend, CubeTensor, FloatElement, WgpuRuntime};
 use burn::tensor::backend::Backend;
 use burn::tensor::{DType, Shape, Tensor, TensorPrimitive};
 use burn_cubecl::fusion::FusionCubeRuntime;
@@ -23,7 +24,8 @@ use burn_ir::{CustomOpIr, HandleContainer, OperationIr, TensorIr, TensorStatus};
 use cubecl::prelude::CubeCount;
 
 use super::{RmsNorm, launch, wgsl_enabled};
-use crate::qlinear::{FusedF32, InnerF32, UnfusedF32};
+use super::{as_f32, from_f32};
+use crate::qlinear::{FusedF32, InnerF32, UnfusedF16, UnfusedF32};
 
 /// `CubeCount::Static` caps each grid dimension at 65535; rows beyond
 /// that (no real shape today) fall back to the burn path.
@@ -62,8 +64,6 @@ pub(crate) fn try_rms_norm<B: Backend, const D: usize>(
     if rows == 0 || n == 0 || rows > MAX_ROWS {
         return None;
     }
-    // f16 builds keep the burn path: its f32 reduction + dtype casts are
-    // the numerics the f16 transcripts were gated on.
     if TypeId::of::<B>() == TypeId::of::<UnfusedF32>() {
         let x: Tensor<UnfusedF32, D> = cast_any(x)?;
         let w: Tensor<UnfusedF32, 1> = cast_any(weight)?;
@@ -73,6 +73,15 @@ pub(crate) fn try_rms_norm<B: Backend, const D: usize>(
         let x: Tensor<FusedF32, D> = cast_any(x)?;
         let w: Tensor<FusedF32, 1> = cast_any(weight)?;
         return cast_any(rms_norm_fused(x, w, eps, flavor));
+    }
+    // The f16 backend the app ships takes the same launch with a cast on
+    // either side. It used to be refused here, and the refusal cost it
+    // the whole burn chain — about thirty dispatches a layer where four
+    // will do (MEASUREMENTS §90, §92).
+    if TypeId::of::<B>() == TypeId::of::<UnfusedF16>() {
+        let x: Tensor<UnfusedF16, D> = cast_any(x)?;
+        let w: Tensor<UnfusedF16, 1> = cast_any(weight)?;
+        return cast_any(rms_norm_unfused(x, w, eps, flavor));
     }
     None
 }
@@ -115,19 +124,23 @@ fn launch_rms_norm(
     CubeTensor::new_contiguous(client, x.device.clone(), shape, out, DType::F32)
 }
 
-fn rms_norm_unfused<const D: usize>(
-    x: Tensor<UnfusedF32, D>,
-    w: Tensor<UnfusedF32, 1>,
+/// One body for every unfused wgpu element type: the launch is f32 by
+/// contract, so an f16 backend differs only by the casts around it,
+/// which are no-ops when the dtype already matches.
+fn rms_norm_unfused<F: FloatElement, const D: usize>(
+    x: Tensor<CubeBackend<WgpuRuntime, F, i32, u32>, D>,
+    w: Tensor<CubeBackend<WgpuRuntime, F, i32, u32>, 1>,
     eps: f64,
     flavor: f32,
-) -> Tensor<UnfusedF32, D> {
+) -> Tensor<CubeBackend<WgpuRuntime, F, i32, u32>, D> {
     let dims = x.dims();
     let n = dims[D - 1];
     let rows: usize = dims[..D - 1].iter().product();
-    let xp = x.into_primitive().tensor();
-    let wp = w.into_primitive().tensor();
+    let in_dtype = x.dtype();
+    let xp = as_f32(x).into_primitive().tensor();
+    let wp = as_f32(w).into_primitive().tensor();
     let out = launch_rms_norm(xp, wp, Shape::from(dims.to_vec()), rows, n, eps, flavor);
-    Tensor::from_primitive(TensorPrimitive::Float(out))
+    from_f32(Tensor::from_primitive(TensorPrimitive::Float(out)), in_dtype)
 }
 
 /// The fusion-stream operation: executed when the stream drains, with
@@ -203,6 +216,7 @@ fn rms_norm_fused<const D: usize>(
 mod tests {
     use super::*;
     use burn::tensor::TensorData;
+    use crate::qlinear::UnfusedF16;
 
     type Ref = burn::backend::NdArray<f32>;
 
@@ -318,6 +332,63 @@ mod tests {
                 assert_close(&got, &expect, 1e-4, &format!("fused n={n} flavor={flavor}"));
             }
         }
+    }
+
+    /// The f16 door: the backend the app ships must take this kernel,
+    /// not the multi-op Burn fallback behind it.
+    ///
+    /// Two claims in one test, because either alone can lie. The values
+    /// prove the casts around the launch are the right way round (a
+    /// mixed-dtype slip returns power-of-two-wrong numbers, silently —
+    /// see the KV cache's note). The door opening at all is proven by
+    /// the `expect`. The dispatch COUNT is the second guard, against a
+    /// future where the door opens but something inside re-materializes
+    /// the row: measured at eleven here (three casts and the launch,
+    /// plus the contiguous copies each of those costs), against roughly
+    /// thirty for the Burn chain this replaces. Twelve is the bound; if
+    /// this ever trips, read what the extra dispatch is before widening
+    /// it.
+    #[test]
+    fn wgsl_rms_norm_takes_the_kernel_on_the_f16_backend() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let (rows, n) = (3usize, 896usize);
+        let xs = signal(rows * n, 0.3);
+        let ws = signal(n, 7.7);
+        let expect = reference(&xs, &ws, rows, n, 1e-6, 0.0);
+
+        let device = Default::default();
+        let mk = || {
+            let x: Tensor<UnfusedF16, 2> =
+                Tensor::from_data(TensorData::new(xs.clone(), [rows, n]), &device);
+            let w: Tensor<UnfusedF16, 1> =
+                Tensor::from_data(TensorData::new(ws.clone(), [n]), &device);
+            (x, w)
+        };
+        // Warm the pipeline first: a cold launch compiles, and the
+        // compilation itself must not be scored as the token's cost.
+        let (x, w) = mk();
+        let warm = try_rms_norm(x, w, 1e-6, 0.0).expect("the f16 backend takes the kernel path");
+        let _ = warm.into_data();
+
+        let (x, w) = mk();
+        let (d0, _) = combs_core::gpu_counters();
+        let got = try_rms_norm(x, w, 1e-6, 0.0)
+            .expect("the f16 backend takes the kernel path")
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap();
+        let (d1, _) = combs_core::gpu_counters();
+        assert!(
+            d1 - d0 <= 12,
+            "f16 rms_norm cost {} dispatches — the kernel was not taken",
+            d1 - d0
+        );
+        // f16 storage on both sides of the launch: one rounding at 2^-11
+        // on the way in and one on the way out, over f32 arithmetic.
+        assert_close(&got, &expect, 2e-3, "f16 n=896");
     }
 
     /// The qk-norm shape: rank 4, rows = heads × seq flattened by the

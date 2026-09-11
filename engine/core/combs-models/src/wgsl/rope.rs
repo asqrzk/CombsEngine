@@ -5,13 +5,14 @@
 //! kernel reads the full resident tables at `pos + r` and writes both
 //! rotated tensors from one elementwise launch.
 //!
-//! Fallback discipline as everywhere: doors, foreign backends, f16, an
-//! odd head dim, a position past the table, or a grid past the dispatch
-//! limit → `None`, and the caller applies the tables the old way.
+//! Fallback discipline as everywhere: doors, a foreign backend, an odd
+//! head dim, a position past the table, or a grid past the dispatch
+//! limit → `None`, and the caller applies the tables the old way. Both
+//! wgpu element types are served: f16 casts around the f32 launch.
 
 use std::any::TypeId;
 
-use burn::backend::wgpu::{CubeTensor, WgpuRuntime};
+use burn::backend::wgpu::{CubeBackend, CubeTensor, FloatElement, WgpuRuntime};
 use burn::tensor::backend::Backend;
 use burn::tensor::{DType, Shape, Tensor, TensorPrimitive};
 use burn_cubecl::fusion::FusionCubeRuntime;
@@ -23,7 +24,8 @@ use cubecl::prelude::CubeCount;
 
 use super::rmsnorm::cast_any;
 use super::{RopeQk, WORKGROUP, launch, wgsl_enabled};
-use crate::qlinear::{FusedF32, InnerF32, UnfusedF32};
+use super::{as_f32, from_f32};
+use crate::qlinear::{FusedF32, InnerF32, UnfusedF16, UnfusedF32};
 
 /// Per-kernel door on top of the master `COMBS_WGSL`; read once.
 fn rope_enabled() -> bool {
@@ -108,6 +110,15 @@ pub(crate) fn try_rope_qk<B: Backend>(
         let s: Tensor<FusedF32, 2> = cast_any(sin)?;
         return cast_any(rope_fused(q, k, c, s, geom));
     }
+    // The f16 backend: one launch with casts on either side, in place of
+    // narrow + neg + cat + a mul-add chain run twice.
+    if TypeId::of::<B>() == TypeId::of::<UnfusedF16>() {
+        let q: Tensor<UnfusedF16, 4> = cast_any(q)?;
+        let k: Tensor<UnfusedF16, 4> = cast_any(k)?;
+        let c: Tensor<UnfusedF16, 2> = cast_any(cos)?;
+        let s: Tensor<UnfusedF16, 2> = cast_any(sin)?;
+        return cast_any(rope_unfused(q, k, c, s, geom));
+    }
     None
 }
 
@@ -159,23 +170,29 @@ fn launch_rope(
     )
 }
 
-fn rope_unfused(
-    q: Tensor<UnfusedF32, 4>,
-    k: Tensor<UnfusedF32, 4>,
-    cos: Tensor<UnfusedF32, 2>,
-    sin: Tensor<UnfusedF32, 2>,
+/// One body for every unfused wgpu element type; see `rms_norm_unfused`
+/// for why the casts are here and not in the kernel.
+fn rope_unfused<F: FloatElement>(
+    q: Tensor<CubeBackend<WgpuRuntime, F, i32, u32>, 4>,
+    k: Tensor<CubeBackend<WgpuRuntime, F, i32, u32>, 4>,
+    cos: Tensor<CubeBackend<WgpuRuntime, F, i32, u32>, 2>,
+    sin: Tensor<CubeBackend<WgpuRuntime, F, i32, u32>, 2>,
     geom: RopeGeom,
-) -> (Tensor<UnfusedF32, 4>, Tensor<UnfusedF32, 4>) {
+) -> (
+    Tensor<CubeBackend<WgpuRuntime, F, i32, u32>, 4>,
+    Tensor<CubeBackend<WgpuRuntime, F, i32, u32>, 4>,
+) {
+    let in_dtype = q.dtype();
     let (oq, ok) = launch_rope(
-        q.into_primitive().tensor(),
-        k.into_primitive().tensor(),
-        cos.into_primitive().tensor(),
-        sin.into_primitive().tensor(),
+        as_f32(q).into_primitive().tensor(),
+        as_f32(k).into_primitive().tensor(),
+        as_f32(cos).into_primitive().tensor(),
+        as_f32(sin).into_primitive().tensor(),
         geom,
     );
     (
-        Tensor::from_primitive(TensorPrimitive::Float(oq)),
-        Tensor::from_primitive(TensorPrimitive::Float(ok)),
+        from_f32(Tensor::from_primitive(TensorPrimitive::Float(oq)), in_dtype),
+        from_f32(Tensor::from_primitive(TensorPrimitive::Float(ok)), in_dtype),
     )
 }
 
@@ -266,6 +283,7 @@ mod tests {
     use super::*;
     use crate::rope::build_tables_scaled;
     use burn::tensor::TensorData;
+    use crate::qlinear::UnfusedF16;
     use combs_formats::RopeScaling;
 
     fn signal(len: usize, salt: f32) -> Vec<f32> {
@@ -315,6 +333,58 @@ mod tests {
         }
     }
 
+    /// The f16 door, the same two claims as rms_norm's: the rotation is
+    /// right through the casts, and the kernel was taken (cast q, cast
+    /// k, cast both tables, one launch, cast both results back is
+    /// eight; the burn path this replaces narrows both tables, negates,
+    /// concatenates and runs the mul-add chain twice).
+    #[test]
+    fn wgsl_rope_takes_the_kernel_on_the_f16_backend() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let device = Default::default();
+        let (n_q, n_kv, seq, d, pos) = (4usize, 2usize, 1usize, 128usize, 7usize);
+        let max_position = 4096usize;
+        let (cos, sin) = build_tables_scaled(d, 10000.0, max_position, &RopeScaling::None);
+        let qv = signal(n_q * seq * d, 1.1);
+        let kv = signal(n_kv * seq * d, 60.6);
+        let eq = reference(&qv, &cos, &sin, n_q, seq, d, pos);
+        let ek = reference(&kv, &cos, &sin, n_kv, seq, d, pos);
+
+        let mk = || {
+            let qt: Tensor<UnfusedF16, 4> =
+                Tensor::from_data(TensorData::new(qv.clone(), [1, n_q, seq, d]), &device);
+            let kt: Tensor<UnfusedF16, 4> =
+                Tensor::from_data(TensorData::new(kv.clone(), [1, n_kv, seq, d]), &device);
+            let ct: Tensor<UnfusedF16, 2> =
+                Tensor::from_data(TensorData::new(cos.clone(), [max_position, d]), &device);
+            let st: Tensor<UnfusedF16, 2> =
+                Tensor::from_data(TensorData::new(sin.clone(), [max_position, d]), &device);
+            (qt, kt, ct, st)
+        };
+        // Warm the pipeline: a cold launch compiles, and compilation is
+        // not the token's cost.
+        let (qt, kt, ct, st) = mk();
+        let (wq, wk) = try_rope_qk(qt, kt, ct, st, pos).expect("the f16 backend takes the kernel path");
+        let _ = (wq.into_data(), wk.into_data());
+
+        let (qt, kt, ct, st) = mk();
+        let (d0, _) = combs_core::gpu_counters();
+        let (gq, gk) = try_rope_qk(qt, kt, ct, st, pos).expect("the f16 backend takes the kernel path");
+        let gqv = gq.into_data().convert::<f32>().to_vec::<f32>().unwrap();
+        let gkv = gk.into_data().convert::<f32>().to_vec::<f32>().unwrap();
+        let (d1, _) = combs_core::gpu_counters();
+        assert!(
+            d1 - d0 <= 8,
+            "f16 rope cost {} dispatches — the kernel was not taken",
+            d1 - d0
+        );
+        // f16 storage on both sides of the launch: one rounding at 2^-11
+        // in and one out, over f32 arithmetic.
+        assert_close(&gqv, &eq, 2e-3, "f16 rope q");
+        assert_close(&gkv, &ek, 2e-3, "f16 rope k");
+    }
     /// The plan's harmony matrix: head dims, plain + llama3 + YaRN scaled
     /// tables, decode and chunk shapes, large positions.
     #[test]

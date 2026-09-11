@@ -43,6 +43,42 @@
 //! process.
 
 use burn_cubecl::template::{KernelSource, SourceKernel, SourceTemplate};
+
+/// The seam's dtype bridge.
+///
+/// Every kernel here computes and stores f32 — the contract line above
+/// ("f32 compute throughout; dtype casts happen outside the launch"),
+/// which is what lets one text pass both validators and lets a browser
+/// build exist at all. A backend whose activations are f16 therefore
+/// casts on the way in and back on the way out: two or three small
+/// elementwise launches, in exchange for a whole multi-op Burn chain.
+/// On a matching dtype both are no-ops, so the f32 path is untouched.
+pub(crate) fn as_f32<B: burn::tensor::backend::Backend, const D: usize>(
+    x: burn::tensor::Tensor<B, D>,
+) -> burn::tensor::Tensor<B, D> {
+    match x.dtype() {
+        burn::tensor::DType::F32 => x,
+        _ => x.cast(burn::tensor::FloatDType::F32),
+    }
+}
+
+/// The return leg of [`as_f32`]: put a kernel's f32 output back into the
+/// dtype the caller handed in, so the tensor rejoins the model's stream
+/// as the type every other op there expects. Mixing them is not merely
+/// slow — an f16 tensor against an f32 broadcast silently returns
+/// power-of-two-wrong values on this backend.
+pub(crate) fn from_f32<B: burn::tensor::backend::Backend, const D: usize>(
+    out: burn::tensor::Tensor<B, D>,
+    dtype: burn::tensor::DType,
+) -> burn::tensor::Tensor<B, D> {
+    match dtype {
+        burn::tensor::DType::F16 => out.cast(burn::tensor::FloatDType::F16),
+        burn::tensor::DType::BF16 => out.cast(burn::tensor::FloatDType::BF16),
+        _ => out,
+    }
+}
+
+
 use cubecl::prelude::{CubeCount, CubeDim, KernelId, Runtime};
 use cubecl::server::{Binding, KernelArguments, MetadataBindingInfo};
 
