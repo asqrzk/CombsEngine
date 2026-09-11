@@ -9,6 +9,7 @@ members = [
     "combs-ffi",
     "combs-wasm",
     "combs-cli",
+    "combs-kit",
     "combs-mesh",
     "combs-mesh-ffi",
     "combs-graphkit",

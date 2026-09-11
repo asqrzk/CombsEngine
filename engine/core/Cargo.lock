@@ -1200,6 +1200,7 @@ dependencies = [
  "burn",
  "cubecl",
  "getrandom 0.4.3",
+ "libc",
  "serde",
  "wgpu",
 ]
@@ -1262,6 +1263,17 @@ name = "combs-graphkit-ffi"
 version = "0.3.0"
 dependencies = [
  "combs-graphkit",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "combs-kit"
+version = "0.3.0"
+dependencies = [
+ "clap",
+ "combs-core",
+ "libc",
  "serde",
  "serde_json",
 ]

@@ -1,0 +1,29 @@
+[package]
+name = "combs-kit"
+version = "0.3.0"
+edition.workspace = true
+license.workspace = true
+description = "Combs Kit: measure a box, a model and a build, and write a record you can compare"
+
+[[bin]]
+name = "combs-kit"
+path = "src/main.rs"
+
+[features]
+# The kit must be buildable in every flavour it measures: a record says
+# which build produced it, and comparing f16 against f32 is two records,
+# not two code paths.
+cpu = ["combs-core/cpu"]
+f16 = ["combs-core/f16"]
+f16-fusion = ["f16", "combs-core/f16-fusion"]
+
+[dependencies]
+combs-core.workspace = true
+clap = { version = "4", features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Only to restore SIGPIPE, so piping the kit into `head` ends quietly
+# instead of panicking.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

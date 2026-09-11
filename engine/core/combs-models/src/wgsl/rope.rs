@@ -333,13 +333,11 @@ mod tests {
         }
     }
 
-    /// The f16 door, the same two claims as rms_norm's: the rotation is
-    /// right through the casts, and the kernel was taken (cast q, cast
-    /// k, cast both tables, one launch, cast both results back is
-    /// eight; the burn path this replaces narrows both tables, negates,
-    /// concatenates and runs the mul-add chain twice).
+    /// The f16 door: the rotation is right through the casts. The
+    /// `expect` proves the door opened; the values prove the casts are
+    /// the right way round.
     #[test]
-    fn wgsl_rope_takes_the_kernel_on_the_f16_backend() {
+    fn wgsl_rope_matches_the_reference_on_the_f16_backend() {
         if crate::skip_no_gpu() {
             return;
         }
@@ -352,6 +350,48 @@ mod tests {
         let eq = reference(&qv, &cos, &sin, n_q, seq, d, pos);
         let ek = reference(&kv, &cos, &sin, n_kv, seq, d, pos);
 
+        let qt: Tensor<UnfusedF16, 4> =
+            Tensor::from_data(TensorData::new(qv, [1, n_q, seq, d]), &device);
+        let kt: Tensor<UnfusedF16, 4> =
+            Tensor::from_data(TensorData::new(kv, [1, n_kv, seq, d]), &device);
+        let ct: Tensor<UnfusedF16, 2> =
+            Tensor::from_data(TensorData::new(cos, [max_position, d]), &device);
+        let st: Tensor<UnfusedF16, 2> =
+            Tensor::from_data(TensorData::new(sin, [max_position, d]), &device);
+        let (gq, gk) =
+            try_rope_qk(qt, kt, ct, st, pos).expect("the f16 backend takes the kernel path");
+        // One f16 rounding in and one out, over f32 arithmetic.
+        assert_close(
+            &gq.into_data().convert::<f32>().to_vec::<f32>().unwrap(),
+            &eq,
+            2e-3,
+            "f16 rope q",
+        );
+        assert_close(
+            &gk.into_data().convert::<f32>().to_vec::<f32>().unwrap(),
+            &ek,
+            2e-3,
+            "f16 rope k",
+        );
+    }
+
+    /// The dispatch guard, alone in its own process — see the rms_norm
+    /// twin for why a process-wide counter cannot be read under a
+    /// parallel suite. Measured at eight: four casts in, one launch,
+    /// two casts out, against the burn path's narrow, negate,
+    /// concatenate and a mul-add chain run twice.
+    #[test]
+    #[ignore = "gpu: reads the process-wide dispatch counter, so it needs its own process"]
+    fn wgsl_rope_costs_one_kernel_on_the_f16_backend() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let device = Default::default();
+        let (n_q, n_kv, seq, d, pos) = (4usize, 2usize, 1usize, 128usize, 7usize);
+        let max_position = 4096usize;
+        let (cos, sin) = build_tables_scaled(d, 10000.0, max_position, &RopeScaling::None);
+        let qv = signal(n_q * seq * d, 1.1);
+        let kv = signal(n_kv * seq * d, 60.6);
         let mk = || {
             let qt: Tensor<UnfusedF16, 4> =
                 Tensor::from_data(TensorData::new(qv.clone(), [1, n_q, seq, d]), &device);
@@ -363,28 +403,24 @@ mod tests {
                 Tensor::from_data(TensorData::new(sin.clone(), [max_position, d]), &device);
             (qt, kt, ct, st)
         };
-        // Warm the pipeline: a cold launch compiles, and compilation is
-        // not the token's cost.
         let (qt, kt, ct, st) = mk();
-        let (wq, wk) = try_rope_qk(qt, kt, ct, st, pos).expect("the f16 backend takes the kernel path");
+        let (wq, wk) =
+            try_rope_qk(qt, kt, ct, st, pos).expect("the f16 backend takes the kernel path");
         let _ = (wq.into_data(), wk.into_data());
 
         let (qt, kt, ct, st) = mk();
         let (d0, _) = combs_core::gpu_counters();
-        let (gq, gk) = try_rope_qk(qt, kt, ct, st, pos).expect("the f16 backend takes the kernel path");
-        let gqv = gq.into_data().convert::<f32>().to_vec::<f32>().unwrap();
-        let gkv = gk.into_data().convert::<f32>().to_vec::<f32>().unwrap();
+        let (gq, gk) =
+            try_rope_qk(qt, kt, ct, st, pos).expect("the f16 backend takes the kernel path");
+        let _ = (gq.into_data(), gk.into_data());
         let (d1, _) = combs_core::gpu_counters();
         assert!(
             d1 - d0 <= 8,
             "f16 rope cost {} dispatches — the kernel was not taken",
             d1 - d0
         );
-        // f16 storage on both sides of the launch: one rounding at 2^-11
-        // in and one out, over f32 arithmetic.
-        assert_close(&gqv, &eq, 2e-3, "f16 rope q");
-        assert_close(&gkv, &ek, 2e-3, "f16 rope k");
     }
+
     /// The plan's harmony matrix: head dims, plain + llama3 + YaRN scaled
     /// tables, decode and chunk shapes, large positions.
     #[test]

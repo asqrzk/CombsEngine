@@ -335,21 +335,12 @@ mod tests {
     }
 
     /// The f16 door: the backend the app ships must take this kernel,
-    /// not the multi-op Burn fallback behind it.
-    ///
-    /// Two claims in one test, because either alone can lie. The values
-    /// prove the casts around the launch are the right way round (a
-    /// mixed-dtype slip returns power-of-two-wrong numbers, silently —
-    /// see the KV cache's note). The door opening at all is proven by
-    /// the `expect`. The dispatch COUNT is the second guard, against a
-    /// future where the door opens but something inside re-materializes
-    /// the row: measured at eleven here (three casts and the launch,
-    /// plus the contiguous copies each of those costs), against roughly
-    /// thirty for the Burn chain this replaces. Twelve is the bound; if
-    /// this ever trips, read what the extra dispatch is before widening
-    /// it.
+    /// not the multi-op Burn fallback behind it. The `expect` is the
+    /// proof the door opened; the values prove the casts around the
+    /// launch are the right way round, since a mixed-dtype slip returns
+    /// power-of-two-wrong numbers silently (see the KV cache's note).
     #[test]
-    fn wgsl_rms_norm_takes_the_kernel_on_the_f16_backend() {
+    fn wgsl_rms_norm_matches_the_reference_on_the_f16_backend() {
         if crate::skip_no_gpu() {
             return;
         }
@@ -359,6 +350,47 @@ mod tests {
         let expect = reference(&xs, &ws, rows, n, 1e-6, 0.0);
 
         let device = Default::default();
+        let x: Tensor<UnfusedF16, 2> =
+            Tensor::from_data(TensorData::new(xs, [rows, n]), &device);
+        let w: Tensor<UnfusedF16, 1> = Tensor::from_data(TensorData::new(ws, [n]), &device);
+        let got = try_rms_norm(x, w, 1e-6, 0.0)
+            .expect("the f16 backend takes the kernel path")
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap();
+        // f16 storage on both sides of the launch: one rounding at 2^-11
+        // on the way in and one on the way out, over f32 arithmetic.
+        assert_close(&got, &expect, 2e-3, "f16 n=896");
+    }
+
+    /// The second guard, and it CANNOT live in the parallel suite: the
+    /// dispatch counter is process-wide and monotone, so a sibling test
+    /// launching a kernel between the two reads lands in this delta.
+    /// Written in the suite first, it passed one gate by luck and failed
+    /// the next — which is exactly the lie the battery law exists to
+    /// forbid. It runs deliberately, alone:
+    ///
+    /// ```text
+    /// cargo test --release -p combs-models --lib -- --ignored \
+    ///   --test-threads=1 costs_one_kernel
+    /// ```
+    ///
+    /// What it guards: a future change where the door still returns
+    /// Some but the work quietly goes back to burn ops. Measured at
+    /// eleven — three casts and the launch, plus the contiguous copy
+    /// each cast carries — against roughly thirty for the chain this
+    /// replaced.
+    #[test]
+    #[ignore = "gpu: reads the process-wide dispatch counter, so it needs its own process"]
+    fn wgsl_rms_norm_costs_one_kernel_on_the_f16_backend() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let (rows, n) = (3usize, 896usize);
+        let xs = signal(rows * n, 0.3);
+        let ws = signal(n, 7.7);
+        let device = Default::default();
         let mk = || {
             let x: Tensor<UnfusedF16, 2> =
                 Tensor::from_data(TensorData::new(xs.clone(), [rows, n]), &device);
@@ -366,29 +398,24 @@ mod tests {
                 Tensor::from_data(TensorData::new(ws.clone(), [n]), &device);
             (x, w)
         };
-        // Warm the pipeline first: a cold launch compiles, and the
-        // compilation itself must not be scored as the token's cost.
+        // Warm the pipeline: a cold launch compiles, and compilation is
+        // not the token's cost.
         let (x, w) = mk();
-        let warm = try_rms_norm(x, w, 1e-6, 0.0).expect("the f16 backend takes the kernel path");
-        let _ = warm.into_data();
+        let _ = try_rms_norm(x, w, 1e-6, 0.0)
+            .expect("the f16 backend takes the kernel path")
+            .into_data();
 
         let (x, w) = mk();
         let (d0, _) = combs_core::gpu_counters();
-        let got = try_rms_norm(x, w, 1e-6, 0.0)
+        let _ = try_rms_norm(x, w, 1e-6, 0.0)
             .expect("the f16 backend takes the kernel path")
-            .into_data()
-            .convert::<f32>()
-            .to_vec::<f32>()
-            .unwrap();
+            .into_data();
         let (d1, _) = combs_core::gpu_counters();
         assert!(
             d1 - d0 <= 12,
             "f16 rms_norm cost {} dispatches — the kernel was not taken",
             d1 - d0
         );
-        // f16 storage on both sides of the launch: one rounding at 2^-11
-        // on the way in and one on the way out, over f32 arithmetic.
-        assert_close(&got, &expect, 2e-3, "f16 n=896");
     }
 
     /// The qk-norm shape: rank 4, rows = heads × seq flattened by the
