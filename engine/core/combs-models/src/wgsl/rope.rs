@@ -112,11 +112,19 @@ pub(crate) fn try_rope_qk<B: Backend>(
     }
     // The f16 backend: one launch with casts on either side, in place of
     // narrow + neg + cat + a mul-add chain run twice.
+    //
+    // The tables are f16 here (`from_data` takes the device's dtype) and the
+    // launch reads them as f32, so the cast is paid on every call. Cast only
+    // the rows this call reads: the whole `[max_position, d]` table cast per
+    // layer per token cost a 262k-position model ~91 ms a token and every
+    // 40,960-position seat ~15-19 ms (§106). The kernel indexes rows at
+    // `pos + r`, so the narrowed tables are read from row 0.
     if TypeId::of::<B>() == TypeId::of::<UnfusedF16>() {
         let q: Tensor<UnfusedF16, 4> = cast_any(q)?;
         let k: Tensor<UnfusedF16, 4> = cast_any(k)?;
-        let c: Tensor<UnfusedF16, 2> = cast_any(cos)?;
-        let s: Tensor<UnfusedF16, 2> = cast_any(sin)?;
+        let c: Tensor<UnfusedF16, 2> = cast_any(cos.narrow(0, pos, seq))?;
+        let s: Tensor<UnfusedF16, 2> = cast_any(sin.narrow(0, pos, seq))?;
+        let geom = RopeGeom { pos: 0, ..geom };
         return cast_any(rope_unfused(q, k, c, s, geom));
     }
     None
@@ -373,6 +381,49 @@ mod tests {
             2e-3,
             "f16 rope k",
         );
+    }
+
+    /// Deep in a large table the f16 door must read the rows the position
+    /// names. The door narrows the tables to those rows and re-bases the
+    /// kernel's position to zero; a re-base done wrong reads another row, or
+    /// past the slice, and the values say so. Decode and a short prefill.
+    #[test]
+    fn wgsl_rope_reads_the_right_rows_deep_in_a_large_table_on_the_f16_backend() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let device = Default::default();
+        let (n_q, n_kv, d) = (4usize, 2usize, 128usize);
+        let max_position = 40_960usize;
+        let (cos, sin) = build_tables_scaled(d, 1_000_000.0, max_position, &RopeScaling::None);
+        for (seq, pos) in [(1usize, 40_000usize), (3, 40_957)] {
+            let qv = signal(n_q * seq * d, 1.3);
+            let kv = signal(n_kv * seq * d, 17.9);
+            let eq = reference(&qv, &cos, &sin, n_q, seq, d, pos);
+            let ek = reference(&kv, &cos, &sin, n_kv, seq, d, pos);
+            let qt: Tensor<UnfusedF16, 4> =
+                Tensor::from_data(TensorData::new(qv, [1, n_q, seq, d]), &device);
+            let kt: Tensor<UnfusedF16, 4> =
+                Tensor::from_data(TensorData::new(kv, [1, n_kv, seq, d]), &device);
+            let ct: Tensor<UnfusedF16, 2> =
+                Tensor::from_data(TensorData::new(cos.clone(), [max_position, d]), &device);
+            let st: Tensor<UnfusedF16, 2> =
+                Tensor::from_data(TensorData::new(sin.clone(), [max_position, d]), &device);
+            let (gq, gk) = try_rope_qk(qt, kt, ct, st, pos)
+                .expect("the f16 backend takes the kernel path deep in the table");
+            assert_close(
+                &gq.into_data().convert::<f32>().to_vec::<f32>().unwrap(),
+                &eq,
+                2e-3,
+                &format!("f16 rope q at pos {pos}, seq {seq}"),
+            );
+            assert_close(
+                &gk.into_data().convert::<f32>().to_vec::<f32>().unwrap(),
+                &ek,
+                2e-3,
+                &format!("f16 rope k at pos {pos}, seq {seq}"),
+            );
+        }
     }
 
     /// The dispatch guard, alone in its own process — see the rms_norm
