@@ -27,6 +27,10 @@ pub const PRESETS: &[(&str, &str, &str)] = &[
     ("smollm2-1.7b", "HuggingFaceTB/SmolLM2-1.7B-Instruct", "smollm2-1.7b"),
     ("qwen3-0.6b", "Qwen/Qwen3-0.6B", "qwen3-0.6b"),
     ("qwen3-0.6b-gguf", "Qwen/Qwen3-0.6B-GGUF", "qwen3-0.6b-gguf"),
+    ("qwen3-1.7b-gguf", "Qwen/Qwen3-1.7B-GGUF", "qwen3-1.7b-gguf"),
+    ("qwen3-4b-instruct-2507-gguf", "unsloth/Qwen3-4B-Instruct-2507-GGUF", "qwen3-4b-instruct-2507-gguf"),
+    ("qwen3-8b-gguf", "Qwen/Qwen3-8B-GGUF", "qwen3-8b-gguf"),
+    ("qwen3-14b-gguf", "Qwen/Qwen3-14B-GGUF", "qwen3-14b-gguf"),
     ("phi-3.1-mini", "bartowski/Phi-3.1-mini-4k-instruct-GGUF", "phi-3.1-mini-4k-instruct-gguf"),
     ("gemma-3-1b-gguf", "ggml-org/gemma-3-1b-it-GGUF", "gemma-3-1b-it-gguf"),
     ("smolvlm-256m", "HuggingFaceTB/SmolVLM-256M-Instruct", "smolvlm-256m"),
@@ -825,6 +829,23 @@ mod tests {
             .iter()
             .map(|p| TreeEntry { path: p.to_string(), r#type: "file".to_string() })
             .collect()
+    }
+
+    /// The reachable Qwen3 line for this engine (arch `qwen3`, dense):
+    /// the Hard candidate, the Deep card, the Medium refresh and the
+    /// better-Low candidate. The newer Qwen3.5/3.6/Next families are a
+    /// different architecture (linear-attention hybrids, MoE) and are not
+    /// offered until the engine can run them.
+    #[test]
+    fn the_qwen3_presets_name_their_repos_and_slugs() {
+        for (id, repo) in [
+            ("qwen3-1.7b-gguf", "Qwen/Qwen3-1.7B-GGUF"),
+            ("qwen3-8b-gguf", "Qwen/Qwen3-8B-GGUF"),
+            ("qwen3-14b-gguf", "Qwen/Qwen3-14B-GGUF"),
+            ("qwen3-4b-instruct-2507-gguf", "unsloth/Qwen3-4B-Instruct-2507-GGUF"),
+        ] {
+            assert_eq!(resolve_repo(id), (id.to_string(), repo.to_string()), "{id}");
+        }
     }
 
     #[test]
