@@ -207,7 +207,7 @@ impl<B: Backend> WhisperModel<B> {
         let (q, k, v) = (to_f32(q), to_f32(k), to_f32(v));
         let mut scores = safe_matmul(q, k.transpose()).mul_scalar(self.scale);
         if let Some(m) = mask {
-            scores = scores + m.clone().reshape([1, 1, q_len, kv_len]);
+            scores = add_mask(scores, m, q_len, kv_len);
         }
         let ctx = to_float(safe_matmul(softmax(scores, 3), v), out_dtype);
         let ctx = ctx.swap_dims(1, 2).reshape([batch, q_len, h * d]);
@@ -228,14 +228,29 @@ impl<B: Backend> WhisperModel<B> {
     /// Additive causal mask `[n, n]`: 0 on and below the diagonal, a large
     /// negative above. Built host-side — n is ≤ the 448 decoder context.
     fn causal_mask(&self, n: usize) -> Tensor<B, 2> {
-        let mut data = vec![0.0f32; n * n];
-        for r in 0..n {
-            for c in (r + 1)..n {
-                data[r * n + c] = f32::MIN / 2.0;
-            }
-        }
-        Tensor::from_data(TensorData::new(data, [n, n]), &self.device)
+        causal_mask(n, &self.device)
     }
+}
+
+/// The decoder's additive causal mask `[n, n]`: 0 on and below the
+/// diagonal, a large negative above. Born f32 on every build: `from_data`
+/// otherwise takes the device's dtype, and on the f16 build ±65,504 turns
+/// the fill into infinity.
+fn causal_mask<B: Backend>(n: usize, device: &Device<B>) -> Tensor<B, 2> {
+    let mut data = vec![0.0f32; n * n];
+    for r in 0..n {
+        for c in (r + 1)..n {
+            data[r * n + c] = f32::MIN / 2.0;
+        }
+    }
+    Tensor::from_data(TensorData::new(data, [n, n]), (device, burn::tensor::DType::F32))
+}
+
+/// The mask added to the f32 attention scores, in f32. An f32 tensor plus an
+/// f16 broadcast is not rejected on this backend; it silently returns wrong
+/// values — the decoder then reads as silence to the confidence gate.
+fn add_mask<B: Backend>(scores: Tensor<B, 4>, mask: &Tensor<B, 2>, q_len: usize, kv_len: usize) -> Tensor<B, 4> {
+    scores + to_f32(mask.clone()).reshape([1, 1, q_len, kv_len])
 }
 
 impl<B: Backend> SpeechToTextModel<B> for WhisperModel<B> {
@@ -382,5 +397,46 @@ mod tests {
         assert!(m[0 * 4 + 1] < -1e30);
         assert_eq!(m[3 * 4 + 3], 0.0);
         assert_eq!(m[3 * 4 + 0], 0.0);
+    }
+}
+
+#[cfg(test)]
+mod f16_mask_tests {
+    use super::*;
+    use crate::qlinear::UnfusedF16;
+    use burn::tensor::DType;
+
+    /// On the f16 backend the decoder's mask must still hide the future: a
+    /// masked softmax row puts no weight past the diagonal and matches the
+    /// host. The scores are f32 (attention lifts q/k/v); the mask is built the
+    /// way the decoder builds it.
+    #[test]
+    fn the_decoder_mask_hides_the_future_on_the_f16_backend() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let device: Device<UnfusedF16> = Default::default();
+        let n = 4usize;
+        let raw: Vec<f32> = (0..n * n).map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.37).collect();
+        let scores: Tensor<UnfusedF16, 4> =
+            Tensor::from_data(TensorData::new(raw.clone(), [1, 1, n, n]), (&device, DType::F32));
+        let mask = causal_mask::<UnfusedF16>(n, &device);
+        let probs = softmax(add_mask(scores, &mask, n, n), 3);
+        let got = probs.into_data().convert::<f32>().to_vec::<f32>().unwrap();
+        for r in 0..n {
+            let row: Vec<f64> = (0..=r).map(|c| raw[r * n + c] as f64).collect();
+            let max = row.iter().cloned().fold(f64::MIN, f64::max);
+            let z: f64 = row.iter().map(|v| (v - max).exp()).sum();
+            for c in 0..n {
+                let g = got[r * n + c];
+                assert!(g.is_finite(), "row {r} col {c}: non-finite {g}");
+                if c > r {
+                    assert!(g.abs() < 1e-6, "row {r} col {c}: the future got weight {g}");
+                } else {
+                    let e = ((raw[r * n + c] as f64 - max).exp() / z) as f32;
+                    assert!((g - e).abs() <= 1e-4, "row {r} col {c}: got {g}, expect {e}");
+                }
+            }
+        }
     }
 }
