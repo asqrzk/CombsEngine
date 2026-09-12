@@ -46,6 +46,19 @@ impl Subject {
         })
     }
 
+    /// The shape that goes into a RECORD: the model by name, never by
+    /// path. A committed baseline must not carry someone's home
+    /// directory, and a path makes a record impossible to compare
+    /// against a run on another machine.
+    pub fn to_json_for_record(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "model": crate::model::identity(&self.model),
+            "prompt_tokens": self.prompt_tokens,
+            "max_tokens": self.max_tokens,
+        })
+    }
+
     pub fn from_json(v: &serde_json::Value) -> Option<Self> {
         Some(Self {
             id: v["id"].as_str()?.to_string(),
@@ -119,8 +132,8 @@ fn failed(subject: &Subject, why: &str) -> Run {
     Run {
         id: subject.id.clone(),
         kind: "model".to_string(),
-        subject: subject.model.clone(),
-        config: subject.to_json(),
+        subject: crate::model::identity(&subject.model),
+        config: subject.to_json_for_record(),
         warm: false,
         values: Vec::new(),
         notes: vec![format!("no measurement: {why}")],
@@ -151,7 +164,10 @@ mod tests {
 
     /// A subject that produced nothing must still appear in the record,
     /// carrying why. A sweep that silently drops its failures reads as
-    /// complete when it is not.
+    /// complete when it is not. It is named rather than pathed, like
+    /// every other subject: a committed baseline must not publish
+    /// someone's home directory, and the hygiene gate refuses one that
+    /// does.
     #[test]
     fn a_failed_subject_is_recorded_not_erased() {
         let s = Subject {
@@ -165,6 +181,8 @@ mod tests {
         assert!(!run.warm, "a failure is never reported as a warm reading");
         assert_eq!(run.notes.len(), 1);
         assert!(run.notes[0].contains("the model does not exist"));
-        assert_eq!(run.subject, "/nowhere");
+        // Named, not pathed — even a failure must not carry a home
+        // directory into a record that may be committed.
+        assert_eq!(run.subject, "nowhere");
     }
 }

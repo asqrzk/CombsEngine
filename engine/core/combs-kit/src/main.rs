@@ -33,9 +33,11 @@
 //!   kit names the command; the person runs it.
 
 mod child;
+mod diff;
 mod doors;
 mod model;
 mod ops;
+mod report;
 mod machine;
 mod record;
 
@@ -104,6 +106,34 @@ enum Command {
         #[arg(long)]
         subject: String,
     },
+    /// Render a record as the ledger's own section shape, so a
+    /// measurement and its write-up cannot disagree.
+    Report {
+        record: std::path::PathBuf,
+        /// The section number this will be filed as.
+        #[arg(long, default_value = "N")]
+        section: String,
+        /// The one-sentence claim the section stands on.
+        #[arg(long, default_value = "what this run measured")]
+        claim: String,
+        #[arg(long, default_value = "today")]
+        date: String,
+        #[arg(long, default_value = "")]
+        branch: String,
+    },
+    /// Did it get worse? Compares two records figure by figure, knowing
+    /// which direction is better for each. Exits non-zero when anything
+    /// regressed past the band.
+    Diff {
+        before: std::path::PathBuf,
+        after: std::path::PathBuf,
+        /// How far a figure may move before it counts, in percent. Wide
+        /// by default: this estate has produced a 2.4x outlier from a
+        /// single reading, and a tool that cries regression at noise is
+        /// one people learn to ignore.
+        #[arg(long, default_value_t = 5.0)]
+        tolerance: f64,
+    },
     /// Answer one operation. Exit 0 when it works, 1 when it does not,
     /// 2 when the name is unknown — a question we did not understand is
     /// never answered "no".
@@ -145,6 +175,38 @@ fn main() {
             cmd_model(&path, &depths, tokens, json, out.as_deref())
         }
         Command::RunOne { subject } => cmd_run_one(&subject),
+        Command::Report { record, section, claim, date, branch } => {
+            match load(&record) {
+                Ok(rec) => {
+                    println!("{}", report::markdown(&rec, &section, &claim, &date, &branch));
+                    0
+                }
+                Err(e) => {
+                    eprintln!("combs-kit: {e}");
+                    1
+                }
+            }
+        }
+        Command::Diff { before, after, tolerance } => match (load(&before), load(&after)) {
+            (Ok(a), Ok(b)) => {
+                let v = diff::compare(&a, &b, tolerance);
+                if let Some(why) = v.refused {
+                    eprintln!("combs-kit: {why}");
+                    std::process::exit(2);
+                }
+                for line in &v.lines {
+                    println!("{line}");
+                }
+                if v.regressions > 0 {
+                    println!("\n{} figure(s) regressed past {}%.", v.regressions, tolerance);
+                }
+                i32::from(v.regressions > 0)
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("combs-kit: {e}");
+                1
+            }
+        },
     };
     std::process::exit(code);
 }
@@ -177,6 +239,21 @@ fn cmd_system(json: bool, out: Option<&std::path::Path>) -> i32 {
             1
         }
     }
+}
+
+fn load(path: &std::path::Path) -> Result<record::Record, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let rec: record::Record =
+        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    if rec.schema != record::SCHEMA {
+        return Err(format!(
+            "{} is schema {}, and this kit reads {}",
+            path.display(),
+            rec.schema,
+            record::SCHEMA
+        ));
+    }
+    Ok(rec)
 }
 
 fn cmd_model(

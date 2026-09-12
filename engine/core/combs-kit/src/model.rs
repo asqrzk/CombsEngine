@@ -58,6 +58,27 @@ pub fn resolve(path: &str) -> Result<String, String> {
     }
 }
 
+/// What a model is CALLED, as opposed to where it happens to sit.
+///
+/// A record carries this, never the path. Two reasons, and the second is
+/// the one that bit: a baseline naming a home directory's cache is
+/// not portable and cannot be compared against anyone else's run — and
+/// committing it would publish a home directory, which the hygiene gate
+/// refuses by name and was right to.
+pub fn identity(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    // A packed seat is a directory holding one file; the DIRECTORY is
+    // the name people use for it.
+    let named = if p.extension().is_some_and(|x| x == "gguf") {
+        p.parent().and_then(|d| d.file_name())
+    } else {
+        p.file_name()
+    };
+    named
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// Measure one subject. Runs INSIDE a child process; never call it from
 /// the parent.
 pub fn run_one(subject: &Subject) -> Run {
@@ -68,8 +89,8 @@ pub fn run_one(subject: &Subject) -> Run {
             return Run {
                 id: subject.id.clone(),
                 kind: "model".into(),
-                subject: subject.model.clone(),
-                config: subject.to_json(),
+                subject: identity(&subject.model),
+                config: subject.to_json_for_record(),
                 warm: false,
                 values: Vec::new(),
                 notes: vec![format!("no measurement: {e}")],
@@ -82,8 +103,8 @@ pub fn run_one(subject: &Subject) -> Run {
             return Run {
                 id: subject.id.clone(),
                 kind: "model".into(),
-                subject: subject.model.clone(),
-                config: subject.to_json(),
+                subject: identity(&subject.model),
+                config: subject.to_json_for_record(),
                 warm: false,
                 values: Vec::new(),
                 notes: vec![format!("no measurement: cannot open the model: {e}")],
@@ -98,8 +119,8 @@ pub fn run_one(subject: &Subject) -> Run {
             return Run {
                 id: subject.id.clone(),
                 kind: "model".into(),
-                subject: subject.model.clone(),
-                config: subject.to_json(),
+                subject: identity(&subject.model),
+                config: subject.to_json_for_record(),
                 warm: false,
                 values: Vec::new(),
                 notes: vec![format!("no measurement: cannot load the model: {e}")],
@@ -116,8 +137,8 @@ pub fn run_one(subject: &Subject) -> Run {
             return Run {
                 id: subject.id.clone(),
                 kind: "model".into(),
-                subject: subject.model.clone(),
-                config: subject.to_json(),
+                subject: identity(&subject.model),
+                config: subject.to_json_for_record(),
                 warm: false,
                 values: Vec::new(),
                 notes: vec![format!("no measurement: cannot encode the prompt: {e}")],
@@ -167,8 +188,8 @@ pub fn run_one(subject: &Subject) -> Run {
             return Run {
                 id: subject.id.clone(),
                 kind: "model".into(),
-                subject: subject.model.clone(),
-                config: subject.to_json(),
+                subject: identity(&subject.model),
+                config: subject.to_json_for_record(),
                 warm: true,
                 values: Vec::new(),
                 notes: vec![format!("no measurement: the measured generation failed: {e}")],
@@ -232,8 +253,8 @@ pub fn run_one(subject: &Subject) -> Run {
     Run {
         id: subject.id.clone(),
         kind: "model".into(),
-        subject: subject.model.clone(),
-        config: subject.to_json(),
+        subject: identity(&subject.model),
+        config: subject.to_json_for_record(),
         warm: true,
         values,
         notes,

@@ -1,0 +1,233 @@
+{
+  "schema": "combs-kit.v1",
+  "kit": "combs-kit 0.3.0",
+  "build": {
+    "cpu_backend": false,
+    "dtype": "f32",
+    "fusion": true,
+    "kit_version": "0.3.0",
+    "profile": "release",
+    "target": "aarch64-macos"
+  },
+  "machine": {
+    "arch": "aarch64",
+    "available_bytes": 12344229888,
+    "cpu": "Apple M3 Pro",
+    "gpu": {
+      "backend": "Metal",
+      "device_type": "IntegratedGpu",
+      "driver": " ()",
+      "features": "Features { features_wgpu: FeaturesWGPU(SHADER_FLOAT32_ATOMIC | TEXTURE_FORMAT_16BIT_NORM | TEXTURE_COMPRESSION_ASTC_HDR | TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES | TIMESTAMP_QUERY_INSIDE_ENCODERS | MAPPABLE_PRIMARY_BUFFERS | TEXTURE_BINDING_ARRAY | STORAGE_RESOURCE_BINDING_ARRAY | SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING | STORAGE_TEXTURE_ARRAY_NON_UNIFORM_INDEXING | PARTIALLY_BOUND_BINDING_ARRAY | ADDRESS_MODE_CLAMP_TO_ZERO | ADDRESS_MODE_CLAMP_TO_BORDER | POLYGON_MODE_LINE | VERTEX_WRITABLE_STORAGE | CLEAR_TEXTURE | MULTIVIEW | TEXTURE_ATOMIC | EXTERNAL_TEXTURE | SHADER_INT64 | SUBGROUP | SUBGROUP_BARRIER | SHADER_INT64_ATOMIC_MIN_MAX | TEXTURE_INT64_ATOMIC | EXPERIMENTAL_MESH_SHADER | PASSTHROUGH_SHADERS | SHADER_BARYCENTRICS | EXPERIMENTAL_COOPERATIVE_MATRIX), features_webgpu: FeaturesWebGPU(DEPTH_CLIP_CONTROL | DEPTH32FLOAT_STENCIL8 | TEXTURE_COMPRESSION_BC | TEXTURE_COMPRESSION_BC_SLICED_3D | TEXTURE_COMPRESSION_ETC2 | TEXTURE_COMPRESSION_ASTC | TEXTURE_COMPRESSION_ASTC_SLICED_3D | TIMESTAMP_QUERY | INDIRECT_FIRST_INSTANCE | SHADER_F16 | RG11B10UFLOAT_RENDERABLE | BGRA8UNORM_STORAGE | FLOAT32_FILTERABLE | FLOAT32_BLENDABLE | DUAL_SOURCE_BLENDING | IMMEDIATES | PRIMITIVE_INDEX) }",
+      "max_buffer_size": 9663676416,
+      "max_compute_invocations_per_workgroup": 1024,
+      "max_compute_workgroup_size_x": 1024,
+      "max_storage_buffer_binding_size": 4294967292,
+      "name": "Apple M3 Pro",
+      "subgroup_max_size": 64,
+      "subgroup_min_size": 4
+    },
+    "os": "macos",
+    "power": "ac",
+    "probes": {
+      "available_memory": true,
+      "process_footprint": true
+    },
+    "ram_bytes": 19327352832,
+    "shader_f16": true
+  },
+  "trust": {
+    "doctor": "not run",
+    "detail": "these are timings, not a verdict on the machine. Run `combs doctor`."
+  },
+  "runs": [
+    {
+      "id": "d4",
+      "kind": "model",
+      "subject": "qwen3-0.6b-gguf",
+      "config": {
+        "id": "d4",
+        "max_tokens": 16,
+        "model": "qwen3-0.6b-gguf",
+        "prompt_tokens": 4
+      },
+      "warm": true,
+      "values": [
+        {
+          "name": "load_ms",
+          "value": 1136.8005,
+          "unit": "ms",
+          "tier": "measured"
+        },
+        {
+          "name": "load_dispatches",
+          "value": 199.0,
+          "unit": "dispatches",
+          "tier": "measured"
+        },
+        {
+          "name": "prompt_tokens",
+          "value": 27.0,
+          "unit": "tokens",
+          "tier": "measured"
+        },
+        {
+          "name": "generated_tokens",
+          "value": 16.0,
+          "unit": "tokens",
+          "tier": "measured"
+        },
+        {
+          "name": "ttft_ms",
+          "value": 151.97816699999998,
+          "unit": "ms",
+          "tier": "measured"
+        },
+        {
+          "name": "prefill_tok_s",
+          "value": 177.65709728555944,
+          "unit": "tokens/s",
+          "tier": "measured"
+        },
+        {
+          "name": "decode_tok_s",
+          "value": 100.70645578734826,
+          "unit": "tokens/s",
+          "tier": "measured"
+        },
+        {
+          "name": "dispatches_per_token",
+          "value": 580.3125,
+          "unit": "dispatches/token",
+          "tier": "measured"
+        },
+        {
+          "name": "submits_per_token",
+          "value": 37.5,
+          "unit": "submits/token",
+          "tier": "measured"
+        },
+        {
+          "name": "prefill_dispatches",
+          "value": 1516.0,
+          "unit": "dispatches",
+          "tier": "measured"
+        },
+        {
+          "name": "us_per_dispatch",
+          "value": 17.11121163166397,
+          "unit": "us",
+          "tier": "derived",
+          "basis": "1e6 / decode_tok_s / dispatches_per_token"
+        },
+        {
+          "name": "pool_in_use_mb",
+          "value": 679.671875,
+          "unit": "MB",
+          "tier": "measured"
+        },
+        {
+          "name": "pool_reserved_mb",
+          "value": 679.671875,
+          "unit": "MB",
+          "tier": "measured"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "id": "d2000",
+      "kind": "model",
+      "subject": "qwen3-0.6b-gguf",
+      "config": {
+        "id": "d2000",
+        "max_tokens": 16,
+        "model": "qwen3-0.6b-gguf",
+        "prompt_tokens": 2000
+      },
+      "warm": true,
+      "values": [
+        {
+          "name": "load_ms",
+          "value": 507.38754200000005,
+          "unit": "ms",
+          "tier": "measured"
+        },
+        {
+          "name": "load_dispatches",
+          "value": 199.0,
+          "unit": "dispatches",
+          "tier": "measured"
+        },
+        {
+          "name": "prompt_tokens",
+          "value": 2185.0,
+          "unit": "tokens",
+          "tier": "measured"
+        },
+        {
+          "name": "generated_tokens",
+          "value": 16.0,
+          "unit": "tokens",
+          "tier": "measured"
+        },
+        {
+          "name": "ttft_ms",
+          "value": 4668.311458,
+          "unit": "ms",
+          "tier": "measured"
+        },
+        {
+          "name": "prefill_tok_s",
+          "value": 468.0493192577384,
+          "unit": "tokens/s",
+          "tier": "measured"
+        },
+        {
+          "name": "decode_tok_s",
+          "value": 48.97630670598415,
+          "unit": "tokens/s",
+          "tier": "measured"
+        },
+        {
+          "name": "dispatches_per_token",
+          "value": 606.5625,
+          "unit": "dispatches/token",
+          "tier": "measured"
+        },
+        {
+          "name": "submits_per_token",
+          "value": 39.375,
+          "unit": "submits/token",
+          "tier": "measured"
+        },
+        {
+          "name": "prefill_dispatches",
+          "value": 14693.0,
+          "unit": "dispatches",
+          "tier": "measured"
+        },
+        {
+          "name": "us_per_dispatch",
+          "value": 33.66188337283187,
+          "unit": "us",
+          "tier": "derived",
+          "basis": "1e6 / decode_tok_s / dispatches_per_token"
+        },
+        {
+          "name": "pool_in_use_mb",
+          "value": 679.671875,
+          "unit": "MB",
+          "tier": "measured"
+        },
+        {
+          "name": "pool_reserved_mb",
+          "value": 679.671875,
+          "unit": "MB",
+          "tier": "measured"
+        }
+      ],
+      "notes": []
+    }
+  ],
+  "verdicts": []
+}
