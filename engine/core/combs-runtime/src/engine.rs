@@ -453,6 +453,32 @@ impl Engine {
         // S2c: refuse what cannot fit BEFORE any allocation. The paged
         // arena math below is the same the observability snapshot uses.
         let meta_pre = source.metadata();
+        // int8 KV quantizes in groups of 32 along head_dim, so a model
+        // whose head_dim does not divide by 32 cannot use it. That used
+        // to be decided per call, deep in the cache, where it SILENTLY
+        // did nothing: the setting was accepted, no refusal was worded,
+        // and — worse — every memory figure the engine reported still
+        // priced the arena at the quantized rate it was not using. A
+        // person read a room that fit and got one that did not.
+        //
+        // One choke point now, where head_dim is already in hand: the
+        // request is turned down out loud and the flag is corrected, so
+        // the arithmetic below, the stats and the cache all agree.
+        let (effective_kv_quant, refusal) =
+            resolve_kv_quant(cache_config.quantize_kv, meta_pre.head_dim);
+        cache_config.quantize_kv = effective_kv_quant;
+        if let Some(words) = refusal {
+            eprintln!("combs: {words}");
+            combs_core::provenance::event(
+                "engine",
+                "kv.quant.refused",
+                &[
+                    ("head_dim", meta_pre.head_dim.to_string()),
+                    ("group", KV_QUANT_GROUP.to_string()),
+                    ("why", words),
+                ],
+            );
+        }
         let elem_bytes_pre: u64 = if cfg!(feature = "f16") { 2 } else { 4 };
         let pattern_pre = &meta_pre.attention_pattern;
         let globals = (0..meta_pre.num_hidden_layers)
@@ -1531,6 +1557,38 @@ fn run_generation(
     result
 }
 
+/// The quantization group int8 KV packs along `head_dim`.
+const KV_QUANT_GROUP: usize = 32;
+
+/// Can int8 KV apply to this model, and if not, the words for why.
+///
+/// This used to be decided per call, deep inside the cache, where it
+/// SILENTLY did nothing: the setting was accepted, nothing was worded,
+/// and every memory figure the engine reported still priced the arena
+/// at the quantized rate it was not using. Someone read a room that fit
+/// and got one that did not.
+///
+/// Pure, so the decision can be tested without a model on disk. Note
+/// the third case: a person who never asked for int8 KV is not told it
+/// was refused — a refusal for something nobody requested is noise, and
+/// noise is how real refusals stop being read.
+fn resolve_kv_quant(requested: bool, head_dim: usize) -> (bool, Option<String>) {
+    if !requested {
+        return (false, None);
+    }
+    if head_dim.is_multiple_of(KV_QUANT_GROUP) {
+        return (true, None);
+    }
+    (
+        false,
+        Some(format!(
+            "int8 KV was asked for and cannot apply to this model — head_dim {head_dim} does \
+             not divide by {KV_QUANT_GROUP}, the quantization group. The KV arena stays float \
+             and is priced as such."
+        )),
+    )
+}
+
 /// Merges `generation_config.json` sampler defaults over the built-in
 /// defaults. `None` fields keep the built-in default (greedy, no filters).
 pub(crate) fn default_config_from(sampler: Option<&SamplerConfig>) -> GenerationConfig {
@@ -1551,6 +1609,45 @@ pub(crate) fn default_config_from(sampler: Option<&SamplerConfig>) -> Generation
 
 #[cfg(test)]
 mod tests {
+    use super::{resolve_kv_quant, KV_QUANT_GROUP};
+
+    /// The group is the reason for the whole rule; if it moves, the
+    /// tests below must be read again rather than silently re-tuned.
+    #[test]
+    fn the_quantization_group_is_thirty_two() {
+        assert_eq!(KV_QUANT_GROUP, 32);
+    }
+
+    /// The silent no-op, pinned. A model whose head_dim does not divide
+    /// by the group must be REFUSED in words, and the flag corrected so
+    /// the arena arithmetic downstream stops reporting a size it is not
+    /// using.
+    #[test]
+    fn int8_kv_is_refused_in_words_when_the_head_dim_cannot_carry_it() {
+        // The common head dims: all multiples of the group.
+        for d in [64usize, 96, 128, 256] {
+            assert_eq!(resolve_kv_quant(true, d), (true, None), "head_dim {d}");
+        }
+        // gemma-3-1b's 80 is the real case this guards.
+        let (on, words) = resolve_kv_quant(true, 80);
+        assert!(!on, "the flag must be corrected, not merely ignored");
+        let words = words.expect("a refusal must be worded");
+        assert!(words.contains("80"), "name the head dim: {words}");
+        assert!(words.contains("32"), "name the group: {words}");
+        assert!(
+            words.contains("priced"),
+            "say that the memory figures follow the correction: {words}"
+        );
+    }
+
+    /// A refusal nobody asked for is noise, and noise is how real
+    /// refusals stop being read.
+    #[test]
+    fn a_model_that_never_asked_for_int8_kv_is_not_told_it_was_refused() {
+        assert_eq!(resolve_kv_quant(false, 80), (false, None));
+        assert_eq!(resolve_kv_quant(false, 128), (false, None));
+    }
+
     use super::*;
 
     #[test]

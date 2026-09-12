@@ -13,12 +13,14 @@ path = "src/main.rs"
 # The kit must be buildable in every flavour it measures: a record says
 # which build produced it, and comparing f16 against f32 is two records,
 # not two code paths.
-cpu = ["combs-core/cpu"]
-f16 = ["combs-core/f16"]
-f16-fusion = ["f16", "combs-core/f16-fusion"]
+cpu = ["combs-core/cpu", "combs-runtime/cpu"]
+f16 = ["combs-core/f16", "combs-runtime/f16"]
+f16-fusion = ["f16", "combs-core/f16-fusion", "combs-runtime/f16-fusion"]
 
 [dependencies]
 combs-core.workspace = true
+combs-formats = { path = "../combs-formats", version = "0.3.0" }
+combs-runtime = { path = "../combs-runtime", version = "0.3.0" }
 clap = { version = "4", features = ["derive"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

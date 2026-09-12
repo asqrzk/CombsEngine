@@ -1273,6 +1273,8 @@ version = "0.3.0"
 dependencies = [
  "clap",
  "combs-core",
+ "combs-formats",
+ "combs-runtime",
  "libc",
  "serde",
  "serde_json",

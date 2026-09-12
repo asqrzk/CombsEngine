@@ -142,9 +142,9 @@ pub const OPS: &[Op] = &[
         id: "int8-kv",
         title: "quantize the key-value cache to int8",
         wher: "any, head_dim not divisible by 32",
-        state: State::Unavailable,
-        reason: "the door NO-OPS SILENTLY on such a model: you set it, nothing refuses, and nothing changes. Check the model's head dim before believing the setting",
-        evidence: "combs-models/src/kv.rs",
+        state: State::Refused,
+        reason: "refused out loud at load, with the head dim and the group named, and the flag corrected so the arena is priced at what it actually uses. It used to no-op silently AND keep reporting the quantized size — a room that read as fitting and did not",
+        evidence: "combs-runtime/src/engine.rs resolve_kv_quant; the kv.quant.refused event",
     },
     Op {
         id: "software-rasterizer",
@@ -333,14 +333,18 @@ mod tests {
         assert_eq!(answer("no-such-operation", None), 2);
     }
 
-    /// A silently no-opping door is the most dangerous kind, so the
-    /// table must carry it as a row rather than leave it to folklore.
+    /// int8 KV on an unsuitable head dim was the estate's most
+    /// dangerous door: it did nothing, said nothing, and kept reporting
+    /// the memory it was not saving. It is refused out loud now, and
+    /// the table must say so rather than describe the old silence.
     #[test]
-    fn the_silent_no_ops_are_named() {
+    fn int8_kv_on_a_bad_head_dim_is_a_loud_refusal_now() {
         let kv = rows_for("int8-kv");
-        assert!(
-            kv.iter().any(|o| o.reason.contains("NO-OPS SILENTLY")),
-            "int8 kv on an unsuitable head dim must be a row"
-        );
+        let bad = kv
+            .iter()
+            .find(|o| o.wher.contains("not divisible"))
+            .expect("the unsuitable-head-dim row exists");
+        assert!(matches!(bad.state, State::Refused), "silence is not a state we keep");
+        assert!(bad.reason.contains("out loud"), "{}", bad.reason);
     }
 }
