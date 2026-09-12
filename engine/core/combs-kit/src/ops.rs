@@ -199,7 +199,7 @@ pub const OPS: &[Op] = &[
         title: "decode a Q5_K model through a hand-written gemv",
         wher: "any",
         state: State::Unavailable,
-        reason: "Q4_K, Q6_K and Q8_0 have gemv kernels; Q5_K has only the untiled cube path, so a Q5_K model decodes slowly. One roster model uses that format",
+        reason: "Q4_K, Q6_K and Q8_0 have gemv kernels; Q5_K has only the untiled cube path, so a Q5_K model decodes slowly. No roster model uses it today — phi-3.1-mini was thought to, and `combs inspect` says Q4_K + Q6_K",
         evidence: "combs-models/src/wgsl",
     },
     Op {

@@ -96,6 +96,14 @@ enum XCommand {
     Matrix,
     /// Assemble dist/<target>/ artifacts (library + include/combs.h).
     Bundle,
+    /// Build the host CLI and install it where the app looks for it,
+    /// behind the doctor: a binary that cannot pass `combs doctor` is not
+    /// installed. Keeps the previous one as `combs.prev`.
+    InstallBin {
+        /// Install the f32 build instead of the f16 default.
+        #[arg(long)]
+        f32: bool,
+    },
 }
 
 /// One row of the platform matrix.
@@ -612,14 +620,76 @@ fn cmd_matrix() {
     }
 }
 
+/// The road the app's engine binary takes to `~/.cache/combs/bin/combs`.
+///
+/// Until this existed the binary there was copied by hand once and then
+/// forgotten: on 2026-09-12 the app was serving every road from a build
+/// six days old, from before every kernel door of that week. The app's
+/// battery refuses a stale lantern-dev by name; the engine deserved the
+/// same law.
+///
+/// Two rules. The DOCTOR runs on the freshly built binary before it is
+/// installed — the RunPod lesson: a binary that cannot pass the doctor
+/// serves plausible garbage and calls itself healthy, and installing it
+/// would put that on every road at once. And the previous binary is kept
+/// beside the new one as `combs.prev`, so a bad install is one rename
+/// from undone.
+fn cmd_install_bin(ctx: &Ctx, f32: bool) -> Result<()> {
+    let built = if f32 {
+        let mut cmd = Command::new(cargo());
+        cmd.current_dir(&ctx.root)
+            .args(["build", "--release", "-p", "combs-cli"]);
+        eprintln!("== combs (f32) ==");
+        run(cmd)?;
+        ctx.root.join("target/release/combs")
+    } else {
+        build_f16_cli(ctx)?
+    };
+
+    eprintln!("== doctor, on the binary about to be installed ==");
+    let mut doctor = Command::new(&built);
+    doctor.args(["doctor", "--skip-e2e"]);
+    let status = doctor
+        .status()
+        .with_context(|| format!("running {}", built.display()))?;
+    if !status.success() {
+        bail!(
+            "combs doctor refused the freshly built binary — not installing it. \
+             A binary that cannot pass the doctor must not serve any road."
+        );
+    }
+
+    let home = std::env::var("HOME").context("HOME is not set")?;
+    let bin_dir = PathBuf::from(home).join(".cache/combs/bin");
+    std::fs::create_dir_all(&bin_dir)?;
+    let target = bin_dir.join("combs");
+    if target.exists() {
+        let prev = bin_dir.join("combs.prev");
+        std::fs::rename(&target, &prev)
+            .with_context(|| format!("keeping the previous binary as {}", prev.display()))?;
+        eprintln!("previous binary kept as {}", prev.display());
+    }
+    std::fs::copy(&built, &target)
+        .with_context(|| format!("copying {} to {}", built.display(), target.display()))?;
+
+    eprintln!("== installed ==");
+    let mut info = Command::new(&target);
+    info.arg("build-info");
+    run(info)?;
+    Ok(())
+}
+
 fn cmd_bundle(ctx: &Ctx) -> Result<()> {
     let dist = ctx.root.join("dist");
     std::fs::create_dir_all(&dist)?;
 
     // Host CLI, both float variants. `combs` is the f16 build (fleet-wide
-    // perplexity deltas under 0.2% and faster throughout; diffusion is
-    // pinned to f32 internally either way); `combs-f32` ships alongside
-    // for full-precision runs.
+    // perplexity deltas under 0.2%; diffusion is pinned to f32 internally
+    // either way); `combs-f32` ships alongside. "Faster throughout" used
+    // to stand here and was wrong: without fusion the f16 build paid 1.3-
+    // 4.2x the dispatches (MEASUREMENTS §90) until the kernel doors took
+    // f16 (§92, §96, §97). Halved dense weights and a halved KV arena are
+    // what it buys; the speed question is measured per seat, not assumed.
     {
         let mut cmd = Command::new(cargo());
         cmd.current_dir(&ctx.root)
@@ -717,6 +787,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         XCommand::Bundle => cmd_bundle(&ctx),
+        XCommand::InstallBin { f32 } => cmd_install_bin(&ctx, f32),
     }
 }
 

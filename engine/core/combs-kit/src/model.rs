@@ -230,6 +230,29 @@ pub fn run_one(subject: &Subject) -> Run {
             "1e6 / decode_tok_s / dispatches_per_token",
         ));
     }
+    // What a room costs and how large one this seat may hold: the two
+    // figures a posture card is priced from. Before this they were read
+    // off a running server's stats by hand.
+    let cfg = engine.cache_config();
+    let snap = engine.stats_snapshot();
+    if cfg.page_size > 0 {
+        values.push(Value::measured(
+            "kv_bytes_per_token",
+            snap.kv_page_bytes as f64 / cfg.page_size as f64,
+            "bytes/token",
+        ));
+    }
+    values.push(Value::measured(
+        "arena_max_tokens",
+        cfg.max_seq_len as f64,
+        "tokens",
+    ));
+    values.push(Value::measured(
+        "kv_int8",
+        if cfg.quantize_kv { 1.0 } else { 0.0 },
+        "bool",
+    ));
+
     // Sampled between generations, never during one: reading the pool is
     // a blocking submit on the compute stream.
     if let Some(mem) = combs_core::gpu_memory(&combs_core::init_device()) {
@@ -286,6 +309,16 @@ pub fn print_run(run: &Run) {
         get("us_per_dispatch"),
         get("pool_in_use_mb"),
     );
+    let kv = get("kv_bytes_per_token");
+    if kv.is_finite() {
+        println!(
+            "  {:<8} kv {:>7.0} B/token{} | arena {:>6.0} tokens",
+            "",
+            kv,
+            if get("kv_int8") == 1.0 { " (int8)" } else { "" },
+            get("arena_max_tokens"),
+        );
+    }
 }
 
 #[cfg(test)]
