@@ -1,4 +1,4 @@
-// Split-K decode gemv over a packed Q6_K table — the q8 kernel's
+{{f16_enable}}// Split-K decode gemv over a packed Q6_K table — the q8 kernel's
 // occupancy shape with Q6_K's arithmetic mirrored from
 // q6_k_dequant_kernel: q = ((ql nibble) | (qh 2-bit << 4)) − 32, times
 // d · scales[i8], one i8 scale per 16 values (two per 32-value chunk,
@@ -9,12 +9,12 @@ struct Params {
   k: vec2<u32>,
 }
 
-@group(0) @binding(0) var<storage, read_write> x: array<vec4<f32>>;
+@group(0) @binding(0) var<storage, read_write> x: array<{{act4}}>;
 @group(0) @binding(1) var<storage, read_write> ql: array<u32>;
 @group(0) @binding(2) var<storage, read_write> qh: array<u32>;
 @group(0) @binding(3) var<storage, read_write> sc: array<u32>;
 @group(0) @binding(4) var<storage, read_write> d: array<f32>;
-@group(0) @binding(5) var<storage, read_write> out: array<f32>;
+@group(0) @binding(5) var<storage, read_write> out: array<{{act}}>;
 @group(0) @binding(6) var<uniform> params: Params;
 
 var<workgroup> partial: array<f32, 256>;
@@ -61,7 +61,7 @@ fn main(
       for (var w = 0u; w < 8u; w += 1u) {
         let lw = ql[qlb + w];
         let hw = qh[qhb + w];
-        let xv = x[xb + w];
+        let xv = vec4<f32>(x[xb + w]);
         let q0 = f32(((lw >> nib_shift) & 0xfu) | (((hw >> h_shift) & 3u) << 4u)) - 32.0;
         let q1 = f32(((lw >> (8u + nib_shift)) & 0xfu) | (((hw >> (8u + h_shift)) & 3u) << 4u)) - 32.0;
         let q2 = f32(((lw >> (16u + nib_shift)) & 0xfu) | (((hw >> (16u + h_shift)) & 3u) << 4u)) - 32.0;
@@ -85,6 +85,6 @@ fn main(
     workgroupBarrier();
   }
   if (lane == 0u && row < params.n_out.x) {
-    out[row] = partial[local];
+    out[row] = {{act}}(partial[local]);
   }
 }

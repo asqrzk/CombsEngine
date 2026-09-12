@@ -95,8 +95,8 @@ pub const OPS: &[Op] = &[
         title: "hand-written kernels that read and write f16 directly",
         wher: "macos / metal",
         state: State::Works,
-        reason: "rmsnorm and attention read and write f16 in place with f32 arithmetic; perplexity identical to four decimals, five of five transcripts byte-identical; decode doubles at 2.2k. On by default here",
-        evidence: "MEASUREMENTS §96, §97, §98",
+        reason: "rmsnorm, attention and the three projection gemvs read and write f16 in place with f32 arithmetic; perplexity identical to four decimals, five of five transcripts byte-identical; decode doubles at 2.2k. On by default here",
+        evidence: "MEASUREMENTS §96, §97, §98, §100",
     },
     Op {
         id: "f16-storage-kernels",

@@ -1,4 +1,4 @@
-// Split-K decode gemv over a packed Q8_0 table: y = W·x for one token.
+{{f16_enable}}// Split-K decode gemv over a packed Q8_0 table: y = W·x for one token.
 //
 // The #[cube] untiled gemv launches one thread per output row — 1–3k
 // threads for the per-layer projections, an order of magnitude under
@@ -21,10 +21,10 @@ struct Params {
   k: vec2<u32>,
 }
 
-@group(0) @binding(0) var<storage, read_write> x: array<vec4<f32>>;
+@group(0) @binding(0) var<storage, read_write> x: array<{{act4}}>;
 @group(0) @binding(1) var<storage, read_write> qs: array<u32>;
 @group(0) @binding(2) var<storage, read_write> d: array<f32>;
-@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<{{act}}>;
 @group(0) @binding(4) var<uniform> params: Params;
 
 var<workgroup> partial: array<f32, 256>;
@@ -59,7 +59,7 @@ fn main(
       var s = 0.0;
       for (var w = 0u; w < 8u; w += 1u) {
         let word = qs[qbase + w];
-        let xv = x[xbase + w];
+        let xv = vec4<f32>(x[xbase + w]);
         s += sext8(word, 0u) * xv.x;
         s += sext8(word, 1u) * xv.y;
         s += sext8(word, 2u) * xv.z;
@@ -79,6 +79,6 @@ fn main(
   }
 
   if (lane == 0u && row < params.n_out.x) {
-    out[row] = partial[local];
+    out[row] = {{act}}(partial[local]);
   }
 }

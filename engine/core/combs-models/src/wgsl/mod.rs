@@ -255,9 +255,9 @@ wgsl_kernel_dual!(DecodeAttnSplit, "decode_attn_split.wgsl");
 wgsl_kernel_dual!(DecodeAttnCombine, "decode_attn_combine.wgsl");
 wgsl_kernel!(PrefillAttn, "prefill_attn.wgsl");
 wgsl_kernel!(RopeQk, "rope.wgsl");
-wgsl_kernel!(DecodeGemvQ8, "decode_gemv_q8.wgsl");
-wgsl_kernel!(DecodeGemvQ4K, "decode_gemv_q4k.wgsl");
-wgsl_kernel!(DecodeGemvQ6K, "decode_gemv_q6k.wgsl");
+wgsl_kernel_dual!(DecodeGemvQ8, "decode_gemv_q8.wgsl");
+wgsl_kernel_dual!(DecodeGemvQ4K, "decode_gemv_q4k.wgsl");
+wgsl_kernel_dual!(DecodeGemvQ6K, "decode_gemv_q6k.wgsl");
 
 /// Door for the split-K decode gemv (`COMBS_WGSL_GEMV=0` restores the
 /// cube untiled kernel); read once, like every door here.
@@ -294,15 +294,16 @@ pub(crate) enum GemvKernel {
 pub(crate) fn launch_gemv(
     client: &cubecl::prelude::ComputeClient<WgpuRuntime>,
     kernel: GemvKernel,
+    storage: Storage,
     workgroups: u32,
     buffers: Vec<Binding>,
     scalars: Vec<u64>,
 ) {
     let count = CubeCount::Static(workgroups, 1, 1);
     match kernel {
-        GemvKernel::Q8 => launch(client, DecodeGemvQ8, count, buffers, scalars),
-        GemvKernel::Q4K => launch(client, DecodeGemvQ4K, count, buffers, scalars),
-        GemvKernel::Q6K => launch(client, DecodeGemvQ6K, count, buffers, scalars),
+        GemvKernel::Q8 => launch(client, DecodeGemvQ8(storage), count, buffers, scalars),
+        GemvKernel::Q4K => launch(client, DecodeGemvQ4K(storage), count, buffers, scalars),
+        GemvKernel::Q6K => launch(client, DecodeGemvQ6K(storage), count, buffers, scalars),
     }
 }
 
@@ -734,7 +735,7 @@ async fn gemv_canary(
             .map_err(|e| format!("q8_0 pack failed: {e}"))?;
             let dense = combs_formats::quants::dequantize_q8_0(&data, n_out * k)
                 .map_err(|e| format!("q8_0 reference failed: {e}"))?;
-            (dense, w.decode_gemv_wgsl(client, x_h))
+            (dense, w.decode_gemv_wgsl(client, x_h, Storage::F32))
         }
         "q4_k" => {
             let data = synth(144, &[0, 2]);
@@ -744,7 +745,7 @@ async fn gemv_canary(
             .map_err(|e| format!("q4_k pack failed: {e}"))?;
             let dense = combs_formats::quants::dequantize_q4_k(&data, n_out * k)
                 .map_err(|e| format!("q4_k reference failed: {e}"))?;
-            (dense, w.decode_gemv_wgsl(client, x_h))
+            (dense, w.decode_gemv_wgsl(client, x_h, Storage::F32))
         }
         _ => {
             let data = synth(210, &[208]);
@@ -754,7 +755,7 @@ async fn gemv_canary(
             .map_err(|e| format!("q6_k pack failed: {e}"))?;
             let dense = combs_formats::quants::dequantize_q6_k(&data, n_out * k)
                 .map_err(|e| format!("q6_k reference failed: {e}"))?;
-            (dense, w.decode_gemv_wgsl(client, x_h))
+            (dense, w.decode_gemv_wgsl(client, x_h, Storage::F32))
         }
     };
     let bytes = client
@@ -1160,6 +1161,130 @@ mod tests {
         assert!(!storage_door_default(false, None), "unproven elsewhere: shut by default");
         assert!(!storage_door_default(true, Some("0")), "the off switch wins on Apple");
         assert!(storage_door_default(false, Some("1")), "the on switch wins elsewhere");
+    }
+
+    /// The three projection shaders render for f32 EXACTLY as the audited
+    /// files did — no `enable`, no f16, no unfilled placeholder — and for
+    /// f16 with the directive on line one and the partials still f32.
+    /// Narrowing the accumulator is the one thing §66 forbids outright.
+    #[test]
+    fn the_gemv_renderings_hold_the_storage_contract() {
+        use burn_cubecl::template::KernelSource;
+        let f32s = [
+            DecodeGemvQ8(Storage::F32).source().complete(),
+            DecodeGemvQ4K(Storage::F32).source().complete(),
+            DecodeGemvQ6K(Storage::F32).source().complete(),
+        ];
+        for (i, t) in f32s.iter().enumerate() {
+            assert!(!t.contains("enable"), "gemv {i}: an f32 shader enables nothing");
+            assert!(!t.contains("f16"), "gemv {i}: no f16 in the f32 rendering");
+            assert!(!t.contains("{{"), "gemv {i}: a placeholder reached the compiler");
+            assert!(t.contains("x: array<vec4<f32>>"), "gemv {i}: f32 bindings");
+        }
+        let f16s = [
+            DecodeGemvQ8(Storage::F16).source().complete(),
+            DecodeGemvQ4K(Storage::F16).source().complete(),
+            DecodeGemvQ6K(Storage::F16).source().complete(),
+        ];
+        for (i, t) in f16s.iter().enumerate() {
+            assert!(t.starts_with("enable f16;"), "gemv {i}: the directive is line one");
+            assert!(t.contains("x: array<vec4<f16>>"), "gemv {i}: f16 activations");
+            assert!(t.contains("out: array<f16>"), "gemv {i}: f16 output");
+            assert!(
+                t.contains("var<workgroup> partial: array<f32, 256>"),
+                "gemv {i}: the partials stay f32 in every rendering"
+            );
+            assert!(!t.contains("{{"), "gemv {i}: a placeholder reached the compiler");
+        }
+    }
+
+    /// The f16-STORAGE gemv per format, against the host dequant
+    /// reference on an activation ROUNDED to f16 first — so operand
+    /// rounding is not scored as kernel error. The dot is f32 over f16
+    /// operands with one f16 store rounding at the end: rel 1e-3, where a
+    /// real mistake lands near 1e0. Skips by name where the adapter does
+    /// not admit f16.
+    #[test]
+    fn f16_storage_gemv_matches_the_host_on_rounded_input() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        use cubecl::prelude::*;
+        let device = cubecl::wgpu::WgpuDevice::default();
+        let client = WgpuRuntime::client(&device);
+        if !f16_storage_enabled_for_test(&client) {
+            eprintln!("skipped: this adapter does not admit f16 in a shader");
+            return;
+        }
+        let (n_out, k) = (211usize, 1024usize);
+        let synth = |format: &str, block_bytes: usize, scale_offsets: &[usize]| -> Vec<u8> {
+            let blocks = match format {
+                "q8_0" => n_out * k / 32,
+                _ => n_out * k / 256,
+            };
+            let mut data: Vec<u8> = (0..blocks * block_bytes)
+                .map(|i| ((i * 37 + 11) % 251) as u8)
+                .collect();
+            for b in 0..blocks {
+                for (which, &off) in scale_offsets.iter().enumerate() {
+                    let bits: u16 = if which == 0 { 0x3C00 } else { 0x3400 };
+                    data[b * block_bytes + off..b * block_bytes + off + 2]
+                        .copy_from_slice(&bits.to_le_bytes());
+                }
+            }
+            data
+        };
+        // The activation, rounded the way the f16 binding will hold it —
+        // and SCALED DOWN, because the synthetic weights (unit scales,
+        // 6-bit values, k = 1024) drive the f32 canary's dot products to
+        // ~80,000, past f16's 65,504. The first run of this test stored
+        // infinity there and was RIGHT to: that is what an f16 store does.
+        // It is not a kernel defect — a real model already lives within
+        // f16 on this backend, so an activation that large would already
+        // have broken before any projection — it is a fixture that only
+        // f32 could hold. The scale keeps the reference honest and the
+        // outputs inside the format the kernel is being asked to write.
+        let x: Vec<f32> = (0..k)
+            .map(|i| f32::from(burn::tensor::f16::from_f32((((i as f32 * 0.311).sin() * 1.4) - 0.1) / 32.0)))
+            .collect();
+        let x_bytes: Vec<u8> = x
+            .iter()
+            .flat_map(|v| burn::tensor::f16::from_f32(*v).to_le_bytes())
+            .collect();
+        for format in ["q8_0", "q4_k", "q6_k"] {
+            let x_h = client.create_from_slice(&x_bytes);
+            let (dense, out_h) = match format {
+                "q8_0" => {
+                    let data = synth(format, 34, &[0]);
+                    let w = crate::qmatmul::Q80Weight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
+                    (combs_formats::quants::dequantize_q8_0(&data, n_out * k).unwrap(), w.decode_gemv_wgsl(&client, x_h, Storage::F16))
+                }
+                "q4_k" => {
+                    let data = synth(format, 144, &[0, 2]);
+                    let w = crate::qmatmul::Q4KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
+                    (combs_formats::quants::dequantize_q4_k(&data, n_out * k).unwrap(), w.decode_gemv_wgsl(&client, x_h, Storage::F16))
+                }
+                _ => {
+                    let data = synth(format, 210, &[208]);
+                    let w = crate::qmatmul::Q6KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
+                    (combs_formats::quants::dequantize_q6_k(&data, n_out * k).unwrap(), w.decode_gemv_wgsl(&client, x_h, Storage::F16))
+                }
+            };
+            let bytes = cubecl::future::block_on(client.read_async(vec![out_h])).unwrap();
+            let got: Vec<f32> = bytes[0]
+                .chunks_exact(2)
+                .map(|c| f32::from(burn::tensor::f16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            assert_eq!(got.len(), n_out, "{format}: the f16 output has one row per output");
+            for r in 0..n_out {
+                let expect: f32 = (0..k).map(|c| x[c] * dense[r * k + c]).sum();
+                let g = got[r];
+                assert!(
+                    g.is_finite() && (g - expect).abs() <= 1e-3 * expect.abs().max(1.0),
+                    "{format} f16 gemv wrong at row {r}: got {g}, expected {expect}"
+                );
+            }
+        }
     }
 
     #[test]

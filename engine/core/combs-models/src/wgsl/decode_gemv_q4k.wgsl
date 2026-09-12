@@ -1,4 +1,4 @@
-// Split-K decode gemv over a packed Q4_K table — decode_gemv_q8's
+{{f16_enable}}// Split-K decode gemv over a packed Q4_K table — decode_gemv_q8's
 // occupancy shape (16 rows x 16 lanes per workgroup, lane-strided
 // 32-value chunks, smem tree combine) with Q4_K's arithmetic mirrored
 // from q4_k_dequant_kernel: per sub-block, value = (d·sc)·q − (dmin·m),
@@ -11,11 +11,11 @@ struct Params {
   k: vec2<u32>,
 }
 
-@group(0) @binding(0) var<storage, read_write> x: array<vec4<f32>>;
+@group(0) @binding(0) var<storage, read_write> x: array<{{act4}}>;
 @group(0) @binding(1) var<storage, read_write> qs: array<u32>;
 @group(0) @binding(2) var<storage, read_write> dd: array<f32>;
 @group(0) @binding(3) var<storage, read_write> scales: array<u32>;
-@group(0) @binding(4) var<storage, read_write> out: array<f32>;
+@group(0) @binding(4) var<storage, read_write> out: array<{{act}}>;
 @group(0) @binding(5) var<uniform> params: Params;
 
 var<workgroup> partial: array<f32, 256>;
@@ -71,7 +71,7 @@ fn main(
       var s2 = 0.0;
       for (var w = 0u; w < 8u; w += 1u) {
         let word = qs[wb + w];
-        let xv = x[xb + w];
+        let xv = vec4<f32>(x[xb + w]);
         s1 += f32((word >> (shift)) & 0xfu) * xv.x;
         s1 += f32((word >> (8u + shift)) & 0xfu) * xv.y;
         s1 += f32((word >> (16u + shift)) & 0xfu) * xv.z;
@@ -90,6 +90,6 @@ fn main(
     workgroupBarrier();
   }
   if (lane == 0u && row < params.n_out.x) {
-    out[row] = partial[local];
+    out[row] = {{act}}(partial[local]);
   }
 }

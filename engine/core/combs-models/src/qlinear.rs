@@ -518,11 +518,36 @@ impl QuantLinearOp<UnfusedF32> for CubeQuantLinear {
 
 impl QuantLinearOp<UnfusedF16> for CubeQuantLinear {
     fn forward(&self, x: Tensor<UnfusedF16, 3>) -> Tensor<UnfusedF16, 3> {
-        // Casting the (small) activation up costs nothing next to the
-        // weight win, and the f32-accumulated matmul is *better*
-        // numerically than an f16 one.
         let in_dtype = x.dtype();
         let [batch, seq, _] = x.dims();
+
+        // The f16 road: at the decode shape, on a format with a gemv
+        // kernel, where the adapter admits f16 and the door is open, the
+        // kernel reads the f16 activation in place and writes f16 back.
+        // Two casts a projection disappear — roughly 840 dispatches a
+        // token on a 28-layer model, most of what f16 still paid after
+        // the other doors opened. The decision is asked BEFORE anything
+        // is cast, because the alternative — handing f16 bytes to the
+        // dense path — reads them as f32 and returns garbage silently.
+        if in_dtype == DType::F16 && batch * seq == 1 && self.w.takes_wgsl_gemv(1) {
+            let prim = x.clone().into_primitive().tensor();
+            if crate::wgsl::f16_storage_enabled(&prim.client) {
+                let prim = into_contiguous(prim);
+                let out_h = self.w.matmul_device_f16(&prim.client, prim.handle.clone(), 1);
+                let out = CubeTensor::new_contiguous(
+                    prim.client.clone(),
+                    prim.device.clone(),
+                    Shape::from([batch, seq, self.w.n_out()]),
+                    out_h,
+                    DType::F16,
+                );
+                return Tensor::from_primitive(TensorPrimitive::Float(out));
+            }
+        }
+
+        // The cast road. Casting the (small) activation up costs nothing
+        // next to the weight win, and the f32-accumulated matmul is
+        // *better* numerically than an f16 one.
         let prim = to_f32(x).into_primitive().tensor();
         let out = self.forward_cube(prim, batch, seq);
         to_dtype(
@@ -741,6 +766,64 @@ pub fn try_quant_linear<B: Backend>(
 
 #[cfg(test)]
 mod tests {
+
+    /// The decision at the seam: an f16 activation at the decode shape
+    /// takes the f16 road (proven by the OUTPUT dtype — no counter, they
+    /// are process-wide), and matches the cast road's answer; at a
+    /// prefill shape it takes the cast road as before. Skips by name
+    /// where the adapter does not admit f16.
+    #[test]
+    fn an_f16_activation_takes_the_f16_road_only_at_the_decode_shape() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        use cubecl::prelude::*;
+        let device = WgpuDevice::default();
+        let client = WgpuRuntime::client(&device);
+        if !crate::wgsl::f16_storage_enabled_for_test(&client) {
+            eprintln!("skipped: this adapter does not admit f16 in a shader");
+            return;
+        }
+        let (n_out, k) = (96usize, 512usize);
+        let blocks = n_out * k / 32;
+        let mut data: Vec<u8> = (0..blocks * 34).map(|i| ((i * 37 + 11) % 251) as u8).collect();
+        for b in 0..blocks {
+            data[b * 34..b * 34 + 2].copy_from_slice(&0x3C00u16.to_le_bytes());
+        }
+        let w = crate::qmatmul::Q80Weight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
+        let w = std::sync::Arc::new(QuantWeight::Q80(w));
+        let f16_lin = quant_linear_from_weight::<UnfusedF16>(w.clone()).expect("f16 backend admitted");
+        let f32_lin = quant_linear_from_weight::<UnfusedF32>(w).expect("f32 backend admitted");
+
+        let dev = Default::default();
+        for (m, road) in [(1usize, "f16"), (8usize, "cast")] {
+            let xs: Vec<f32> = (0..m * k)
+                .map(|i| f32::from(burn::tensor::f16::from_f32(((i as f32 * 0.311).sin() * 1.4) - 0.1)))
+                .collect();
+            // `Tensor` in this module's prelude is cubecl's; name burn's.
+            let x16: burn::tensor::Tensor<UnfusedF16, 3> = crate::wgsl::from_f32(
+                burn::tensor::Tensor::from_data(burn::tensor::TensorData::new(xs.clone(), [1, m, k]), &dev),
+                burn::tensor::DType::F16,
+            );
+            assert_eq!(x16.dtype(), burn::tensor::DType::F16, "the fixture must be f16 before the seam sees it");
+            let x32: burn::tensor::Tensor<UnfusedF32, 3> =
+                burn::tensor::Tensor::from_data(burn::tensor::TensorData::new(xs, [1, m, k]), &dev);
+            let got16 = f16_lin.forward(x16);
+            assert_eq!(got16.dtype(), burn::tensor::DType::F16, "{road}: the f16 backend hands back f16");
+            let got: Vec<f32> = got16.into_data().convert::<f32>().to_vec().unwrap();
+            // Convert on the f32 side too: burn resolves a tensor's dtype
+            // from per-device defaults, so an f32 backend on a device the
+            // f16 backend touched first hands back f16 — the quirk this
+            // file's own comment above `to_f32` names.
+            let want: Vec<f32> = f32_lin.forward(x32).into_data().convert::<f32>().to_vec().unwrap();
+            for (i, (g, e)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    g.is_finite() && (g - e).abs() <= 2e-3 * e.abs().max(1.0),
+                    "{road} road, m={m}, [{i}]: got {g}, expected {e}"
+                );
+            }
+        }
+    }
     use super::*;
     use burn::tensor::TensorData;
     use combs_formats::QuantFormat;
