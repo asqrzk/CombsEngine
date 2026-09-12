@@ -195,10 +195,10 @@ pub const DOORS: &[Door] = &[
     Door {
         kind: Kind::Knob,
         name: "COMBS_WGSL_F16",
-        default: "off",
-        does: "let the hand-written kernels store activations in f16 instead of casting around an f32 launch; arithmetic stays f32 either way. Opt-in until it has sat on a box where bytes cost more than launches",
+        default: "on (Apple/Metal, where it is blessed); off elsewhere until a Vulkan sitting; 0/1 wins",
+        does: "let the hand-written kernels store activations in f16 instead of casting around an f32 launch; arithmetic stays f32 either way. Attention reads the f16 arena in place, which is where decode doubles at depth",
         read_at: "combs-models/src/wgsl/mod.rs f16_storage_enabled",
-        measured: Some("MEASUREMENTS §96"),
+        measured: Some("MEASUREMENTS §96, §97, §98"),
     },
 
     // ── knobs the table lacked until the drift test named them ──

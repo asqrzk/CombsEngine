@@ -93,10 +93,18 @@ pub const OPS: &[Op] = &[
     Op {
         id: "f16-storage-kernels",
         title: "hand-written kernels that read and write f16 directly",
-        wher: "native, adapter reporting SHADER_F16",
+        wher: "macos / metal",
+        state: State::Works,
+        reason: "rmsnorm and attention read and write f16 in place with f32 arithmetic; perplexity identical to four decimals, five of five transcripts byte-identical; decode doubles at 2.2k. On by default here",
+        evidence: "MEASUREMENTS §96, §97, §98",
+    },
+    Op {
+        id: "f16-storage-kernels",
+        title: "hand-written kernels that read and write f16 directly",
+        wher: "vulkan / dx12 (linux, windows, android)",
         state: State::Unproven,
-        reason: "the adapter admits it and a probe proved f16 operands with an f32 accumulator match the host, but no kernel has been written yet. `combs-kit system` says whether this adapter admits it",
-        evidence: "MEASUREMENTS §66",
+        reason: "the kernels exist and the adapter check is the same, but a shader `enable` directive is exactly what a second driver may handle differently. Off by default there until one sitting; COMBS_WGSL_F16=1 opens it for the sitting",
+        evidence: "MEASUREMENTS §97; the matrix's own rule that a default is a promise to every box",
     },
     Op {
         id: "fused-f16-backend",

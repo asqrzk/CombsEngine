@@ -84,6 +84,25 @@ impl Storage {
     }
 }
 
+/// The storage door's default, as a pure decision so the walk is the
+/// test.
+///
+/// `COMBS_WGSL_F16=0` shuts it and `=1` opens it anywhere the adapter
+/// admits the type. Unset, it is OPEN on macOS — where AutoGraphicsApi
+/// resolves to Metal and nothing else, and where the road was blessed
+/// (§98: perplexity identical to four decimals, five of five transcripts
+/// byte-identical; §97: decode doubles at depth) — and SHUT elsewhere
+/// until one Vulkan sitting has proven it there. A shader `enable`
+/// directive is exactly the kind of thing a second driver may handle
+/// differently, and a default is a promise to every box at once.
+pub(crate) fn storage_door_default(on_macos: bool, env: Option<&str>) -> bool {
+    match env {
+        Some("0") => false,
+        Some("1") => true,
+        _ => on_macos,
+    }
+}
+
 /// May this box store kernel activations in f16?
 ///
 /// Four conditions, and each is load-bearing. Never in a browser (the
@@ -101,7 +120,9 @@ pub(crate) fn f16_storage_enabled(
         return false;
     }
     static ASKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ASKED.get_or_init(|| matches!(std::env::var("COMBS_WGSL_F16").as_deref(), Ok("1"))) {
+    if !*ASKED.get_or_init(|| {
+        storage_door_default(cfg!(target_os = "macos"), std::env::var("COMBS_WGSL_F16").ok().as_deref())
+    }) {
         return false;
     }
     client
@@ -1131,6 +1152,16 @@ mod tests {
     /// The exact probe the browser runs, on the native compiler — when
     /// the Chrome probe fails a canary that passes here, the divergence
     /// is Tint's, not the fixture's.
+    /// The default is a promise to every box at once, so it opens only
+    /// where it has been blessed and the switch wins in both directions.
+    #[test]
+    fn the_storage_door_defaults_open_only_where_it_is_blessed() {
+        assert!(storage_door_default(true, None), "blessed on Apple: open by default");
+        assert!(!storage_door_default(false, None), "unproven elsewhere: shut by default");
+        assert!(!storage_door_default(true, Some("0")), "the off switch wins on Apple");
+        assert!(storage_door_default(false, Some("1")), "the on switch wins elsewhere");
+    }
+
     #[test]
     fn probe_report_passes_natively() {
         if crate::skip_no_gpu() {
