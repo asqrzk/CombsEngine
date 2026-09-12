@@ -112,6 +112,12 @@ enum Command {
         /// which is the difference between a measurement and an anecdote.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
+        /// The KV arena in tokens. Leave it out and the engine picks its
+        /// own default (32,768 on f32, 65,536 on f16, lowered to the
+        /// model's maximum) — not a room the app ever seats. Name the
+        /// room to measure what a person gets.
+        #[arg(long)]
+        arena: Option<usize>,
         #[arg(long)]
         json: bool,
         #[arg(long)]
@@ -228,8 +234,8 @@ fn main() {
             0
         }
         Command::Can { op, r#where } => ops::answer(&op, r#where.as_deref()),
-        Command::Model { path, depths, tokens, repeat, envs, json, out } => {
-            cmd_model(&path, &depths, tokens, repeat, &envs, json, out.as_deref())
+        Command::Model { path, depths, tokens, repeat, envs, arena, json, out } => {
+            cmd_model(&path, &depths, tokens, repeat, &envs, arena, json, out.as_deref())
         }
         Command::RunOne { subject } => cmd_run_one(&subject),
         Command::Micro { cells, model, json, out } => cmd_micro(cells, model, json, out.as_deref()),
@@ -333,6 +339,7 @@ fn cmd_model(
     tokens: usize,
     repeat: usize,
     envs: &[String],
+    arena: Option<usize>,
     json: bool,
     out: Option<&std::path::Path>,
 ) -> i32 {
@@ -377,6 +384,7 @@ fn cmd_model(
             model: path.to_string(),
             prompt_tokens: *depth,
             max_tokens: tokens,
+            arena,
         };
         // Separate children, not a loop inside one: a loop shares a
         // warmed pool and one thermal state and would agree with itself.
@@ -482,6 +490,7 @@ fn cmd_micro(
                     model: seat.clone(),
                     prompt_tokens: 4,
                     max_tokens: 16,
+                    arena: None,
                 };
                 let run = child::measure_with_env(&subject, &[("CUBECL_WGPU_MAX_TASKS".into(), tasks.to_string())]);
                 if human {

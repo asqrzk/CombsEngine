@@ -34,6 +34,10 @@ pub struct Subject {
     pub model: String,
     pub prompt_tokens: usize,
     pub max_tokens: usize,
+    /// The KV arena in tokens, when the run names one. None leaves the
+    /// engine's own default (32,768 on f32, 65,536 on f16, lowered to the
+    /// model's positional maximum) — which is not a room the app seats.
+    pub arena: Option<usize>,
 }
 
 impl Subject {
@@ -43,6 +47,7 @@ impl Subject {
             "model": self.model,
             "prompt_tokens": self.prompt_tokens,
             "max_tokens": self.max_tokens,
+            "arena": self.arena,
         })
     }
 
@@ -56,6 +61,7 @@ impl Subject {
             "model": crate::model::identity(&self.model),
             "prompt_tokens": self.prompt_tokens,
             "max_tokens": self.max_tokens,
+            "arena": self.arena,
         })
     }
 
@@ -65,6 +71,8 @@ impl Subject {
             model: v["model"].as_str()?.to_string(),
             prompt_tokens: v["prompt_tokens"].as_u64()? as usize,
             max_tokens: v["max_tokens"].as_u64()? as usize,
+            // Optional: a subject from before arenas were named still parses.
+            arena: v["arena"].as_u64().map(|n| n as usize),
         })
     }
 }
@@ -198,6 +206,26 @@ pub fn is_child() -> bool {
 mod tests {
     use super::*;
 
+    /// The child must seat the room the parent named: a record that says
+    /// "arena 16,384" over a run that took the engine's default is the
+    /// same lie as a record that measured the wrong backend.
+    #[test]
+    fn a_subject_carries_the_arena_it_was_asked_for() {
+        let s = Subject {
+            id: "d4".into(),
+            model: "m".into(),
+            prompt_tokens: 4,
+            max_tokens: 16,
+            arena: Some(16_384),
+        };
+        let back = Subject::from_json(&s.to_json()).expect("round trip");
+        assert_eq!(back.arena, Some(16_384), "the child must seat the room the parent named");
+        let mut older = s.to_json();
+        older.as_object_mut().unwrap().remove("arena");
+        let parsed = Subject::from_json(&older).expect("a subject without an arena still parses");
+        assert_eq!(parsed.arena, None);
+    }
+
     #[test]
     fn a_subject_round_trips_through_its_json() {
         let s = Subject {
@@ -205,6 +233,7 @@ mod tests {
             model: "/models/qwen3-0.6b-gguf".into(),
             prompt_tokens: 2000,
             max_tokens: 16,
+            arena: None,
         };
         let back = Subject::from_json(&s.to_json()).expect("round trip");
         assert_eq!(back.id, s.id);
@@ -224,6 +253,7 @@ mod tests {
             model: "/nowhere".into(),
             prompt_tokens: 4,
             max_tokens: 16,
+            arena: None,
         };
         let run = failed(&s, "the model does not exist");
         assert!(run.values.is_empty());

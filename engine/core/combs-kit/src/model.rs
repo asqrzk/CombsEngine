@@ -113,7 +113,19 @@ pub fn run_one(subject: &Subject) -> Run {
     };
 
     let load_started = std::time::Instant::now();
-    let engine = match Engine::load(&source, combs_core::init_device()) {
+    // A named arena seats the room the app would seat; none leaves the
+    // engine's own default, and the record reports whichever it was.
+    let loaded = match subject.arena {
+        Some(tokens) => {
+            let mut config = combs_runtime::CacheConfig::paged(tokens);
+            if matches!(std::env::var("COMBS_KV").as_deref(), Ok("contiguous")) {
+                config.kind = combs_runtime::CacheKind::Contiguous;
+            }
+            Engine::load_with_cache_config(&source, combs_core::init_device(), config)
+        }
+        None => Engine::load(&source, combs_core::init_device()),
+    };
+    let engine = match loaded {
         Ok(e) => e,
         Err(e) => {
             return Run {
