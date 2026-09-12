@@ -39,6 +39,7 @@ mod model;
 mod ops;
 mod report;
 mod machine;
+mod micro;
 mod record;
 
 use clap::{Parser, Subcommand};
@@ -98,6 +99,28 @@ enum Command {
         json: bool,
         #[arg(long)]
         out: Option<std::path::PathBuf>,
+    },
+    /// The box's fingerprint without a model: launch latency, the bus,
+    /// the gemv against its packed bytes, and the submit sweep. Each
+    /// cell its own process.
+    Micro {
+        /// Cells to run; default all four.
+        #[arg(long, value_delimiter = ',')]
+        cells: Option<Vec<String>>,
+        /// The seat the submit sweep decodes (packed; the 0.6b by default
+        /// when present).
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// One micro cell. Spawned by `micro`; not for hand use.
+    #[command(hide = true)]
+    RunMicro {
+        #[arg(long)]
+        cell: String,
     },
     /// Measure ONE subject. Spawned by `model`; not for hand use — the
     /// one-subject-per-process rule is the reason this exists.
@@ -175,6 +198,20 @@ fn main() {
             cmd_model(&path, &depths, tokens, json, out.as_deref())
         }
         Command::RunOne { subject } => cmd_run_one(&subject),
+        Command::Micro { cells, model, json, out } => cmd_micro(cells, model, json, out.as_deref()),
+        Command::RunMicro { cell } => {
+            let run = micro::run_cell(&cell);
+            match serde_json::to_string(&run) {
+                Ok(t) => {
+                    println!("{t}");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("combs-kit: {e}");
+                    1
+                }
+            }
+        }
         Command::Report { record, section, claim, date, branch } => {
             match load(&record) {
                 Ok(rec) => {
@@ -317,6 +354,86 @@ fn cmd_model(
     rec.runs = runs;
     match rec.write(out) {
         Ok(()) => i32::from(measured == 0),
+        Err(e) => {
+            eprintln!("combs-kit: {e}");
+            1
+        }
+    }
+}
+
+fn cmd_micro(
+    cells: Option<Vec<String>>,
+    model: Option<String>,
+    json: bool,
+    out: Option<&std::path::Path>,
+) -> i32 {
+    if child::is_child() {
+        eprintln!("combs-kit: a child may not run a sweep of its own");
+        return 2;
+    }
+    let m = machine::read();
+    let human = !json && out.is_none();
+    if human {
+        machine::print_human(&m);
+        println!("\nmicro");
+    }
+    let wanted: Vec<String> = cells.unwrap_or_else(|| micro::CELLS.iter().map(|c| c.to_string()).collect());
+    let mut runs = Vec::new();
+    for cell in &wanted {
+        if cell == "submits" {
+            let seat = model.clone().or_else(|| {
+                let home = std::env::var("HOME").ok()?;
+                let p = std::path::PathBuf::from(home).join(".cache/combs/models/qwen3-0.6b-gguf");
+                p.is_dir().then(|| p.to_string_lossy().into_owned())
+            });
+            let Some(seat) = seat else {
+                runs.push(record::Run {
+                    id: "submits".into(),
+                    kind: "micro".into(),
+                    subject: "this box".into(),
+                    config: serde_json::Value::Null,
+                    warm: false,
+                    values: vec![],
+                    notes: vec!["no measurement: no packed seat to decode; pass --model".into()],
+                });
+                continue;
+            };
+            for tasks in [8usize, 16, 32, 64, 128] {
+                let subject = child::Subject {
+                    id: format!("tasks{tasks}"),
+                    model: seat.clone(),
+                    prompt_tokens: 4,
+                    max_tokens: 16,
+                };
+                let run = child::measure_with_env(&subject, &[("CUBECL_WGPU_MAX_TASKS".into(), tasks.to_string())]);
+                if human {
+                    model::print_run(&run);
+                }
+                runs.push(run);
+            }
+            continue;
+        }
+        let run = child::measure_cell(cell, &[]);
+        if human {
+            micro::print_run(&run);
+        }
+        runs.push(run);
+    }
+    if human {
+        return 0;
+    }
+    let trust = record::Trust {
+        doctor: "not run".into(),
+        detail: "timings of the box itself; run `combs doctor` for its verdict".into(),
+    };
+    let mut rec = record::Record::new(
+        serde_json::to_value(&m).unwrap_or(serde_json::Value::Null),
+        build_stamp(),
+        trust,
+    );
+    rec.runs = runs;
+    match rec.write(out) {
+        Ok(()) => 0,
         Err(e) => {
             eprintln!("combs-kit: {e}");
             1

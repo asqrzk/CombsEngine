@@ -109,6 +109,13 @@ pub type CombsBackend = burn::backend::Wgpu<burn::tensor::f16, i32, u32>;
 /// Both counters are monotone and process-wide; the engine is
 /// single-flight, so a difference across a step is that step's cost.
 /// Zero on the cpu floor, which dispatches nothing.
+///
+/// NEVER read this inside a parallel test suite. It is process-wide,
+/// so a sibling test's launches land in your delta; a test doing so
+/// passes alone and fails in company, and this tree has written that
+/// test three times. A counter test is `#[ignore]` and runs with
+/// `--test-threads=1`, or it runs in its own child process, as the kit
+/// does.
 pub fn gpu_counters() -> (u64, u64) {
     cubecl::wgpu::meter::counts()
 }

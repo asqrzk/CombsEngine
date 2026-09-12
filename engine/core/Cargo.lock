@@ -1274,6 +1274,7 @@ dependencies = [
  "clap",
  "combs-core",
  "combs-formats",
+ "combs-models",
  "combs-runtime",
  "libc",
  "serde",

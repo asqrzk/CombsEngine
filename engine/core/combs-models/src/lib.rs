@@ -42,6 +42,10 @@ pub use quant_linear::QuantizedLinear;
 pub use registry::ModelRegistry;
 pub use forward_probe::{batched_probe_report, forward_probe_report};
 pub use wgsl::probe_report as wgsl_probe_report;
+// The kit's micro cells: the launch floor, the bus, and the gemv against
+// its packed bytes. Public for the same reason the probe is — a stranger's
+// box must be able to answer them.
+pub use wgsl::{bus_cell, dispatch_latency, gemv_cell};
 pub use rope::RotaryEmbedding;
 pub use smolvlm::{SmolVlmModel, image_prompt_expansion, pixels_to_tensor};
 pub use whisper::{WhisperModel, load_speech_model};

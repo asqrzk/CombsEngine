@@ -75,7 +75,55 @@ impl Subject {
 /// carrying the reason so the record shows what was attempted and why it
 /// produced nothing. Erasing a failed subject would make a partial
 /// sweep look complete.
+/// One micro cell in a child of this binary; the same discipline as a
+/// model subject, for the same two reasons.
+pub fn measure_cell(cell: &str, extra_env: &[(String, String)]) -> Run {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return failed_cell(cell, &format!("cannot find my own binary: {e}")),
+    };
+    let mut cmd = Command::new(exe);
+    cmd.arg("run-micro").arg("--cell").arg(cell).env("COMBS_KIT_CHILD", "1");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let out = match cmd.stderr(Stdio::inherit()).output() {
+        Ok(o) => o,
+        Err(e) => return failed_cell(cell, &format!("cannot spawn a child: {e}")),
+    };
+    if !out.status.success() {
+        return failed_cell(cell, &format!("the child exited {}", out.status));
+    }
+    match serde_json::from_str::<Run>(String::from_utf8_lossy(&out.stdout).trim()) {
+        Ok(run) => run,
+        Err(e) => failed_cell(cell, &format!("the child's answer did not parse: {e}")),
+    }
+}
+
+fn failed_cell(cell: &str, why: &str) -> Run {
+    Run {
+        id: cell.to_string(),
+        kind: "micro".to_string(),
+        subject: "this box".to_string(),
+        config: serde_json::json!({ "cell": cell }),
+        warm: false,
+        values: Vec::new(),
+        notes: vec![format!("no measurement: {why}")],
+    }
+}
+
+/// A model subject with extra environment on the child — the submit
+/// sweep's road, since `CUBECL_WGPU_MAX_TASKS` is read once at device
+/// init and a sweep is therefore one child per point.
+pub fn measure_with_env(subject: &Subject, extra_env: &[(String, String)]) -> Run {
+    measure_inner(subject, extra_env)
+}
+
 pub fn measure(subject: &Subject) -> Run {
+    measure_inner(subject, &[])
+}
+
+fn measure_inner(subject: &Subject, extra_env: &[(String, String)]) -> Run {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => return failed(subject, &format!("cannot find my own binary: {e}")),
@@ -85,6 +133,7 @@ pub fn measure(subject: &Subject) -> Run {
         .arg("--subject")
         .arg(subject.to_json().to_string())
         .env("COMBS_KIT_CHILD", "1")
+        .envs(extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()

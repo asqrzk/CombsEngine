@@ -332,6 +332,85 @@ pub(crate) fn launch(
     );
 }
 
+/// The floor cost of asking this driver to do anything: `n` launches
+/// of the scalar-echo kernel — one workgroup, five words written — then
+/// one sync. Returns the wall time and the dispatch-counter delta, so
+/// the caller can prove the instrument counted exactly what it timed
+/// (delta must equal `n`; anything else means another launch landed in
+/// the window). Every µs/dispatch this ledger has ever quoted was
+/// arithmetic over a whole decode step; this reads the launch alone.
+pub fn dispatch_latency(n: usize) -> (std::time::Duration, u64) {
+    use cubecl::prelude::*;
+    let device = Default::default();
+    let client = WgpuRuntime::client(&device);
+    let out = client.empty(5 * core::mem::size_of::<u32>());
+    let scalars = vec![1u64, 0xAABB_CCDD_0011_2233, 7, f32::to_bits(1.5) as u64];
+    // Warm: the first launch compiles the pipeline, which is not a
+    // launch cost.
+    launch(&client, ProbeEcho, CubeCount::Static(1, 1, 1), vec![out.clone().binding()], scalars.clone());
+    cubecl::future::block_on(client.sync()).expect("sync after warm-up");
+    let (d0, _) = combs_core::gpu_counters();
+    let started = std::time::Instant::now();
+    for _ in 0..n {
+        launch(&client, ProbeEcho, CubeCount::Static(1, 1, 1), vec![out.clone().binding()], scalars.clone());
+    }
+    cubecl::future::block_on(client.sync()).expect("sync after the launches");
+    let took = started.elapsed();
+    let (d1, _) = combs_core::gpu_counters();
+    (took, d1 - d0)
+}
+
+/// Host→device and device→host at one size, timed to completion.
+/// Returns (h2d, d2h). Device→device is not offered: the runtime has no
+/// plain copy kernel, and timing a tensor op as if it were one would
+/// report the op. Said here rather than approximated.
+pub fn bus_cell(bytes: usize) -> (std::time::Duration, std::time::Duration) {
+    use cubecl::prelude::*;
+    let device = Default::default();
+    let client = WgpuRuntime::client(&device);
+    let payload: Vec<u8> = (0..bytes).map(|i| (i % 251) as u8).collect();
+    // Warm both directions once.
+    let h = client.create_from_slice(&payload);
+    let _ = cubecl::future::block_on(client.read_async(vec![h]));
+    let started = std::time::Instant::now();
+    let h = client.create_from_slice(&payload);
+    cubecl::future::block_on(client.sync()).expect("sync after upload");
+    let h2d = started.elapsed();
+    let started = std::time::Instant::now();
+    let back = cubecl::future::block_on(client.read_async(vec![h])).expect("readback");
+    let d2h = started.elapsed();
+    assert_eq!(back[0].len(), bytes, "the bus returned a different size");
+    (h2d, d2h)
+}
+
+/// The Q4_K decode gemv at a real projection shape, `reps` times, timed
+/// to completion — the kernel the packed seats spend most of a token in.
+/// Returns the wall time per rep; the caller turns it into bytes read
+/// per second against the packed size, which is the roofline question.
+pub fn gemv_cell(n_out: usize, k: usize, reps: usize) -> std::time::Duration {
+    use cubecl::prelude::*;
+    let device = Default::default();
+    let client = WgpuRuntime::client(&device);
+    let blocks = n_out * k / 256;
+    let mut data: Vec<u8> = (0..blocks * 144).map(|i| ((i * 37 + 11) % 251) as u8).collect();
+    for b in 0..blocks {
+        data[b * 144..b * 144 + 2].copy_from_slice(&0x3C00u16.to_le_bytes());
+        data[b * 144 + 2..b * 144 + 4].copy_from_slice(&0x3400u16.to_le_bytes());
+    }
+    let w = crate::qmatmul::Q4KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k)
+        .expect("a synthetic q4_k weight packs");
+    let x: Vec<f32> = (0..k).map(|i| (((i as f32 * 0.311).sin() * 1.4) - 0.1) / 32.0).collect();
+    let x_h = client.create_from_slice(f32::as_bytes(&x));
+    let _ = w.decode_gemv_wgsl(&client, x_h.clone(), Storage::F32, None);
+    cubecl::future::block_on(client.sync()).expect("sync after warm-up");
+    let started = std::time::Instant::now();
+    for _ in 0..reps {
+        let _ = w.decode_gemv_wgsl(&client, x_h.clone(), Storage::F32, None);
+    }
+    cubecl::future::block_on(client.sync()).expect("sync after the reps");
+    started.elapsed() / reps as u32
+}
+
 /// Runs both probes against the current device and reports the first
 /// contract violation, if any.
 ///
@@ -1161,6 +1240,32 @@ mod tests {
         assert!(!storage_door_default(false, None), "unproven elsewhere: shut by default");
         assert!(!storage_door_default(true, Some("0")), "the off switch wins on Apple");
         assert!(storage_door_default(false, Some("1")), "the on switch wins elsewhere");
+    }
+
+    /// The dispatch-latency cell counts exactly what it times: the
+    /// counter delta across the window equals the launches issued.
+    /// Anything else and the number is someone else's launches.
+    ///
+    /// Own process, like every counter test (§92's lesson, repeated
+    /// once here before it was honoured): the counter is process-wide,
+    /// so under the parallel suite a sibling's launches land in the
+    /// window and the assertion's own message comes true. The LIVE
+    /// proof is `combs-kit micro`'s dispatch cell, which runs in a
+    /// child and prints counted against issued (§102: 2,000 / 2,000).
+    ///
+    /// ```text
+    /// cargo test --release -p combs-models --lib -- --ignored \
+    ///   --test-threads=1 counts_exactly_what_it_times
+    /// ```
+    #[test]
+    #[ignore = "gpu: reads the process-wide dispatch counter, so it needs its own process"]
+    fn the_empty_launch_cell_counts_exactly_what_it_times() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let (took, delta) = dispatch_latency(64);
+        assert_eq!(delta, 64, "the window held launches that were not ours");
+        assert!(took.as_micros() > 0, "sixty-four launches took no time at all");
     }
 
     /// The three projection shaders render for f32 EXACTLY as the audited
