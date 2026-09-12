@@ -103,6 +103,38 @@ pub(crate) fn storage_door_default(on_macos: bool, env: Option<&str>) -> bool {
     }
 }
 
+/// How a gemv workgroup is cut: `rows` output rows per workgroup,
+/// `lanes` lanes cooperating on each. Their product is the workgroup
+/// size, so they trade against each other — more rows means fewer
+/// workgroups and more work per lane, more lanes the reverse. That is
+/// exactly the question §102 left open, which is why this is a
+/// parameter and not a constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Geometry {
+    pub rows: u32,
+    pub lanes: u32,
+}
+
+impl Geometry {
+    /// The shape every measurement in this ledger was taken at, and the
+    /// production default until a sweep beats it by a margin worth the
+    /// change.
+    pub const DEFAULT: Geometry = Geometry { rows: 16, lanes: 16 };
+
+    /// The cuts of a 256-thread workgroup worth asking about. Fewer
+    /// than 8 lanes leaves the block-strided read too scattered; more
+    /// than 32 leaves fewer than four rows a group.
+    pub const SWEEP: &'static [Geometry] = &[
+        Geometry { rows: 8, lanes: 32 },
+        Geometry { rows: 16, lanes: 16 },
+        Geometry { rows: 32, lanes: 8 },
+    ];
+
+    pub fn workgroup(&self) -> u32 {
+        self.rows * self.lanes
+    }
+}
+
 /// May this box store kernel activations in f16?
 ///
 /// Four conditions, and each is load-bearing. Never in a browser (the
@@ -141,6 +173,40 @@ pub(crate) fn f16_storage_enabled_for_test(
         && client
             .properties()
             .supports_type(cubecl::ir::ElemType::Float(cubecl::ir::FloatKind::F16))
+}
+
+/// What is ACTUALLY live, asked of the code that reads each door.
+///
+/// A measurement that does not carry its own configuration is a number
+/// with no question attached, and this estate has already published one
+/// taken on the wrong backend because nothing on screen said which.
+/// Every door here is read through the SAME function the kernels read,
+/// so the report cannot drift from the behaviour: if a door is reported
+/// on, a kernel took it.
+///
+/// `f16_storage` needs the device (it asks the adapter), so it is the
+/// one door that must be asked with a client in hand.
+pub fn active_doors(
+    client: &cubecl::prelude::ComputeClient<WgpuRuntime>,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("wgsl", wgsl_enabled().to_string()),
+        ("gemv", gemv_enabled().to_string()),
+        ("rmsnorm", rmsnorm::rmsnorm_enabled().to_string()),
+        ("rope", rope::rope_enabled().to_string()),
+        ("attn", decode_attn::attn_enabled().to_string()),
+        // The DOOR only. Whether it is ever WALKED THROUGH depends on the
+        // dtype of the tensors that arrive, which this crate cannot see:
+        // it has no f16 feature of its own, so asking `cfg!` here
+        // answered about the wrong thing and printed "f32 build" under an
+        // f16 one. The caller knows its own dtype and composes the
+        // sentence; this reports the fact it actually holds.
+        ("f16_storage_door", f16_storage_enabled(client).to_string()),
+        (
+            "gemv_geometry",
+            format!("{}x{}", Geometry::DEFAULT.rows, Geometry::DEFAULT.lanes),
+        ),
+    ]
 }
 
 /// The seam's dtype bridge.
@@ -222,6 +288,32 @@ macro_rules! wgsl_kernel {
 /// two copies drift and only one of them stays reviewed. The f32
 /// rendering must come out byte-identical to the pre-change file, and a
 /// unit below holds that line.
+/// A kernel rendered for one storage type AND one workgroup cut. Same
+/// substitution discipline as `wgsl_kernel_dual!`: one audited body,
+/// the parameters in the id so renderings cannot share a cache entry.
+macro_rules! wgsl_kernel_gemv {
+    ($name:ident, $file:expr) => {
+        pub(crate) struct $name(pub(crate) Storage, pub(crate) Geometry);
+
+        impl KernelSource for $name {
+            fn source(&self) -> SourceTemplate {
+                SourceTemplate::new(include_str!($file))
+                    .register("f16_enable", self.0.enable_line())
+                    .register("act", self.0.act())
+                    .register("act4", self.0.act4())
+                    .register("rows", self.1.rows.to_string())
+                    .register("lanes", self.1.lanes.to_string())
+            }
+
+            fn id(&self) -> KernelId {
+                KernelId::new::<Self>()
+                    .cube_dim(CubeDim::new_1d(self.1.workgroup()))
+                    .info((self.0, self.1))
+            }
+        }
+    };
+}
+
 macro_rules! wgsl_kernel_dual {
     ($name:ident, $file:expr) => {
         pub(crate) struct $name(pub(crate) Storage);
@@ -255,9 +347,9 @@ wgsl_kernel_dual!(DecodeAttnSplit, "decode_attn_split.wgsl");
 wgsl_kernel_dual!(DecodeAttnCombine, "decode_attn_combine.wgsl");
 wgsl_kernel!(PrefillAttn, "prefill_attn.wgsl");
 wgsl_kernel!(RopeQk, "rope.wgsl");
-wgsl_kernel_dual!(DecodeGemvQ8, "decode_gemv_q8.wgsl");
-wgsl_kernel_dual!(DecodeGemvQ4K, "decode_gemv_q4k.wgsl");
-wgsl_kernel_dual!(DecodeGemvQ6K, "decode_gemv_q6k.wgsl");
+wgsl_kernel_gemv!(DecodeGemvQ8, "decode_gemv_q8.wgsl");
+wgsl_kernel_gemv!(DecodeGemvQ4K, "decode_gemv_q4k.wgsl");
+wgsl_kernel_gemv!(DecodeGemvQ6K, "decode_gemv_q6k.wgsl");
 
 /// Door for the split-K decode gemv (`COMBS_WGSL_GEMV=0` restores the
 /// cube untiled kernel); read once, like every door here.
@@ -295,15 +387,16 @@ pub(crate) fn launch_gemv(
     client: &cubecl::prelude::ComputeClient<WgpuRuntime>,
     kernel: GemvKernel,
     storage: Storage,
+    geom: Geometry,
     workgroups: u32,
     buffers: Vec<Binding>,
     scalars: Vec<u64>,
 ) {
     let count = CubeCount::Static(workgroups, 1, 1);
     match kernel {
-        GemvKernel::Q8 => launch(client, DecodeGemvQ8(storage), count, buffers, scalars),
-        GemvKernel::Q4K => launch(client, DecodeGemvQ4K(storage), count, buffers, scalars),
-        GemvKernel::Q6K => launch(client, DecodeGemvQ6K(storage), count, buffers, scalars),
+        GemvKernel::Q8 => launch_at(client, DecodeGemvQ8(storage, geom), geom.workgroup(), count, buffers, scalars),
+        GemvKernel::Q4K => launch_at(client, DecodeGemvQ4K(storage, geom), geom.workgroup(), count, buffers, scalars),
+        GemvKernel::Q6K => launch_at(client, DecodeGemvQ6K(storage, geom), geom.workgroup(), count, buffers, scalars),
     }
 }
 
@@ -321,8 +414,22 @@ pub(crate) fn launch(
     buffers: Vec<Binding>,
     scalars: Vec<u64>,
 ) {
+    launch_at(client, kernel, WORKGROUP, count, buffers, scalars);
+}
+
+/// `launch` for a kernel whose workgroup size is not the house default.
+/// The size must match the `@workgroup_size` the rendering carries, or
+/// the dispatch is a silent mismatch.
+pub(crate) fn launch_at(
+    client: &cubecl::prelude::ComputeClient<WgpuRuntime>,
+    kernel: impl KernelSource,
+    workgroup: u32,
+    count: CubeCount,
+    buffers: Vec<Binding>,
+    scalars: Vec<u64>,
+) {
     let task: <<WgpuRuntime as Runtime>::Server as cubecl::server::ComputeServer>::Kernel =
-        Box::new(SourceKernel::new(kernel, CubeDim::new_1d(WORKGROUP)));
+        Box::new(SourceKernel::new(kernel, CubeDim::new_1d(workgroup)));
     client.launch(
         task,
         count,
@@ -383,11 +490,61 @@ pub fn bus_cell(bytes: usize) -> (std::time::Duration, std::time::Duration) {
     (h2d, d2h)
 }
 
+/// The Q4_K decode gemv at one shape and one workgroup cut, `reps`
+/// times, timed to completion — and CHECKED once against the host
+/// before it is timed, because a cut that computes the wrong answer
+/// quickly is not a faster kernel. Returns (per-rep time, max relative
+/// error against the host dequant reference).
+pub fn gemv_cell_at(n_out: usize, k: usize, reps: usize, rows: u32, lanes: u32) -> (std::time::Duration, f32) {
+    use cubecl::prelude::*;
+    let geom = Geometry { rows, lanes };
+    let device = Default::default();
+    let client = WgpuRuntime::client(&device);
+    let blocks = n_out * k / 256;
+    let mut data: Vec<u8> = (0..blocks * 144).map(|i| ((i * 37 + 11) % 251) as u8).collect();
+    for b in 0..blocks {
+        data[b * 144..b * 144 + 2].copy_from_slice(&0x3C00u16.to_le_bytes());
+        data[b * 144 + 2..b * 144 + 4].copy_from_slice(&0x3400u16.to_le_bytes());
+    }
+    let w = crate::qmatmul::Q4KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k)
+        .expect("a synthetic q4_k weight packs");
+    let x: Vec<f32> = (0..k).map(|i| (((i as f32 * 0.311).sin() * 1.4) - 0.1) / 32.0).collect();
+    let x_h = client.create_from_slice(f32::as_bytes(&x));
+
+    // Correctness at this cut, once, before any timing.
+    let out = w.decode_gemv_wgsl_at(&client, x_h.clone(), Storage::F32, None, geom);
+    let bytes = cubecl::future::block_on(client.read_async(vec![out])).expect("readback");
+    let got = f32::from_bytes(&bytes[0]);
+    let dense = combs_formats::quants::dequantize_q4_k(&data, n_out * k).expect("reference");
+    let mut worst = 0.0f32;
+    for r in 0..n_out {
+        let expect: f32 = (0..k).map(|c| x[c] * dense[r * k + c]).sum();
+        let rel = (got[r] - expect).abs() / expect.abs().max(1.0);
+        if rel > worst {
+            worst = rel;
+        }
+    }
+
+    let _ = w.decode_gemv_wgsl_at(&client, x_h.clone(), Storage::F32, None, geom);
+    cubecl::future::block_on(client.sync()).expect("sync after warm-up");
+    let started = std::time::Instant::now();
+    for _ in 0..reps {
+        let _ = w.decode_gemv_wgsl_at(&client, x_h.clone(), Storage::F32, None, geom);
+    }
+    cubecl::future::block_on(client.sync()).expect("sync after the reps");
+    (started.elapsed() / reps as u32, worst)
+}
+
 /// The Q4_K decode gemv at a real projection shape, `reps` times, timed
 /// to completion — the kernel the packed seats spend most of a token in.
 /// Returns the wall time per rep; the caller turns it into bytes read
 /// per second against the packed size, which is the roofline question.
 pub fn gemv_cell(n_out: usize, k: usize, reps: usize) -> std::time::Duration {
+    gemv_cell_at(n_out, k, reps, Geometry::DEFAULT.rows, Geometry::DEFAULT.lanes).0
+}
+
+#[allow(dead_code)]
+fn gemv_cell_unused(n_out: usize, k: usize, reps: usize) -> std::time::Duration {
     use cubecl::prelude::*;
     let device = Default::default();
     let client = WgpuRuntime::client(&device);
@@ -1242,6 +1399,29 @@ mod tests {
         assert!(storage_door_default(false, Some("1")), "the on switch wins elsewhere");
     }
 
+    /// Every cut renders a shader whose workgroup size matches the cut,
+    /// and the default rendering is still the audited 16x16 text.
+    #[test]
+    fn every_gemv_cut_renders_its_own_workgroup_size() {
+        use burn_cubecl::template::KernelSource;
+        for g in Geometry::SWEEP {
+            let t = DecodeGemvQ4K(Storage::F32, *g).source().complete();
+            assert!(
+                t.contains(&format!("const ROWS: u32 = {}u;", g.rows)),
+                "cut {g:?} did not render its rows"
+            );
+            assert!(
+                t.contains(&format!("const LANES: u32 = {}u;", g.lanes)),
+                "cut {g:?} did not render its lanes"
+            );
+            assert!(!t.contains("{{"), "cut {g:?} left a placeholder");
+            assert_eq!(g.workgroup(), 256, "a cut must fill the workgroup");
+        }
+        let default = DecodeGemvQ4K(Storage::F32, Geometry::DEFAULT).source().complete();
+        assert!(default.contains("const ROWS: u32 = 16u;"));
+        assert!(default.contains("@compute @workgroup_size(16 * 16)"));
+    }
+
     /// The dispatch-latency cell counts exactly what it times: the
     /// counter delta across the window equals the launches issued.
     /// Anything else and the number is someone else's launches.
@@ -1276,9 +1456,9 @@ mod tests {
     fn the_gemv_renderings_hold_the_storage_contract() {
         use burn_cubecl::template::KernelSource;
         let f32s = [
-            DecodeGemvQ8(Storage::F32).source().complete(),
-            DecodeGemvQ4K(Storage::F32).source().complete(),
-            DecodeGemvQ6K(Storage::F32).source().complete(),
+            DecodeGemvQ8(Storage::F32, Geometry::DEFAULT).source().complete(),
+            DecodeGemvQ4K(Storage::F32, Geometry::DEFAULT).source().complete(),
+            DecodeGemvQ6K(Storage::F32, Geometry::DEFAULT).source().complete(),
         ];
         for (i, t) in f32s.iter().enumerate() {
             assert!(!t.contains("enable"), "gemv {i}: an f32 shader enables nothing");
@@ -1289,9 +1469,9 @@ mod tests {
             assert!(t.contains("fuse: vec2<u32>"), "gemv {i}: the fold flag rides the scalars");
         }
         let f16s = [
-            DecodeGemvQ8(Storage::F16).source().complete(),
-            DecodeGemvQ4K(Storage::F16).source().complete(),
-            DecodeGemvQ6K(Storage::F16).source().complete(),
+            DecodeGemvQ8(Storage::F16, Geometry::DEFAULT).source().complete(),
+            DecodeGemvQ4K(Storage::F16, Geometry::DEFAULT).source().complete(),
+            DecodeGemvQ6K(Storage::F16, Geometry::DEFAULT).source().complete(),
         ];
         for (i, t) in f16s.iter().enumerate() {
             assert!(t.starts_with("enable f16;"), "gemv {i}: the directive is line one");

@@ -23,6 +23,9 @@ combs-formats = { path = "../combs-formats", version = "0.3.0" }
 # For the micro cells: the launch floor, the bus and the gemv cell live
 # beside the kernel canaries, where the kernels are.
 combs-models = { path = "../combs-models", version = "0.3.0" }
+# Only to name the runtime when asking the models crate which doors are
+# live — the same client the kernels themselves use.
+cubecl = { version = "0.10.0", default-features = false, features = ["wgpu", "std"] }
 combs-runtime = { path = "../combs-runtime", version = "0.3.0" }
 clap = { version = "4", features = ["derive"] }
 serde = { workspace = true }

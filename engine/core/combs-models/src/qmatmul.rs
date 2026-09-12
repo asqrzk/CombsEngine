@@ -957,6 +957,21 @@ impl<R: Runtime> Q80Weight<R> {
         storage: crate::wgsl::Storage,
         residual: Option<Handle>,
     ) -> Handle {
+        self.decode_gemv_wgsl_at(client, x, storage, residual, crate::wgsl::Geometry::DEFAULT)
+    }
+
+    /// The gemv at a stated workgroup cut. Production takes the default;
+    /// only the kit's sweep asks for others, and it asks because §102
+    /// left the question open rather than because anything is known.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decode_gemv_wgsl_at(
+        &self,
+        client: &ComputeClient<cubecl::wgpu::WgpuRuntime>,
+        x: Handle,
+        storage: crate::wgsl::Storage,
+        residual: Option<Handle>,
+        geom: crate::wgsl::Geometry,
+    ) -> Handle {
         // The output follows the activation's width; the packed weights
         // are the quant format and never change. The accumulator inside
         // is f32 either way.
@@ -969,7 +984,8 @@ impl<R: Runtime> Q80Weight<R> {
             client,
             crate::wgsl::GemvKernel::Q8,
             storage,
-            (self.n_out as u32).div_ceil(16),
+            geom,
+            (self.n_out as u32).div_ceil(geom.rows).max(1),
             vec![
                 x.binding(),
                 self.qs.clone().binding(),
@@ -2285,6 +2301,21 @@ impl<R: Runtime> Q4KWeight<R> {
         storage: crate::wgsl::Storage,
         residual: Option<Handle>,
     ) -> Handle {
+        self.decode_gemv_wgsl_at(client, x, storage, residual, crate::wgsl::Geometry::DEFAULT)
+    }
+
+    /// The gemv at a stated workgroup cut. Production takes the default;
+    /// only the kit's sweep asks for others, and it asks because §102
+    /// left the question open rather than because anything is known.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decode_gemv_wgsl_at(
+        &self,
+        client: &ComputeClient<cubecl::wgpu::WgpuRuntime>,
+        x: Handle,
+        storage: crate::wgsl::Storage,
+        residual: Option<Handle>,
+        geom: crate::wgsl::Geometry,
+    ) -> Handle {
         // The output follows the activation's width; the packed weights
         // are the quant format and never change. The accumulator inside
         // is f32 either way.
@@ -2297,7 +2328,8 @@ impl<R: Runtime> Q4KWeight<R> {
             client,
             crate::wgsl::GemvKernel::Q4K,
             storage,
-            (self.n_out as u32).div_ceil(16),
+            geom,
+            (self.n_out as u32).div_ceil(geom.rows).max(1),
             vec![
                 x.binding(),
                 self.qs.clone().binding(),
@@ -2598,6 +2630,21 @@ impl<R: Runtime> Q6KWeight<R> {
         storage: crate::wgsl::Storage,
         residual: Option<Handle>,
     ) -> Handle {
+        self.decode_gemv_wgsl_at(client, x, storage, residual, crate::wgsl::Geometry::DEFAULT)
+    }
+
+    /// The gemv at a stated workgroup cut. Production takes the default;
+    /// only the kit's sweep asks for others, and it asks because §102
+    /// left the question open rather than because anything is known.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decode_gemv_wgsl_at(
+        &self,
+        client: &ComputeClient<cubecl::wgpu::WgpuRuntime>,
+        x: Handle,
+        storage: crate::wgsl::Storage,
+        residual: Option<Handle>,
+        geom: crate::wgsl::Geometry,
+    ) -> Handle {
         // The output follows the activation's width; the packed weights
         // are the quant format and never change. The accumulator inside
         // is f32 either way.
@@ -2610,7 +2657,8 @@ impl<R: Runtime> Q6KWeight<R> {
             client,
             crate::wgsl::GemvKernel::Q6K,
             storage,
-            (self.n_out as u32).div_ceil(16),
+            geom,
+            (self.n_out as u32).div_ceil(geom.rows).max(1),
             vec![
                 x.binding(),
                 self.ql.clone().binding(),

@@ -24,14 +24,14 @@ struct Params {
 
 var<workgroup> partial: array<f32, 256>;
 
-const LANES: u32 = 16u;
-const ROWS: u32 = 16u;
+const LANES: u32 = {{lanes}}u;
+const ROWS: u32 = {{rows}}u;
 
 fn i8_sc(idx: u32) -> f32 {
   return f32(bitcast<i32>((sc[idx / 4u] << ((3u - idx % 4u) * 8u))) >> 24u);
 }
 
-@compute @workgroup_size(256)
+@compute @workgroup_size({{rows}} * {{lanes}})
 fn main(
   @builtin(workgroup_id) wg: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,

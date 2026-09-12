@@ -25,8 +25,8 @@ struct Params {
 
 var<workgroup> partial: array<f32, 256>;
 
-const LANES: u32 = 16u;
-const ROWS: u32 = 16u;
+const LANES: u32 = {{lanes}}u;
+const ROWS: u32 = {{rows}}u;
 
 fn byte_sc(idx: u32) -> u32 {
   return (scales[idx / 4u] >> ((idx % 4u) * 8u)) & 0xffu;
@@ -47,7 +47,7 @@ fn k4_min(base: u32, j: u32) -> u32 {
   return (byte_sc(base + j + 4u) >> 4u) | ((byte_sc(base + j) >> 6u) << 4u);
 }
 
-@compute @workgroup_size(256)
+@compute @workgroup_size({{rows}} * {{lanes}})
 fn main(
   @builtin(workgroup_id) wg: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,

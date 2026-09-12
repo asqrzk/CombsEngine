@@ -32,7 +32,7 @@ use crate::qlinear::{FusedF32, InnerF32, UnfusedF16, UnfusedF32};
 const MAX_ROWS: usize = 65535;
 
 /// Per-kernel door on top of the master `COMBS_WGSL`; read once.
-fn rmsnorm_enabled() -> bool {
+pub(super) fn rmsnorm_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         wgsl_enabled() && !matches!(std::env::var("COMBS_WGSL_RMSNORM").as_deref(), Ok("0"))

@@ -98,9 +98,18 @@ pub fn markdown(rec: &Record, section: &str, claim: &str, date: &str, branch: &s
                 Some(v) => {
                     // A derived number is MARKED in the table, not only in
                     // the JSON. A reader must not have to open the record
-                    // to learn that a figure is arithmetic.
+                    // to learn that a figure is arithmetic. And a figure
+                    // that MOVED across its readings is printed as the
+                    // range it is, because a median alone would read as a
+                    // fact — which is how this ledger published an 8.4x
+                    // that was really 3.5x.
                     let mark = if v.tier == Tier::Measured { "" } else { "*" };
-                    out.push_str(&format!(" {:.2}{mark} |", v.value));
+                    match v.spread_pct {
+                        Some(sp) if sp > crate::record::SPREAD_BAND_PCT => {
+                            out.push_str(&format!(" {:.2}{mark} ±{sp:.0}% |", v.value));
+                        }
+                        _ => out.push_str(&format!(" {:.2}{mark} |", v.value)),
+                    }
                 }
                 None => out.push_str(" — |"),
             }
@@ -124,6 +133,23 @@ pub fn markdown(rec: &Record, section: &str, claim: &str, date: &str, branch: &s
                     v.basis.as_deref().unwrap_or("(no basis recorded)")
                 ));
             }
+        }
+    }
+    let unsteady: Vec<String> = rec
+        .runs
+        .iter()
+        .flat_map(|r| r.values.iter().map(move |v| (r, v)))
+        .filter(|(_, v)| v.spread_pct.is_some_and(|sp| sp > crate::record::SPREAD_BAND_PCT))
+        .map(|(r, v)| format!("- {}/{}: {}", r.id, v.name, v.steady().unwrap_err()))
+        .collect();
+    if !unsteady.is_empty() {
+        out.push_str(
+            "\nThese figures MOVED across their readings and are ranges, not \
+             numbers. Do not quote them as facts:\n",
+        );
+        for line in unsteady {
+            out.push_str(&line);
+            out.push('\n');
         }
     }
     let failed: Vec<&crate::record::Run> =

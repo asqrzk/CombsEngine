@@ -35,6 +35,7 @@
 mod child;
 mod diff;
 mod doors;
+mod freshness;
 mod model;
 mod ops;
 mod report;
@@ -51,6 +52,11 @@ use clap::{Parser, Subcommand};
     about = "Measure a box, a model and a build — and write a record you can compare"
 )]
 struct Cli {
+    /// Measure with this binary even though the sources are newer than
+    /// it. For deliberately measuring an old build; never for haste.
+    #[arg(long, global = true)]
+    allow_stale: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -95,6 +101,17 @@ enum Command {
         /// Tokens to generate per depth.
         #[arg(long, default_value_t = 16)]
         tokens: usize,
+        /// Readings per depth, each in its own process. Three by
+        /// default: one reading cannot show its own spread, and this
+        /// estate has been told four stories by single readings.
+        #[arg(long, default_value_t = 3)]
+        repeat: usize,
+        /// Engine doors for this run, as KEY=VALUE, repeatable. They are
+        /// set on the child AND written into the record, so a number can
+        /// never be separated from the configuration that produced it —
+        /// which is the difference between a measurement and an anecdote.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        envs: Vec<String>,
         #[arg(long)]
         json: bool,
         #[arg(long)]
@@ -179,6 +196,23 @@ fn main() {
     }
 
     let cli = Cli::parse();
+
+    // Before anything is measured: is this binary newer than the code it
+    // claims to speak for? A child inherits the parent's judgement and
+    // does not re-ask, so the refusal lands once, at the top.
+    if !child::is_child() {
+        match freshness::check() {
+            freshness::Freshness::Stale(names) if !cli.allow_stale => {
+                eprintln!("combs-kit: {}", freshness::refusal(&names));
+                std::process::exit(2);
+            }
+            freshness::Freshness::Stale(names) => {
+                eprintln!("combs-kit: STALE, measured anyway by request — newer: {}", names.join(", "));
+            }
+            freshness::Freshness::Unknown | freshness::Freshness::Fresh => {}
+        }
+    }
+
     let code = match cli.command {
         Command::System { json, out } => cmd_system(json, out.as_deref()),
         Command::Doors { json } => cmd_doors(json),
@@ -194,8 +228,8 @@ fn main() {
             0
         }
         Command::Can { op, r#where } => ops::answer(&op, r#where.as_deref()),
-        Command::Model { path, depths, tokens, json, out } => {
-            cmd_model(&path, &depths, tokens, json, out.as_deref())
+        Command::Model { path, depths, tokens, repeat, envs, json, out } => {
+            cmd_model(&path, &depths, tokens, repeat, &envs, json, out.as_deref())
         }
         Command::RunOne { subject } => cmd_run_one(&subject),
         Command::Micro { cells, model, json, out } => cmd_micro(cells, model, json, out.as_deref()),
@@ -297,15 +331,28 @@ fn cmd_model(
     path: &str,
     depths: &[usize],
     tokens: usize,
+    repeat: usize,
+    envs: &[String],
     json: bool,
     out: Option<&std::path::Path>,
 ) -> i32 {
+    let mut extra: Vec<(String, String)> = Vec::new();
+    for e in envs {
+        match e.split_once('=') {
+            Some((k, v)) => extra.push((k.to_string(), v.to_string())),
+            None => {
+                eprintln!("combs-kit: --env wants KEY=VALUE, got {e:?}");
+                return 2;
+            }
+        }
+    }
     if child::is_child() {
         eprintln!("combs-kit: a child may not run a sweep of its own");
         return 2;
     }
     let m = machine::read();
-    if !json && out.is_none() {
+    let human = human_on_console(json);
+    if human {
         machine::print_human(&m);
         // The build, on screen, every time. Half of every number here is
         // which binary produced it, and this estate has already measured
@@ -313,14 +360,17 @@ fn cmd_model(
         // and nothing on screen said so.
         let b = build_stamp();
         println!(
-            "  build       {} · fusion {} · {}",
+            "  build       {} · fusion {} · {} · {}{}",
             b["dtype"].as_str().unwrap_or("?"),
             b["fusion"].as_bool().unwrap_or(false),
             b["profile"].as_str().unwrap_or("?"),
+            b["commit"].as_str().unwrap_or("?"),
+            if b["dirty"].as_bool().unwrap_or(false) { " DIRTY" } else { "" },
         );
         println!("\nmodel {path}");
     }
     let mut runs = Vec::new();
+    let repeat = repeat.max(1);
     for depth in depths {
         let subject = child::Subject {
             id: format!("d{depth}"),
@@ -328,21 +378,40 @@ fn cmd_model(
             prompt_tokens: *depth,
             max_tokens: tokens,
         };
-        let run = child::measure(&subject);
-        if !json && out.is_none() {
+        // Separate children, not a loop inside one: a loop shares a
+        // warmed pool and one thermal state and would agree with itself.
+        let readings: Vec<record::Run> =
+            (0..repeat).map(|_| child::measure_with_env(&subject, &extra)).collect();
+        let mut run = model::merge(readings);
+        // The doors asked for ride the record beside the doors observed,
+        // so a reader sees both what was requested and what took effect.
+        if !extra.is_empty() {
+            if let Some(obj) = run.config.as_object_mut() {
+                obj.insert(
+                    "env_requested".into(),
+                    serde_json::Value::Object(
+                        extra
+                            .iter()
+                            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                            .collect(),
+                    ),
+                );
+            }
+        }
+        if human {
             model::print_run(&run);
         }
         runs.push(run);
     }
     let measured = runs.iter().filter(|r| !r.values.is_empty()).count();
+    if human && measured < runs.len() {
+        println!(
+            "\n{} of {} depths produced no measurement — see the notes above.",
+            runs.len() - measured,
+            runs.len()
+        );
+    }
     if !json && out.is_none() {
-        if measured < runs.len() {
-            println!(
-                "\n{} of {} depths produced no measurement — see the notes above.",
-                runs.len() - measured,
-                runs.len()
-            );
-        }
         return i32::from(measured == 0);
     }
     let machine_json = serde_json::to_value(&m).unwrap_or(serde_json::Value::Null);
@@ -361,6 +430,15 @@ fn cmd_model(
     }
 }
 
+/// Whether a sweep prints its lines to the console. Only `--json` takes
+/// stdout away from them; `--out` writes a file and the screen still shows
+/// the model the engine loaded, the build, the doors and any range. A
+/// 14b grid run with `--out` once printed nothing at all, and a ±24%
+/// reading reached the record without ever reaching a person.
+fn human_on_console(json: bool) -> bool {
+    !json
+}
+
 fn cmd_micro(
     cells: Option<Vec<String>>,
     model: Option<String>,
@@ -372,7 +450,7 @@ fn cmd_micro(
         return 2;
     }
     let m = machine::read();
-    let human = !json && out.is_none();
+    let human = human_on_console(json);
     if human {
         machine::print_human(&m);
         println!("\nmicro");
@@ -419,7 +497,7 @@ fn cmd_micro(
         }
         runs.push(run);
     }
-    if human {
+    if !json && out.is_none() {
         return 0;
     }
     let trust = record::Trust {
@@ -480,6 +558,12 @@ fn cmd_doors(json: bool) -> i32 {
 fn build_stamp() -> serde_json::Value {
     serde_json::json!({
         "kit_version": env!("CARGO_PKG_VERSION"),
+        // WHICH code, not just when. The mtime guard answers staleness;
+        // this answers identity, and a stranger checking a record needs
+        // both. `dirty` means the tree had uncommitted work, so the
+        // commit alone does not reproduce the number.
+        "commit": env!("COMBS_KIT_COMMIT"),
+        "dirty": env!("COMBS_KIT_DIRTY") == "true",
         "dtype": if cfg!(feature = "f16") { "f16" } else { "f32" },
         "fusion": !cfg!(feature = "f16") || cfg!(feature = "f16-fusion"),
         "cpu_backend": cfg!(feature = "cpu"),
@@ -503,6 +587,19 @@ mod tests {
         assert!(s.get("fusion").is_some());
         let dtype = s["dtype"].as_str().unwrap();
         assert!(dtype == "f16" || dtype == "f32");
+        // Identity, not only timing: a record that cannot name its code
+        // cannot be checked by anyone but its author.
+        assert!(s.get("commit").is_some(), "the stamp must name the commit");
+        assert!(s.get("dirty").is_some(), "and whether the tree was clean");
+    }
+
+    /// `--out` writes a file; it does not take the screen. Only `--json`
+    /// owns stdout. The 14b grid of §104 ran with `--out` and printed no
+    /// loaded model, no doors and no range to anyone.
+    #[test]
+    fn writing_a_record_to_a_file_still_prints_to_the_console() {
+        assert!(human_on_console(false), "--out alone must still print");
+        assert!(!human_on_console(true), "--json owns stdout");
     }
 
     #[test]

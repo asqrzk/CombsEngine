@@ -28,7 +28,7 @@ use super::{as_f32, from_f32};
 use crate::qlinear::{FusedF32, InnerF32, UnfusedF16, UnfusedF32};
 
 /// Per-kernel door on top of the master `COMBS_WGSL`; read once.
-fn rope_enabled() -> bool {
+pub(super) fn rope_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         wgsl_enabled() && !matches!(std::env::var("COMBS_WGSL_ROPE").as_deref(), Ok("0"))

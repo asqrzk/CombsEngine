@@ -40,11 +40,36 @@ pub struct Value {
     /// Required for every tier but `Measured`; the formula or the source.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub basis: Option<String>,
+    /// How many readings `value` is the median of. `None` means one
+    /// reading, which this estate has learned to distrust: four single
+    /// readings told stories in one day — a speed-up that was an outlier,
+    /// a prefill "regression" that was one pass, a cold perplexity pass,
+    /// and a fingerprint taken on battery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub samples: Option<usize>,
+    /// `(max - min) / median` as a percentage. `None` means unmeasured
+    /// spread — not a small one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spread_pct: Option<f64>,
 }
+
+/// How far a figure may move across repeats before it stops being a
+/// number and becomes a range. Wide, because this desk's honest
+/// run-to-run drift is around ten percent on derived figures, and a
+/// tool that cries noise at everything is one people stop reading.
+pub const SPREAD_BAND_PCT: f64 = 10.0;
 
 impl Value {
     pub fn measured(name: impl Into<String>, value: f64, unit: impl Into<String>) -> Self {
-        Self { name: name.into(), value, unit: unit.into(), tier: Tier::Measured, basis: None }
+        Self {
+            name: name.into(),
+            value,
+            unit: unit.into(),
+            tier: Tier::Measured,
+            basis: None,
+            samples: None,
+            spread_pct: None,
+        }
     }
 
     pub fn derived(
@@ -59,6 +84,8 @@ impl Value {
             unit: unit.into(),
             tier: Tier::Derived,
             basis: Some(basis.into()),
+            samples: None,
+            spread_pct: None,
         }
     }
 
@@ -74,6 +101,59 @@ impl Value {
             unit: unit.into(),
             tier: Tier::Estimated,
             basis: Some(basis.into()),
+            samples: None,
+            spread_pct: None,
+        }
+    }
+
+    /// One value from several readings of the same thing: the MEDIAN,
+    /// with the spread beside it.
+    ///
+    /// The median rather than the mean because the errors this estate
+    /// actually makes are single outliers — a cold run, a busy desk, a
+    /// thermal dip — and one of those moves a mean while the median
+    /// shrugs. The spread is kept whole (max − min over the median) and
+    /// not summarised further: it is the reader's evidence that the
+    /// number is a number.
+    pub fn from_samples(mut readings: Vec<Value>) -> Option<Value> {
+        let first = readings.first()?.clone();
+        if readings.len() == 1 {
+            return Some(first);
+        }
+        readings.sort_by(|a, b| a.value.partial_cmp(&b.value).unwrap_or(std::cmp::Ordering::Equal));
+        let n = readings.len();
+        let median = if n % 2 == 1 {
+            readings[n / 2].value
+        } else {
+            (readings[n / 2 - 1].value + readings[n / 2].value) / 2.0
+        };
+        let min = readings[0].value;
+        let max = readings[n - 1].value;
+        let spread = if median.abs() > f64::EPSILON {
+            (max - min) / median.abs() * 100.0
+        } else {
+            0.0
+        };
+        Some(Value {
+            value: median,
+            samples: Some(n),
+            spread_pct: Some(spread),
+            ..first
+        })
+    }
+
+    /// May this value be stated as a fact?
+    ///
+    /// A value measured once cannot be: its spread is unknown, which is
+    /// not the same as small. A value whose spread exceeds the band is a
+    /// RANGE, and a consumer that prints it as a number is telling a
+    /// story. Both cases are reported as what they are rather than
+    /// hidden, which is why this returns the reason.
+    pub fn steady(&self) -> Result<(), String> {
+        match (self.samples, self.spread_pct) {
+            (Some(n), Some(sp)) if n > 1 && sp <= SPREAD_BAND_PCT => Ok(()),
+            (Some(n), Some(sp)) if n > 1 => Err(format!("spread {sp:.0}% over {n} readings")),
+            _ => Err("one reading; spread unmeasured".to_string()),
         }
     }
 
@@ -207,6 +287,45 @@ mod tests {
         );
         r.runs.push(run_with(v));
         r
+    }
+
+    /// The median shrugs at the single outlier this estate actually
+    /// produces; the spread carries the evidence.
+    #[test]
+    fn a_repeated_value_takes_the_median_and_keeps_the_spread() {
+        let readings = vec![
+            Value::measured("decode", 30.0, "tokens/s"),
+            Value::measured("decode", 31.0, "tokens/s"),
+            // the §95 outlier, in miniature
+            Value::measured("decode", 13.0, "tokens/s"),
+        ];
+        let v = Value::from_samples(readings).unwrap();
+        assert_eq!(v.value, 30.0, "the median, not the mean (24.7)");
+        assert_eq!(v.samples, Some(3));
+        assert!((v.spread_pct.unwrap() - 60.0).abs() < 0.5, "{:?}", v.spread_pct);
+        assert!(v.steady().is_err(), "a 60% spread is a range, not a number");
+    }
+
+    /// A number measured once is not a steady number. It is allowed —
+    /// it is simply not allowed to be stated as a fact.
+    #[test]
+    fn one_reading_is_never_steady_and_says_why() {
+        let v = Value::measured("decode", 30.0, "tokens/s");
+        let why = v.steady().unwrap_err();
+        assert!(why.contains("one reading"), "{why}");
+        assert!(why.contains("unmeasured"), "the spread is unknown, not small: {why}");
+    }
+
+    #[test]
+    fn agreement_across_repeats_is_steady() {
+        let readings = vec![
+            Value::measured("decode", 30.0, "tokens/s"),
+            Value::measured("decode", 31.0, "tokens/s"),
+            Value::measured("decode", 30.5, "tokens/s"),
+        ];
+        let v = Value::from_samples(readings).unwrap();
+        assert_eq!(v.value, 30.5);
+        assert!(v.steady().is_ok(), "3% spread is a number");
     }
 
     /// The rule the whole record exists for: arithmetic cannot pass

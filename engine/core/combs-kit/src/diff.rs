@@ -90,6 +90,24 @@ pub fn compare(a: &Record, b: &Record, tolerance_pct: f64) -> Verdict {
             if pct.abs() < tolerance_pct {
                 continue;
             }
+            // A figure that moved across its own readings cannot be the
+            // evidence for a regression: the change may be the noise the
+            // spread already showed. Reported, never counted — silence
+            // here would be its own lie.
+            let noisy = va
+                .spread_pct
+                .into_iter()
+                .chain(vb.spread_pct)
+                .fold(0.0f64, f64::max);
+            if noisy > crate::record::SPREAD_BAND_PCT || noisy >= pct.abs() {
+                if va.spread_pct.is_some() || vb.spread_pct.is_some() {
+                    lines.push(format!(
+                        "{:<6} {:<22} {:>10.2} → {:>10.2} {:<16} {:+.1}%  within its own spread (±{noisy:.0}%)",
+                        run_a.id, va.name, va.value, vb.value, va.unit, pct,
+                    ));
+                    continue;
+                }
+            }
             let worse = match dir {
                 Better::Higher => pct < 0.0,
                 Better::Lower => pct > 0.0,
@@ -191,6 +209,21 @@ mod tests {
         let b = rec("m", "f32", "battery", vec![Value::measured("decode_tok_s", 60.0, "tokens/s")]);
         let v = compare(&a, &b, 5.0);
         assert!(v.lines.iter().any(|l| l.starts_with("WARNING: different power")));
+    }
+
+    /// A change smaller than the figure's own spread is not a
+    /// regression, and must not be counted as one.
+    #[test]
+    fn a_change_inside_its_own_spread_is_not_a_regression() {
+        let mut a = rec("m", "f32", "ac", vec![Value::measured("decode_tok_s", 100.0, "tokens/s")]);
+        let mut b = rec("m", "f32", "ac", vec![Value::measured("decode_tok_s", 80.0, "tokens/s")]);
+        a.runs[0].values[0].samples = Some(3);
+        a.runs[0].values[0].spread_pct = Some(40.0);
+        b.runs[0].values[0].samples = Some(3);
+        b.runs[0].values[0].spread_pct = Some(40.0);
+        let v = compare(&a, &b, 5.0);
+        assert_eq!(v.regressions, 0, "a 20% move under a 40% spread is noise");
+        assert!(v.lines.iter().any(|l| l.contains("within its own spread")), "{:?}", v.lines);
     }
 
     #[test]

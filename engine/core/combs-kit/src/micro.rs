@@ -17,7 +17,7 @@
 
 use crate::record::{Run, Value};
 
-pub const CELLS: &[&str] = &["dispatch", "bus", "gemv", "submits"];
+pub const CELLS: &[&str] = &["dispatch", "bus", "gemv", "gemv-cuts", "submits"];
 
 /// One cell, inside a child. Never call from the parent.
 pub fn run_cell(cell: &str) -> Run {
@@ -64,6 +64,39 @@ pub fn run_cell(cell: &str) -> Run {
                     "GB/s",
                     "packed q4_k bytes / time per rep",
                 ));
+            }
+        }
+        "gemv-cuts" => {
+            // The experiment §102 asked for: does the narrow projection
+            // want more workgroups or more work per lane? The two cuts
+            // either side of the default answer opposite ways, so the
+            // winner names the cause rather than only the cure.
+            for (label, n_out, k) in [
+                ("kv_proj_512", 512usize, 1024usize),
+                ("q_proj_2048", 2048, 1024),
+                ("up_proj_3072", 3072, 1024),
+                ("down_proj_1024", 1024, 3072),
+            ] {
+                for (rows, lanes) in [(8u32, 32u32), (16, 16), (32, 8)] {
+                    let (per, worst) = combs_models::gemv_cell_at(n_out, k, 200, rows, lanes);
+                    let packed = (n_out * k / 256) * 144;
+                    values.push(Value::measured(
+                        format!("{label}_r{rows}l{lanes}_us"),
+                        per.as_secs_f64() * 1e6,
+                        "us",
+                    ));
+                    values.push(Value::derived(
+                        format!("{label}_r{rows}l{lanes}_gbs"),
+                        packed as f64 / per.as_secs_f64() / 1e9,
+                        "GB/s",
+                        "packed q4_k bytes / time per rep",
+                    ));
+                    // A cut that computes the wrong answer quickly is
+                    // not a faster kernel; the error rides the record.
+                    if worst > 1e-3 {
+                        notes.push(format!("{label} at {rows}x{lanes}: rel error {worst:.1e} — WRONG, not faster"));
+                    }
+                }
             }
         }
         other => notes.push(format!("no measurement: unknown cell {other:?}")),

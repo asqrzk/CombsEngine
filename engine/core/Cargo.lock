@@ -1276,6 +1276,7 @@ dependencies = [
  "combs-formats",
  "combs-models",
  "combs-runtime",
+ "cubecl",
  "libc",
  "serde",
  "serde_json",

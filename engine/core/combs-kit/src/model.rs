@@ -128,6 +128,25 @@ pub fn run_one(subject: &Subject) -> Run {
         }
     };
     let load_ms = load_started.elapsed().as_secs_f64() * 1e3;
+    // The model as the ENGINE reports it after loading, not as the path
+    // suggests. A directory named "14b" that held a 7b would otherwise be
+    // recorded as a 14b — and the person reading the record has asked,
+    // plainly, that nothing about the model be assumed.
+    let meta = engine.metadata();
+    let loaded = serde_json::json!({
+        "file": std::path::Path::new(&resolved)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        "architecture": meta.architecture,
+        "layers": meta.num_hidden_layers,
+        "hidden": meta.hidden_size,
+        "heads": meta.num_attention_heads,
+        "kv_heads": meta.num_key_value_heads,
+        "head_dim": meta.head_dim,
+        "vocab": meta.vocab_size,
+        "max_positions": meta.max_position_embeddings,
+    });
     let (load_dispatches, _) = combs_core::gpu_counters();
 
     let prompt = prompt_of(subject.prompt_tokens);
@@ -268,24 +287,143 @@ pub fn run_one(subject: &Subject) -> Run {
         ));
     }
 
+    // What was ACTUALLY live, asked of the code that read each door,
+    // and what ACTUALLY dispatched. Assumed configuration is how this
+    // estate measured the wrong backend for an afternoon; a run that
+    // cannot say what it ran is a number with no question attached.
+    let mut doors: Vec<(String, String)> = combs_models::active_doors(
+        &<combs_core::wgpu::WgpuRuntime as cubecl::prelude::Runtime>::client(
+            &combs_core::init_device(),
+        ),
+    )
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    // An open door is not a road taken. Only THIS crate knows whether
+    // the tensors reaching those kernels are f16, so only this crate may
+    // say whether the storage road was walked.
+    if let Some(entry) = doors.iter_mut().find(|(k, _)| k == "f16_storage_door") {
+        entry.1 = match (entry.1 == "true", cfg!(feature = "f16")) {
+            (true, true) => "open · taken (f16 tensors reach the kernels)".to_string(),
+            (true, false) => "open · never taken (this build has no f16 tensors)".to_string(),
+            (false, _) => "shut".to_string(),
+        };
+    }
+    let census = combs_models::quant_census();
+
     // The engine complains if it is dropped without one, and a bench
     // whose output is half diagnostics is harder to read than it needs
     // to be.
     engine.shutdown();
 
+    let mut config = subject.to_json_for_record();
+    if let Some(obj) = config.as_object_mut() {
+        obj.insert(
+            "doors".into(),
+            serde_json::Value::Object(doors.into_iter().map(|(k, v)| (k, serde_json::Value::String(v))).collect()),
+        );
+        obj.insert("quant_dispatch".into(), serde_json::Value::String(census));
+        obj.insert("loaded".into(), loaded);
+    }
+
     Run {
         id: subject.id.clone(),
         kind: "model".into(),
         subject: identity(&subject.model),
-        config: subject.to_json_for_record(),
+        config,
         warm: true,
         values,
         notes,
     }
 }
 
+/// Several readings of one subject, merged into a Run whose values
+/// carry the median and the spread.
+///
+/// The readings are separate CHILDREN, not a loop inside one: a loop
+/// would share a warmed pool, a settled clock and one thermal state,
+/// and would therefore agree with itself. The point is to catch the run
+/// that disagrees.
+pub fn merge(readings: Vec<Run>) -> Run {
+    let mut first = match readings.first() {
+        Some(r) => r.clone(),
+        None => return Run {
+            id: "none".into(),
+            kind: "model".into(),
+            subject: "none".into(),
+            config: serde_json::Value::Null,
+            warm: false,
+            values: vec![],
+            notes: vec!["no measurement: nothing to merge".into()],
+        },
+    };
+    if readings.len() == 1 {
+        return first;
+    }
+    let mut names: Vec<String> = Vec::new();
+    for r in &readings {
+        for v in &r.values {
+            if !names.contains(&v.name) {
+                names.push(v.name.clone());
+            }
+        }
+    }
+    let mut merged = Vec::new();
+    for name in names {
+        let group: Vec<crate::record::Value> = readings
+            .iter()
+            .flat_map(|r| r.values.iter())
+            .filter(|v| v.name == name)
+            .cloned()
+            .collect();
+        // A value missing from some readings is reported on the ones it
+        // appeared in, and says so — never silently averaged over fewer.
+        if group.len() < readings.len() {
+            first.notes.push(format!(
+                "{name}: {} of {} readings carried it",
+                group.len(),
+                readings.len()
+            ));
+        }
+        if let Some(v) = crate::record::Value::from_samples(group) {
+            merged.push(v);
+        }
+    }
+    let failed = readings.iter().filter(|r| r.values.is_empty()).count();
+    if failed > 0 {
+        first
+            .notes
+            .push(format!("{failed} of {} readings produced nothing", readings.len()));
+    }
+    first.values = merged;
+    first
+}
+
 /// Print one run as a human line. The record is the artefact; this is
 /// so a person watching a sweep can see it moving.
+/// The spread badge on the bench line: the figure people quote carries
+/// its own range on the same line, so a range cannot be read as a number.
+/// It is the WORST spread among the headline figures (prefill and
+/// decode), named: §105's first cell had a steady decode and a ±121%
+/// prefill, and a decode-only badge let the range reach the record and
+/// never the screen.
+pub fn spread_badge(run: &Run) -> String {
+    let worst = ["decode_tok_s", "prefill_tok_s"]
+        .iter()
+        .filter_map(|name| {
+            let v = run.values.iter().find(|v| &v.name == name)?;
+            v.spread_pct.map(|sp| (sp, v.samples.unwrap_or(1), name.trim_end_matches("_tok_s")))
+        })
+        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    match worst {
+        Some((sp, n, which)) if sp > crate::record::SPREAD_BAND_PCT => {
+            format!("  ±{sp:.0}% over {n} on {which} — A RANGE, NOT A NUMBER")
+        }
+        Some((sp, n, _)) => format!("  ±{sp:.0}% over {n}"),
+        None => String::new(),
+    }
+}
+
 pub fn print_run(run: &Run) {
     let get = |name: &str| {
         run.values
@@ -298,8 +436,42 @@ pub fn print_run(run: &Run) {
         println!("  {:<8} {}", run.id, run.notes.join("; "));
         return;
     }
+    let tail = spread_badge(run);
+    if let Some(m) = run.config.get("loaded") {
+        println!(
+            "  {:<8} loaded {} · {} · {} layers · {}q/{}kv heads × {} · hidden {} · file {}",
+            "",
+            m["architecture"].as_str().unwrap_or("?"),
+            run.subject,
+            m["layers"],
+            m["heads"],
+            m["kv_heads"],
+            m["head_dim"],
+            m["hidden"],
+            m["file"].as_str().unwrap_or("?"),
+        );
+    }
+    if let Some(req) = run.config.get("env_requested").and_then(|d| d.as_object()) {
+        let asked: Vec<String> = req
+            .iter()
+            .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or("?")))
+            .collect();
+        println!("  {:<8} asked {}", "", asked.join(" "));
+    }
+    if let Some(doors) = run.config.get("doors").and_then(|d| d.as_object()) {
+        let live: Vec<String> = doors
+            .iter()
+            .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or("?")))
+            .collect();
+        println!("  {:<8} doors {}", "", live.join(" "));
+        if let Some(c) = run.config.get("quant_dispatch").and_then(|v| v.as_str()) {
+            if !c.is_empty() {
+                println!("  {:<8} dispatch {c}", "");
+            }
+        }
+    }
     println!(
-        "  {:<8} prompt {:>6.0} | prefill {:>7.1} tok/s | ttft {:>7.0} ms | decode {:>7.2} tok/s | {:>8.1} disp/tok | {:>6.1} us/disp | pool {:>7.0} MB",
+        "  {:<8} prompt {:>6.0} | prefill {:>7.1} tok/s | ttft {:>7.0} ms | decode {:>7.2} tok/s | {:>8.1} disp/tok | {:>6.1} us/disp | pool {:>7.0} MB{tail}",
         run.id,
         get("prompt_tokens"),
         get("prefill_tok_s"),
@@ -327,6 +499,37 @@ mod tests {
 
     /// The prompt must actually reach the depth asked for, or every
     /// "at 2k" figure in the record is a figure at some other depth.
+    /// §105's first cell: decode steady at ±0.7%, prefill at ±121%. The
+    /// badge printed "±1% over 2" and the range reached the record but
+    /// never the screen. The badge must name the WORST headline spread.
+    #[test]
+    fn the_badge_names_the_worst_headline_spread_not_only_decode() {
+        use crate::record::Value;
+        let two = |name: &str, a: f64, b: f64| {
+            Value::from_samples(vec![
+                Value::measured(name, a, "tokens/s"),
+                Value::measured(name, b, "tokens/s"),
+            ])
+            .unwrap()
+        };
+        let run = Run {
+            id: "d4".into(),
+            kind: "model".into(),
+            subject: "seat".into(),
+            config: serde_json::Value::Null,
+            warm: true,
+            values: vec![two("prefill_tok_s", 5.0, 22.0), two("decode_tok_s", 18.5, 18.6)],
+            notes: vec![],
+        };
+        let badge = spread_badge(&run);
+        assert!(badge.contains("A RANGE"), "a ±121% prefill is a range: {badge:?}");
+        assert!(badge.contains("prefill"), "the badge names the figure that ranged: {badge:?}");
+        let steady = Run { values: vec![two("prefill_tok_s", 22.0, 22.1), two("decode_tok_s", 18.5, 18.6)], ..run };
+        let badge = spread_badge(&steady);
+        assert!(!badge.contains("A RANGE"), "{badge:?}");
+        assert!(badge.contains("over 2"), "{badge:?}");
+    }
+
     #[test]
     fn a_prompt_reaches_roughly_the_depth_asked_for() {
         // ~12 tokens per repeated unit; the check is deliberately loose
