@@ -735,7 +735,7 @@ async fn gemv_canary(
             .map_err(|e| format!("q8_0 pack failed: {e}"))?;
             let dense = combs_formats::quants::dequantize_q8_0(&data, n_out * k)
                 .map_err(|e| format!("q8_0 reference failed: {e}"))?;
-            (dense, w.decode_gemv_wgsl(client, x_h, Storage::F32))
+            (dense, w.decode_gemv_wgsl(client, x_h, Storage::F32, None))
         }
         "q4_k" => {
             let data = synth(144, &[0, 2]);
@@ -745,7 +745,7 @@ async fn gemv_canary(
             .map_err(|e| format!("q4_k pack failed: {e}"))?;
             let dense = combs_formats::quants::dequantize_q4_k(&data, n_out * k)
                 .map_err(|e| format!("q4_k reference failed: {e}"))?;
-            (dense, w.decode_gemv_wgsl(client, x_h, Storage::F32))
+            (dense, w.decode_gemv_wgsl(client, x_h, Storage::F32, None))
         }
         _ => {
             let data = synth(210, &[208]);
@@ -755,7 +755,7 @@ async fn gemv_canary(
             .map_err(|e| format!("q6_k pack failed: {e}"))?;
             let dense = combs_formats::quants::dequantize_q6_k(&data, n_out * k)
                 .map_err(|e| format!("q6_k reference failed: {e}"))?;
-            (dense, w.decode_gemv_wgsl(client, x_h, Storage::F32))
+            (dense, w.decode_gemv_wgsl(client, x_h, Storage::F32, None))
         }
     };
     let bytes = client
@@ -1180,6 +1180,8 @@ mod tests {
             assert!(!t.contains("f16"), "gemv {i}: no f16 in the f32 rendering");
             assert!(!t.contains("{{"), "gemv {i}: a placeholder reached the compiler");
             assert!(t.contains("x: array<vec4<f32>>"), "gemv {i}: f32 bindings");
+            assert!(t.contains("residual: array<f32>"), "gemv {i}: the residual binding follows the storage");
+            assert!(t.contains("fuse: vec2<u32>"), "gemv {i}: the fold flag rides the scalars");
         }
         let f16s = [
             DecodeGemvQ8(Storage::F16).source().complete(),
@@ -1190,11 +1192,75 @@ mod tests {
             assert!(t.starts_with("enable f16;"), "gemv {i}: the directive is line one");
             assert!(t.contains("x: array<vec4<f16>>"), "gemv {i}: f16 activations");
             assert!(t.contains("out: array<f16>"), "gemv {i}: f16 output");
+            assert!(t.contains("residual: array<f16>"), "gemv {i}: an f16 out takes an f16 residual");
             assert!(
                 t.contains("var<workgroup> partial: array<f32, 256>"),
                 "gemv {i}: the partials stay f32 in every rendering"
             );
             assert!(!t.contains("{{"), "gemv {i}: a placeholder reached the compiler");
+        }
+    }
+
+    /// The residual folded into the epilogue equals the separate add, row
+    /// for row, per format. Same weights, same activation, same kernel;
+    /// the ONLY difference is the flag, so any drift is the fold's.
+    #[test]
+    fn a_folded_residual_equals_the_separate_add_per_format() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        use cubecl::prelude::*;
+        let device = cubecl::wgpu::WgpuDevice::default();
+        let client = WgpuRuntime::client(&device);
+        let (n_out, k) = (211usize, 1024usize);
+        let synth = |format: &str, block_bytes: usize, scale_offsets: &[usize]| -> Vec<u8> {
+            let blocks = match format {
+                "q8_0" => n_out * k / 32,
+                _ => n_out * k / 256,
+            };
+            let mut data: Vec<u8> = (0..blocks * block_bytes)
+                .map(|i| ((i * 37 + 11) % 251) as u8)
+                .collect();
+            for b in 0..blocks {
+                for (which, &off) in scale_offsets.iter().enumerate() {
+                    let bits: u16 = if which == 0 { 0x3C00 } else { 0x3400 };
+                    data[b * block_bytes + off..b * block_bytes + off + 2]
+                        .copy_from_slice(&bits.to_le_bytes());
+                }
+            }
+            data
+        };
+        let x: Vec<f32> = (0..k).map(|i| (((i as f32 * 0.311).sin() * 1.4) - 0.1) / 32.0).collect();
+        let res: Vec<f32> = (0..n_out).map(|r| (r as f32 * 0.73).cos() * 5.0).collect();
+        for format in ["q8_0", "q4_k", "q6_k"] {
+            let x_h = client.create_from_slice(f32::as_bytes(&x));
+            let x_h2 = client.create_from_slice(f32::as_bytes(&x));
+            let r_h = client.create_from_slice(f32::as_bytes(&res));
+            let (plain, folded) = match format {
+                "q8_0" => {
+                    let w = crate::qmatmul::Q80Weight::<WgpuRuntime>::from_gguf_bytes(&client, &synth(format, 34, &[0]), n_out, k).unwrap();
+                    (w.decode_gemv_wgsl(&client, x_h, Storage::F32, None), w.decode_gemv_wgsl(&client, x_h2, Storage::F32, Some(r_h)))
+                }
+                "q4_k" => {
+                    let w = crate::qmatmul::Q4KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &synth(format, 144, &[0, 2]), n_out, k).unwrap();
+                    (w.decode_gemv_wgsl(&client, x_h, Storage::F32, None), w.decode_gemv_wgsl(&client, x_h2, Storage::F32, Some(r_h)))
+                }
+                _ => {
+                    let w = crate::qmatmul::Q6KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &synth(format, 210, &[208]), n_out, k).unwrap();
+                    (w.decode_gemv_wgsl(&client, x_h, Storage::F32, None), w.decode_gemv_wgsl(&client, x_h2, Storage::F32, Some(r_h)))
+                }
+            };
+            let bytes = cubecl::future::block_on(client.read_async(vec![plain, folded])).unwrap();
+            let a = f32::from_bytes(&bytes[0]);
+            let b = f32::from_bytes(&bytes[1]);
+            for r in 0..n_out {
+                let want = a[r] + res[r];
+                assert!(
+                    (b[r] - want).abs() <= 1e-5 * want.abs().max(1.0),
+                    "{format} fold wrong at row {r}: folded {} vs separate {} + residual {}",
+                    b[r], a[r], res[r]
+                );
+            }
         }
     }
 
@@ -1257,17 +1323,17 @@ mod tests {
                 "q8_0" => {
                     let data = synth(format, 34, &[0]);
                     let w = crate::qmatmul::Q80Weight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
-                    (combs_formats::quants::dequantize_q8_0(&data, n_out * k).unwrap(), w.decode_gemv_wgsl(&client, x_h, Storage::F16))
+                    (combs_formats::quants::dequantize_q8_0(&data, n_out * k).unwrap(), w.decode_gemv_wgsl(&client, x_h, Storage::F16, None))
                 }
                 "q4_k" => {
                     let data = synth(format, 144, &[0, 2]);
                     let w = crate::qmatmul::Q4KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
-                    (combs_formats::quants::dequantize_q4_k(&data, n_out * k).unwrap(), w.decode_gemv_wgsl(&client, x_h, Storage::F16))
+                    (combs_formats::quants::dequantize_q4_k(&data, n_out * k).unwrap(), w.decode_gemv_wgsl(&client, x_h, Storage::F16, None))
                 }
                 _ => {
                     let data = synth(format, 210, &[208]);
                     let w = crate::qmatmul::Q6KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
-                    (combs_formats::quants::dequantize_q6_k(&data, n_out * k).unwrap(), w.decode_gemv_wgsl(&client, x_h, Storage::F16))
+                    (combs_formats::quants::dequantize_q6_k(&data, n_out * k).unwrap(), w.decode_gemv_wgsl(&client, x_h, Storage::F16, None))
                 }
             };
             let bytes = cubecl::future::block_on(client.read_async(vec![out_h])).unwrap();

@@ -955,6 +955,7 @@ impl<R: Runtime> Q80Weight<R> {
         client: &ComputeClient<cubecl::wgpu::WgpuRuntime>,
         x: Handle,
         storage: crate::wgsl::Storage,
+        residual: Option<Handle>,
     ) -> Handle {
         // The output follows the activation's width; the packed weights
         // are the quant format and never change. The accumulator inside
@@ -974,8 +975,9 @@ impl<R: Runtime> Q80Weight<R> {
                 self.qs.clone().binding(),
                 self.d.clone().binding(),
                 out_h.clone().binding(),
+                residual.clone().unwrap_or_else(|| out_h.clone()).binding(),
             ],
-            vec![self.n_out as u64, self.k as u64],
+            vec![self.n_out as u64, self.k as u64, u64::from(residual.is_some())],
         );
         out_h
     }
@@ -2281,6 +2283,7 @@ impl<R: Runtime> Q4KWeight<R> {
         client: &ComputeClient<cubecl::wgpu::WgpuRuntime>,
         x: Handle,
         storage: crate::wgsl::Storage,
+        residual: Option<Handle>,
     ) -> Handle {
         // The output follows the activation's width; the packed weights
         // are the quant format and never change. The accumulator inside
@@ -2301,8 +2304,9 @@ impl<R: Runtime> Q4KWeight<R> {
                 self.dd.clone().binding(),
                 self.scales.clone().binding(),
                 out_h.clone().binding(),
+                residual.clone().unwrap_or_else(|| out_h.clone()).binding(),
             ],
-            vec![self.n_out as u64, self.k as u64],
+            vec![self.n_out as u64, self.k as u64, u64::from(residual.is_some())],
         );
         out_h
     }
@@ -2592,6 +2596,7 @@ impl<R: Runtime> Q6KWeight<R> {
         client: &ComputeClient<cubecl::wgpu::WgpuRuntime>,
         x: Handle,
         storage: crate::wgsl::Storage,
+        residual: Option<Handle>,
     ) -> Handle {
         // The output follows the activation's width; the packed weights
         // are the quant format and never change. The accumulator inside
@@ -2613,8 +2618,9 @@ impl<R: Runtime> Q6KWeight<R> {
                 self.sc.clone().binding(),
                 self.d.clone().binding(),
                 out_h.clone().binding(),
+                residual.clone().unwrap_or_else(|| out_h.clone()).binding(),
             ],
-            vec![self.n_out as u64, self.k as u64],
+            vec![self.n_out as u64, self.k as u64, u64::from(residual.is_some())],
         );
         out_h
     }
@@ -2889,15 +2895,23 @@ impl QuantWeight {
         x: Handle,
         m: usize,
     ) -> Handle {
-        assert!(
-            self.takes_wgsl_gemv(m),
-            "matmul_device_f16 called off the gemv road (m={m}) — the caller must ask takes_wgsl_gemv first"
-        );
+        self.matmul_device_f16_add(client, x, m, None)
+    }
+
+    /// The f16 road with an optional residual folded into the epilogue.
+    pub fn matmul_device_f16_add(
+        &self,
+        client: &ComputeClient<cubecl::wgpu::WgpuRuntime>,
+        x: Handle,
+        m: usize,
+        residual: Option<Handle>,
+    ) -> Handle {
+        assert!(self.takes_wgsl_gemv(m), "matmul_device_f16 called off the gemv road (m={m})");
         let st = crate::wgsl::Storage::F16;
         match self {
-            QuantWeight::Q80(w) => w.decode_gemv_wgsl(client, x, st),
-            QuantWeight::Q4K(w) => w.decode_gemv_wgsl(client, x, st),
-            QuantWeight::Q6K(w) => w.decode_gemv_wgsl(client, x, st),
+            QuantWeight::Q80(w) => w.decode_gemv_wgsl(client, x, st, residual),
+            QuantWeight::Q4K(w) => w.decode_gemv_wgsl(client, x, st, residual),
+            QuantWeight::Q6K(w) => w.decode_gemv_wgsl(client, x, st, residual),
             _ => unreachable!("takes_wgsl_gemv admits only the three gemv formats"),
         }
     }
@@ -2908,25 +2922,43 @@ impl QuantWeight {
         x: Handle,
         m: usize,
     ) -> Handle {
+        self.matmul_device_add(client, x, m, None)
+    }
+
+    /// `matmul_device` with an optional residual folded into the gemv's
+    /// epilogue on the decode road. Off that road the residual is
+    /// returned untouched in the answer — the CALLER adds it — because
+    /// the dense cube path has no epilogue to fold into; `residual` must
+    /// be `None` there, and this asserts it so the add is never lost.
+    pub fn matmul_device_add(
+        &self,
+        client: &ComputeClient<cubecl::wgpu::WgpuRuntime>,
+        x: Handle,
+        m: usize,
+        residual: Option<Handle>,
+    ) -> Handle {
+        if residual.is_some() {
+            assert!(self.takes_wgsl_gemv(m), "a residual can only be folded on the gemv road (m={m})");
+        }
         match self {
             QuantWeight::Q40(w) => w.matmul_device(client, x, m),
             QuantWeight::Q50(w) => w.matmul_device(client, x, m),
             QuantWeight::Q80(w) => {
                 if m == 1 && w.k % Q4_0_BLOCK == 0 && crate::wgsl::gemv_enabled() {
-                    return w.decode_gemv_wgsl(client, x, crate::wgsl::Storage::F32);
+                    return w.decode_gemv_wgsl(client, x, crate::wgsl::Storage::F32, residual);
                 }
                 w.matmul_device(client, x, m)
             }
             QuantWeight::Q4K(w) => {
                 if m == 1 && w.k % K_SUPERBLOCK == 0 && crate::wgsl::gemv_enabled() {
-                    return w.decode_gemv_wgsl(client, x, crate::wgsl::Storage::F32);
+                    return w.decode_gemv_wgsl(client, x, crate::wgsl::Storage::F32, residual);
                 }
                 w.matmul_device(client, x, m)
             }
             QuantWeight::Q5K(w) => w.matmul_device(client, x, m),
             QuantWeight::Q6K(w) => {
                 if m == 1 && w.k % K_SUPERBLOCK == 0 && crate::wgsl::gemv_enabled() {
-                    return w.decode_gemv_wgsl(client, x, crate::wgsl::Storage::F32);
+                    return w.decode_gemv_wgsl(client, x, crate::wgsl::Storage::F32, residual);
                 }
                 w.matmul_device(client, x, m)
             }
@@ -3625,7 +3657,7 @@ mod tests {
             let dense = combs_formats::quants::dequantize_q8_0(&data, n_out * k).unwrap();
             let x = mk_x(k);
             let x_h = client.create_from_slice(f32::as_bytes(&x));
-            let got_h = w.decode_gemv_wgsl(&client, x_h.clone(), crate::wgsl::Storage::F32);
+            let got_h = w.decode_gemv_wgsl(&client, x_h.clone(), crate::wgsl::Storage::F32, None);
             let cube_h = w.matmul_device_with(&client, x_h, 1, false);
             let got = f32::from_bytes(&client.read_one_unchecked(got_h)).to_vec();
             let cube = f32::from_bytes(&client.read_one_unchecked(cube_h)).to_vec();
@@ -3638,7 +3670,7 @@ mod tests {
             let dense = combs_formats::quants::dequantize_q4_k(&data, n_out * k).unwrap();
             let x = mk_x(k);
             let x_h = client.create_from_slice(f32::as_bytes(&x));
-            let got_h = w.decode_gemv_wgsl(&client, x_h.clone(), crate::wgsl::Storage::F32);
+            let got_h = w.decode_gemv_wgsl(&client, x_h.clone(), crate::wgsl::Storage::F32, None);
             let cube_h = w.matmul_device_with(&client, x_h, 1, false);
             let got = f32::from_bytes(&client.read_one_unchecked(got_h)).to_vec();
             let cube = f32::from_bytes(&client.read_one_unchecked(cube_h)).to_vec();
@@ -3651,7 +3683,7 @@ mod tests {
             let dense = combs_formats::quants::dequantize_q6_k(&data, n_out * k).unwrap();
             let x = mk_x(k);
             let x_h = client.create_from_slice(f32::as_bytes(&x));
-            let got_h = w.decode_gemv_wgsl(&client, x_h.clone(), crate::wgsl::Storage::F32);
+            let got_h = w.decode_gemv_wgsl(&client, x_h.clone(), crate::wgsl::Storage::F32, None);
             let cube_h = w.matmul_device(&client, x_h, 1);
             let got = f32::from_bytes(&client.read_one_unchecked(got_h)).to_vec();
             let cube = f32::from_bytes(&client.read_one_unchecked(cube_h)).to_vec();

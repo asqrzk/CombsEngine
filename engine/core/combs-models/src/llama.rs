@@ -317,21 +317,28 @@ impl<B: Backend> LlamaModel<B> {
             let ctx = ctx
                 .swap_dims(1, 2)
                 .reshape([1, seq, m.num_attention_heads * m.head_dim]);
-            let mut attn_out = layer.o.forward(ctx, layer.o_bias.as_ref());
-            if let Some(n) = &layer.attn_out_norm {
-                attn_out = self.norm(attn_out, n);
-            }
-            x = x + attn_out;
+            // The residual add rides the projection's epilogue when nothing
+            // sits between them; gemma's post-attention norm does, and keeps
+            // the two-launch road.
+            x = match &layer.attn_out_norm {
+                None => layer.o.forward_add(ctx, layer.o_bias.as_ref(), x),
+                Some(n) => {
+                    let attn_out = self.norm(layer.o.forward(ctx, layer.o_bias.as_ref()), n);
+                    x + attn_out
+                }
+            };
 
             // --- MLP block (gated) ----------------------------------------------
             let h = self.norm(x.clone(), &layer.pre_mlp_norm);
             let gated = crate::act::apply(self.spec.activation, layer.gate.forward(h.clone(), None))
                 * layer.up.forward(h.clone(), None);
-            let mut mlp_out = layer.down.forward(gated, None);
-            if let Some(n) = &layer.mlp_out_norm {
-                mlp_out = self.norm(mlp_out, n);
-            }
-            x = x + mlp_out;
+            x = match &layer.mlp_out_norm {
+                None => layer.down.forward_add(gated, None, x),
+                Some(n) => {
+                    let mlp_out = self.norm(layer.down.forward(gated, None), n);
+                    x + mlp_out
+                }
+            };
 
             let applied = layer_idx + 1;
             for (slot, &t) in taps.iter().enumerate() {

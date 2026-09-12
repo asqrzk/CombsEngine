@@ -9,6 +9,7 @@
 struct Params {
   n_out: vec2<u32>,
   k: vec2<u32>,
+  fuse: vec2<u32>,
 }
 
 @group(0) @binding(0) var<storage, read_write> x: array<{{act4}}>;
@@ -16,7 +17,11 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> dd: array<f32>;
 @group(0) @binding(3) var<storage, read_write> scales: array<u32>;
 @group(0) @binding(4) var<storage, read_write> out: array<{{act}}>;
-@group(0) @binding(5) var<uniform> params: Params;
+// The residual stream to add in the epilogue when params.fuse.x == 1u;
+// bound to `out` itself (never read) when nothing is fused, so the
+// pipeline layout never changes. Read_write like every buffer here.
+@group(0) @binding(5) var<storage, read_write> residual: array<{{act}}>;
+@group(0) @binding(6) var<uniform> params: Params;
 
 var<workgroup> partial: array<f32, 256>;
 
@@ -90,6 +95,10 @@ fn main(
     workgroupBarrier();
   }
   if (lane == 0u && row < params.n_out.x) {
-    out[row] = {{act}}(partial[local]);
+    var y = partial[local];
+    if (params.fuse.x == 1u) {
+      y += f32(residual[row]);
+    }
+    out[row] = {{act}}(y);
   }
 }

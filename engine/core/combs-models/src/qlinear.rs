@@ -58,6 +58,16 @@ pub(crate) type InnerF32 = CubeBackend<WgpuRuntime, f32, i32, u32>;
 pub trait QuantLinearOp<B: Backend>: Send + Sync {
     /// `y = x @ W^T` for `x: [batch, seq, k]` → `[batch, seq, n_out]`.
     fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3>;
+
+    /// `forward(x) + residual`, with the add folded into the gemv's
+    /// epilogue where the road allows it. The default is the two-launch
+    /// answer, so every implementation is correct before any is fast;
+    /// the unfused wgpu arms override it on the decode road. Exact by
+    /// construction: the epilogue adds in f32 before the single store,
+    /// which is at least as good as the separate add ever was.
+    fn forward_add(&self, x: Tensor<B, 3>, residual: Tensor<B, 3>) -> Tensor<B, 3> {
+        self.forward(x) + residual
+    }
     /// `[n_out, k]`, matching a dense weight's `dims()`.
     fn dims(&self) -> [usize; 2];
     /// Bytes the packed weight occupies in VRAM.
@@ -83,6 +93,22 @@ impl<B: Backend> Linear<B> {
     }
 
     /// `y = x @ W^T (+ b)` for `x: [batch, seq, k]`.
+    /// `forward(x, bias) + residual`, folded into the projection's own
+    /// epilogue on the quantized decode road. A bias keeps the plain
+    /// road: it is one more add and it is rare (phi), and one fused shape
+    /// is worth more than two.
+    pub fn forward_add(
+        &self,
+        x: Tensor<B, 3>,
+        bias: Option<&Tensor<B, 1>>,
+        residual: Tensor<B, 3>,
+    ) -> Tensor<B, 3> {
+        match (self, bias) {
+            (Linear::Quant(op), None) => op.forward_add(x, residual),
+            _ => self.forward(x, bias) + residual,
+        }
+    }
+
     pub fn forward(&self, x: Tensor<B, 3>, bias: Option<&Tensor<B, 1>>) -> Tensor<B, 3> {
         match self {
             Linear::Dense(w) => dense_linear(x, w, bias),
@@ -496,6 +522,26 @@ fn try_batched_matmul_with(
 }
 
 impl QuantLinearOp<UnfusedF32> for CubeQuantLinear {
+    fn forward_add(&self, x: Tensor<UnfusedF32, 3>, residual: Tensor<UnfusedF32, 3>) -> Tensor<UnfusedF32, 3> {
+        let [batch, seq, _] = x.dims();
+        // Fold only where the epilogue exists and the dtypes agree: the
+        // decode shape on the gemv road, an f32 residual for an f32 out.
+        if batch * seq == 1 && self.w.takes_wgsl_gemv(1) && residual.dtype() == DType::F32 {
+            let prim = into_contiguous(to_f32(x).into_primitive().tensor());
+            let res = into_contiguous(residual.into_primitive().tensor());
+            let out_h = self.w.matmul_device_add(&prim.client, prim.handle.clone(), 1, Some(res.handle.clone()));
+            let out = CubeTensor::new_contiguous(
+                prim.client.clone(),
+                prim.device.clone(),
+                Shape::from([batch, seq, self.w.n_out()]),
+                out_h,
+                DType::F32,
+            );
+            return Tensor::from_primitive(TensorPrimitive::Float(out));
+        }
+        self.forward(x) + residual
+    }
+
     fn forward(&self, x: Tensor<UnfusedF32, 3>) -> Tensor<UnfusedF32, 3> {
         let in_dtype = x.dtype();
         let [batch, seq, _] = x.dims();
@@ -517,6 +563,31 @@ impl QuantLinearOp<UnfusedF32> for CubeQuantLinear {
 }
 
 impl QuantLinearOp<UnfusedF16> for CubeQuantLinear {
+    fn forward_add(&self, x: Tensor<UnfusedF16, 3>, residual: Tensor<UnfusedF16, 3>) -> Tensor<UnfusedF16, 3> {
+        let in_dtype = x.dtype();
+        let [batch, seq, _] = x.dims();
+        // On the f16 storage road the out is f16 and so is the residual
+        // stream: fold. On the cast road the out is f32 and the residual
+        // f16 — no epilogue can add those, so the plain road stands.
+        if in_dtype == DType::F16 && residual.dtype() == DType::F16 && batch * seq == 1 && self.w.takes_wgsl_gemv(1) {
+            let prim = x.clone().into_primitive().tensor();
+            if crate::wgsl::f16_storage_enabled(&prim.client) {
+                let prim = into_contiguous(prim);
+                let res = into_contiguous(residual.into_primitive().tensor());
+                let out_h = self.w.matmul_device_f16_add(&prim.client, prim.handle.clone(), 1, Some(res.handle.clone()));
+                let out = CubeTensor::new_contiguous(
+                    prim.client.clone(),
+                    prim.device.clone(),
+                    Shape::from([batch, seq, self.w.n_out()]),
+                    out_h,
+                    DType::F16,
+                );
+                return Tensor::from_primitive(TensorPrimitive::Float(out));
+            }
+        }
+        self.forward(x) + residual
+    }
+
     fn forward(&self, x: Tensor<UnfusedF16, 3>) -> Tensor<UnfusedF16, 3> {
         let in_dtype = x.dtype();
         let [batch, seq, _] = x.dims();
@@ -766,6 +837,56 @@ pub fn try_quant_linear<B: Backend>(
 
 #[cfg(test)]
 mod tests {
+
+    /// `forward_add` is `forward` plus the residual, on both unfused arms
+    /// and at both shapes — the decode shape takes the epilogue, the
+    /// prefill shape the default road, and the answer must not know which.
+    #[test]
+    fn forward_add_is_forward_plus_the_residual_on_every_road() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        use cubecl::prelude::*;
+        let device = WgpuDevice::default();
+        let client = WgpuRuntime::client(&device);
+        let (n_out, k) = (96usize, 512usize);
+        let blocks = n_out * k / 32;
+        let mut data: Vec<u8> = (0..blocks * 34).map(|i| ((i * 37 + 11) % 251) as u8).collect();
+        for b in 0..blocks {
+            data[b * 34..b * 34 + 2].copy_from_slice(&0x3C00u16.to_le_bytes());
+        }
+        let w = crate::qmatmul::Q80Weight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
+        let w = std::sync::Arc::new(QuantWeight::Q80(w));
+        let lin32 = quant_linear_from_weight::<UnfusedF32>(w.clone()).unwrap();
+        let lin16 = quant_linear_from_weight::<UnfusedF16>(w).unwrap();
+        let dev = Default::default();
+        let f16_road = crate::wgsl::f16_storage_enabled_for_test(&client);
+        for m in [1usize, 8] {
+            let xs: Vec<f32> = (0..m * k).map(|i| (((i as f32 * 0.311).sin() * 1.4) - 0.1) / 8.0).collect();
+            let rs: Vec<f32> = (0..m * n_out).map(|i| (i as f32 * 0.73).cos() * 3.0).collect();
+            // f32 arm
+            let x = burn::tensor::Tensor::<UnfusedF32, 3>::from_data(burn::tensor::TensorData::new(xs.clone(), [1, m, k]), &dev);
+            let r = burn::tensor::Tensor::<UnfusedF32, 3>::from_data(burn::tensor::TensorData::new(rs.clone(), [1, m, n_out]), &dev);
+            let want: Vec<f32> = (lin32.forward(x.clone()) + r.clone()).into_data().convert::<f32>().to_vec().unwrap();
+            let got: Vec<f32> = lin32.forward_add(x, r).into_data().convert::<f32>().to_vec().unwrap();
+            for (i, (g, e)) in got.iter().zip(&want).enumerate() {
+                assert!((g - e).abs() <= 1e-4 * e.abs().max(1.0), "f32 arm m={m} [{i}]: {g} vs {e}");
+            }
+            // f16 arm, where the adapter admits it
+            if f16_road {
+                let x = crate::wgsl::from_f32(burn::tensor::Tensor::<UnfusedF16, 3>::from_data(burn::tensor::TensorData::new(xs.clone(), [1, m, k]), &dev), burn::tensor::DType::F16);
+                let r = crate::wgsl::from_f32(burn::tensor::Tensor::<UnfusedF16, 3>::from_data(burn::tensor::TensorData::new(rs.clone(), [1, m, n_out]), &dev), burn::tensor::DType::F16);
+                let want: Vec<f32> = (lin16.forward(x.clone()) + r.clone()).into_data().convert::<f32>().to_vec().unwrap();
+                let got16 = lin16.forward_add(x, r);
+                assert_eq!(got16.dtype(), burn::tensor::DType::F16, "the f16 arm hands back f16 on both roads");
+                let got: Vec<f32> = got16.into_data().convert::<f32>().to_vec().unwrap();
+                for (i, (g, e)) in got.iter().zip(&want).enumerate() {
+                    // one f16 rounding on each side of the add
+                    assert!((g - e).abs() <= 3e-3 * e.abs().max(1.0), "f16 arm m={m} [{i}]: {g} vs {e}");
+                }
+            }
+        }
+    }
 
     /// The decision at the seam: an f16 activation at the decode shape
     /// takes the f16 road (proven by the OUTPUT dtype — no counter, they
