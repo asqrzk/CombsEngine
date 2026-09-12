@@ -192,6 +192,15 @@ pub const DOORS: &[Door] = &[
         read_at: "combs-formats",
         measured: None,
     },
+    Door {
+        kind: Kind::Knob,
+        name: "COMBS_WGSL_F16",
+        default: "off",
+        does: "let the hand-written kernels store activations in f16 instead of casting around an f32 launch; arithmetic stays f32 either way. Opt-in until it has sat on a box where bytes cost more than launches",
+        read_at: "combs-models/src/wgsl/mod.rs f16_storage_enabled",
+        measured: Some("MEASUREMENTS §96"),
+    },
+
     // ── knobs the table lacked until the drift test named them ──
     Door { kind: Kind::Knob, name: "COMBS_ATTN", default: "fused", does: "manual sends attention back to the hand-rolled path instead of the fused one", read_at: "combs-models/src/kv.rs:27", measured: None },
     Door { kind: Kind::Knob, name: "COMBS_PACKED_EMBED", default: "on", does: "0 dequantizes the embedding table instead of gathering from packed bytes", read_at: "combs-models/src/embed.rs:260", measured: None },
