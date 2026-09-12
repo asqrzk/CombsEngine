@@ -1,4 +1,4 @@
-// Fused RMSNorm: one workgroup per row, y = x * inv_rms(x) * (w + flavor).
+{{f16_enable}}// Fused RMSNorm: one workgroup per row, y = x * inv_rms(x) * (w + flavor).
 //
 // flavor crosses as f32 bits: 0.0 is the plain norm, 1.0 the gemma
 // zero-centered weight. eps is added to mean(x²) inside the sqrt, matching
@@ -16,9 +16,9 @@ struct Params {
   flavor: vec2<u32>,
 }
 
-@group(0) @binding(0) var<storage, read_write> x: array<f32>;
-@group(0) @binding(1) var<storage, read_write> w: array<f32>;
-@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(0) var<storage, read_write> x: array<{{act}}>;
+@group(0) @binding(1) var<storage, read_write> w: array<{{act}}>;
+@group(0) @binding(2) var<storage, read_write> out: array<{{act}}>;
 @group(0) @binding(3) var<uniform> params: Params;
 
 var<workgroup> scratch: array<f32, 256>;
@@ -35,7 +35,7 @@ fn main(
 
   var sum = 0.0;
   for (var i = lane; i < n; i += 256u) {
-    let v = x[base + i];
+    let v = f32(x[base + i]);
     sum += v * v;
   }
   scratch[lane] = sum;
@@ -51,6 +51,6 @@ fn main(
   let inv_rms = 1.0 / sqrt(scratch[0] / f32(n) + bitcast<f32>(params.eps.x));
   let flavor = bitcast<f32>(params.flavor.x);
   for (var i = lane; i < n; i += 256u) {
-    out[base + i] = x[base + i] * inv_rms * (w[i] + flavor);
+    out[base + i] = {{act}}(f32(x[base + i]) * inv_rms * (f32(w[i]) + flavor));
   }
 }

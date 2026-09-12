@@ -193,6 +193,17 @@ fn cmd_model(
     let m = machine::read();
     if !json && out.is_none() {
         machine::print_human(&m);
+        // The build, on screen, every time. Half of every number here is
+        // which binary produced it, and this estate has already measured
+        // the wrong backend once because a feature flag did not forward
+        // and nothing on screen said so.
+        let b = build_stamp();
+        println!(
+            "  build       {} · fusion {} · {}",
+            b["dtype"].as_str().unwrap_or("?"),
+            b["fusion"].as_bool().unwrap_or(false),
+            b["profile"].as_str().unwrap_or("?"),
+        );
         println!("\nmodel {path}");
     }
     let mut runs = Vec::new();

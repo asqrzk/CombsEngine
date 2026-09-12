@@ -44,6 +44,84 @@
 
 use burn_cubecl::template::{KernelSource, SourceKernel, SourceTemplate};
 
+/// Which element type a kernel's STORAGE uses. Its arithmetic is f32
+/// either way — that is not a tuning choice but a measured law (§66:
+/// f16 operands with an f32 accumulator match the host to 1.5e-6, while
+/// accumulating IN f16 diverges 3.4e-3 and overflows at a sum of
+/// 14,467). What this changes is what crosses the bus and what sits in
+/// the arena.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Storage {
+    F32,
+    F16,
+}
+
+impl Storage {
+    /// Line one of the shader. WGSL requires `enable` directives before
+    /// anything else, and a browser REJECTS them — then dispatches the
+    /// invalid pipeline as a silent no-op, which is how a model decodes
+    /// zeros with no error. The door below is what keeps this empty in
+    /// a browser build.
+    fn enable_line(self) -> &'static str {
+        match self {
+            Storage::F32 => "",
+            Storage::F16 => "enable f16;\n",
+        }
+    }
+
+    fn act(self) -> &'static str {
+        match self {
+            Storage::F32 => "f32",
+            Storage::F16 => "f16",
+        }
+    }
+
+    fn act4(self) -> &'static str {
+        match self {
+            Storage::F32 => "vec4<f32>",
+            Storage::F16 => "vec4<f16>",
+        }
+    }
+}
+
+/// May this box store kernel activations in f16?
+///
+/// Four conditions, and each is load-bearing. Never in a browser (the
+/// `enable` above). Never when the master WGSL door is shut. Opt-in
+/// while the road is young (`COMBS_WGSL_F16=1`). And only when the
+/// ADAPTER admits the type — asked through the same registration the
+/// compiler itself consults, rather than a feature string we parse
+/// ourselves. cubecl requests every adapter feature when it creates the
+/// device, so a type the properties admit is a type the shader may
+/// `enable`.
+pub(crate) fn f16_storage_enabled(
+    client: &cubecl::prelude::ComputeClient<WgpuRuntime>,
+) -> bool {
+    if cfg!(target_family = "wasm") || !wgsl_enabled() {
+        return false;
+    }
+    static ASKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ASKED.get_or_init(|| matches!(std::env::var("COMBS_WGSL_F16").as_deref(), Ok("1"))) {
+        return false;
+    }
+    client
+        .properties()
+        .supports_type(cubecl::ir::ElemType::Float(cubecl::ir::FloatKind::F16))
+}
+
+/// The adapter half of [`f16_storage_enabled`], without the opt-in env
+/// door — so a test can ask "can this box do it at all?" and skip by
+/// name, rather than silently pass because the door happened to be shut.
+#[cfg(test)]
+pub(crate) fn f16_storage_enabled_for_test(
+    client: &cubecl::prelude::ComputeClient<WgpuRuntime>,
+) -> bool {
+    !cfg!(target_family = "wasm")
+        && client
+            .properties()
+            .supports_type(cubecl::ir::ElemType::Float(cubecl::ir::FloatKind::F16))
+}
+
 /// The seam's dtype bridge.
 ///
 /// Every kernel here computes and stores f32 — the contract line above
@@ -116,9 +194,40 @@ macro_rules! wgsl_kernel {
     };
 }
 
+/// A kernel whose source is rendered for one STORAGE type.
+///
+/// Substitution, not a second file: the audited body — tiling, the
+/// reduction's barrier discipline, the guards — must not fork, or the
+/// two copies drift and only one of them stays reviewed. The f32
+/// rendering must come out byte-identical to the pre-change file, and a
+/// unit below holds that line.
+macro_rules! wgsl_kernel_dual {
+    ($name:ident, $file:expr) => {
+        pub(crate) struct $name(pub(crate) Storage);
+
+        impl KernelSource for $name {
+            fn source(&self) -> SourceTemplate {
+                SourceTemplate::new(include_str!($file))
+                    .register("f16_enable", self.0.enable_line())
+                    .register("act", self.0.act())
+                    .register("act4", self.0.act4())
+            }
+
+            fn id(&self) -> KernelId {
+                // The storage rides the id, or the two renderings would
+                // collide in the pipeline cache and whichever compiled
+                // first would serve both.
+                KernelId::new::<Self>()
+                    .cube_dim(CubeDim::new_1d(WORKGROUP))
+                    .info(self.0)
+            }
+        }
+    };
+}
+
 wgsl_kernel!(ProbeEcho, "probe_echo.wgsl");
 wgsl_kernel!(ProbeSmem, "probe_smem.wgsl");
-wgsl_kernel!(RmsNorm, "rmsnorm.wgsl");
+wgsl_kernel_dual!(RmsNorm, "rmsnorm.wgsl");
 wgsl_kernel!(DecodeAttn, "decode_attn.wgsl");
 wgsl_kernel!(DecodeAttnQ8, "decode_attn_q8.wgsl");
 wgsl_kernel!(DecodeAttnSplit, "decode_attn_split.wgsl");
@@ -281,7 +390,7 @@ pub async fn probe_report() -> Result<(), String> {
     let y_h = client.empty(rows * n * core::mem::size_of::<f32>());
     launch(
         &client,
-        RmsNorm,
+        RmsNorm(Storage::F32),
         CubeCount::Static(rows as u32, 1, 1),
         vec![x_h.binding(), w_h.binding(), y_h.clone().binding()],
         vec![
