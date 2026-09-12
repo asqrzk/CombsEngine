@@ -16,7 +16,7 @@
 
 use std::any::TypeId;
 
-use burn::backend::wgpu::{CubeTensor, WgpuRuntime};
+use burn::backend::wgpu::{CubeBackend, CubeTensor, FloatElement, WgpuRuntime};
 use burn::tensor::backend::Backend;
 use burn::tensor::{DType, Int, Shape, Tensor, TensorPrimitive};
 use burn_cubecl::fusion::FusionCubeRuntime;
@@ -27,10 +27,11 @@ use burn_ir::{CustomOpIr, HandleContainer, OperationIr, TensorIr, TensorStatus};
 use cubecl::prelude::CubeCount;
 
 use super::rmsnorm::cast_any;
+use super::Storage;
 use super::{
     DecodeAttn, DecodeAttnCombine, DecodeAttnSplit, PrefillAttn, WORKGROUP, launch, wgsl_enabled,
 };
-use crate::qlinear::{FusedF32, InnerF32, UnfusedF32};
+use crate::qlinear::{FusedF32, InnerF32, UnfusedF16, UnfusedF32};
 
 /// Per-kernel door on top of the master `COMBS_WGSL`; read once.
 pub(super) fn attn_enabled() -> bool {
@@ -115,7 +116,7 @@ pub(crate) fn try_decode_attention<B: Backend>(
         let k: Tensor<UnfusedF32, 4> = cast_any(k_arena)?;
         let v: Tensor<UnfusedF32, 4> = cast_any(v_arena)?;
         let t: Tensor<UnfusedF32, 1, Int> = cast_any(table)?;
-        return cast_any(attn_unfused(q, k, v, t, geom, scale));
+        return cast_any(attn_unfused(q, k, v, t, geom, scale, Storage::F32));
     }
     if TypeId::of::<B>() == TypeId::of::<FusedF32>() {
         let q: Tensor<FusedF32, 4> = cast_any(q)?;
@@ -123,6 +124,20 @@ pub(crate) fn try_decode_attention<B: Backend>(
         let v: Tensor<FusedF32, 4> = cast_any(v_arena)?;
         let t: Tensor<FusedF32, 1, Int> = cast_any(table)?;
         return cast_any(attn_fused(q, k, v, t, geom, scale));
+    }
+    if TypeId::of::<B>() == TypeId::of::<UnfusedF16>() {
+        let q: Tensor<UnfusedF16, 4> = cast_any(q)?;
+        let k: Tensor<UnfusedF16, 4> = cast_any(k_arena)?;
+        let v: Tensor<UnfusedF16, 4> = cast_any(v_arena)?;
+        let t: Tensor<UnfusedF16, 1, Int> = cast_any(table)?;
+        // No cast road here, deliberately: casting the arena would be
+        // larger than the work saved. Either the kernel reads f16 where
+        // it lies, or f16 keeps the burn path it had.
+        let client = q.clone().into_primitive().tensor().client;
+        if q.dtype() != DType::F16 || !super::f16_storage_enabled(&client) {
+            return None;
+        }
+        return cast_any(attn_unfused(q, k, v, t, geom, scale, Storage::F16));
     }
     None
 }
@@ -378,7 +393,7 @@ pub(crate) fn try_sliding_decode_attention<B: Backend>(
         let k: Tensor<UnfusedF32, 4> = cast_any(k)?;
         let v: Tensor<UnfusedF32, 4> = cast_any(v)?;
         let t = Tensor::<UnfusedF32, 1, Int>::zeros([1], &q.device());
-        return cast_any(attn_unfused(q, k, v, t, geom, scale));
+        return cast_any(attn_unfused(q, k, v, t, geom, scale, Storage::F32));
     }
     if TypeId::of::<B>() == TypeId::of::<FusedF32>() {
         let q: Tensor<FusedF32, 4> = cast_any(q)?;
@@ -386,6 +401,17 @@ pub(crate) fn try_sliding_decode_attention<B: Backend>(
         let v: Tensor<FusedF32, 4> = cast_any(v)?;
         let t = Tensor::<FusedF32, 1, Int>::zeros([1], &q.device());
         return cast_any(attn_fused(q, k, v, t, geom, scale));
+    }
+    if TypeId::of::<B>() == TypeId::of::<UnfusedF16>() {
+        let q: Tensor<UnfusedF16, 4> = cast_any(q)?;
+        let k: Tensor<UnfusedF16, 4> = cast_any(k)?;
+        let v: Tensor<UnfusedF16, 4> = cast_any(v)?;
+        let client = q.clone().into_primitive().tensor().client;
+        if q.dtype() != DType::F16 || !super::f16_storage_enabled(&client) {
+            return None;
+        }
+        let t = Tensor::<UnfusedF16, 1, Int>::zeros([1], &q.device());
+        return cast_any(attn_unfused(q, k, v, t, geom, scale, Storage::F16));
     }
     None
 }
@@ -406,13 +432,22 @@ fn launch_attn(
     table: CubeTensor<WgpuRuntime>,
     geom: AttnGeom,
     scale: f64,
+    storage: Storage,
 ) -> CubeTensor<WgpuRuntime> {
     let q = into_contiguous(q);
     let k = into_contiguous(k);
     let v = into_contiguous(v);
     let table = into_contiguous(table);
     let client = q.client.clone();
-    let out = client.empty(geom.n_q * geom.d * core::mem::size_of::<f32>());
+    // The output follows the arena's own width. The flash partials
+    // below do NOT: m, s and o are running maxima and sums across
+    // segments, and narrowing an accumulator is the one thing §66
+    // forbids outright.
+    let elem = match storage {
+        Storage::F32 => core::mem::size_of::<f32>(),
+        Storage::F16 => core::mem::size_of::<f32>() / 2,
+    };
+    let out = client.empty(geom.n_q * geom.d * elem);
 
     // K8: a deep global-visibility paged total starves the single-pass
     // kernel (one workgroup per head, serial tile walk), so the key
@@ -425,7 +460,7 @@ fn launch_attn(
         let o_part = client.empty(geom.n_q * segs * geom.d * core::mem::size_of::<f32>());
         launch(
             &client,
-            DecodeAttnSplit,
+            DecodeAttnSplit(storage),
             CubeCount::Static(geom.n_q as u32, segs as u32, 1),
             vec![
                 q.handle.binding(),
@@ -449,7 +484,7 @@ fn launch_attn(
         );
         launch(
             &client,
-            DecodeAttnCombine,
+            DecodeAttnCombine(storage),
             CubeCount::Static(geom.n_q as u32, 1, 1),
             vec![
                 m_part.binding(),
@@ -462,7 +497,7 @@ fn launch_attn(
     } else {
         launch(
             &client,
-            DecodeAttn,
+            DecodeAttn(storage),
             CubeCount::Static(geom.n_q as u32, 1, 1),
             vec![
                 q.handle.binding(),
@@ -474,23 +509,40 @@ fn launch_attn(
             geom.scalar_slots(scale),
         );
     }
+    let dtype = match storage {
+        Storage::F32 => DType::F32,
+        Storage::F16 => DType::F16,
+    };
     CubeTensor::new_contiguous(
         client,
         q.device.clone(),
         Shape::from([1, geom.n_q, 1, geom.d]),
         out,
-        DType::F32,
+        dtype,
     )
 }
 
-fn attn_unfused(
-    q: Tensor<UnfusedF32, 4>,
-    k: Tensor<UnfusedF32, 4>,
-    v: Tensor<UnfusedF32, 4>,
-    table: Tensor<UnfusedF32, 1, Int>,
+/// One body for both unfused element types.
+///
+/// This is the door F.2 deliberately left shut. Casting the arena up to
+/// f32 around the launch — the trick that served rmsnorm and rope —
+/// would have copied the WHOLE KV arena every layer of every token,
+/// which is larger than the work it saves. Reading it where it lies
+/// costs nothing extra and halves the bytes attention pulls per token,
+/// which is the part that grows with context.
+///
+/// The f16 road needs no cast at all, so it is taken only when the
+/// kernel can read f16 directly; otherwise f16 falls back to burn, as
+/// it did before.
+fn attn_unfused<F: FloatElement>(
+    q: Tensor<CubeBackend<WgpuRuntime, F, i32, u32>, 4>,
+    k: Tensor<CubeBackend<WgpuRuntime, F, i32, u32>, 4>,
+    v: Tensor<CubeBackend<WgpuRuntime, F, i32, u32>, 4>,
+    table: Tensor<CubeBackend<WgpuRuntime, F, i32, u32>, 1, Int>,
     geom: AttnGeom,
     scale: f64,
-) -> Tensor<UnfusedF32, 4> {
+    storage: Storage,
+) -> Tensor<CubeBackend<WgpuRuntime, F, i32, u32>, 4> {
     let out = launch_attn(
         q.into_primitive().tensor(),
         k.into_primitive().tensor(),
@@ -498,6 +550,7 @@ fn attn_unfused(
         table.into_primitive(),
         geom,
         scale,
+        storage,
     );
     Tensor::from_primitive(TensorPrimitive::Float(out))
 }
@@ -529,7 +582,7 @@ impl Operation<FusionCubeRuntime<WgpuRuntime>> for DecodeAttnOp {
         let kp: CubeTensor<WgpuRuntime> = handles.get_float_tensor::<InnerF32>(k);
         let vp: CubeTensor<WgpuRuntime> = handles.get_float_tensor::<InnerF32>(v);
         let tp: CubeTensor<WgpuRuntime> = handles.get_int_tensor::<InnerF32>(t);
-        let out = launch_attn(qp, kp, vp, tp, self.geom, self.scale);
+        let out = launch_attn(qp, kp, vp, tp, self.geom, self.scale, Storage::F32);
         handles.register_float_tensor::<InnerF32>(&output.id, out);
     }
 }
@@ -678,6 +731,108 @@ mod tests {
     /// The plan's harmony matrix: head dims, GQA ratios, totals straddling
     /// page and tile boundaries, windows, and a non-default scale — every
     /// case against the host reference, on the unfused backend.
+    /// Attention reading an f16 ARENA where it lies — the door F.2 shut
+    /// on purpose, because casting the arena up would copy the whole
+    /// thing every layer of every token.
+    ///
+    /// Two totals matter and both are covered: one below the split
+    /// threshold (the single-pass kernel) and one above it (the split
+    /// and combine pair), because deep context is the entire reason
+    /// this road exists and the deep path is a DIFFERENT kernel.
+    ///
+    /// The fixture is rounded to f16 on the host and the expectation
+    /// computed from the rounded values, so operand rounding is not
+    /// scored as kernel error. Softmax, the running maximum and the
+    /// partials are f32 in the kernel regardless.
+    #[test]
+    fn f16_storage_attention_matches_the_host_on_rounded_arenas() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let device = Default::default();
+        let half = |v: f32| f32::from(burn::tensor::f16::from_f32(v));
+        // 257 stays under the split threshold; 1300 is over it, so the
+        // split + combine pair is exercised too.
+        for &total in &[257usize, 1300] {
+            for &window in &[0usize, 512] {
+                let (d, n_kv, n_q, page_size) = (128usize, 2usize, 4usize, 16usize);
+                let scale = 1.0f32 / (d as f32).sqrt();
+                let keys: Vec<Vec<f32>> = (0..n_kv * total)
+                    .map(|i| signal(d, i as f32 * 0.71).iter().map(|v| half(*v)).collect())
+                    .collect();
+                let vals: Vec<Vec<f32>> = (0..n_kv * total)
+                    .map(|i| {
+                        signal(d, i as f32 * 0.71 + 90.0)
+                            .iter()
+                            .map(|v| half(*v))
+                            .collect()
+                    })
+                    .collect();
+                let q: Vec<f32> = signal(n_q * d, 42.5).iter().map(|v| half(*v)).collect();
+                let expect = reference(&q, &keys, &vals, n_q, n_kv, d, window, scale);
+
+                let (ak, av, table, num_pages) =
+                    paged_layout(&keys, &vals, n_kv, d, total, page_size);
+                // `from_data` keeps the dtype of the DATA, so the arenas
+                // must be cast down explicitly or an f16 kernel would be
+                // handed f32 bytes — the exact trap the rmsnorm canary
+                // fell into.
+                let qt: Tensor<UnfusedF16, 4> = crate::wgsl::from_f32(
+                    Tensor::from_data(TensorData::new(q, [1, n_q, 1, d]), &device),
+                    DType::F16,
+                );
+                let kt: Tensor<UnfusedF16, 4> = crate::wgsl::from_f32(
+                    Tensor::from_data(
+                        TensorData::new(ak, [num_pages, n_kv, page_size, d]),
+                        &device,
+                    ),
+                    DType::F16,
+                );
+                let vt: Tensor<UnfusedF16, 4> = crate::wgsl::from_f32(
+                    Tensor::from_data(
+                        TensorData::new(av, [num_pages, n_kv, page_size, d]),
+                        &device,
+                    ),
+                    DType::F16,
+                );
+                assert_eq!(kt.dtype(), DType::F16, "the arena must be f16 before the kernel sees it");
+                let len = table.len();
+                let tt: Tensor<UnfusedF16, 1, Int> =
+                    Tensor::from_data(TensorData::new(table, [len]), &device);
+
+                let client = qt.clone().into_primitive().tensor().client;
+                if !crate::wgsl::f16_storage_enabled_for_test(&client) {
+                    eprintln!("skipped: this adapter does not admit f16 in a shader");
+                    return;
+                }
+                let got = attn_unfused(
+                    qt,
+                    kt,
+                    vt,
+                    tt,
+                    AttnGeom {
+                        n_q,
+                        n_kv,
+                        d,
+                        page_size,
+                        total,
+                        window,
+                        mode: 0,
+                    },
+                    scale as f64,
+                    Storage::F16,
+                )
+                .into_data()
+                .convert::<f32>()
+                .to_vec::<f32>()
+                .unwrap();
+                // f32 softmax and f32 partials; one f16 store rounding at
+                // 2^-11 on the output, and f16 operands on the dot.
+                assert_close(&got, &expect, 3e-3, &format!("f16 arena T={total} w={window}"));
+            }
+        }
+    }
+
     #[test]
     fn decode_attention_matches_the_reference_across_the_matrix() {
         if crate::skip_no_gpu() {

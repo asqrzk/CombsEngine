@@ -1,4 +1,4 @@
-// Fused decode attention (flash-decode, M = 1): one workgroup per query
+{{f16_enable}}// Fused decode attention (flash-decode, M = 1): one workgroup per query
 // head, K/V read straight from the paged arena — no gather, no repeat_kv,
 // no materialized scores row.
 //
@@ -41,11 +41,11 @@ struct Params {
 // counts; divide by 4 at the access. Requires d % 4 == 0 (the
 // dispatcher guards; every real head dim qualifies). v stays scalar —
 // its access is one column per lane, already coalesced across lanes.
-@group(0) @binding(0) var<storage, read_write> q: array<vec4<f32>>;
-@group(0) @binding(1) var<storage, read_write> k: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read_write> v: array<f32>;
+@group(0) @binding(0) var<storage, read_write> q: array<{{act4}}>;
+@group(0) @binding(1) var<storage, read_write> k: array<{{act4}}>;
+@group(0) @binding(2) var<storage, read_write> v: array<{{act}}>;
 @group(0) @binding(3) var<storage, read_write> table: array<u32>;
-@group(0) @binding(4) var<storage, read_write> out: array<f32>;
+@group(0) @binding(4) var<storage, read_write> out: array<{{act}}>;
 @group(0) @binding(5) var<uniform> params: Params;
 
 var<workgroup> q_v: array<vec4<f32>, 64>;
@@ -77,7 +77,7 @@ fn main(
   let scale = bitcast<f32>(params.scale.x);
 
   if (lane < d / 4u) {
-    q_v[lane] = q[(h * d) / 4u + lane];
+    q_v[lane] = vec4<f32>(q[(h * d) / 4u + lane]);
   }
   workgroupBarrier();
 
@@ -94,7 +94,7 @@ fn main(
       let base = kv_base(j, g) / 4u;
       var acc = 0.0;
       for (var c = 0u; c < d / 4u; c += 1u) {
-        acc += dot(q_v[c], k[base + c]);
+        acc += dot(q_v[c], vec4<f32>(k[base + c]));
       }
       score = acc * scale;
     }
@@ -135,7 +135,7 @@ fn main(
         // Zero probability doubles as the bounds guard: kv_base is only
         // evaluated for keys that were visible when scored.
         if (pv != 0.0) {
-          o += pv * v[kv_base(t * 256u + jj, g) + lane];
+          o += pv * f32(v[kv_base(t * 256u + jj, g) + lane]);
         }
       }
     }
@@ -143,6 +143,6 @@ fn main(
   }
 
   if (lane < d) {
-    out[h * d + lane] = o / s;
+    out[h * d + lane] = {{act}}(o / s);
   }
 }

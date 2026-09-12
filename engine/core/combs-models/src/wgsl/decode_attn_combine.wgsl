@@ -1,4 +1,4 @@
-// K8, pass 2: merge the per-segment flash partials into the final
+{{f16_enable}}// K8, pass 2: merge the per-segment flash partials into the final
 // attention output. One workgroup per query head; every lane serially
 // folds the (few) segments — a global max first, then the standard
 // rescaled sum: out[c] = Σ exp(m_i − M)·o_i[c] / Σ exp(m_i − M)·s_i.
@@ -16,7 +16,7 @@ struct Params {
 @group(0) @binding(0) var<storage, read_write> m_part: array<f32>;
 @group(0) @binding(1) var<storage, read_write> s_part: array<f32>;
 @group(0) @binding(2) var<storage, read_write> o_part: array<f32>;
-@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<{{act}}>;
 @group(0) @binding(4) var<uniform> params: Params;
 
 @compute @workgroup_size(256)
@@ -44,5 +44,5 @@ fn main(
     s += w * s_part[slot];
     o += w * o_part[slot * d + lane];
   }
-  out[h * d + lane] = o / s;
+  out[h * d + lane] = {{act}}(o / s);
 }

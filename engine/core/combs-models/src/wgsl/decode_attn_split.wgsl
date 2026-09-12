@@ -1,4 +1,4 @@
-// K8, pass 1: decode attention over ONE key segment, emitting flash
+{{f16_enable}}// K8, pass 1: decode attention over ONE key segment, emitting flash
 // partials. Deep contexts starved the single-pass kernel — one
 // workgroup per query head walking every tile serially, 16 workgroups
 // on a machine that seats hundreds — so the key range splits into
@@ -25,9 +25,9 @@ struct Params {
   scale: vec2<u32>,
 }
 
-@group(0) @binding(0) var<storage, read_write> q: array<vec4<f32>>;
-@group(0) @binding(1) var<storage, read_write> k: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read_write> v: array<f32>;
+@group(0) @binding(0) var<storage, read_write> q: array<{{act4}}>;
+@group(0) @binding(1) var<storage, read_write> k: array<{{act4}}>;
+@group(0) @binding(2) var<storage, read_write> v: array<{{act}}>;
 @group(0) @binding(3) var<storage, read_write> table: array<u32>;
 @group(0) @binding(4) var<storage, read_write> m_part: array<f32>;
 @group(0) @binding(5) var<storage, read_write> s_part: array<f32>;
@@ -62,7 +62,7 @@ fn main(
   let scale = bitcast<f32>(params.scale.x);
 
   if (lane < d / 4u) {
-    q_v[lane] = q[(h * d) / 4u + lane];
+    q_v[lane] = vec4<f32>(q[(h * d) / 4u + lane]);
   }
   workgroupBarrier();
 
@@ -80,7 +80,7 @@ fn main(
       let base = kv_base(j, g) / 4u;
       var acc = 0.0;
       for (var c = 0u; c < d / 4u; c += 1u) {
-        acc += dot(q_v[c], k[base + c]);
+        acc += dot(q_v[c], vec4<f32>(k[base + c]));
       }
       score = acc * scale;
     }
@@ -119,7 +119,7 @@ fn main(
       for (var jj = 0u; jj < limit; jj += 1u) {
         let pv = p_s[jj];
         if (pv != 0.0) {
-          o += pv * v[kv_base(seg_start + t * 256u + jj, g) + lane];
+          o += pv * f32(v[kv_base(seg_start + t * 256u + jj, g) + lane]);
         }
       }
     }

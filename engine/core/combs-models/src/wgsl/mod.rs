@@ -228,10 +228,10 @@ macro_rules! wgsl_kernel_dual {
 wgsl_kernel!(ProbeEcho, "probe_echo.wgsl");
 wgsl_kernel!(ProbeSmem, "probe_smem.wgsl");
 wgsl_kernel_dual!(RmsNorm, "rmsnorm.wgsl");
-wgsl_kernel!(DecodeAttn, "decode_attn.wgsl");
+wgsl_kernel_dual!(DecodeAttn, "decode_attn.wgsl");
 wgsl_kernel!(DecodeAttnQ8, "decode_attn_q8.wgsl");
-wgsl_kernel!(DecodeAttnSplit, "decode_attn_split.wgsl");
-wgsl_kernel!(DecodeAttnCombine, "decode_attn_combine.wgsl");
+wgsl_kernel_dual!(DecodeAttnSplit, "decode_attn_split.wgsl");
+wgsl_kernel_dual!(DecodeAttnCombine, "decode_attn_combine.wgsl");
 wgsl_kernel!(PrefillAttn, "prefill_attn.wgsl");
 wgsl_kernel!(RopeQk, "rope.wgsl");
 wgsl_kernel!(DecodeGemvQ8, "decode_gemv_q8.wgsl");
@@ -607,7 +607,7 @@ async fn split_attn_canary(
     let out_h = client.empty(n_q * d * core::mem::size_of::<f32>());
     launch(
         client,
-        DecodeAttnSplit,
+        DecodeAttnSplit(Storage::F32),
         CubeCount::Static(n_q as u32, segs as u32, 1),
         vec![
             q_h.binding(),
@@ -631,7 +631,7 @@ async fn split_attn_canary(
     );
     launch(
         client,
-        DecodeAttnCombine,
+        DecodeAttnCombine(Storage::F32),
         CubeCount::Static(n_q as u32, 1, 1),
         vec![
             m_h.binding(),
@@ -1064,7 +1064,7 @@ async fn decode_attn_canary(
     let o_h = client.empty(n_q * d * core::mem::size_of::<f32>());
     launch(
         client,
-        DecodeAttn,
+        DecodeAttn(Storage::F32),
         CubeCount::Static(n_q as u32, 1, 1),
         vec![
             q_h.binding(),
