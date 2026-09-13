@@ -102,8 +102,65 @@ pub type Result<T> = std::result::Result<T, ModelError>;
 #[cfg(test)]
 pub(crate) fn skip_no_gpu() -> bool {
     if combs_core::gpu_available() {
+        pin_test_device();
         return false;
     }
     eprintln!("skipped: no wgpu adapter on this machine");
     true
+}
+
+/// Test-only: pin the shared test device's default dtypes to F32 before any
+/// tensor exists. burn 0.21 keeps ONE default dtype per device type for the
+/// whole process (keyed by the device id and `WgpuDevice`'s type, write-once),
+/// shared by every CubeBackend float width, so whichever backend resolves it
+/// first decides it for every test after: an f16-backend test that ran first
+/// turned the f32 tests' tensors f16 (19 failures in one gate run, a clean
+/// pass in the run before). Every GPU test pins through `skip_no_gpu`; a test
+/// that means another width names it at creation. Production-faithful f16
+/// defaults are the integration tests' job, each binary its own process.
+#[cfg(test)]
+pub(crate) fn pin_test_device() {
+    static PIN: std::sync::Once = std::sync::Once::new();
+    PIN.call_once(|| {
+        let device = burn::backend::wgpu::WgpuDevice::default();
+        let _ = burn::tensor::set_default_dtypes::<crate::qlinear::UnfusedF32>(
+            &device,
+            burn::tensor::FloatDType::F32,
+            burn::tensor::IntDType::I32,
+        );
+        let got =
+            burn::tensor::get_device_settings::<crate::qlinear::UnfusedF32>(&device).float_dtype;
+        assert_eq!(
+            got,
+            burn::tensor::FloatDType::F32,
+            "the test device's default dtype was decided before the pin: a GPU test touched the device without skip_no_gpu"
+        );
+    });
+}
+
+#[cfg(test)]
+mod device_default_tests {
+    use crate::qlinear::{UnfusedF16, UnfusedF32};
+    use burn::tensor::{DType, Int, Tensor, TensorData};
+
+    /// burn keeps one default dtype per device type for the whole process,
+    /// decided by whichever backend resolves it first. A GPU test that
+    /// touches an f16-backend tensor first must not decide the dtype of
+    /// every f32 test after it. Its own process (`--ignored --exact`): it
+    /// has to be the first thing to touch the device.
+    #[test]
+    #[ignore = "gpu: must be the first to touch the device, so it needs its own process"]
+    fn an_f16_backend_tensor_cannot_turn_the_f32_tests_f16() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let device = burn::backend::wgpu::WgpuDevice::default();
+        let _ = Tensor::<UnfusedF16, 1, Int>::zeros([1], &device);
+        let x = Tensor::<UnfusedF32, 1>::from_data(TensorData::new(vec![0.5f32], [1]), &device);
+        assert_eq!(
+            x.dtype(),
+            DType::F32,
+            "an f16-backend tensor decided the f32 tests' default dtype"
+        );
+    }
 }

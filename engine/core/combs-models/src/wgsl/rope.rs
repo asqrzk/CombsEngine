@@ -349,7 +349,7 @@ mod tests {
         if crate::skip_no_gpu() {
             return;
         }
-        let device = Default::default();
+        let device = burn::backend::wgpu::WgpuDevice::default();
         let (n_q, n_kv, seq, d, pos) = (4usize, 2usize, 1usize, 128usize, 7usize);
         let max_position = 4096usize;
         let (cos, sin) = build_tables_scaled(d, 10000.0, max_position, &RopeScaling::None);
@@ -359,13 +359,13 @@ mod tests {
         let ek = reference(&kv, &cos, &sin, n_kv, seq, d, pos);
 
         let qt: Tensor<UnfusedF16, 4> =
-            Tensor::from_data(TensorData::new(qv, [1, n_q, seq, d]), &device);
+            Tensor::from_data(TensorData::new(qv, [1, n_q, seq, d]), (&device, burn::tensor::DType::F16));
         let kt: Tensor<UnfusedF16, 4> =
-            Tensor::from_data(TensorData::new(kv, [1, n_kv, seq, d]), &device);
+            Tensor::from_data(TensorData::new(kv, [1, n_kv, seq, d]), (&device, burn::tensor::DType::F16));
         let ct: Tensor<UnfusedF16, 2> =
-            Tensor::from_data(TensorData::new(cos, [max_position, d]), &device);
+            Tensor::from_data(TensorData::new(cos, [max_position, d]), (&device, burn::tensor::DType::F16));
         let st: Tensor<UnfusedF16, 2> =
-            Tensor::from_data(TensorData::new(sin, [max_position, d]), &device);
+            Tensor::from_data(TensorData::new(sin, [max_position, d]), (&device, burn::tensor::DType::F16));
         let (gq, gk) =
             try_rope_qk(qt, kt, ct, st, pos).expect("the f16 backend takes the kernel path");
         // One f16 rounding in and one out, over f32 arithmetic.
@@ -392,7 +392,7 @@ mod tests {
         if crate::skip_no_gpu() {
             return;
         }
-        let device = Default::default();
+        let device = burn::backend::wgpu::WgpuDevice::default();
         let (n_q, n_kv, d) = (4usize, 2usize, 128usize);
         let max_position = 40_960usize;
         let (cos, sin) = build_tables_scaled(d, 1_000_000.0, max_position, &RopeScaling::None);
@@ -402,13 +402,13 @@ mod tests {
             let eq = reference(&qv, &cos, &sin, n_q, seq, d, pos);
             let ek = reference(&kv, &cos, &sin, n_kv, seq, d, pos);
             let qt: Tensor<UnfusedF16, 4> =
-                Tensor::from_data(TensorData::new(qv, [1, n_q, seq, d]), &device);
+                Tensor::from_data(TensorData::new(qv, [1, n_q, seq, d]), (&device, burn::tensor::DType::F16));
             let kt: Tensor<UnfusedF16, 4> =
-                Tensor::from_data(TensorData::new(kv, [1, n_kv, seq, d]), &device);
+                Tensor::from_data(TensorData::new(kv, [1, n_kv, seq, d]), (&device, burn::tensor::DType::F16));
             let ct: Tensor<UnfusedF16, 2> =
-                Tensor::from_data(TensorData::new(cos.clone(), [max_position, d]), &device);
+                Tensor::from_data(TensorData::new(cos.clone(), [max_position, d]), (&device, burn::tensor::DType::F16));
             let st: Tensor<UnfusedF16, 2> =
-                Tensor::from_data(TensorData::new(sin.clone(), [max_position, d]), &device);
+                Tensor::from_data(TensorData::new(sin.clone(), [max_position, d]), (&device, burn::tensor::DType::F16));
             let (gq, gk) = try_rope_qk(qt, kt, ct, st, pos)
                 .expect("the f16 backend takes the kernel path deep in the table");
             assert_close(
@@ -437,7 +437,7 @@ mod tests {
         if crate::skip_no_gpu() {
             return;
         }
-        let device = Default::default();
+        let device = burn::backend::wgpu::WgpuDevice::default();
         let (n_q, n_kv, seq, d, pos) = (4usize, 2usize, 1usize, 128usize, 7usize);
         let max_position = 4096usize;
         let (cos, sin) = build_tables_scaled(d, 10000.0, max_position, &RopeScaling::None);
@@ -445,13 +445,13 @@ mod tests {
         let kv = signal(n_kv * seq * d, 60.6);
         let mk = || {
             let qt: Tensor<UnfusedF16, 4> =
-                Tensor::from_data(TensorData::new(qv.clone(), [1, n_q, seq, d]), &device);
+                Tensor::from_data(TensorData::new(qv.clone(), [1, n_q, seq, d]), (&device, burn::tensor::DType::F16));
             let kt: Tensor<UnfusedF16, 4> =
-                Tensor::from_data(TensorData::new(kv.clone(), [1, n_kv, seq, d]), &device);
+                Tensor::from_data(TensorData::new(kv.clone(), [1, n_kv, seq, d]), (&device, burn::tensor::DType::F16));
             let ct: Tensor<UnfusedF16, 2> =
-                Tensor::from_data(TensorData::new(cos.clone(), [max_position, d]), &device);
+                Tensor::from_data(TensorData::new(cos.clone(), [max_position, d]), (&device, burn::tensor::DType::F16));
             let st: Tensor<UnfusedF16, 2> =
-                Tensor::from_data(TensorData::new(sin.clone(), [max_position, d]), &device);
+                Tensor::from_data(TensorData::new(sin.clone(), [max_position, d]), (&device, burn::tensor::DType::F16));
             (qt, kt, ct, st)
         };
         let (qt, kt, ct, st) = mk();

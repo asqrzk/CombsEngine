@@ -515,10 +515,10 @@ mod tests {
         let ws = signal(n, 7.7);
         let expect = reference(&xs, &ws, rows, n, 1e-6, 0.0);
 
-        let device = Default::default();
+        let device = burn::backend::wgpu::WgpuDevice::default();
         let x: Tensor<UnfusedF16, 2> =
-            Tensor::from_data(TensorData::new(xs, [rows, n]), &device);
-        let w: Tensor<UnfusedF16, 1> = Tensor::from_data(TensorData::new(ws, [n]), &device);
+            Tensor::from_data(TensorData::new(xs, [rows, n]), (&device, burn::tensor::DType::F16));
+        let w: Tensor<UnfusedF16, 1> = Tensor::from_data(TensorData::new(ws, [n]), (&device, burn::tensor::DType::F16));
         let got = try_rms_norm(x, w, 1e-6, 0.0)
             .expect("the f16 backend takes the kernel path")
             .into_data()
@@ -556,12 +556,12 @@ mod tests {
         let (rows, n) = (3usize, 896usize);
         let xs = signal(rows * n, 0.3);
         let ws = signal(n, 7.7);
-        let device = Default::default();
+        let device = burn::backend::wgpu::WgpuDevice::default();
         let mk = || {
             let x: Tensor<UnfusedF16, 2> =
-                Tensor::from_data(TensorData::new(xs.clone(), [rows, n]), &device);
+                Tensor::from_data(TensorData::new(xs.clone(), [rows, n]), (&device, burn::tensor::DType::F16));
             let w: Tensor<UnfusedF16, 1> =
-                Tensor::from_data(TensorData::new(ws.clone(), [n]), &device);
+                Tensor::from_data(TensorData::new(ws.clone(), [n]), (&device, burn::tensor::DType::F16));
             (x, w)
         };
         // Warm the pipeline: a cold launch compiles, and compilation is

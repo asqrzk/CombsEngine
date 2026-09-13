@@ -965,23 +965,11 @@ mod tests {
         out
     }
 
-    /// burn 0.21 locks per-device default dtypes to whichever backend
-    /// touches the device first, and tests share one wgpu device — without
-    /// pinning, the f16 test can lock the device to F16 and the f32 test's
-    /// `from_data` would round its reference tensors through f16. Pin F32
-    /// defaults before any tensor exists; each test then casts explicitly
-    /// to the dtype it intends.
+    /// This module met burn's per-device default dtype first and pinned
+    /// for itself; every GPU test now pins through the crate's
+    /// `pin_test_device`, so the pin cannot race a sibling module's test.
     fn pin_device_dtypes() {
-        use std::sync::Once;
-        static PIN: Once = Once::new();
-        PIN.call_once(|| {
-            let device = WgpuDevice::default();
-            let _ = burn::tensor::set_default_dtypes::<UnfusedF32>(
-                &device,
-                FloatDType::F32,
-                burn::tensor::IntDType::I32,
-            );
-        });
+        crate::pin_test_device();
     }
 
     fn quant_and_dense<B: Backend>(
