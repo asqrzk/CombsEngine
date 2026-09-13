@@ -116,3 +116,65 @@ mod tests {
         assert!(summary().contains(SERVING_DTYPE));
     }
 }
+
+/// The identity a build stamps comes from one resolver shared with
+/// build.rs: git where the source is a checkout, the packed stamp where it
+/// is an archive (a pod builds from `git archive`), "unknown" otherwise.
+#[cfg(test)]
+mod source_identity_tests {
+    include!("../build/stamp.rs");
+
+    fn s(v: &str) -> Option<String> {
+        Some(v.to_string())
+    }
+
+    #[test]
+    fn a_checkout_is_named_by_git() {
+        let id = source_identity(
+            s("7f91a84aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            s("7f91a84"),
+            s("w/qwen35"),
+            Some(true),
+            s("0123456789abcdef0123456789abcdef01234567"),
+            s("elsewhere"),
+        );
+        assert_eq!(id.commit, "7f91a84aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(id.short, "7f91a84");
+        assert_eq!(id.branch, "w/qwen35");
+        assert!(id.dirty);
+    }
+
+    #[test]
+    fn an_archive_without_git_is_named_by_its_stamp() {
+        let id = source_identity(
+            None,
+            None,
+            None,
+            None,
+            s("7F91A84C0FFEE1234567890ABCDEF1234567890A"),
+            s("w/qwen35"),
+        );
+        assert_eq!(id.commit, "7f91a84c0ffee1234567890abcdef1234567890a");
+        assert_eq!(id.short, "7f91a84");
+        assert_eq!(id.branch, "w/qwen35");
+        assert!(!id.dirty, "an archive of a commit is that commit, unmodified");
+    }
+
+    #[test]
+    fn a_stamp_that_is_not_a_commit_is_refused() {
+        for bad in ["", "not-a-sha", "7f91a8", "$(rm -rf /)", "7f91a84c0ffee1234567890abcdef1234567890a0"] {
+            let id = source_identity(None, None, None, None, s(bad), s("w/qwen35"));
+            assert_eq!(id.commit, "unknown", "{bad:?}");
+            assert_eq!(id.short, "unknown", "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn nothing_to_go_on_says_unknown() {
+        let id = source_identity(None, None, None, None, None, None);
+        assert_eq!(id.commit, "unknown");
+        assert_eq!(id.short, "unknown");
+        assert_eq!(id.branch, "unknown");
+        assert!(!id.dirty);
+    }
+}

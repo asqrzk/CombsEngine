@@ -30,6 +30,10 @@ use std::process::Command;
 // fails the workspace tests the moment the two files differ by a byte.
 include!("build/timefmt.rs");
 
+// Where the source's identity comes from when there is no git to ask — a
+// packed archive names its commit through COMBS_SOURCE_COMMIT.
+include!("build/stamp.rs");
+
 fn git(args: &[&str]) -> Option<String> {
     let out = Command::new("git").args(args).output().ok()?;
     if !out.status.success() {
@@ -66,6 +70,7 @@ fn built_at_epoch() -> u64 {
 fn watched_paths() -> Vec<String> {
     let mut paths = vec![
         "build.rs".to_string(),
+        "build".to_string(),
         "src".to_string(),
         "../vendor".to_string(),
     ];
@@ -92,14 +97,25 @@ fn main() {
     for path in watched_paths() {
         println!("cargo:rerun-if-changed={path}");
     }
-    let commit = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    let short = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    println!("cargo:rerun-if-env-changed=COMBS_SOURCE_COMMIT");
+    println!("cargo:rerun-if-env-changed=COMBS_SOURCE_REF");
     // Any tracked modification, staged or not, makes this build
-    // unreproducible from the commit alone — the flag says so plainly.
-    let dirty = git(&["status", "--porcelain", "--untracked-files=no"])
-        .map(|s| !s.is_empty())
-        .unwrap_or(false);
+    // unreproducible from the commit alone — the flag says so plainly. A
+    // packed archive has no git; the pod's provision step reads the commit
+    // the archive was packed from and hands it in as COMBS_SOURCE_COMMIT.
+    let SourceIdentity {
+        commit,
+        short,
+        branch,
+        dirty,
+    } = source_identity(
+        git(&["rev-parse", "HEAD"]),
+        git(&["rev-parse", "--short", "HEAD"]),
+        git(&["rev-parse", "--abbrev-ref", "HEAD"]),
+        git(&["status", "--porcelain", "--untracked-files=no"]).map(|s| !s.is_empty()),
+        env::var("COMBS_SOURCE_COMMIT").ok(),
+        env::var("COMBS_SOURCE_REF").ok(),
+    );
 
     // Cargo hands the enabled features in as CARGO_FEATURE_<NAME>.
     let mut features: Vec<String> = std::env::vars()
