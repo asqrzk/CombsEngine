@@ -67,10 +67,10 @@ pub const DOORS: &[Door] = &[
     Door {
         kind: Kind::Knob,
         name: "COMBS_WGSL_DELTANET",
-        default: "on",
-        does: "the Gated DeltaNet decode step as two WGSL dispatches (qwen35); 0 keeps the generic-op road",
+        default: "off",
+        does: "1 runs the Gated DeltaNet decode step as two WGSL dispatches (qwen35); opt-in: it cuts dispatches but decodes slower than the generic-op road today",
         read_at: "combs-models/src/wgsl/deltanet.rs",
-        measured: None,
+        measured: Some("MEASUREMENTS §113"),
     },
     Door {
         kind: Kind::Knob,

@@ -6,6 +6,12 @@
 //! against qwen3-4b's 1,151, and at 15 µs a launch the count is the wall.
 //! Here the conv step and the state step are one dispatch each.
 //!
+//! OPT-IN (`COMBS_WGSL_DELTANET=1`): on Qwen3.5-4B it cut dispatches from
+//! 2,801 to 1,136 a token and decode fell from 23.68 to 7.42 tok/s — the
+//! state step walks each head's 16,384 cells serially inside one workgroup,
+//! so the count went down and the work per launch went up eightfold. It stays
+//! shut until a parallel state step beats the generic road.
+//!
 //! Decode only (seq = 1): prefill keeps the host road. The model asks
 //! [`deltanet_step_available`] BEFORE it projects or takes the state, so a
 //! refusal costs nothing and loses nothing. Every buffer is f32 on every
@@ -33,8 +39,13 @@ const MAX_HEAD_DIM: usize = 256;
 pub(crate) fn deltanet_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        wgsl_enabled() && !matches!(std::env::var("COMBS_WGSL_DELTANET").as_deref(), Ok("0"))
+        wgsl_enabled() && deltanet_door(std::env::var("COMBS_WGSL_DELTANET").ok().as_deref())
     })
+}
+
+/// The door's parse, pure so a unit can hold it.
+fn deltanet_door(env: Option<&str>) -> bool {
+    env == Some("1")
 }
 
 /// One layer's geometry, as the file declares it.
@@ -83,8 +94,13 @@ pub(crate) type StepOutputs<B> = (Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>);
 /// Whether [`try_deltanet_step`] will run for this backend and geometry —
 /// the same predicate it routes on, asked first so a refusal is free.
 pub(crate) fn deltanet_step_available<B: Backend>(g: &StepGeometry) -> bool {
-    deltanet_enabled()
-        && g.kh > 0
+    deltanet_enabled() && step_supported::<B>(g)
+}
+
+/// The geometry and backends the two kernels take, door aside: what the
+/// device test holds them to whether or not the door is open.
+fn step_supported<B: Backend>(g: &StepGeometry) -> bool {
+    g.kh > 0
         && g.vh % g.kh == 0
         && g.kd <= MAX_HEAD_DIM
         && g.vd <= MAX_HEAD_DIM
@@ -100,7 +116,15 @@ pub(crate) fn try_deltanet_step<B: Backend>(
     inputs: StepInputs<B>,
     g: StepGeometry,
 ) -> Option<StepOutputs<B>> {
-    if !deltanet_step_available::<B>(&g) {
+    if !deltanet_enabled() {
+        return None;
+    }
+    run_step(inputs, g)
+}
+
+/// The two launches, door aside.
+fn run_step<B: Backend>(inputs: StepInputs<B>, g: StepGeometry) -> Option<StepOutputs<B>> {
+    if !step_supported::<B>(&g) {
         return None;
     }
     if TypeId::of::<B>() == TypeId::of::<UnfusedF32>() {
@@ -335,11 +359,16 @@ mod tests {
         let (want_out, want_ring, want_state) =
             host_step(&g, &qkv, &z, &b, &a, &decay_a, &dt, &normw, &conv_w, &ring, &state);
 
-        let proj = |v: &[f32]| Tensor::<B, 1>::from_data(TensorData::new(v.to_vec(), [v.len()]), device);
+        // The projections are born at the arm's width, never from the device
+        // default: burn shares one default per device across both backends.
+        let width = if f16_backend { DType::F16 } else { DType::F32 };
+        let proj = |v: &[f32]| {
+            Tensor::<B, 1>::from_data(TensorData::new(v.to_vec(), [v.len()]), (device, width))
+        };
         let f32s = |v: &[f32]| {
             Tensor::<B, 1>::from_data(TensorData::new(v.to_vec(), [v.len()]), (device, DType::F32))
         };
-        assert!(deltanet_step_available::<B>(&g), "the door is shut on this backend");
+        assert!(step_supported::<B>(&g), "the kernels do not take this backend");
         let inputs = StepInputs {
             qkv: proj(&qkv),
             z: proj(&z),
@@ -353,7 +382,7 @@ mod tests {
             state: f32s(&state),
         };
         let (out, ring2, state2) =
-            try_deltanet_step(inputs, g).expect("the step runs where it is available");
+            run_step(inputs, g).expect("the kernels run where they are supported");
         let read = |t: Tensor<B, 1>| t.into_data().convert::<f32>().to_vec::<f32>().expect("readback");
         let (out, ring2, state2) = (read(out), read(ring2), read(state2));
         let arm = if f16_backend { "f16 backend" } else { "f32 backend" };
@@ -366,6 +395,16 @@ mod tests {
         close(&format!("out ({arm})"), &out, &want_out);
         close(&format!("ring ({arm})"), &ring2, &want_ring);
         close(&format!("state ({arm})"), &state2, &want_state);
+    }
+
+    /// Opt-in until it beats the generic road: on bd8d20b the kernel cut
+    /// dispatches 2,801 -> 1,136 a token and decode fell 23.68 -> 7.42 tok/s.
+    #[test]
+    fn the_deltanet_kernel_is_opt_in_until_it_beats_the_generic_road() {
+        assert!(!deltanet_door(None), "unset must keep the generic road");
+        assert!(!deltanet_door(Some("0")));
+        assert!(!deltanet_door(Some("yes")), "only 1 opens it");
+        assert!(deltanet_door(Some("1")));
     }
 
     #[test]
