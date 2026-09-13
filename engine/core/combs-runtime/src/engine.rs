@@ -333,6 +333,9 @@ pub struct EngineStatsSnapshot {
     /// Bytes one KV page costs across all layers (both K and V), so
     /// consumers can turn page counts into memory: `pages × kv_page_bytes`.
     pub kv_page_bytes: u64,
+    /// Bytes one session's recurrent state holds (hybrid families; zero
+    /// otherwise) — fixed per session, beside the KV pages.
+    pub recurrent_state_bytes: u64,
     /// Load-time estimate of resident weight bytes + the full KV arena —
     /// what the S2c budget refusal reasons over, exported so observers
     /// (and the footprint proof) can hold the allocator to it.
@@ -488,11 +491,7 @@ impl Engine {
             );
         }
         let elem_bytes_pre: u64 = if cfg!(feature = "f16") { 2 } else { 4 };
-        let pattern_pre = &meta_pre.attention_pattern;
-        let globals = (0..meta_pre.num_hidden_layers)
-            .filter(|&i| pattern_pre.is_global_layer(i))
-            .count()
-            .max(1);
+        let globals = meta_pre.kv_layers();
         let kv_bytes_per_value_x8 = if cache_config.quantize_kv {
             9
         } else {
@@ -572,12 +571,9 @@ impl Engine {
         let meta = source.metadata();
         let elem_bytes: u64 = if cfg!(feature = "f16") { 2 } else { 4 };
         // Only global-attention layers hold paged arenas; sliding layers
-        // (gemma's 5:1 pattern) keep a small rolling tensor instead.
-        let pattern = &meta.attention_pattern;
-        let global_layers = (0..meta.num_hidden_layers)
-            .filter(|&i| pattern.is_global_layer(i))
-            .count()
-            .max(1);
+        // (gemma's 5:1 pattern) keep a small rolling tensor instead, and a
+        // hybrid's DeltaNet layers a recurrent state.
+        let global_layers = meta.kv_layers();
         // int8 KV packs to 1 byte/value + one f32 scale per 32 values.
         let bytes_per_value_x8 = if cache_config.quantize_kv {
             9 // (1 + 4/32) * 8
@@ -595,6 +591,7 @@ impl Engine {
                 / 8
                 * 2 // K and V
                 * global_layers as u64,
+            recurrent_state_bytes: meta.recurrent_state_bytes(),
             // Priming the GPU sample here is ALSO the load-time sync:
             // gpu_memory blocks on the compute stream, so every enqueued
             // weight upload materializes before load() returns — an

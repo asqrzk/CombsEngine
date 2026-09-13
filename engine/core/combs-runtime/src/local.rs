@@ -435,10 +435,7 @@ impl LocalEngine {
     pub fn kv_page_bytes(&self) -> u64 {
         let meta = &self.metadata;
         let elem_bytes: u64 = if cfg!(feature = "f16") { 2 } else { 4 };
-        let global_layers = (0..meta.num_hidden_layers)
-            .filter(|&i| meta.attention_pattern.is_global_layer(i))
-            .count()
-            .max(1);
+        let global_layers = meta.kv_layers();
         let bytes_per_value_x8 = if self.cache_config.quantize_kv {
             9 // (1 + 4/32) * 8
         } else {

@@ -463,18 +463,17 @@ fn auto_arena_len(
     let available = crate::fit::available_memory_bytes()?;
     let elem_bytes: u64 = if cfg!(feature = "f16") { 2 } else { 4 };
     let per_value_x8 = if quantize_kv { 9 } else { elem_bytes * 8 };
-    let globals = (0..meta.num_hidden_layers)
-        .filter(|&i| meta.attention_pattern.is_global_layer(i))
-        .count()
-        .max(1);
+    let globals = meta.kv_layers();
     let per_token = (meta.num_key_value_heads as u64 * meta.head_dim as u64 * per_value_x8 / 8)
         * 2
         * globals as u64;
     if per_token == 0 {
         return None;
     }
+    // A hybrid's recurrent state is fixed per session: priced once, off the top.
     let budget = available
         .saturating_sub(weight_file_bytes)
+        .saturating_sub(meta.recurrent_state_bytes())
         .saturating_sub(crate::fit::DEFAULT_HEADROOM_BYTES);
     let tokens = (budget / per_token) as usize;
     Some(
@@ -675,16 +674,15 @@ fn cmd_serve(
         let meta = source.metadata();
         let elem_bytes: u64 = if cfg!(feature = "f16") { 2 } else { 4 };
         let per_value_x8 = if quantize_kv { 9 } else { elem_bytes * 8 };
-        let globals = (0..meta.num_hidden_layers)
-            .filter(|&i| meta.attention_pattern.is_global_layer(i))
-            .count()
-            .max(1);
+        let globals = meta.kv_layers();
+        // KV for the arena, plus one session's recurrent state (hybrids).
         let kv_bytes = (meta.num_key_value_heads as u64 * meta.head_dim as u64
             * per_value_x8
             / 8)
             * 2
             * globals as u64
-            * arena_tokens as u64;
+            * arena_tokens as u64
+            + meta.recurrent_state_bytes();
         match fit::llm_gate(
             &model.display().to_string(),
             host_dense,

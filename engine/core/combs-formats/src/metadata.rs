@@ -352,6 +352,38 @@ fn token_ids(v: Option<&serde_json::Value>) -> Vec<u32> {
 }
 
 impl ModelMetadata {
+    /// Layers that hold a paged KV arena: the global-attention layers, and
+    /// in a hybrid family only its attention ones — a DeltaNet layer keeps
+    /// a recurrent state instead. Never zero, so byte estimates stay
+    /// defined for a malformed file.
+    pub fn kv_layers(&self) -> usize {
+        let every = self
+            .linear_attention
+            .map(|la| la.full_attention_interval.max(1));
+        (0..self.num_hidden_layers)
+            .filter(|&i| self.attention_pattern.is_global_layer(i))
+            .filter(|&i| every.is_none_or(|n| (i + 1) % n == 0))
+            .count()
+            .max(1)
+    }
+
+    /// Bytes one sequence's recurrent state holds across every DeltaNet
+    /// layer — the state matrix and the conv ring, f32 on every build.
+    /// Zero for every attention-only model.
+    pub fn recurrent_state_bytes(&self) -> u64 {
+        let Some(la) = self.linear_attention else {
+            return 0;
+        };
+        let every = la.full_attention_interval.max(1);
+        let delta_layers = (0..self.num_hidden_layers)
+            .filter(|&i| (i + 1) % every != 0)
+            .count() as u64;
+        let state = (la.value_heads * la.key_head_dim * la.value_head_dim) as u64;
+        let channels = (2 * la.key_heads * la.key_head_dim + la.value_heads * la.value_head_dim) as u64;
+        let ring = la.conv_kernel.saturating_sub(1) as u64 * channels;
+        delta_layers * (state + ring) * 4
+    }
+
     /// Minimal placeholder metadata for diffusion components that do not
     /// carry a language-model `config.json` (UNet, VAE, etc.).
     pub fn diffusion_placeholder(architecture: &str) -> Self {
@@ -694,5 +726,49 @@ mod tests {
         assert_eq!(v.head_dim(), 64);
         // (512/16)² / 4² = 1024/16 = 64 visual tokens per image.
         assert_eq!(v.image_seq_len(), 64);
+    }
+}
+
+#[cfg(test)]
+mod hybrid_tests {
+    use super::*;
+
+    fn qwen35_4b() -> ModelMetadata {
+        let mut m = ModelMetadata::diffusion_placeholder("qwen35");
+        m.num_hidden_layers = 32;
+        m.num_key_value_heads = 4;
+        m.head_dim = 256;
+        m.linear_attention = Some(LinearAttention {
+            key_heads: 16,
+            value_heads: 32,
+            key_head_dim: 128,
+            value_head_dim: 128,
+            conv_kernel: 4,
+            full_attention_interval: 4,
+        });
+        m
+    }
+
+    #[test]
+    fn a_hybrid_model_holds_kv_only_on_its_attention_layers() {
+        let m = qwen35_4b();
+        assert_eq!(m.kv_layers(), 8, "one attention layer in four holds KV");
+        // 24 DeltaNet layers × (32 × 128 × 128 state + 3 × 8,192 conv ring) × 4 B
+        assert_eq!(m.recurrent_state_bytes(), 52_690_944);
+    }
+
+    #[test]
+    fn attention_only_models_keep_their_count() {
+        let mut m = ModelMetadata::diffusion_placeholder("llama");
+        m.num_hidden_layers = 16;
+        assert_eq!(m.kv_layers(), 16);
+        assert_eq!(m.recurrent_state_bytes(), 0);
+        m.num_hidden_layers = 12;
+        m.attention_pattern = AttentionPattern {
+            sliding_window: Some(512),
+            pattern: 6,
+            ..AttentionPattern::default()
+        };
+        assert_eq!(m.kv_layers(), 2, "gemma: every sixth layer is global");
     }
 }

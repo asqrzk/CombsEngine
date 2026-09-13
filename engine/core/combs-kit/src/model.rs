@@ -273,6 +273,16 @@ pub fn run_one(subject: &Subject) -> Run {
             "bytes/token",
         ));
     }
+    // A hybrid's recurrent state: fixed per session, beside the pages.
+    // Arithmetic over the file's geometry, so it is labelled as such.
+    if snap.recurrent_state_bytes > 0 {
+        values.push(Value::derived(
+            "recurrent_state_bytes",
+            snap.recurrent_state_bytes as f64,
+            "bytes/session",
+            "DeltaNet layers x (value heads x key dim x value dim + (kernel - 1) x conv channels) x 4 B",
+        ));
+    }
     values.push(Value::measured(
         "arena_max_tokens",
         cfg.max_seq_len as f64,
@@ -495,12 +505,18 @@ pub fn print_run(run: &Run) {
     );
     let kv = get("kv_bytes_per_token");
     if kv.is_finite() {
+        let state = get("recurrent_state_bytes");
         println!(
-            "  {:<8} kv {:>7.0} B/token{} | arena {:>6.0} tokens",
+            "  {:<8} kv {:>7.0} B/token{} | arena {:>6.0} tokens{}",
             "",
             kv,
             if get("kv_int8") == 1.0 { " (int8)" } else { "" },
             get("arena_max_tokens"),
+            if state.is_finite() {
+                format!(" | state {:.1} MB/session", state / 1_048_576.0)
+            } else {
+                String::new()
+            },
         );
     }
 }
