@@ -34,7 +34,7 @@ pub mod quants {
         dequantize_q8_0, quantize_q8_0,
     };
 }
-pub use metadata::{Activation, AttentionPattern, ModelMetadata, RopeScaling, VisionConfig};
+pub use metadata::{Activation, AttentionPattern, ModelMetadata, RopeScaling, VisionConfig, LinearAttention};
 pub use safetensors::SafetensorsSource;
 pub use lora::{merge_lora, LoraFile, LoraMergedSource, LoraSpec};
 pub use litertlm::{SectionInfo, read_sections as litertlm_read_sections};

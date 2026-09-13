@@ -318,6 +318,8 @@ fn metadata_from_params(p: &LlmParameters) -> Result<ModelMetadata> {
         // ODML text exports are gemma-family (gelu-tanh MLPs).
         activation: crate::metadata::Activation::GeluTanh,
         rope_scaling: crate::metadata::RopeScaling::None,
+        linear_attention: None,
+        rotary_dim: None,
     })
 }
 

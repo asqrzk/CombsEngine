@@ -49,6 +49,28 @@ pub struct ModelMetadata {
     pub activation: Activation,
     /// RoPE frequency scaling (`rope_scaling`); `None` variant when absent.
     pub rope_scaling: RopeScaling,
+    /// Gated DeltaNet (linear attention) geometry for hybrid families —
+    /// Qwen3.5 runs three DeltaNet layers to every full-attention layer;
+    /// `None` for every pure-attention model.
+    pub linear_attention: Option<LinearAttention>,
+    /// Head dimensions RoPE turns when only part of each head rotates
+    /// (Qwen3.5: 64 of 256); `None` = the whole head.
+    pub rotary_dim: Option<usize>,
+}
+
+/// One hybrid family's Gated DeltaNet geometry (see
+/// [`ModelMetadata::linear_attention`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinearAttention {
+    /// Key (and query) heads; each repeats across the value heads.
+    pub key_heads: usize,
+    pub value_heads: usize,
+    pub key_head_dim: usize,
+    pub value_head_dim: usize,
+    /// The causal conv1d kernel over the concatenated q|k|v stream.
+    pub conv_kernel: usize,
+    /// Every Nth layer (1-based) is full attention; the rest are DeltaNet.
+    pub full_attention_interval: usize,
 }
 
 /// MLP activation function, parsed from `hidden_act`/`hidden_activation`.
@@ -353,6 +375,8 @@ impl ModelMetadata {
             attention_pattern: AttentionPattern::default(),
             activation: Activation::default(),
             rope_scaling: RopeScaling::default(),
+            linear_attention: None,
+            rotary_dim: None,
         }
     }
 
@@ -494,6 +518,8 @@ impl ModelMetadata {
                     .and_then(|x| x.as_str()),
             ),
             rope_scaling: RopeScaling::parse(text)?,
+            linear_attention: None,
+            rotary_dim: None,
         })
     }
 }

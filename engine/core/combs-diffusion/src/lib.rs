@@ -142,6 +142,8 @@ pub(crate) fn diffusion_metadata(architecture: &str) -> ModelMetadata {
         attention_pattern: AttentionPattern::default(),
         activation: combs_formats::Activation::default(),
         rope_scaling: combs_formats::RopeScaling::default(),
+        linear_attention: None,
+        rotary_dim: None,
     }
 }
 

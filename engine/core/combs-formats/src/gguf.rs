@@ -774,6 +774,36 @@ fn build_model_metadata(kv: &HashMap<String, MetaValue>) -> Result<ModelMetadata
     };
     let (eos_ids, bos_id, _) = tokenizer_ids(kv);
 
+    // Hybrid families (qwen35): the Gated DeltaNet geometry llama.cpp writes
+    // under `ssm.*` — group_count key heads, time_step_rank value heads,
+    // state_size per key head, inner_size split across the value heads —
+    // with a full-attention layer every `full_attention_interval`.
+    let linear_attention = if arch == "qwen35" {
+        let need = |name: &str| {
+            field(name)
+                .map(|v| v as usize)
+                .ok_or_else(|| FormatError::MissingField(format!("{prefix}.{name}")))
+        };
+        let value_heads = need("ssm.time_step_rank")?;
+        Some(crate::metadata::LinearAttention {
+            key_heads: need("ssm.group_count")?,
+            value_heads,
+            key_head_dim: need("ssm.state_size")?,
+            value_head_dim: need("ssm.inner_size")? / value_heads.max(1),
+            conv_kernel: need("ssm.conv_kernel")?,
+            full_attention_interval: field("full_attention_interval").unwrap_or(4) as usize,
+        })
+    } else {
+        None
+    };
+    let head_dim = field("attention.key_length")
+        .map(|v| v as usize)
+        .unwrap_or(hidden / heads);
+    // Partial rotary only when the file says fewer dims than the head.
+    let rotary_dim = field("rope.dimension_count")
+        .map(|v| v as usize)
+        .filter(|&d| d > 0 && d < head_dim);
+
     Ok(ModelMetadata {
         architecture: arch,
         hidden_size: hidden,
@@ -809,6 +839,8 @@ fn build_model_metadata(kv: &HashMap<String, MetaValue>) -> Result<ModelMetadata
         // GGUF stores no activation key; the per-arch resolver supplies it.
         activation: crate::metadata::Activation::default(),
         rope_scaling: gguf_rope_scaling(kv, &prefix)?,
+        linear_attention,
+        rotary_dim,
     })
 }
 
@@ -906,8 +938,12 @@ fn special_token_count(kv: &HashMap<String, MetaValue>) -> usize {
 fn pretokenizer_regex(kv: &HashMap<String, MetaValue>) -> &'static str {
     const DEFAULT: &str = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
     const QWEN2: &str = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+    // llama.cpp's qwen35 split: qwen2's, with combining marks (\p{M}) kept
+    // inside letter runs.
+    const QWEN35: &str = "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
     match kv.get("tokenizer.ggml.pre") {
         Some(MetaValue::String(pre)) if pre == "qwen2" => QWEN2,
+        Some(MetaValue::String(pre)) if pre == "qwen35" => QWEN35,
         _ => DEFAULT,
     }
 }
@@ -1200,12 +1236,26 @@ fn map_tensor_name(ggml: &str, arch: &str) -> Option<String> {
     let rest = ggml.strip_prefix("blk.")?;
     let (layer, rest) = rest.split_once('.')?;
     let gemma = matches!(arch, "gemma3" | "gemma3_text");
+    let qwen35 = arch == "qwen35";
     let hf = match rest {
         "attn_norm.weight" => "input_layernorm.weight",
         "ffn_norm.weight" if gemma => "pre_feedforward_layernorm.weight",
         "post_attention_norm.weight" if gemma => "post_attention_layernorm.weight",
         "post_ffw_norm.weight" if gemma => "post_feedforward_layernorm.weight",
         "ffn_norm.weight" => "post_attention_layernorm.weight",
+        // Qwen3.5 writes its pre-MLP norm as `post_attention_norm`, and its
+        // Gated DeltaNet layers carry their own tensors. `ssm_a` holds
+        // -exp(A_log) as converted, hence the plain `A`.
+        "post_attention_norm.weight" if qwen35 => "post_attention_layernorm.weight",
+        "attn_qkv.weight" if qwen35 => "linear_attn.in_proj_qkv.weight",
+        "attn_gate.weight" if qwen35 => "linear_attn.in_proj_z.weight",
+        "ssm_beta.weight" if qwen35 => "linear_attn.in_proj_b.weight",
+        "ssm_alpha.weight" if qwen35 => "linear_attn.in_proj_a.weight",
+        "ssm_conv1d.weight" if qwen35 => "linear_attn.conv1d.weight",
+        "ssm_dt.bias" if qwen35 => "linear_attn.dt_bias",
+        "ssm_a" if qwen35 => "linear_attn.A",
+        "ssm_norm.weight" if qwen35 => "linear_attn.norm.weight",
+        "ssm_out.weight" if qwen35 => "linear_attn.out_proj.weight",
         // Per-head QK norms (qwen3, gemma3); the loader probes these only
         // when the resolved spec asks for them.
         "attn_q_norm.weight" => "self_attn.q_norm.weight",
@@ -2226,5 +2276,81 @@ mod quant_access_tests {
 
     fn dirs_home() -> std::path::PathBuf {
         std::path::PathBuf::from(std::env::var("HOME").unwrap())
+    }
+}
+
+#[cfg(test)]
+mod qwen35_tests {
+    use super::*;
+
+    #[test]
+    fn the_qwen35_pretokenizer_is_llama_cpps() {
+        let kv = HashMap::from([(
+            "tokenizer.ggml.pre".to_string(),
+            MetaValue::String("qwen35".into()),
+        )]);
+        // llama.cpp's LLAMA_VOCAB_PRE_TYPE_QWEN35: qwen2's single-digit split
+        // with combining marks (\p{M}) kept inside letter runs.
+        assert_eq!(
+            pretokenizer_regex(&kv),
+            "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+        );
+    }
+
+    #[test]
+    fn qwen35_roles_map_to_linear_attention_names() {
+        let cases = [
+            (
+                "blk.0.attn_qkv.weight",
+                "model.layers.0.linear_attn.in_proj_qkv.weight",
+            ),
+            (
+                "blk.0.attn_gate.weight",
+                "model.layers.0.linear_attn.in_proj_z.weight",
+            ),
+            (
+                "blk.0.ssm_beta.weight",
+                "model.layers.0.linear_attn.in_proj_b.weight",
+            ),
+            (
+                "blk.0.ssm_alpha.weight",
+                "model.layers.0.linear_attn.in_proj_a.weight",
+            ),
+            (
+                "blk.0.ssm_conv1d.weight",
+                "model.layers.0.linear_attn.conv1d.weight",
+            ),
+            ("blk.0.ssm_dt.bias", "model.layers.0.linear_attn.dt_bias"),
+            ("blk.0.ssm_a", "model.layers.0.linear_attn.A"),
+            (
+                "blk.0.ssm_norm.weight",
+                "model.layers.0.linear_attn.norm.weight",
+            ),
+            (
+                "blk.0.ssm_out.weight",
+                "model.layers.0.linear_attn.out_proj.weight",
+            ),
+            (
+                "blk.3.post_attention_norm.weight",
+                "model.layers.3.post_attention_layernorm.weight",
+            ),
+            (
+                "blk.3.attn_q.weight",
+                "model.layers.3.self_attn.q_proj.weight",
+            ),
+            (
+                "blk.3.attn_q_norm.weight",
+                "model.layers.3.self_attn.q_norm.weight",
+            ),
+        ];
+        for (ggml, hf) in cases {
+            assert_eq!(
+                map_tensor_name(ggml, "qwen35").as_deref(),
+                Some(hf),
+                "{ggml}"
+            );
+        }
+        // phi3's fused qkv stays a sliced source, never a direct name
+        assert_eq!(map_tensor_name("blk.0.attn_qkv.weight", "phi3"), None);
     }
 }
