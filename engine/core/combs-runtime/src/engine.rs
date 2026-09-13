@@ -447,6 +447,14 @@ impl Engine {
         device: CombsDevice,
         mut cache_config: CacheConfig,
     ) -> Result<Self> {
+        // Which backend this engine computes on, said once per seat, from
+        // the crate that chose it — not from anyone's feature flag.
+        tracing::info!(
+            "engine seating {} on {} · arena {} tokens",
+            source.metadata().architecture,
+            combs_core::backend_line(),
+            cache_config.max_seq_len
+        );
         if matches!(std::env::var("COMBS_KV_QUANT").as_deref(), Ok("1")) {
             cache_config.quantize_kv = true;
         }

@@ -25,7 +25,7 @@ pub const BUILT_AT_RFC3339: &str = env!("COMBS_BUILD_AT_RFC3339");
 /// Which float width the engine serves at — the single fact most often
 /// assumed and least often checked (an f16 twin looks identical from
 /// the outside and fails in ways that look like model bugs).
-pub const SERVING_DTYPE: &str = if cfg!(feature = "f16") { "f16" } else { "f32" };
+pub const SERVING_DTYPE: &str = combs_core::BACKEND.dtype;
 
 fn features_list() -> Vec<&'static str> {
     FEATURES.split(',').filter(|f| !f.is_empty()).collect()

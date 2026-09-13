@@ -60,7 +60,8 @@ pub fn serve(
     let static_info = Arc::new(static_info);
     let provenance_config = vec![
         ("model", model_id.clone()),
-        ("dtype", crate::build_info::SERVING_DTYPE.to_string()),
+        ("dtype", combs_core::BACKEND.dtype.to_string()),
+        ("backend", combs_core::backend_line()),
         ("matmul", combs_models::batched_matmul_summary()),
     ];
     combs_core::provenance::startup("text", &provenance_config);
@@ -324,7 +325,9 @@ fn stats_response(
             "load": static_info.get("load").cloned().unwrap_or(Value::Null),
             "lora": static_info.get("lora").cloned().unwrap_or(Value::Null),
             "build": {
-                "dtype": if cfg!(feature = "f16") { "f16" } else { "f32" },
+                "dtype": combs_core::BACKEND.dtype,
+                "fusion": combs_core::BACKEND.fusion,
+                "cpu_backend": combs_core::BACKEND.cpu,
                 "kv_env": std::env::var("COMBS_KV").ok(),
                 "attn_env": std::env::var("COMBS_ATTN").ok(),
                 "quant_kernels": std::env::var_os("COMBS_NO_QUANT_KERNELS").is_none(),

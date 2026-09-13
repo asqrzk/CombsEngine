@@ -73,6 +73,40 @@ pub type CombsBackend = burn::backend::NdArray<f32, i32, i8>;
 #[cfg(all(feature = "cpu", feature = "f16"))]
 compile_error!("features `cpu` and `f16` are mutually exclusive: f16 is a wgpu backend");
 
+/// What `CombsBackend` IS in this build, stated by the crate that chose it.
+/// Every label of the serving dtype — the CLI's build line, `/v1/stats`,
+/// the provenance startup event, the app's stats, the kit's stamp — reads
+/// this instead of its own crate's feature flag, which can disagree with
+/// the backend when a feature does not forward.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackendFacts {
+    /// "f16" or "f32": the float type text inference computes in.
+    pub dtype: &'static str,
+    /// Whether burn-fusion merges op chains on this backend.
+    pub fusion: bool,
+    /// The ndarray CPU floor rather than wgpu.
+    pub cpu: bool,
+}
+
+#[cfg(all(not(feature = "f16"), not(feature = "cpu")))]
+pub const BACKEND: BackendFacts = BackendFacts { dtype: "f32", fusion: true, cpu: false };
+#[cfg(feature = "cpu")]
+pub const BACKEND: BackendFacts = BackendFacts { dtype: "f32", fusion: false, cpu: true };
+#[cfg(all(feature = "f16", not(feature = "f16-fusion")))]
+pub const BACKEND: BackendFacts = BackendFacts { dtype: "f16", fusion: false, cpu: false };
+#[cfg(all(feature = "f16", feature = "f16-fusion"))]
+pub const BACKEND: BackendFacts = BackendFacts { dtype: "f16", fusion: true, cpu: false };
+
+/// One line for logs: `f16 · fusion off` or `f32 · fusion on (cpu)`.
+pub fn backend_line() -> String {
+    format!(
+        "{} · fusion {}{}",
+        BACKEND.dtype,
+        if BACKEND.fusion { "on" } else { "off" },
+        if BACKEND.cpu { " (cpu)" } else { "" }
+    )
+}
+
 /// Always-f32 backend on the same wgpu runtime. The diffusion pipeline is
 /// pinned to it in every build: SD-1.5's UNet/VAE collapse to black output
 /// under f16 (range, not rounding), so image generation computes in f32
@@ -664,5 +698,30 @@ impl BufferPool {
                 <burn::backend::wgpu::WgpuRuntime as cubecl::prelude::Runtime>::client(device);
             client.memory_cleanup();
         }
+    }
+}
+
+#[cfg(test)]
+mod backend_facts_tests {
+    use super::*;
+    use burn::tensor::{DType, Tensor};
+
+    /// The label is the backend's own dtype: a real tensor made on this
+    /// build's device reports the dtype `BACKEND` names. A label read from a
+    /// feature flag that did not forward would fail here.
+    #[test]
+    fn the_backend_label_is_the_backends_own_dtype() {
+        if !cfg!(feature = "cpu") && !gpu_available() {
+            return;
+        }
+        let device = init_device();
+        let t: Tensor<CombsBackend, 1> = Tensor::zeros([4], &device);
+        let real = match t.dtype() {
+            DType::F16 => "f16",
+            DType::F32 => "f32",
+            other => panic!("unexpected backend dtype {other:?}"),
+        };
+        assert_eq!(BACKEND.dtype, real, "the label must be the backend's own dtype");
+        assert_eq!(BACKEND.cpu, cfg!(feature = "cpu"));
     }
 }

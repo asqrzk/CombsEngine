@@ -573,9 +573,9 @@ fn build_stamp() -> serde_json::Value {
         // commit alone does not reproduce the number.
         "commit": env!("COMBS_KIT_COMMIT"),
         "dirty": env!("COMBS_KIT_DIRTY") == "true",
-        "dtype": if cfg!(feature = "f16") { "f16" } else { "f32" },
-        "fusion": !cfg!(feature = "f16") || cfg!(feature = "f16-fusion"),
-        "cpu_backend": cfg!(feature = "cpu"),
+        "dtype": combs_core::BACKEND.dtype,
+        "fusion": combs_core::BACKEND.fusion,
+        "cpu_backend": combs_core::BACKEND.cpu,
         "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
         "target": format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
     })
