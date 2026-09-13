@@ -127,6 +127,81 @@ impl<B: Backend> Qwen35Model<B> {
         self.metadata.rms_norm_eps
     }
 
+    /// The decode step through the two WGSL dispatches (seq = 1). Asks the
+    /// door first, so a refusal projects nothing and takes no state; `None`
+    /// leaves the host road to run.
+    fn delta_step_kernel(
+        &self,
+        d: &DeltaNet<B>,
+        h: Tensor<B, 3>,
+        cache: &mut dyn KVCache<B>,
+        layer: usize,
+    ) -> Option<Tensor<B, 3>> {
+        let la = self.la;
+        let [channels, kernel] = d.conv.dims();
+        let g = crate::wgsl::StepGeometry {
+            kh: la.key_heads,
+            vh: la.value_heads,
+            kd: la.key_head_dim,
+            vd: la.value_head_dim,
+            kernel,
+            rms_eps: self.eps() as f32,
+            l2_eps: L2_EPS as f32,
+        };
+        if g.channels() != channels || !crate::wgsl::deltanet_step_available::<B>(&g) {
+            return None;
+        }
+        let out_dtype = h.dtype();
+        let device = h.device();
+        let hist = kernel - 1;
+        let state_len = g.vh * g.kd * g.vd;
+        let flat = |t: Tensor<B, 3>| {
+            let n = t.dims().iter().product::<usize>();
+            t.reshape([n])
+        };
+        let inputs_proj = (
+            flat(d.qkv.forward(h.clone(), None)),
+            flat(d.z.forward(h.clone(), None)),
+            flat(d.b.forward(h.clone(), None)),
+            flat(d.a.forward(h, None)),
+        );
+        let slot = cache
+            .delta_state(layer)
+            .expect("a qwen35 model runs on its hybrid cache");
+        let (ring, state) = match slot.take() {
+            Some(DeltaState { conv, state }) => {
+                (conv.reshape([channels * hist]), state.reshape([state_len]))
+            }
+            None => (
+                to_f32(Tensor::<B, 1>::zeros([channels * hist], &device)),
+                to_f32(Tensor::<B, 1>::zeros([state_len], &device)),
+            ),
+        };
+        let (qkv, z, b, a) = inputs_proj;
+        let inputs = crate::wgsl::StepInputs {
+            qkv,
+            z,
+            b,
+            a,
+            decay_a: d.decay_a.clone(),
+            dt: d.dt_bias.clone(),
+            normw: d.norm.clone(),
+            conv_w: d.conv.clone().reshape([channels * kernel]),
+            ring,
+            state,
+        };
+        // The door said yes before the state left its slot; a refusal now is
+        // a defect, and losing the state silently would be worse than loud.
+        let (out, ring, state) = crate::wgsl::try_deltanet_step(inputs, g)
+            .expect("the DeltaNet step runs where the door said it is available");
+        *slot = Some(DeltaState {
+            conv: ring.reshape([1, channels, hist]),
+            state: state.reshape([1, g.vh, g.kd, g.vd]),
+        });
+        let y = to_float(out.reshape([1, 1, g.vh * g.vd]), out_dtype);
+        Some(d.out.forward(y, None))
+    }
+
     /// One Gated DeltaNet mixer over `h` (`[1, seq, hidden]`, normed),
     /// carrying the conv ring and the state matrix in `cache`.
     fn delta(
@@ -138,6 +213,11 @@ impl<B: Backend> Qwen35Model<B> {
     ) -> Tensor<B, 3> {
         let la = self.la;
         let [_, seq, _] = h.dims();
+        if seq == 1 {
+            if let Some(y) = self.delta_step_kernel(d, h.clone(), cache, layer) {
+                return y;
+            }
+        }
         let out_dtype = h.dtype();
         let (kh, vh, kd, vd) = (
             la.key_heads,

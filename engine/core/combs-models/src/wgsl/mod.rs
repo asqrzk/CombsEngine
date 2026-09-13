@@ -347,6 +347,8 @@ wgsl_kernel_dual!(DecodeAttnSplit, "decode_attn_split.wgsl");
 wgsl_kernel_dual!(DecodeAttnCombine, "decode_attn_combine.wgsl");
 wgsl_kernel!(PrefillAttn, "prefill_attn.wgsl");
 wgsl_kernel!(RopeQk, "rope.wgsl");
+wgsl_kernel!(DeltanetConvStep, "deltanet_conv_step.wgsl");
+wgsl_kernel!(DeltanetStateStep, "deltanet_state_step.wgsl");
 wgsl_kernel_gemv!(DecodeGemvQ8, "decode_gemv_q8.wgsl");
 wgsl_kernel_gemv!(DecodeGemvQ4K, "decode_gemv_q4k.wgsl");
 wgsl_kernel_gemv!(DecodeGemvQ5K, "decode_gemv_q5k.wgsl");
@@ -362,12 +364,14 @@ pub(crate) fn gemv_enabled() -> bool {
 }
 
 mod decode_attn;
+mod deltanet;
 mod decode_attn_q8;
 mod rmsnorm;
 mod rope;
 
 pub(crate) use decode_attn::{try_decode_attention, try_prefill_attention, try_sliding_decode_attention};
 pub(crate) use decode_attn_q8::{QuantArena, try_decode_attention_q8};
+pub(crate) use deltanet::{StepGeometry, StepInputs, deltanet_step_available, try_deltanet_step};
 pub(crate) use rmsnorm::try_rms_norm;
 pub(crate) use rope::try_rope_qk;
 

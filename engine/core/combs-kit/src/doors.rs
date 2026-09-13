@@ -66,6 +66,14 @@ pub const DOORS: &[Door] = &[
     },
     Door {
         kind: Kind::Knob,
+        name: "COMBS_WGSL_DELTANET",
+        default: "on",
+        does: "the Gated DeltaNet decode step as two WGSL dispatches (qwen35); 0 keeps the generic-op road",
+        read_at: "combs-models/src/wgsl/deltanet.rs",
+        measured: None,
+    },
+    Door {
+        kind: Kind::Knob,
         name: "COMBS_WGSL_ROPE",
         default: "on",
         does: "the fused rope kernel for q and k in one dispatch; accepts f16 since §92",
