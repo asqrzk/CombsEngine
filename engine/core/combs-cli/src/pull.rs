@@ -31,6 +31,7 @@ pub const PRESETS: &[(&str, &str, &str)] = &[
     ("qwen3-4b-instruct-2507-gguf", "unsloth/Qwen3-4B-Instruct-2507-GGUF", "qwen3-4b-instruct-2507-gguf"),
     ("qwen3-8b-gguf", "Qwen/Qwen3-8B-GGUF", "qwen3-8b-gguf"),
     ("qwen3-14b-gguf", "Qwen/Qwen3-14B-GGUF", "qwen3-14b-gguf"),
+    ("qwen3.5-4b-gguf", "unsloth/Qwen3.5-4B-GGUF", "qwen3.5-4b-gguf"),
     ("phi-3.1-mini", "bartowski/Phi-3.1-mini-4k-instruct-GGUF", "phi-3.1-mini-4k-instruct-gguf"),
     ("gemma-3-1b-gguf", "ggml-org/gemma-3-1b-it-GGUF", "gemma-3-1b-it-gguf"),
     ("smolvlm-256m", "HuggingFaceTB/SmolVLM-256M-Instruct", "smolvlm-256m"),
@@ -846,6 +847,16 @@ mod tests {
         ] {
             assert_eq!(resolve_repo(id), (id.to_string(), repo.to_string()), "{id}");
         }
+    }
+
+    #[test]
+    fn the_qwen35_preset_names_its_repo_and_slug() {
+        // The slug is the dir the app's card and the platform's catalog
+        // name; the repo carries the Q4_K_M file the engine was measured on.
+        assert_eq!(
+            resolve_repo("qwen3.5-4b-gguf"),
+            ("qwen3.5-4b-gguf".to_string(), "unsloth/Qwen3.5-4B-GGUF".to_string())
+        );
     }
 
     #[test]
