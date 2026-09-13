@@ -23,6 +23,9 @@ pub enum NormFlavor {
 pub enum LayerKind {
     Global,
     Sliding(usize),
+    /// A Gated DeltaNet (linear attention) layer: a recurrent state per
+    /// sequence instead of a KV arena (Qwen3.5).
+    DeltaNet,
 }
 
 /// Resolved architecture description consumed by the decoder.
@@ -58,7 +61,15 @@ impl ArchSpec {
         let n = meta.num_hidden_layers;
         let arch = meta.architecture.as_str();
 
-        let layers: Vec<LayerKind> = match (arch, pattern.sliding_window) {
+        let layers: Vec<LayerKind> = if let Some(la) = meta.linear_attention {
+            // Hybrid: every `interval`-th layer (1-based) attends, the rest
+            // run the delta rule.
+            let every = la.full_attention_interval.max(1);
+            (0..n)
+                .map(|i| if (i + 1) % every == 0 { LayerKind::Global } else { LayerKind::DeltaNet })
+                .collect()
+        } else {
+            match (arch, pattern.sliding_window) {
             (_, None) => vec![LayerKind::Global; n],
             // Gemma interleave: every `pattern`-th layer is global.
             ("gemma3" | "gemma3_text", Some(w)) => (0..n)
@@ -85,6 +96,7 @@ impl ArchSpec {
             // Unknown sliding semantics: run global rather than guess a
             // wrong mask (the registry guards refuse the risky cases).
             (_, Some(_)) => vec![LayerKind::Global; n],
+            }
         };
 
         let gemma = matches!(arch, "gemma3" | "gemma3_text");
@@ -93,7 +105,7 @@ impl ArchSpec {
             // family never uses silu.
             activation: if gemma { Activation::GeluTanh } else { meta.activation },
             norm_flavor: if gemma { NormFlavor::GemmaRmsNorm } else { NormFlavor::RmsNorm },
-            qk_norm: matches!(arch, "gemma3" | "gemma3_text" | "qwen3"),
+            qk_norm: matches!(arch, "gemma3" | "gemma3_text" | "qwen3" | "qwen35"),
             sandwich_norms: gemma,
             embed_scale_sqrt_hidden: gemma,
             attn_logit_softcap: None,
@@ -113,7 +125,7 @@ impl ArchSpec {
         self.layers
             .iter()
             .map(|k| match k {
-                LayerKind::Global => None,
+                LayerKind::Global | LayerKind::DeltaNet => None,
                 LayerKind::Sliding(w) => Some(*w),
             })
             .collect()
@@ -173,6 +185,24 @@ mod tests {
         };
         let spec = ArchSpec::resolve(&meta("qwen2", 4, p));
         assert_eq!(spec.layers, vec![LayerKind::Global; 4]);
+    }
+
+    #[test]
+    fn qwen35_attends_every_fourth_layer_and_runs_the_delta_rule_between() {
+        let mut m = meta("qwen35", 8, AttentionPattern::default());
+        m.linear_attention = Some(combs_formats::LinearAttention {
+            key_heads: 16,
+            value_heads: 32,
+            key_head_dim: 128,
+            value_head_dim: 128,
+            conv_kernel: 4,
+            full_attention_interval: 4,
+        });
+        let spec = ArchSpec::resolve(&m);
+        let d = LayerKind::DeltaNet;
+        let g = LayerKind::Global;
+        assert_eq!(spec.layers, vec![d, d, d, g, d, d, d, g]);
+        assert!(spec.qk_norm);
     }
 
     #[test]

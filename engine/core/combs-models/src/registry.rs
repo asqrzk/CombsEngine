@@ -51,6 +51,13 @@ impl<B: Backend> ModelRegistry<B> {
         r.register("qwen3", |source, device| {
             Ok(Box::new(crate::llama::LlamaModel::<B>::load(source, device)?))
         });
+        // Qwen3.5: Gated DeltaNet layers interleaved with gated attention,
+        // a recurrent state per session beside the KV arena.
+        r.register("qwen35", |source, device| {
+            Ok(Box::new(crate::qwen35::Qwen35Model::<B>::load(
+                source, device,
+            )?))
+        });
         // Mistral v0.3+/Nemo report `sliding_window: null` and are plain
         // llama; v0.1's all-layer sliding window rides the same per-layer
         // layout phi3 uses.

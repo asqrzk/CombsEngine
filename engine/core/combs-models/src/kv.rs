@@ -135,6 +135,13 @@ pub trait KVCache<B: Backend>: Send {
         0
     }
 
+    /// The recurrent state slot of a Gated DeltaNet layer (hybrid families);
+    /// `None` for every attention-only cache.
+    fn delta_state(&mut self, layer: usize) -> Option<&mut Option<DeltaState<B>>> {
+        let _ = layer;
+        None
+    }
+
     /// Drops all cached state (session reset).
     fn reset(&mut self);
 
@@ -147,6 +154,102 @@ pub trait KVCache<B: Backend>: Send {
     /// reads counters, never touches device memory.
     fn page_stats(&self) -> Option<PageStats> {
         None
+    }
+}
+
+/// One Gated DeltaNet layer's memory for one sequence: the last
+/// `kernel - 1` columns of the conv input `[1, channels, kernel - 1]` and
+/// the state matrix `[1, value_heads, key_dim, value_dim]`, both f32 on
+/// every backend.
+pub struct DeltaState<B: Backend> {
+    pub conv: Tensor<B, 3>,
+    pub state: Tensor<B, 4>,
+}
+
+/// A hybrid family's cache: attention layers keep K/V in an inner cache
+/// indexed by their own compact slots, DeltaNet layers keep a recurrent
+/// state beside it. The state is one point in time, so this cache never
+/// rolls back — a session that diverges from its history is rebuilt.
+pub struct HybridCache<B: Backend> {
+    inner: Box<dyn KVCache<B>>,
+    /// Model layer -> inner attention slot (`None` for DeltaNet layers).
+    slots: Vec<Option<usize>>,
+    states: Vec<Option<DeltaState<B>>>,
+}
+
+impl<B: Backend> HybridCache<B> {
+    /// `attends[i]` says whether model layer `i` is an attention layer;
+    /// `inner` must hold exactly that many layers.
+    pub fn new(inner: Box<dyn KVCache<B>>, attends: &[bool]) -> Self {
+        let mut next = 0;
+        let slots = attends
+            .iter()
+            .map(|&a| {
+                a.then(|| {
+                    next += 1;
+                    next - 1
+                })
+            })
+            .collect();
+        HybridCache {
+            inner,
+            slots,
+            states: attends.iter().map(|_| None).collect(),
+        }
+    }
+
+    /// Bytes the recurrent states hold (zero before the first write).
+    pub fn state_bytes(&self) -> u64 {
+        self.states
+            .iter()
+            .flatten()
+            .map(|s| {
+                let n = |d: &[usize]| d.iter().product::<usize>() as u64;
+                4 * (n(&s.conv.dims()) + n(&s.state.dims()))
+            })
+            .sum()
+    }
+}
+
+impl<B: Backend> KVCache<B> for HybridCache<B> {
+    fn attention_opts(
+        &mut self,
+        layer: usize,
+        q: Tensor<B, 4>,
+        k: Tensor<B, 4>,
+        v: Tensor<B, 4>,
+        pos: usize,
+        scale: f64,
+        window: Option<usize>,
+    ) -> Tensor<B, 4> {
+        let slot = self.slots[layer].expect("attention asked of a DeltaNet layer");
+        self.inner.attention_opts(slot, q, k, v, pos, scale, window)
+    }
+
+    fn seq_len(&self) -> usize {
+        self.inner.seq_len()
+    }
+
+    fn popn(&mut self, n: usize) -> usize {
+        let _ = n;
+        0
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+        self.states.iter_mut().for_each(|s| *s = None);
+    }
+
+    fn pages_used(&self) -> Option<usize> {
+        self.inner.pages_used()
+    }
+
+    fn page_stats(&self) -> Option<PageStats> {
+        self.inner.page_stats()
+    }
+
+    fn delta_state(&mut self, layer: usize) -> Option<&mut Option<DeltaState<B>>> {
+        self.states.get_mut(layer)
     }
 }
 

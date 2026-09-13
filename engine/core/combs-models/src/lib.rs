@@ -11,6 +11,7 @@ mod embed;
 mod forward_probe;
 mod kv;
 mod llama;
+mod qwen35;
 mod matmul;
 mod norm;
 mod precision;
@@ -27,8 +28,12 @@ mod traits;
 mod whisper;
 
 pub use archspec::{ArchSpec, LayerKind, NormFlavor};
-pub use kv::{CacheConfig, CacheKind, ContiguousKVCache, KVCache, PageStats, PagedKVCache};
+pub use kv::{
+    CacheConfig, CacheKind, ContiguousKVCache, DeltaState, HybridCache, KVCache, PageStats,
+    PagedKVCache,
+};
 pub use llama::LlamaModel;
+pub use qwen35::Qwen35Model;
 pub use norm::rms_norm;
 pub use staged::flush_device;
 pub use qlinear::{batched_matmul_summary, quant_census, Linear, QuantLinearOp, try_quant_linear};

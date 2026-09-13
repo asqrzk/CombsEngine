@@ -17,6 +17,9 @@ engine/core/dist/
 models/
 *.safetensors
 *.gguf
+# ...except the tiny parity fixtures tests read (hundreds of KB, generated
+# by the script beside them); real model files stay out of the tree.
+!engine/core/combs-models/tests/fixtures/*.gguf
 *.bpk
 
 # Deno / JS
