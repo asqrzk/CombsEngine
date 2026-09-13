@@ -373,6 +373,10 @@ fn cmd_gates(ctx: &Ctx, quick: bool, strict: bool) -> Result<()> {
         "core",
         &["test", "--release", "-p", "combs-core", "-p", "combs-media"],
     );
+    // The CLI and the kit carry their own unit tests (the pull presets, the
+    // kit's record and child protocol) and no GPU; they ride every gate.
+    tier("cli", &["test", "--release", "-p", "combs-cli"]);
+    tier("kit", &["test", "--release", "-p", "combs-kit"]);
     if !quick {
         // These need a GPU adapter and take minutes; a machine without
         // one skips their GPU cases rather than failing them.
@@ -385,6 +389,29 @@ fn cmd_gates(ctx: &Ctx, quick: bool, strict: bool) -> Result<()> {
         tier(
             "diffusion",
             &["test", "--release", "-p", "combs-diffusion", "--lib"],
+        );
+        // The app and the fleet ship the f16 build; every tier above is the
+        // f32 build. These compile the f16 backend itself (CombsBackend is
+        // f16 here) in its own target dir so the two never invalidate each
+        // other. combs-runtime's own `f16` does not reach combs-core, so the
+        // feature is named on combs-core explicitly.
+        let mut tier_f16 = |name: &str, args: &[&str]| {
+            eprintln!("== {name} ==");
+            let mut cmd = Command::new(cargo());
+            cmd.current_dir(&ctx.root)
+                .env("CARGO_TARGET_DIR", ctx.root.join("target-f16"))
+                .args(args);
+            if run(cmd).is_err() {
+                failed.push(name.to_string());
+            }
+        };
+        tier_f16(
+            "models-f16",
+            &["test", "--release", "-p", "combs-models", "--lib", "--features", "combs-core/f16"],
+        );
+        tier_f16(
+            "runtime-f16",
+            &["test", "--release", "-p", "combs-runtime", "--features", "f16,combs-core/f16"],
         );
     }
 
