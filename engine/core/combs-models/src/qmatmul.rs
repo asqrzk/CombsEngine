@@ -2457,6 +2457,61 @@ pub struct Q5KWeight<R: Runtime> {
 }
 
 impl<R: Runtime> Q5KWeight<R> {
+    /// Split-K decode gemv through the Combs Kernel — Q4_K's, with the
+    /// high-bit plane bound beside the nibbles; see
+    /// `Q4KWeight::decode_gemv_wgsl`. `k % 256 == 0` (whole superblocks)
+    /// is guaranteed by construction for Q5_K tables.
+    pub(crate) fn decode_gemv_wgsl(
+        &self,
+        client: &ComputeClient<cubecl::wgpu::WgpuRuntime>,
+        x: Handle,
+        storage: crate::wgsl::Storage,
+        residual: Option<Handle>,
+    ) -> Handle {
+        self.decode_gemv_wgsl_at(client, x, storage, residual, crate::wgsl::Geometry::DEFAULT)
+    }
+
+    /// The gemv at a stated workgroup cut; production takes the default.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decode_gemv_wgsl_at(
+        &self,
+        client: &ComputeClient<cubecl::wgpu::WgpuRuntime>,
+        x: Handle,
+        storage: crate::wgsl::Storage,
+        residual: Option<Handle>,
+        geom: crate::wgsl::Geometry,
+    ) -> Handle {
+        let elem = match storage {
+            crate::wgsl::Storage::F32 => core::mem::size_of::<f32>(),
+            crate::wgsl::Storage::F16 => core::mem::size_of::<f32>() / 2,
+        };
+        let out_h = client.empty(self.n_out * elem);
+        crate::wgsl::launch_gemv(
+            client,
+            crate::wgsl::GemvKernel::Q5K,
+            storage,
+            geom,
+            (self.n_out as u32).div_ceil(geom.rows).max(1),
+            vec![
+                x.binding(),
+                self.qs.clone().binding(),
+                self.qh.clone().binding(),
+                self.dd.clone().binding(),
+                self.scales.clone().binding(),
+                out_h.clone().binding(),
+                residual.clone().unwrap_or_else(|| out_h.clone()).binding(),
+            ],
+            vec![
+                self.n_out as u64,
+                self.k as u64,
+                u64::from(residual.is_some()),
+            ],
+        );
+        out_h
+    }
+}
+
+impl<R: Runtime> Q5KWeight<R> {
     /// Repacks a GGUF Q5_K tensor onto the device.
     pub fn from_gguf_bytes(
         client: &ComputeClient<R>,
@@ -2926,8 +2981,9 @@ impl QuantWeight {
         match self {
             QuantWeight::Q80(w) => w.k % Q4_0_BLOCK == 0,
             QuantWeight::Q4K(w) => w.k % K_SUPERBLOCK == 0,
+            QuantWeight::Q5K(w) => w.k % K_SUPERBLOCK == 0,
             QuantWeight::Q6K(w) => w.k % K_SUPERBLOCK == 0,
-            QuantWeight::Q40(_) | QuantWeight::Q50(_) | QuantWeight::Q5K(_) => false,
+            QuantWeight::Q40(_) | QuantWeight::Q50(_) => false,
         }
     }
 
@@ -2959,8 +3015,9 @@ impl QuantWeight {
         match self {
             QuantWeight::Q80(w) => w.decode_gemv_wgsl(client, x, st, residual),
             QuantWeight::Q4K(w) => w.decode_gemv_wgsl(client, x, st, residual),
+            QuantWeight::Q5K(w) => w.decode_gemv_wgsl(client, x, st, residual),
             QuantWeight::Q6K(w) => w.decode_gemv_wgsl(client, x, st, residual),
-            _ => unreachable!("takes_wgsl_gemv admits only the three gemv formats"),
+            _ => unreachable!("takes_wgsl_gemv admits only the four gemv formats"),
         }
     }
 
@@ -3003,7 +3060,12 @@ impl QuantWeight {
                 }
                 w.matmul_device(client, x, m)
             }
-            QuantWeight::Q5K(w) => w.matmul_device(client, x, m),
+            QuantWeight::Q5K(w) => {
+                if m == 1 && w.k % K_SUPERBLOCK == 0 && crate::wgsl::gemv_enabled() {
+                    return w.decode_gemv_wgsl(client, x, crate::wgsl::Storage::F32, residual);
+                }
+                w.matmul_device(client, x, m)
+            }
             QuantWeight::Q6K(w) => {
                 if m == 1 && w.k % K_SUPERBLOCK == 0 && crate::wgsl::gemv_enabled() {
                     return w.decode_gemv_wgsl(client, x, crate::wgsl::Storage::F32, residual);

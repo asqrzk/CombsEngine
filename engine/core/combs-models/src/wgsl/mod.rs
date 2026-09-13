@@ -349,6 +349,7 @@ wgsl_kernel!(PrefillAttn, "prefill_attn.wgsl");
 wgsl_kernel!(RopeQk, "rope.wgsl");
 wgsl_kernel_gemv!(DecodeGemvQ8, "decode_gemv_q8.wgsl");
 wgsl_kernel_gemv!(DecodeGemvQ4K, "decode_gemv_q4k.wgsl");
+wgsl_kernel_gemv!(DecodeGemvQ5K, "decode_gemv_q5k.wgsl");
 wgsl_kernel_gemv!(DecodeGemvQ6K, "decode_gemv_q6k.wgsl");
 
 /// Door for the split-K decode gemv (`COMBS_WGSL_GEMV=0` restores the
@@ -377,6 +378,8 @@ pub(crate) enum GemvKernel {
     Q8,
     /// Q4_K superblocks (qs, [d, dmin] pairs, packed 6-bit scales).
     Q4K,
+    /// Q5_K superblocks: Q4_K's plus the high-bit words (qh).
+    Q5K,
     /// Q6_K superblocks (ql, qh, i8 scales, d).
     Q6K,
 }
@@ -396,6 +399,7 @@ pub(crate) fn launch_gemv(
     match kernel {
         GemvKernel::Q8 => launch_at(client, DecodeGemvQ8(storage, geom), geom.workgroup(), count, buffers, scalars),
         GemvKernel::Q4K => launch_at(client, DecodeGemvQ4K(storage, geom), geom.workgroup(), count, buffers, scalars),
+        GemvKernel::Q5K => launch_at(client, DecodeGemvQ5K(storage, geom), geom.workgroup(), count, buffers, scalars),
         GemvKernel::Q6K => launch_at(client, DecodeGemvQ6K(storage, geom), geom.workgroup(), count, buffers, scalars),
     }
 }
@@ -737,7 +741,7 @@ pub async fn probe_report() -> Result<(), String> {
     // The same fixtures at m = 1 through the WGSL gemv vs the cube
     // untiled kernel: the decode path's dominant kernels, value-checked
     // per format on this compiler before the door means anything here.
-    for format in ["q8_0", "q4_k", "q6_k"] {
+    for format in ["q8_0", "q4_k", "q5_k", "q6_k"] {
         gemv_canary(&client, format).await?;
     }
 
@@ -981,6 +985,16 @@ async fn gemv_canary(
             .map_err(|e| format!("q4_k pack failed: {e}"))?;
             let dense = combs_formats::quants::dequantize_q4_k(&data, n_out * k)
                 .map_err(|e| format!("q4_k reference failed: {e}"))?;
+            (dense, w.decode_gemv_wgsl(client, x_h, Storage::F32, None))
+        }
+        "q5_k" => {
+            let data = synth(176, &[0, 2]);
+            let w = crate::qmatmul::Q5KWeight::<WgpuRuntime>::from_gguf_bytes(
+                client, &data, n_out, k,
+            )
+            .map_err(|e| format!("q5_k pack failed: {e}"))?;
+            let dense = combs_formats::quants::dequantize_q5_k(&data, n_out * k)
+                .map_err(|e| format!("q5_k reference failed: {e}"))?;
             (dense, w.decode_gemv_wgsl(client, x_h, Storage::F32, None))
         }
         _ => {
@@ -1448,7 +1462,7 @@ mod tests {
         assert!(took.as_micros() > 0, "sixty-four launches took no time at all");
     }
 
-    /// The three projection shaders render for f32 EXACTLY as the audited
+    /// The four projection shaders render for f32 EXACTLY as the audited
     /// files did — no `enable`, no f16, no unfilled placeholder — and for
     /// f16 with the directive on line one and the partials still f32.
     /// Narrowing the accumulator is the one thing §66 forbids outright.
@@ -1458,6 +1472,7 @@ mod tests {
         let f32s = [
             DecodeGemvQ8(Storage::F32, Geometry::DEFAULT).source().complete(),
             DecodeGemvQ4K(Storage::F32, Geometry::DEFAULT).source().complete(),
+            DecodeGemvQ5K(Storage::F32, Geometry::DEFAULT).source().complete(),
             DecodeGemvQ6K(Storage::F32, Geometry::DEFAULT).source().complete(),
         ];
         for (i, t) in f32s.iter().enumerate() {
@@ -1471,6 +1486,7 @@ mod tests {
         let f16s = [
             DecodeGemvQ8(Storage::F16, Geometry::DEFAULT).source().complete(),
             DecodeGemvQ4K(Storage::F16, Geometry::DEFAULT).source().complete(),
+            DecodeGemvQ5K(Storage::F16, Geometry::DEFAULT).source().complete(),
             DecodeGemvQ6K(Storage::F16, Geometry::DEFAULT).source().complete(),
         ];
         for (i, t) in f16s.iter().enumerate() {
@@ -1602,7 +1618,7 @@ mod tests {
             .iter()
             .flat_map(|v| burn::tensor::f16::from_f32(*v).to_le_bytes())
             .collect();
-        for format in ["q8_0", "q4_k", "q6_k"] {
+        for format in ["q8_0", "q4_k", "q5_k", "q6_k"] {
             let x_h = client.create_from_slice(&x_bytes);
             let (dense, out_h) = match format {
                 "q8_0" => {
@@ -1614,6 +1630,11 @@ mod tests {
                     let data = synth(format, 144, &[0, 2]);
                     let w = crate::qmatmul::Q4KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
                     (combs_formats::quants::dequantize_q4_k(&data, n_out * k).unwrap(), w.decode_gemv_wgsl(&client, x_h, Storage::F16, None))
+                }
+                "q5_k" => {
+                    let data = synth(format, 176, &[0, 2]);
+                    let w = crate::qmatmul::Q5KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k).unwrap();
+                    (combs_formats::quants::dequantize_q5_k(&data, n_out * k).unwrap(), w.decode_gemv_wgsl(&client, x_h, Storage::F16, None))
                 }
                 _ => {
                     let data = synth(format, 210, &[208]);
