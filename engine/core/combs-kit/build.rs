@@ -17,7 +17,7 @@ use std::process::Command;
 // Where the source's identity comes from when there is no git to ask — a
 // packed archive names its commit through COMBS_SOURCE_COMMIT. A byte copy
 // of combs-cli/build/stamp.rs; xtask's `the_kit_source_resolver_matches_combs_cli`
-// fails the workspace tests the moment the two differ.
+// fails the gate's xtask tier the moment the two differ.
 include!("build/stamp.rs");
 
 fn git(args: &[&str]) -> Option<String> {

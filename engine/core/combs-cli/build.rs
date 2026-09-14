@@ -27,7 +27,7 @@ use std::process::Command;
 // verify build (caught 2026-09-05, the first combs-cli publish). The
 // one-implementation guarantee is now an enforced invariant instead of
 // a shared path: xtask's `the_cli_build_stamp_formatter_matches_combs_core`
-// fails the workspace tests the moment the two files differ by a byte.
+// fails the gate's xtask tier the moment the two files differ by a byte.
 include!("build/timefmt.rs");
 
 // Where the source's identity comes from when there is no git to ask — a
