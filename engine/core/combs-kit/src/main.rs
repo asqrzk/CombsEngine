@@ -285,7 +285,7 @@ fn main() {
             }
         },
     };
-    std::process::exit(code);
+    combs_core::exit::exit_process(code);
 }
 
 fn cmd_system(json: bool, out: Option<&std::path::Path>) -> i32 {

@@ -300,7 +300,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     // Before anything loads: which binary is about to do the work.
     combs_core::provenance::process(cli.command.name());
-    match cli.command {
+    // The result is handed to exit_process rather than returned: a return
+    // (or std::process::exit) runs the GPU driver's static destructors
+    // while cubecl-wgpu's poll thread still holds the device (combs_core::exit).
+    let result = match cli.command {
         Command::Run(args) => cmd_run(args),
         Command::Devices => cmd_devices(),
         Command::Doctor(args) => doctor::run(args),
@@ -365,6 +368,14 @@ fn main() -> Result<()> {
             ChewMode::KvCacheUi(args) => chew::chew("kv-cache-ui", args),
             ChewMode::DebateKvUi(args) => chew::chew("debate-kv-ui", args),
         },
+    };
+    match result {
+        Ok(()) => combs_core::exit::exit_process(0),
+        Err(e) => {
+            // The same line std prints for `main` returning `Err`.
+            eprintln!("Error: {e:?}");
+            combs_core::exit::exit_process(1)
+        }
     }
 }
 

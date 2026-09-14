@@ -9,6 +9,7 @@
 
 pub use burn::backend::wgpu;
 
+pub mod exit;
 pub mod host;
 pub mod progress;
 pub mod provenance;

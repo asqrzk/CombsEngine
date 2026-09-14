@@ -323,7 +323,7 @@ fn finish(args: DoctorArgs, mut checks: Vec<Check>, device_json: Value) -> Resul
     }
 
     if failed {
-        std::process::exit(1);
+        combs_core::exit::exit_process(1);
     }
     Ok(())
 }
