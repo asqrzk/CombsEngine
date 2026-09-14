@@ -957,12 +957,12 @@ impl<R: Runtime> Q80Weight<R> {
         storage: crate::wgsl::Storage,
         residual: Option<Handle>,
     ) -> Handle {
-        self.decode_gemv_wgsl_at(client, x, storage, residual, crate::wgsl::Geometry::DEFAULT)
+        self.decode_gemv_wgsl_at(client, x, storage, residual, crate::wgsl::gemv_geometry())
     }
 
-    /// The gemv at a stated workgroup cut. Production takes the default;
-    /// only the kit's sweep asks for others, and it asks because §102
-    /// left the question open rather than because anything is known.
+    /// The gemv at a stated workgroup cut. Production takes the cut the
+    /// geometry door names ([`crate::wgsl::gemv_geometry`], 16x16 unless
+    /// asked); the kit's sweep asks for each cut in turn.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn decode_gemv_wgsl_at(
         &self,
@@ -2301,12 +2301,12 @@ impl<R: Runtime> Q4KWeight<R> {
         storage: crate::wgsl::Storage,
         residual: Option<Handle>,
     ) -> Handle {
-        self.decode_gemv_wgsl_at(client, x, storage, residual, crate::wgsl::Geometry::DEFAULT)
+        self.decode_gemv_wgsl_at(client, x, storage, residual, crate::wgsl::gemv_geometry())
     }
 
-    /// The gemv at a stated workgroup cut. Production takes the default;
-    /// only the kit's sweep asks for others, and it asks because §102
-    /// left the question open rather than because anything is known.
+    /// The gemv at a stated workgroup cut. Production takes the cut the
+    /// geometry door names ([`crate::wgsl::gemv_geometry`], 16x16 unless
+    /// asked); the kit's sweep asks for each cut in turn.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn decode_gemv_wgsl_at(
         &self,
@@ -2468,7 +2468,7 @@ impl<R: Runtime> Q5KWeight<R> {
         storage: crate::wgsl::Storage,
         residual: Option<Handle>,
     ) -> Handle {
-        self.decode_gemv_wgsl_at(client, x, storage, residual, crate::wgsl::Geometry::DEFAULT)
+        self.decode_gemv_wgsl_at(client, x, storage, residual, crate::wgsl::gemv_geometry())
     }
 
     /// The gemv at a stated workgroup cut; production takes the default.
@@ -2685,12 +2685,12 @@ impl<R: Runtime> Q6KWeight<R> {
         storage: crate::wgsl::Storage,
         residual: Option<Handle>,
     ) -> Handle {
-        self.decode_gemv_wgsl_at(client, x, storage, residual, crate::wgsl::Geometry::DEFAULT)
+        self.decode_gemv_wgsl_at(client, x, storage, residual, crate::wgsl::gemv_geometry())
     }
 
-    /// The gemv at a stated workgroup cut. Production takes the default;
-    /// only the kit's sweep asks for others, and it asks because §102
-    /// left the question open rather than because anything is known.
+    /// The gemv at a stated workgroup cut. Production takes the cut the
+    /// geometry door names ([`crate::wgsl::gemv_geometry`], 16x16 unless
+    /// asked); the kit's sweep asks for each cut in turn.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn decode_gemv_wgsl_at(
         &self,
@@ -3798,6 +3798,81 @@ mod tests {
             let got = f32::from_bytes(&client.read_one_unchecked(got_h)).to_vec();
             let cube = f32::from_bytes(&client.read_one_unchecked(cube_h)).to_vec();
             check(&got, &cube, &x, &dense, n_out, k, "q6_k");
+        }
+    }
+
+    /// Every packed format at every cut the geometry door accepts, against
+    /// the CPU reference: whichever cut production takes must compute the
+    /// same product. The shapes cross the edges a cut can break — n_out
+    /// that no cut's rows divide, rows with fewer blocks than a cut has
+    /// lanes, and whole workgroups.
+    #[test]
+    fn every_gemv_format_matches_the_reference_at_every_cut() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        let device = Default::default();
+        let client = WgpuRuntime::client(&device);
+        let mk_x = |k: usize| -> Vec<f32> {
+            (0..k)
+                .map(|i| ((i as f32 * 0.311).sin() * 1.4) - 0.1)
+                .collect()
+        };
+        let check = |got: &[f32], x: &[f32], dense: &[f32], n_out: usize, k: usize, what: &str| {
+            for r in 0..n_out {
+                let expect: f32 = (0..k).map(|c| x[c] * dense[r * k + c]).sum();
+                let tol = 1e-3 * expect.abs().max(1.0);
+                assert!(
+                    (got[r] - expect).abs() <= tol,
+                    "{what} n_out={n_out} k={k} row {r}: wgsl {} vs reference {expect}",
+                    got[r]
+                );
+            }
+        };
+        for geom in crate::wgsl::Geometry::SWEEP.iter().copied() {
+            let cut = format!("{}x{}", geom.rows, geom.lanes);
+            for (n_out, k) in [(37usize, 64usize), (211, 1152), (64, 1024)] {
+                let data = synth_q8_0(n_out * k / 32);
+                let w = Q80Weight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k)
+                    .expect("packed q8_0 table");
+                let dense = combs_formats::quants::dequantize_q8_0(&data, n_out * k).unwrap();
+                let x = mk_x(k);
+                let x_h = client.create_from_slice(f32::as_bytes(&x));
+                let h = w.decode_gemv_wgsl_at(&client, x_h, crate::wgsl::Storage::F32, None, geom);
+                let got = f32::from_bytes(&client.read_one_unchecked(h)).to_vec();
+                check(&got, &x, &dense, n_out, k, &format!("q8_0 at {cut}"));
+            }
+            for (n_out, k) in [(37usize, 256usize), (211, 1024), (64, 2560)] {
+                let x = mk_x(k);
+                let n_sb = n_out * k / 256;
+
+                let data = synth_q4_k(n_sb);
+                let w = Q4KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k)
+                    .expect("packed q4_k table");
+                let dense = combs_formats::quants::dequantize_q4_k(&data, n_out * k).unwrap();
+                let x_h = client.create_from_slice(f32::as_bytes(&x));
+                let h = w.decode_gemv_wgsl_at(&client, x_h, crate::wgsl::Storage::F32, None, geom);
+                let got = f32::from_bytes(&client.read_one_unchecked(h)).to_vec();
+                check(&got, &x, &dense, n_out, k, &format!("q4_k at {cut}"));
+
+                let data = synth_q5_k(n_sb);
+                let w = Q5KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k)
+                    .expect("packed q5_k table");
+                let dense = combs_formats::quants::dequantize_q5_k(&data, n_out * k).unwrap();
+                let x_h = client.create_from_slice(f32::as_bytes(&x));
+                let h = w.decode_gemv_wgsl_at(&client, x_h, crate::wgsl::Storage::F32, None, geom);
+                let got = f32::from_bytes(&client.read_one_unchecked(h)).to_vec();
+                check(&got, &x, &dense, n_out, k, &format!("q5_k at {cut}"));
+
+                let data = synth_q6_k(n_sb);
+                let w = Q6KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k)
+                    .expect("packed q6_k table");
+                let dense = combs_formats::quants::dequantize_q6_k(&data, n_out * k).unwrap();
+                let x_h = client.create_from_slice(f32::as_bytes(&x));
+                let h = w.decode_gemv_wgsl_at(&client, x_h, crate::wgsl::Storage::F32, None, geom);
+                let got = f32::from_bytes(&client.read_one_unchecked(h)).to_vec();
+                check(&got, &x, &dense, n_out, k, &format!("q6_k at {cut}"));
+            }
         }
     }
 

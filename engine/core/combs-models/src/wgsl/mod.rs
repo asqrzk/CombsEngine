@@ -135,6 +135,53 @@ impl Geometry {
     }
 }
 
+/// The cut `COMBS_WGSL_GEMV_GEOMETRY` names, or the default when it is unset.
+///
+/// Only the swept cuts are accepted, spelled as the doors report prints
+/// them (`8x32`, `16x16`, `32x8`), and a refusal names every cut it would
+/// have taken: a mistyped value must not quietly run a cut nobody measured.
+pub(crate) fn geometry_door(env: Option<&str>) -> Result<Geometry, String> {
+    let Some(asked) = env else {
+        return Ok(Geometry::DEFAULT);
+    };
+    let label = |g: &Geometry| format!("{}x{}", g.rows, g.lanes);
+    match Geometry::SWEEP.iter().find(|g| label(*g) == asked) {
+        Some(g) => Ok(*g),
+        None => {
+            let cuts: Vec<String> = Geometry::SWEEP.iter().map(label).collect();
+            Err(format!(
+                "COMBS_WGSL_GEMV_GEOMETRY={asked:?} is not a swept cut ({})",
+                cuts.join(", ")
+            ))
+        }
+    }
+}
+
+/// The workgroup cut every production decode gemv launches with.
+///
+/// The best cut belongs to the adapter, not to the engine: a sweep that
+/// finds no cut ahead of 16x16 on one GPU can find another cut well ahead
+/// on a different one. So the default stays 16x16 and
+/// `COMBS_WGSL_GEMV_GEOMETRY` chooses, read once per process. A value
+/// outside the sweep is refused aloud and the default is used; the doors
+/// report names the cut actually taken either way.
+pub fn gemv_geometry() -> Geometry {
+    static CUT: std::sync::OnceLock<Geometry> = std::sync::OnceLock::new();
+    *CUT.get_or_init(|| {
+        match geometry_door(std::env::var("COMBS_WGSL_GEMV_GEOMETRY").ok().as_deref()) {
+            Ok(g) => g,
+            Err(why) => {
+                eprintln!(
+                    "[wgsl] {why}; the decode gemv takes {}x{}",
+                    Geometry::DEFAULT.rows,
+                    Geometry::DEFAULT.lanes
+                );
+                Geometry::DEFAULT
+            }
+        }
+    })
+}
+
 /// May this box store kernel activations in f16?
 ///
 /// Four conditions, and each is load-bearing. Never in a browser (the
@@ -202,10 +249,10 @@ pub fn active_doors(
         // f16 one. The caller knows its own dtype and composes the
         // sentence; this reports the fact it actually holds.
         ("f16_storage_door", f16_storage_enabled(client).to_string()),
-        (
-            "gemv_geometry",
-            format!("{}x{}", Geometry::DEFAULT.rows, Geometry::DEFAULT.lanes),
-        ),
+        ("gemv_geometry", {
+            let cut = gemv_geometry();
+            format!("{}x{}", cut.rows, cut.lanes)
+        }),
     ]
 }
 
@@ -1415,6 +1462,24 @@ mod tests {
         assert!(!storage_door_default(false, None), "unproven elsewhere: shut by default");
         assert!(!storage_door_default(true, Some("0")), "the off switch wins on Apple");
         assert!(storage_door_default(false, Some("1")), "the on switch wins elsewhere");
+    }
+
+    /// The door takes exactly the cuts the sweep asks about, spelled as
+    /// the doors report prints them, and a refusal names every cut it
+    /// would have taken — a mistyped value must not quietly run a cut
+    /// nobody measured.
+    #[test]
+    fn the_geometry_door_takes_only_the_swept_cuts() {
+        assert_eq!(geometry_door(None), Ok(Geometry::DEFAULT), "no value: the default cut");
+        for (text, rows, lanes) in [("8x32", 8, 32), ("16x16", 16, 16), ("32x8", 32, 8)] {
+            assert_eq!(geometry_door(Some(text)), Ok(Geometry { rows, lanes }), "{text}");
+        }
+        for bad in ["", "8X32", " 8x32", "8x32 ", "4x64", "64x4", "8x16", "16", "banana"] {
+            let why = geometry_door(Some(bad)).expect_err(bad);
+            for cut in ["8x32", "16x16", "32x8"] {
+                assert!(why.contains(cut), "the refusal of {bad:?} names {cut}: {why}");
+            }
+        }
     }
 
     /// Every cut renders a shader whose workgroup size matches the cut,

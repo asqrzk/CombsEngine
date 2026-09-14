@@ -58,6 +58,14 @@ pub const DOORS: &[Door] = &[
     },
     Door {
         kind: Kind::Knob,
+        name: "COMBS_WGSL_GEMV_GEOMETRY",
+        default: "16x16",
+        does: "how every decode gemv workgroup is cut into output rows and lanes: 8x32, 16x16 or 32x8; any other value is refused aloud and 16x16 is used",
+        read_at: "combs-models/src/wgsl/mod.rs",
+        measured: None,
+    },
+    Door {
+        kind: Kind::Knob,
         name: "COMBS_WGSL_RMSNORM",
         default: "on",
         does: "the fused RMSNorm kernel; accepts f16 since §92",
