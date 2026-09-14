@@ -222,8 +222,13 @@ impl GgufHeader {
                 "gguf: unsupported version {version}"
             )));
         }
-        let tensor_count = more!(c.u64()) as usize;
-        let kv_count = more!(c.u64()) as usize;
+        let tensor_raw = more!(c.u64());
+        let kv_raw = more!(c.u64());
+        let (Ok(tensor_count), Ok(kv_count)) = (usize::try_from(tensor_raw), usize::try_from(kv_raw)) else {
+            return Err(FormatError::Safetensors(format!(
+                "gguf: {tensor_raw} tensors and {kv_raw} metadata entries do not fit this platform"
+            )));
+        };
 
         // Counts come off the wire before the entries they describe, so
         // they size allocations before anything has validated them. A
@@ -254,9 +259,23 @@ impl GgufHeader {
         for _ in 0..tensor_count {
             let name = more!(c.string());
             let n_dims = more!(c.u32()) as usize;
-            let mut dims = Vec::with_capacity(n_dims.min(8));
+            // ggml tensors have one to GGML_MAX_DIMS dimensions, none empty.
+            if n_dims == 0 || n_dims > GGML_MAX_DIMS {
+                return Err(FormatError::Safetensors(format!(
+                    "gguf tensor {name}: {n_dims} dimensions (ggml allows 1 to {GGML_MAX_DIMS})"
+                )));
+            }
+            let mut dims = Vec::with_capacity(n_dims);
             for _ in 0..n_dims {
-                dims.push(more!(c.u64()) as usize);
+                let d = more!(c.u64());
+                match usize::try_from(d) {
+                    Ok(d) if d > 0 => dims.push(d),
+                    _ => {
+                        return Err(FormatError::Safetensors(format!(
+                            "gguf tensor {name}: dimension {d} is empty or does not fit this platform"
+                        )));
+                    }
+                }
             }
             let ggml_type = more!(c.u32());
             let offset = more!(c.u64());
@@ -268,8 +287,44 @@ impl GgufHeader {
             Some(MetaValue::U32(a)) => *a as usize,
             _ => 32,
         };
-        let alignment = alignment.max(1);
+        // GGUF requires a power-of-two alignment. Zero used to become one,
+        // and an alignment in the gigabytes made a streamed mount buffer
+        // that much "header" before it could place a byte.
+        if !alignment.is_power_of_two() || alignment > MAX_ALIGNMENT {
+            return Err(FormatError::Safetensors(format!(
+                "gguf: general.alignment {alignment} is not a power of two up to {MAX_ALIGNMENT}"
+            )));
+        }
         let data_start = (c.pos.div_ceil(alignment) * alignment) as u64;
+
+        // Every tensor's byte range, computed checked and held to the file.
+        // An element count that overflows used to shrink to a size the
+        // range check accepted and hand a huge shape to a reader with no
+        // bytes (the class of llama.cpp's CVE-2026-27940). A tensor whose
+        // dtype this engine does not read is still left for the reader to
+        // refuse by name.
+        for info in tensors.values() {
+            let size = match tensor_byte_size(info) {
+                Ok(size) => size as u64,
+                Err(FormatError::UnsupportedDtype { .. }) => continue,
+                Err(e) => return Err(e),
+            };
+            match (data_start.checked_add(info.offset).and_then(|s| s.checked_add(size)), total) {
+                (None, _) => {
+                    return Err(FormatError::Safetensors(format!(
+                        "gguf tensor {}: offset {} and {size} bytes overflow a file position",
+                        info.name, info.offset
+                    )));
+                }
+                (Some(end), Some(t)) if end > t => {
+                    return Err(FormatError::Safetensors(format!(
+                        "gguf tensor {}: ends at byte {end}, past the {t}-byte file",
+                        info.name
+                    )));
+                }
+                _ => {}
+            }
+        }
 
         // Split GGUFs (llama.cpp `gguf-split` shards, `…-00001-of-0000N`)
         // carry only a slice of the tensors; loading one would fail later
@@ -345,8 +400,12 @@ pub fn read_gguf_header(bytes: &[u8], total: Option<u64>) -> Result<Option<GgufH
         .tensors
         .values()
         .map(|info| {
-            tensor_byte_size(info)
-                .map(|size| (info.name.clone(), header.data_start + info.offset, size as u64))
+            tensor_byte_size(info).and_then(|size| {
+                let start = header.data_start.checked_add(info.offset).ok_or_else(|| {
+                    FormatError::Safetensors(format!("gguf tensor {}: offset {} overflows", info.name, info.offset))
+                })?;
+                Ok((info.name.clone(), start, size as u64))
+            })
         })
         .collect::<Result<Vec<_>>>()?;
     tensors.sort_by_key(|(_, start, _)| *start);
@@ -412,17 +471,55 @@ impl<'a> Cursor<'a> {
         Cursor { buf, pos: 0, exhausted: false, limit }
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        if self.pos + n > self.buf.len() {
+        // A length read from the file can be anything, so the end is
+        // computed checked: a u64::MAX string length is a malformed file,
+        // not a cursor that wraps back into bytes it has already read.
+        let Some(end) = self.pos.checked_add(n) else {
+            self.exhausted = false;
+            return Err(FormatError::Safetensors(format!(
+                "gguf: a length of {n} bytes at byte {} runs past any file",
+                self.pos
+            )));
+        };
+        if end > self.buf.len() {
             let within_image = match self.limit {
-                Some(limit) => self.pos.saturating_add(n) as u64 <= limit,
+                Some(limit) => end as u64 <= limit,
                 None => true,
             };
             self.exhausted = within_image;
             return Err(FormatError::Safetensors("gguf: unexpected end of file".into()));
         }
-        let out = &self.buf[self.pos..self.pos + n];
-        self.pos += n;
+        let out = &self.buf[self.pos..end];
+        self.pos = end;
         Ok(out)
+    }
+    /// A count read from the file, bounded before anything is sized by it:
+    /// it must fit this platform's `usize`, and when the image's length is
+    /// known, `count × min_elem` bytes must still fit in what is left of it.
+    fn count(&mut self, what: &str, min_elem: usize) -> Result<usize> {
+        let raw = self.u64()?;
+        let Ok(n) = usize::try_from(raw) else {
+            self.exhausted = false;
+            return Err(FormatError::Safetensors(format!(
+                "gguf: {what} {raw} does not fit this platform"
+            )));
+        };
+        if let Some(limit) = self.limit {
+            let need = (n as u64).saturating_mul(min_elem.max(1) as u64);
+            if (self.pos as u64).saturating_add(need) > limit {
+                self.exhausted = false;
+                return Err(FormatError::Safetensors(format!(
+                    "gguf: {what} {n} at byte {} cannot fit in a {limit}-byte file",
+                    self.pos
+                )));
+            }
+        }
+        Ok(n)
+    }
+    /// A capacity no count can inflate: never more elements than the bytes
+    /// in hand could hold.
+    fn capacity(&self, n: usize, min_elem: usize) -> usize {
+        n.min(self.buf.len().saturating_sub(self.pos) / min_elem.max(1))
     }
     fn u8(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
@@ -446,7 +543,7 @@ impl<'a> Cursor<'a> {
         Ok(f32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
     fn string(&mut self) -> Result<String> {
-        let len = self.u64()? as usize;
+        let len = self.count("string length", 1)?;
         let bytes = self.take(len)?;
         String::from_utf8(bytes.to_vec())
             .map_err(|e| FormatError::Safetensors(format!("gguf: bad utf8 string: {e}")))
@@ -483,24 +580,32 @@ fn read_meta_value(c: &mut Cursor, ty: u32) -> Result<MetaValue> {
         META_STRING => MetaValue::String(c.string()?),
         META_ARRAY => {
             let elem_ty = c.u32()?;
-            let len = c.u64()? as usize;
+            // The smallest encoding of one element, so a length the file
+            // cannot hold is refused before a vector is sized by it.
+            let min_elem = match elem_ty {
+                META_U8 | META_I8 | META_BOOL => 1,
+                META_U16 | META_I16 => 2,
+                META_U32 | META_I32 | META_F32 => 4,
+                _ => 8,
+            };
+            let len = c.count("metadata array length", min_elem)?;
             match elem_ty {
                 META_STRING => {
-                    let mut out = Vec::with_capacity(len);
+                    let mut out = Vec::with_capacity(c.capacity(len, min_elem));
                     for _ in 0..len {
                         out.push(c.string()?);
                     }
                     MetaValue::Strings(out)
                 }
                 META_F32 => {
-                    let mut out = Vec::with_capacity(len);
+                    let mut out = Vec::with_capacity(c.capacity(len, min_elem));
                     for _ in 0..len {
                         out.push(c.f32()?);
                     }
                     MetaValue::F32s(out)
                 }
                 META_I32 | META_I16 | META_I8 => {
-                    let mut out = Vec::with_capacity(len);
+                    let mut out = Vec::with_capacity(c.capacity(len, min_elem));
                     for _ in 0..len {
                         out.push(read_meta_value(c, elem_ty).map(|v| match v {
                             MetaValue::I32(i) => i,
@@ -510,7 +615,7 @@ fn read_meta_value(c: &mut Cursor, ty: u32) -> Result<MetaValue> {
                     MetaValue::I32s(out)
                 }
                 META_U32 | META_U16 | META_U8 => {
-                    let mut out = Vec::with_capacity(len);
+                    let mut out = Vec::with_capacity(c.capacity(len, min_elem));
                     for _ in 0..len {
                         out.push(read_meta_value(c, elem_ty).map(|v| match v {
                             MetaValue::U32(u) => u as i32,
@@ -546,6 +651,11 @@ const GGML_Q4_K: u32 = 12;
 const GGML_Q5_K: u32 = 13;
 const GGML_Q6_K: u32 = 14;
 const GGML_BF16: u32 = 30;
+/// ggml's GGML_MAX_DIMS: no tensor in a GGUF has more.
+const GGML_MAX_DIMS: usize = 4;
+/// The largest alignment a real file uses is far below this; a larger one
+/// is refused rather than buffered as header.
+const MAX_ALIGNMENT: usize = 1 << 20;
 
 impl GgufSource {
     /// Opens and parses a `.gguf` file, mapping it into memory.
@@ -760,10 +870,20 @@ fn build_model_metadata(kv: &HashMap<String, MetaValue>) -> Result<ModelMetadata
         .ok_or_else(|| FormatError::MissingField("attention.head_count".into()))?
         as usize;
     let kv_heads = field("attention.head_count_kv").unwrap_or(heads as u64) as usize;
+    // Divisors read from the file: zero head counts used to divide by zero
+    // here and in the RoPE de-permutation, and key/value heads that do not
+    // divide the query heads are no grouped-query layout.
+    if hidden == 0 || heads == 0 || kv_heads == 0 || heads % kv_heads != 0 {
+        return Err(FormatError::Safetensors(format!(
+            "gguf {prefix}: embedding_length {hidden}, attention.head_count {heads}, \
+             attention.head_count_kv {kv_heads}: head counts must be non-zero and the \
+             key/value heads must divide the query heads"
+        )));
+    }
     let layers = field("block_count")
         .ok_or_else(|| FormatError::MissingField("block_count".into()))? as usize;
     let ctx = field("context_length").unwrap_or(2048) as usize;
-    let ffn = field("feed_forward_length").unwrap_or((hidden * 4) as u64) as usize;
+    let ffn = field("feed_forward_length").unwrap_or_else(|| hidden.saturating_mul(4) as u64) as usize;
     let vocab = match kv.get(&format!("{prefix}.vocab_size")) {
         Some(MetaValue::U32(v)) => *v as usize,
         Some(MetaValue::U64(v)) => *v as usize,
@@ -798,7 +918,7 @@ fn build_model_metadata(kv: &HashMap<String, MetaValue>) -> Result<ModelMetadata
     };
     let head_dim = field("attention.key_length")
         .map(|v| v as usize)
-        .unwrap_or(hidden / heads);
+        .unwrap_or_else(|| hidden / heads);
     // Partial rotary only when the file says fewer dims than the head.
     let rotary_dim = field("rope.dimension_count")
         .map(|v| v as usize)
@@ -822,7 +942,7 @@ fn build_model_metadata(kv: &HashMap<String, MetaValue>) -> Result<ModelMetadata
         // decouple it from hidden/heads.
         head_dim: field("attention.key_length")
             .map(|v| v as usize)
-            .unwrap_or(hidden / heads),
+            .unwrap_or_else(|| hidden / heads),
         // Bias loading is presence-driven (the loader probes bias tensors),
         // so this flag is informational only for GGUF.
         attention_bias: false,
@@ -1013,6 +1133,14 @@ fn synthesize_tokenizer_json(kv: &HashMap<String, MetaValue>) -> Result<String> 
         Some(MetaValue::F32s(s)) => s.clone(),
         _ => vec![0.0; tokens.len()],
     };
+    // Ranks and unigram scores are indexed by token id.
+    if scores.len() != tokens.len() {
+        return Err(FormatError::Safetensors(format!(
+            "gguf: tokenizer.ggml.scores has {} entries for {} tokens",
+            scores.len(),
+            tokens.len()
+        )));
+    }
     let merges: Vec<String> = match kv.get("tokenizer.ggml.merges") {
         Some(MetaValue::Strings(m)) => m.clone(),
         _ => vec![],
@@ -1295,14 +1423,20 @@ fn is_fused_source(ggml: &str, arch: &str) -> bool {
             .is_some_and(|(_, rest)| rest == "attn_qkv.weight" || rest == "attn_qkv.bias")
 }
 
-/// Number of elements in a ggml tensor.
-fn num_elements(dims: &[usize]) -> usize {
-    dims.iter().product()
+/// Number of elements in a ggml tensor; `None` when the product overflows.
+fn checked_num_elements(dims: &[usize]) -> Option<usize> {
+    dims.iter().try_fold(1usize, |acc, &d| acc.checked_mul(d))
 }
 
 /// Byte size of a ggml tensor's data.
 fn tensor_byte_size(info: &TensorInfo) -> Result<usize> {
-    let n = num_elements(&info.dims);
+    let overflow = || {
+        FormatError::Safetensors(format!(
+            "gguf tensor {}: dimensions {:?} overflow a byte count",
+            info.name, info.dims
+        ))
+    };
+    let n = checked_num_elements(&info.dims).ok_or_else(overflow)?;
     let block = |bs: usize| -> Result<usize> {
         if n % 32 != 0 {
             return Err(FormatError::Safetensors(format!(
@@ -1310,7 +1444,7 @@ fn tensor_byte_size(info: &TensorInfo) -> Result<usize> {
                 info.name
             )));
         }
-        Ok(n / 32 * bs)
+        (n / 32).checked_mul(bs).ok_or_else(overflow)
     };
     let superblock = |bs: usize| -> Result<usize> {
         if n % 256 != 0 {
@@ -1319,11 +1453,11 @@ fn tensor_byte_size(info: &TensorInfo) -> Result<usize> {
                 info.name
             )));
         }
-        Ok(n / 256 * bs)
+        (n / 256).checked_mul(bs).ok_or_else(overflow)
     };
     Ok(match info.ggml_type {
-        GGML_F32 => n * 4,
-        GGML_F16 | GGML_BF16 => n * 2,
+        GGML_F32 => n.checked_mul(4).ok_or_else(overflow)?,
+        GGML_F16 | GGML_BF16 => n.checked_mul(2).ok_or_else(overflow)?,
         GGML_Q4_0 => block(18)?, // 2-byte scale + 16 bytes per 32 values
         GGML_Q4_1 => block(20)?, // f16 scale + f16 min + 16 bytes
         GGML_Q5_0 => block(22)?, // f16 scale + u32 high bits + 16 bytes
@@ -1665,13 +1799,13 @@ impl GgufSource {
         let m = &self.metadata;
         let rest = name.strip_prefix("model.layers.")?;
         let (layer, rest) = rest.split_once('.')?;
-        let q_rows = m.num_attention_heads * m.head_dim;
-        let kv_rows = m.num_key_value_heads * m.head_dim;
+        let q_rows = m.num_attention_heads.saturating_mul(m.head_dim);
+        let kv_rows = m.num_key_value_heads.saturating_mul(m.head_dim);
         let ffn = m.intermediate_size;
         let (fused, start, len) = match rest {
             "self_attn.q_proj.weight" => ("attn_qkv.weight", 0, q_rows),
             "self_attn.k_proj.weight" => ("attn_qkv.weight", q_rows, kv_rows),
-            "self_attn.v_proj.weight" => ("attn_qkv.weight", q_rows + kv_rows, kv_rows),
+            "self_attn.v_proj.weight" => ("attn_qkv.weight", q_rows.saturating_add(kv_rows), kv_rows),
             "mlp.gate_proj.weight" => ("ffn_up.weight", 0, ffn),
             "mlp.up_proj.weight" => ("ffn_up.weight", ffn, ffn),
             _ => return None,
@@ -1686,13 +1820,15 @@ impl GgufSource {
     /// it rather than somewhere downstream with a shape mismatch.
     fn tensor_bytes(&self, info: &TensorInfo) -> Result<std::borrow::Cow<'_, [u8]>> {
         let size = tensor_byte_size(info)? as u64;
-        let start = self.data_start + info.offset;
+        let start = self.data_start.checked_add(info.offset).ok_or_else(|| {
+            FormatError::Safetensors(format!("gguf tensor {}: offset {} overflows", info.name, info.offset))
+        })?;
         self.data.slice(start, size).ok_or_else(|| {
             FormatError::Safetensors(format!(
                 "gguf tensor {}: bytes {}..{} are not available{}",
                 info.name,
                 start,
-                start + size,
+                start.saturating_add(size),
                 match &self.data {
                     GgufData::Window { base, buf, .. } => format!(
                         " — the mount window holds {}..{}",
@@ -1829,6 +1965,20 @@ impl ModelSource for GgufSource {
                     )));
                 }
                 let row_bytes = size / rows_total;
+                // The row range comes from metadata, the rows from the tensor:
+                // a file whose two disagree is refused, not sliced past its end.
+                match row_start.checked_add(row_len) {
+                    Some(end) if end <= rows_total => {}
+                    _ => {
+                        return Err(FormatError::Safetensors(format!(
+                            "gguf tensor {}: fused rows {}..{} lie outside its {} rows (metadata and tensor disagree)",
+                            info.name,
+                            row_start,
+                            row_start.saturating_add(row_len),
+                            rows_total
+                        )));
+                    }
+                }
                 shape[0] = row_len;
                 narrow_cow(data, row_start * row_bytes, row_len * row_bytes)
             }
@@ -1960,6 +2110,20 @@ impl ModelSource for GgufSource {
                     return Ok(None);
                 }
                 let row_bytes = size / rows_total;
+                // The row range comes from metadata, the rows from the tensor:
+                // a file whose two disagree is refused, not sliced past its end.
+                match row_start.checked_add(row_len) {
+                    Some(end) if end <= rows_total => {}
+                    _ => {
+                        return Err(FormatError::Safetensors(format!(
+                            "gguf tensor {}: fused rows {}..{} lie outside its {} rows (metadata and tensor disagree)",
+                            info.name,
+                            row_start,
+                            row_start.saturating_add(row_len),
+                            rows_total
+                        )));
+                    }
+                }
                 shape[0] = row_len;
                 narrow_cow(data, row_start * row_bytes, row_len * row_bytes)
             }
@@ -2352,5 +2516,264 @@ mod qwen35_tests {
         }
         // phi3's fused qkv stays a sliced source, never a direct name
         assert_eq!(map_tensor_name("blk.0.attn_qkv.weight", "phi3"), None);
+    }
+}
+
+#[cfg(test)]
+mod hostile_header_tests {
+    //! A model file is bytes someone else wrote. Each test hands the parser
+    //! one crafted header from the classes that broke llama.cpp's GGUF reader
+    //! in 2024–2026 (lengths that wrap a cursor, arrays sized by the file,
+    //! element counts that overflow past the range check, offsets that wrap,
+    //! divisors that are zero) and requires a refusal by error: never a
+    //! panic, never a wrapped size handed downstream, never an allocation
+    //! sized by an unvalidated count. Every hostile case has a control that
+    //! must still parse, so a refusal cannot pass for the wrong reason.
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    fn panic_text(p: Box<dyn std::any::Any + Send>) -> String {
+        p.downcast_ref::<String>()
+            .cloned()
+            .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default()
+    }
+
+    /// The call must return an error: not a value, not a panic.
+    fn refused<T>(what: &str, f: impl FnOnce() -> Result<T>) -> String {
+        match catch_unwind(AssertUnwindSafe(f)) {
+            Ok(Err(e)) => e.to_string(),
+            Ok(Ok(_)) => panic!("{what}: ACCEPTED — a hostile header must be refused"),
+            Err(p) => panic!("{what}: PANICKED instead of refusing: {}", panic_text(p)),
+        }
+    }
+
+    /// A header parse with the file length known must refuse: waiting for
+    /// more bytes of a file that has no more is also a failure.
+    fn refused_header<T>(what: &str, f: impl FnOnce() -> Result<Option<T>>) -> String {
+        match catch_unwind(AssertUnwindSafe(f)) {
+            Ok(Err(e)) => e.to_string(),
+            Ok(Ok(Some(_))) => panic!("{what}: ACCEPTED — a hostile header must be refused"),
+            Ok(Ok(None)) => panic!("{what}: asked for more bytes of a file whose length is known"),
+            Err(p) => panic!("{what}: PANICKED instead of refusing: {}", panic_text(p)),
+        }
+    }
+
+    /// Without a known length the parser may wait for more, but never panic.
+    fn never_panics<T>(what: &str, f: impl FnOnce() -> T) {
+        if let Err(p) = catch_unwind(AssertUnwindSafe(f)) {
+            panic!("{what}: PANICKED: {}", panic_text(p));
+        }
+    }
+
+    struct G(Vec<u8>);
+    impl G {
+        fn new(tensors: u64, kvs: u64) -> G {
+            let mut g = G(Vec::new());
+            g.u32(GGUF_MAGIC).u32(3).u64(tensors).u64(kvs);
+            g
+        }
+        fn u32(&mut self, v: u32) -> &mut G {
+            self.0.extend_from_slice(&v.to_le_bytes());
+            self
+        }
+        fn u64(&mut self, v: u64) -> &mut G {
+            self.0.extend_from_slice(&v.to_le_bytes());
+            self
+        }
+        fn f32(&mut self, v: f32) -> &mut G {
+            self.0.extend_from_slice(&v.to_le_bytes());
+            self
+        }
+        fn s(&mut self, s: &str) -> &mut G {
+            self.u64(s.len() as u64);
+            self.0.extend_from_slice(s.as_bytes());
+            self
+        }
+        fn kv_u32(&mut self, k: &str, v: u32) -> &mut G {
+            self.s(k).u32(META_U32).u32(v)
+        }
+        fn kv_str(&mut self, k: &str, v: &str) -> &mut G {
+            self.s(k).u32(META_STRING).s(v)
+        }
+        fn kv_strs(&mut self, k: &str, v: &[&str]) -> &mut G {
+            self.s(k).u32(META_ARRAY).u32(META_STRING).u64(v.len() as u64);
+            for x in v {
+                self.s(x);
+            }
+            self
+        }
+        fn kv_f32s(&mut self, k: &str, v: &[f32]) -> &mut G {
+            self.s(k).u32(META_ARRAY).u32(META_F32).u64(v.len() as u64);
+            for x in v {
+                self.f32(*x);
+            }
+            self
+        }
+        fn tensor(&mut self, name: &str, dims: &[u64], ty: u32, offset: u64) -> &mut G {
+            self.s(name).u32(dims.len() as u32);
+            for d in dims {
+                self.u64(*d);
+            }
+            self.u32(ty).u64(offset)
+        }
+        fn pad32(&mut self) -> &mut G {
+            let n = self.0.len().div_ceil(32) * 32;
+            self.0.resize(n, 0);
+            self
+        }
+    }
+
+    /// One F32 tensor described by `dims` at `offset`, nothing else.
+    fn one_tensor(dims: &[u64], ty: u32, offset: u64) -> Vec<u8> {
+        let mut g = G::new(1, 0);
+        g.tensor("t.weight", dims, ty, offset).pad32();
+        g.0
+    }
+
+    /// A small whole llama file; `heads`/`kv_heads` and the scores array are the knobs.
+    fn llama(heads: u32, kv_heads: u32, scores: Option<&[f32]>) -> Vec<u8> {
+        let tokens = ["<s>", "a", "b", "c", "d", "e", "f", "</s>"];
+        let mut g = G::new(1, 9 + scores.is_some() as u64);
+        g.kv_str("general.architecture", "llama")
+            .kv_u32("llama.embedding_length", 64)
+            .kv_u32("llama.attention.head_count", heads)
+            .kv_u32("llama.attention.head_count_kv", kv_heads)
+            .kv_u32("llama.block_count", 1)
+            .kv_u32("llama.context_length", 128)
+            .kv_u32("llama.feed_forward_length", 128)
+            .kv_u32("tokenizer.ggml.eos_token_id", 7)
+            .kv_strs("tokenizer.ggml.tokens", &tokens);
+        if let Some(s) = scores {
+            g.kv_f32s("tokenizer.ggml.scores", s);
+        }
+        g.tensor("output_norm.weight", &[64], GGML_F32, 0).pad32();
+        for _ in 0..64 {
+            g.f32(1.0);
+        }
+        g.0
+    }
+
+    /// A small phi3 file with fused attn_qkv [4, 8] and ffn_up [4, 6];
+    /// `key_length` sets head_dim, and so the q/k/v row ranges.
+    fn phi3(key_length: Option<u32>) -> Vec<u8> {
+        let mut g = G::new(2, 9 + key_length.is_some() as u64);
+        g.kv_str("general.architecture", "phi3")
+            .kv_u32("phi3.embedding_length", 4)
+            .kv_u32("phi3.attention.head_count", 2)
+            .kv_u32("phi3.attention.head_count_kv", 1)
+            .kv_u32("phi3.block_count", 1)
+            .kv_u32("phi3.context_length", 64)
+            .kv_u32("phi3.feed_forward_length", 3)
+            .kv_u32("tokenizer.ggml.eos_token_id", 1);
+        if let Some(k) = key_length {
+            g.kv_u32("phi3.attention.key_length", k);
+        }
+        g.kv_strs("tokenizer.ggml.tokens", &["<s>", "<|endoftext|>", "<|end|>", "a"]);
+        g.tensor("blk.0.attn_qkv.weight", &[4, 8], GGML_F32, 0)
+            .tensor("blk.0.ffn_up.weight", &[4, 6], GGML_F32, 4 * 8 * 4)
+            .pad32();
+        for _ in 0..(8 + 6) * 4 {
+            g.f32(0.5);
+        }
+        g.0
+    }
+
+    #[test]
+    fn a_string_length_that_wraps_the_cursor_is_refused() {
+        let mut g = G::new(0, 1);
+        g.u64(u64::MAX); // the first key's length
+        let b = g.0;
+        let total = b.len() as u64 + 64;
+        refused_header("a u64::MAX string length", || GgufHeader::try_parse(&b, Some(total)));
+        never_panics("a u64::MAX string length, no known file length", || GgufHeader::try_parse(&b, None));
+    }
+
+    #[test]
+    fn an_array_length_beyond_the_file_is_refused_before_allocation() {
+        for elem in [META_F32, META_STRING, META_U32] {
+            let mut g = G::new(0, 1);
+            g.s("tokenizer.ggml.scores").u32(META_ARRAY).u32(elem).u64(1 << 62);
+            let b = g.0;
+            let total = b.len() as u64 + 64;
+            refused_header(&format!("a 2^62-element array of type {elem}"), || GgufHeader::try_parse(&b, Some(total)));
+            never_panics(&format!("a 2^62-element array of type {elem}, no known file length"), || {
+                GgufHeader::try_parse(&b, None)
+            });
+        }
+    }
+
+    #[test]
+    fn element_counts_and_byte_sizes_that_overflow_are_refused() {
+        for dims in [&[1u64 << 32, 1u64 << 32][..], &[1u64 << 62][..], &[u64::MAX][..]] {
+            let b = one_tensor(dims, GGML_F32, 0);
+            refused_header(&format!("dims {dims:?}"), || read_gguf_header(&b, Some(u64::MAX)));
+        }
+        let b = one_tensor(&[1u64 << 63], GGML_F16, 0);
+        refused_header("an F16 tensor whose byte count overflows", || read_gguf_header(&b, Some(u64::MAX)));
+        // control: an ordinary tensor still reads
+        let b = one_tensor(&[32], GGML_F32, 0);
+        let h = read_gguf_header(&b, Some(b.len() as u64 + 128)).expect("control parses").expect("control whole");
+        assert_eq!(h.tensors[0].2, 128);
+    }
+
+    #[test]
+    fn too_many_dimensions_or_a_zero_dimension_is_refused() {
+        let b = one_tensor(&[1, 1, 1, 1, 32], GGML_F32, 0);
+        refused_header("five dimensions", || read_gguf_header(&b, Some(1 << 20)));
+        let b = one_tensor(&[0], GGML_F32, 0);
+        refused_header("a zero dimension", || read_gguf_header(&b, Some(1 << 20)));
+    }
+
+    #[test]
+    fn a_tensor_offset_that_wraps_or_ends_past_the_file_is_refused() {
+        let b = one_tensor(&[32], GGML_F32, u64::MAX - 8);
+        refused_header("an offset that wraps data_start", || read_gguf_header(&b, Some(u64::MAX)));
+        let b = one_tensor(&[1 << 20], GGML_F32, 0);
+        refused_header("a 4 MiB tensor in a 1 KiB file", || read_gguf_header(&b, Some(1024)));
+    }
+
+    #[test]
+    fn an_alignment_that_is_zero_not_a_power_of_two_or_huge_is_refused() {
+        let aligned = |a: u32| {
+            let mut g = G::new(1, 1);
+            g.kv_u32("general.alignment", a).tensor("t.weight", &[32], GGML_F32, 0);
+            g.0.resize(g.0.len() + 4096, 0);
+            g.0
+        };
+        for a in [0u32, 3, 100, 1 << 31] {
+            let b = aligned(a);
+            let total = b.len() as u64 + (1u64 << 32);
+            refused_header(&format!("alignment {a}"), || GgufHeader::try_parse(&b, Some(total)));
+        }
+        let b = aligned(64);
+        let total = b.len() as u64 + 4096;
+        assert!(matches!(GgufHeader::try_parse(&b, Some(total)), Ok(Some(_))), "control: alignment 64 parses");
+    }
+
+    #[test]
+    fn zero_attention_heads_are_refused_not_divided_by() {
+        GgufSource::from_bytes(llama(1, 1, None)).expect("control: a llama file with one head parses");
+        let e = refused("head_count 0", || GgufSource::from_bytes(llama(0, 1, None)));
+        assert!(e.contains("head"), "the refusal should name the head count: {e}");
+        let e = refused("head_count_kv 0", || GgufSource::from_bytes(llama(1, 0, None)));
+        assert!(e.contains("head"), "the refusal should name the head count: {e}");
+    }
+
+    #[test]
+    fn a_scores_array_shorter_than_the_tokens_is_refused() {
+        GgufSource::from_bytes(llama(1, 1, Some(&[0.0; 8]))).expect("control: eight scores for eight tokens");
+        let e = refused("2 scores for 8 tokens", || GgufSource::from_bytes(llama(1, 1, Some(&[0.0, 0.0]))));
+        assert!(e.contains("scores"), "the refusal should name the scores: {e}");
+    }
+
+    #[test]
+    fn a_fused_split_beyond_its_tensor_is_refused() {
+        let ok = GgufSource::from_bytes(phi3(None)).expect("control: phi3 parses");
+        ok.open_tensor("model.layers.0.self_attn.v_proj.weight").expect("control: the v rows split");
+        let src = GgufSource::from_bytes(phi3(Some(16))).expect("a head_dim of 16 still parses");
+        refused("v_proj rows 48..64 of an 8-row attn_qkv", || {
+            src.open_tensor("model.layers.0.self_attn.v_proj.weight").map(|_| ())
+        });
     }
 }

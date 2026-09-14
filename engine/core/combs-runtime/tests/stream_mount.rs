@@ -148,14 +148,38 @@ fn a_stream_that_overruns_is_refused_at_the_append() {
     };
     let bytes = std::fs::read(&path).unwrap();
     let device = combs_core::init_device();
-    let mut mount = StreamMount::new(100_000, device);
+    // The declared size must hold the header's own arrays (smollm2's
+    // 49,152-token vocabulary is ~400 KB before a single weight), or the
+    // header refuses first — the test below.
+    const DECLARED: usize = 4 << 20;
+    let mut mount = StreamMount::new(DECLARED as u64, device);
     mount.append(&bytes[..60_000]).expect("under the limit");
-    match mount.append(&bytes[60_000..120_000]) {
+    match mount.append(&bytes[60_000..DECLARED + 20_000]) {
         Err(MountError::Overflow { expected, got }) => {
-            assert_eq!(expected, 100_000);
-            assert_eq!(got, 120_000);
+            assert_eq!(expected, DECLARED as u64);
+            assert_eq!(got, (DECLARED + 20_000) as u64);
         }
         other => panic!("expected an overflow, got {other:?}"),
+    }
+}
+
+/// A declared size too small for the header's own arrays is a lie the
+/// header already proves, so the mount refuses at the header rather than
+/// pull bytes it could never make a model from.
+#[test]
+fn a_declared_size_too_small_for_its_header_is_refused_at_the_header() {
+    let Some(path) = cached("smollm2-360m-instruct-gguf") else {
+        eprintln!("skip: smollm2-360m-instruct-gguf is not in the local cache");
+        return;
+    };
+    let bytes = std::fs::read(&path).unwrap();
+    let device = combs_core::init_device();
+    let mut mount = StreamMount::new(100_000, device);
+    match mount.append(&bytes[..60_000]) {
+        Err(MountError::BadHeader(why)) => {
+            assert!(why.contains("cannot fit in a 100000-byte file"), "{why}");
+        }
+        other => panic!("expected the header to refuse, got {other:?}"),
     }
 }
 
