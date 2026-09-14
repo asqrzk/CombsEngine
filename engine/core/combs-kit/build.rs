@@ -14,6 +14,12 @@
 
 use std::process::Command;
 
+// Where the source's identity comes from when there is no git to ask — a
+// packed archive names its commit through COMBS_SOURCE_COMMIT. A byte copy
+// of combs-cli/build/stamp.rs; xtask's `the_kit_source_resolver_matches_combs_cli`
+// fails the workspace tests the moment the two differ.
+include!("build/stamp.rs");
+
 fn git(args: &[&str]) -> Option<String> {
     let out = Command::new("git").args(args).output().ok()?;
     if !out.status.success() {
@@ -24,7 +30,7 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 fn watched_paths() -> Vec<String> {
-    let mut paths = vec!["build.rs".to_string(), "src".to_string()];
+    let mut paths = vec!["build.rs".to_string(), "build/stamp.rs".to_string(), "src".to_string()];
     let workspace = std::path::Path::new("..");
     if let Ok(entries) = std::fs::read_dir(workspace) {
         let mut crates: Vec<String> = entries
@@ -47,13 +53,20 @@ fn main() {
     for path in watched_paths() {
         println!("cargo:rerun-if-changed={path}");
     }
-    let short = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    println!("cargo:rerun-if-env-changed=COMBS_SOURCE_COMMIT");
+    println!("cargo:rerun-if-env-changed=COMBS_SOURCE_REF");
     // Any tracked modification, staged or not, makes this build
     // unreproducible from the commit alone — the flag says so plainly,
-    // and every number it takes carries the flag.
-    let dirty = git(&["status", "--porcelain", "--untracked-files=no"])
-        .map(|s| !s.is_empty())
-        .unwrap_or(false);
+    // and every number it takes carries the flag. A packed archive has no
+    // git; whoever builds it hands the commit in as COMBS_SOURCE_COMMIT.
+    let SourceIdentity { short, dirty, .. } = source_identity(
+        git(&["rev-parse", "HEAD"]),
+        git(&["rev-parse", "--short", "HEAD"]),
+        git(&["rev-parse", "--abbrev-ref", "HEAD"]),
+        git(&["status", "--porcelain", "--untracked-files=no"]).map(|s| !s.is_empty()),
+        std::env::var("COMBS_SOURCE_COMMIT").ok(),
+        std::env::var("COMBS_SOURCE_REF").ok(),
+    );
     println!("cargo:rustc-env=COMBS_KIT_COMMIT={short}");
     println!("cargo:rustc-env=COMBS_KIT_DIRTY={dirty}");
 }

@@ -833,4 +833,14 @@ mod build_support {
             "combs-cli/build/timefmt.rs has drifted from combs-core/src/timefmt.rs — re-copy it"
         );
     }
+
+    #[test]
+    fn the_kit_source_resolver_matches_combs_cli() {
+        let original = include_str!("../../combs-cli/build/stamp.rs");
+        let copy = include_str!("../../combs-kit/build/stamp.rs");
+        assert_eq!(
+            original, copy,
+            "combs-kit/build/stamp.rs has drifted from combs-cli/build/stamp.rs — re-copy it"
+        );
+    }
 }
