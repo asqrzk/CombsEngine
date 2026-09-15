@@ -23,6 +23,7 @@ combs-formats = { path = "../combs-formats", version = "0.3.0" }
 thiserror.workspace = true
 
 [dev-dependencies]
+wgpu = "29"
 anyhow.workspace = true
 burn = { version = "0.21.0", default-features = false, features = ["ndarray", "std"] }
 tokenizers.workspace = true

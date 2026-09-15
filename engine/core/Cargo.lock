@@ -1340,6 +1340,7 @@ dependencies = [
  "cubecl",
  "thiserror 2.0.19",
  "tokenizers",
+ "wgpu",
 ]
 
 [[package]]

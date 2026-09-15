@@ -1531,6 +1531,584 @@ mod tests {
         assert!(took.as_micros() > 0, "sixty-four launches took no time at all");
     }
 
+// ======================================================================
+// Paste INSIDE `mod tests` of engine/core/combs-models/src/wgsl/mod.rs
+// (see where_to_insert). Two #[ignore] tests plus three private helpers.
+//
+//   BLOCK 1  replay_spike_cubecl_only          compiles at 571c733 as-is
+//   BLOCK 2  replay_spike_today_vs_raw_replay  needs ONE line in
+//            combs-models/Cargo.toml under [dev-dependencies]:  wgpu = "29"
+//
+// Why BLOCK 2 needs the line (read, not guessed): the raw wgpu VALUES are
+// reachable from this crate — `init_setup` returns `WgpuSetup { device,
+// queue, adapter }` (vendor/cubecl-wgpu/src/runtime.rs:210-220, re-exported
+// by burn-wgpu) and `client.get_resource` returns `WgpuResource { buffer,
+// offset, size }` — but the wgpu TYPE PATHS are not: nothing on the chain
+// re-exports the crate (vendor/cubecl-wgpu/src/lib.rs has no `pub use
+// wgpu`; burn-wgpu's lib.rs re-exports cubecl-wgpu items only; combs-core's
+// `pub use burn::backend::wgpu` is burn's module, not `::wgpu`). A pipeline,
+// a bind group, a query set and a mappable buffer are struct literals
+// (`ShaderModuleDescriptor`, `ComputePipelineDescriptor`, `BindGroupEntry`,
+// `QuerySetDescriptor`, `BufferDescriptor`) and a struct literal needs the
+// path. The dev-dependency mirrors combs-core's own `wgpu = "29"` (same
+// resolved 29.0.4, features already unified through combs-core, no new
+// crate compiled, never part of a non-test build).
+//
+// Own process, both tests: they perform the one cubecl initialization
+// themselves (`init_setup`, the doorway to the raw device/queue) and a
+// second initialization on the same device panics ("Can't create a new
+// client on an already registered server", cubecl-runtime client.rs:56-59).
+// `skip_no_gpu` cannot be used here: `pin_test_device` → `set_default_dtypes`
+// → `B::supports_dtype` → `R::client(device)` loads the client and would
+// initialize lazily with cubecl's own defaults (burn-backend device.rs:260-
+// 272, vendor/burn-cubecl/src/backend.rs:102-104). So the gate is
+// `combs_core::gpu_available` (a fresh instance, no cubecl), then
+// `init_setup`, then the pin.
+// ======================================================================
+
+    /// The engine's runtime options as `combs_core::combs_runtime_options`
+    /// builds them (private there): exclusive pages, 16 tasks a submit,
+    /// the person's `CUBECL_WGPU_MAX_TASKS` winning when set.
+    fn spike_runtime_options() -> burn::backend::wgpu::RuntimeOptions {
+        use burn::backend::wgpu::{MemoryConfiguration, RuntimeOptions};
+        let tasks_max = match std::env::var("CUBECL_WGPU_MAX_TASKS") {
+            Ok(_) => RuntimeOptions::default().tasks_max,
+            Err(_) => combs_core::SUBMIT_TASKS,
+        };
+        let memory_config =
+            if matches!(std::env::var("COMBS_MEM_POOLS").as_deref(), Ok("subslices")) {
+                MemoryConfiguration::default()
+            } else {
+                MemoryConfiguration::ExclusivePages
+            };
+        RuntimeOptions { tasks_max, memory_config }
+    }
+
+    /// The synthetic Q4_K table `gemv_cell_at` uses (unit `d`, quarter
+    /// `dmin`, pseudo-random nibbles) and the activation beside it.
+    fn spike_fixture(n_out: usize, k: usize) -> (Vec<u8>, Vec<f32>) {
+        let blocks = n_out * k / 256;
+        let mut data: Vec<u8> = (0..blocks * 144).map(|i| ((i * 37 + 11) % 251) as u8).collect();
+        for b in 0..blocks {
+            data[b * 144..b * 144 + 2].copy_from_slice(&0x3C00u16.to_le_bytes());
+            data[b * 144 + 2..b * 144 + 4].copy_from_slice(&0x3400u16.to_le_bytes());
+        }
+        let x: Vec<f32> = (0..k).map(|i| (((i as f32 * 0.311).sin() * 1.4) - 0.1) / 32.0).collect();
+        (data, x)
+    }
+
+    fn spike_env(name: &str, default: usize) -> usize {
+        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    }
+
+    /// Microseconds per unit.
+    fn spike_us(d: std::time::Duration, per: usize) -> f64 {
+        d.as_secs_f64() * 1e6 / per as f64
+    }
+
+    // ------------------------------------------------------------------
+    // BLOCK 1 — the road with no Cargo change: arm (a) and the pieces of
+    // it the cubecl client can price without naming a wgpu type.
+    //
+    // Run it as its own process THREE times: `CUBECL_WGPU_MAX_TASKS` unset
+    // (the house 16), `=1024`, and `=2048` (≥ N: every launch joins ONE
+    // pass and ONE submit at the sync — cubecl's own single-flush road,
+    // with the caveat printed below about MAX_PENDING_WRITES). The runtime
+    // reads the door once, at init.
+    //
+    //   cargo test --release -p combs-models --lib -- \
+    //     wgsl::tests::replay_spike_cubecl_only --exact --ignored --nocapture --test-threads=1
+    // ------------------------------------------------------------------
+    #[test]
+    #[ignore = "gpu: initializes the device itself and reads the process-wide counters, so it needs its own process"]
+    fn replay_spike_cubecl_only() {
+        use burn::backend::wgpu::{graphics::AutoGraphicsApi, init_setup, WgpuDevice};
+        use cubecl::prelude::*;
+        use std::time::Instant;
+
+        if !combs_core::gpu_available() {
+            return;
+        }
+        let device = WgpuDevice::default();
+        let options = spike_runtime_options();
+        let tasks_max = options.tasks_max;
+        let setup = init_setup::<AutoGraphicsApi>(&device, options);
+        crate::pin_test_device();
+        let client = WgpuRuntime::client(&device);
+        let info = setup.adapter.get_info();
+        eprintln!(
+            "[spike] {} · {:?} · {:?} · driver {} ({}) · tasks_max {} · runtime timing {}",
+            info.name, info.backend, info.device_type, info.driver, info.driver_info,
+            tasks_max, client.properties().timing_method
+        );
+        if tasks_max >= 64 {
+            eprintln!(
+                "[spike] note: tasks_max >= 64 — every launch's uniform is a write_to_buffer, and at \
+                 MAX_PENDING_WRITES (64, vendor stream.rs) the stream submits an empty encoder and polls \
+                 Wait; this configuration is not one flush"
+            );
+        }
+
+        let (n_out, k) = (2048usize, 1024usize);
+        let n = spike_env("COMBS_SPIKE_N", 2000);
+        let reps = spike_env("COMBS_SPIKE_REPS", 3);
+        let geom = Geometry::DEFAULT;
+        let wg = (n_out as u32).div_ceil(geom.rows).max(1);
+        let (data, x) = spike_fixture(n_out, k);
+
+        let w = crate::qmatmul::Q4KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k)
+            .expect("a synthetic q4_k weight packs");
+        let x_h = client.create_from_slice(f32::as_bytes(&x));
+        // The same table again as bare handles, for the launches that
+        // bypass the wrapper (its handles are private to qmatmul).
+        let (qs, dd, scales) = crate::qmatmul::repack_q4_k(&data).expect("repack");
+        let qs_h = client.create_from_slice(u32::as_bytes(&qs));
+        let dd_h = client.create_from_slice(f32::as_bytes(&dd));
+        let sc_h = client.create_from_slice(u32::as_bytes(&scales));
+        let out_fixed = client.empty(n_out * core::mem::size_of::<f32>());
+
+        // Warm: the first launch compiles the pipeline, not a launch cost.
+        let _ = w.decode_gemv_wgsl_at(&client, x_h.clone(), Storage::F32, None, geom);
+        cubecl::future::block_on(client.sync()).expect("sync after warm-up");
+
+        for rep in 0..reps {
+            // (a) today's road: N launches of decode_gemv_wgsl_at — a fresh
+            // `client.empty` output each, six bindings, three scalars —
+            // then one sync.
+            let (d0, s0) = combs_core::gpu_counters();
+            let t0 = Instant::now();
+            for _ in 0..n {
+                let _ = w.decode_gemv_wgsl_at(&client, x_h.clone(), Storage::F32, None, geom);
+            }
+            let a_issue = t0.elapsed();
+            cubecl::future::block_on(client.sync()).expect("sync after the launches");
+            let a_wall = t0.elapsed();
+            let (d1, s1) = combs_core::gpu_counters();
+            assert_eq!(d1 - d0, n as u64, "the window held launches that were not ours");
+
+            // (a-fixed) the same launch with ONE preallocated output: the
+            // per-launch `client.empty` (page scan + a handle) priced by
+            // difference.
+            let t0 = Instant::now();
+            for _ in 0..n {
+                launch_gemv(
+                    &client,
+                    GemvKernel::Q4K,
+                    Storage::F32,
+                    geom,
+                    wg,
+                    vec![
+                        x_h.clone().binding(),
+                        qs_h.clone().binding(),
+                        dd_h.clone().binding(),
+                        sc_h.clone().binding(),
+                        out_fixed.clone().binding(),
+                        out_fixed.clone().binding(),
+                    ],
+                    vec![n_out as u64, k as u64, 0],
+                );
+            }
+            let f_issue = t0.elapsed();
+            cubecl::future::block_on(client.sync()).expect("sync after the fixed launches");
+            let f_wall = t0.elapsed();
+
+            // The GPU span the runtime's own timestamp pair reads. It covers
+            // the FIRST pass after start_profile only (vendor timings.rs:
+            // init_query_set drains init_tokens once and `current` never
+            // moves), i.e. min(n, tasks_max) back-to-back dispatches. With
+            // CUBECL_WGPU_MAX_TASKS >= n that pass is the whole window.
+            let (w_ref, x_ref, c2) = (&w, &x_h, client.clone());
+            let ((), prof) = client
+                .profile(
+                    move || {
+                        for _ in 0..n {
+                            let _ = w_ref.decode_gemv_wgsl_at(&c2, x_ref.clone(), Storage::F32, None, geom);
+                        }
+                    },
+                    "replay-spike-a",
+                )
+                .expect("profile");
+            let method = prof.timing_method();
+            let span = cubecl::future::block_on(prof.resolve()).duration();
+            let in_pass = n.min(tasks_max);
+
+            // Two pieces alone: an output allocation freed at once (the
+            // in-situ pattern), and one blocking round trip to the device
+            // thread (what get_resource costs; a submit_blocking rendezvous).
+            let t0 = Instant::now();
+            for _ in 0..n {
+                let _ = client.empty(n_out * core::mem::size_of::<f32>());
+            }
+            let empty_each = t0.elapsed();
+            let t0 = Instant::now();
+            for _ in 0..n {
+                let _ = client.get_resource(out_fixed.clone()).expect("a handle resolves");
+            }
+            let resolve_each = t0.elapsed();
+
+            eprintln!("[spike] rep {rep} · n {n} · tasks_max {tasks_max}");
+            eprintln!(
+                "[spike]   (a) today        cpu issue {:.2} us/launch · wall {:.2} us/launch · {} submits · {:.3} ms",
+                spike_us(a_issue, n), spike_us(a_wall, n), s1 - s0, a_wall.as_secs_f64() * 1e3
+            );
+            eprintln!(
+                "[spike]   (a-fixed)        cpu issue {:.2} us/launch · wall {:.2} us/launch (one output handle, no client.empty)",
+                spike_us(f_issue, n), spike_us(f_wall, n)
+            );
+            eprintln!(
+                "[spike]   (a) gpu span     {:.1} us over the first pass of {in_pass} dispatches = {:.2} us/dispatch ({method} timing)",
+                span.as_secs_f64() * 1e6, spike_us(span, in_pass)
+            );
+            eprintln!(
+                "[spike]   pieces           client.empty {:.2} us · get_resource round trip {:.2} us",
+                spike_us(empty_each, n), spike_us(resolve_each, n)
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // BLOCK 2 — the spike itself. Needs `wgpu = "29"` in [dev-dependencies].
+    //
+    // (a) today's road: N × decode_gemv_wgsl_at through the cubecl client,
+    //     one sync at the end; the meter proves the count.
+    // (b) the replay ceiling: the SAME render (DecodeGemvQ4K(F32, 16x16)
+    //     .source().complete()) compiled once with raw wgpu (naga), the
+    //     weights uploaded once through cubecl and resolved with
+    //     client.get_resource, ONE constant uniform, ONE bind group, N ×
+    //     (set_bind_group + dispatch) recorded into ONE pass of ONE
+    //     encoder, one submit, one poll — a TIMESTAMP_QUERY pair around the
+    //     pass reads the GPU span beside the wall.
+    // (c) (b) with a fresh bind group per dispatch — entries +
+    //     get_bind_group_layout(0) + create_bind_group, what the vendored
+    //     stream does per launch (stream.rs register_pipeline) — so
+    //     (c) − (b) prices bind-group creation alone.
+    //
+    //   cargo test --release -p combs-models --lib -- \
+    //     wgsl::tests::replay_spike_today_vs_raw_replay --exact --ignored --nocapture --test-threads=1
+    // ------------------------------------------------------------------
+    #[test]
+    #[ignore = "gpu: initializes the device itself and reads the process-wide counters, so it needs its own process"]
+    fn replay_spike_today_vs_raw_replay() {
+        use burn::backend::wgpu::{graphics::AutoGraphicsApi, init_setup, WgpuDevice};
+        use burn_cubecl::template::KernelSource;
+        use cubecl::prelude::*;
+        use std::time::{Duration, Instant};
+
+        if !combs_core::gpu_available() {
+            return;
+        }
+        let device = WgpuDevice::default();
+        let options = spike_runtime_options();
+        let tasks_max = options.tasks_max;
+        let setup = init_setup::<AutoGraphicsApi>(&device, options);
+        crate::pin_test_device();
+        let client = WgpuRuntime::client(&device);
+        let dev = &setup.device;
+        let queue = &setup.queue;
+        let stamps = dev.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let info = setup.adapter.get_info();
+        eprintln!(
+            "[spike] {} · {:?} · {:?} · driver {} ({}) · tasks_max {} · timestamp_query {}",
+            info.name, info.backend, info.device_type, info.driver, info.driver_info, tasks_max, stamps
+        );
+
+        let (n_out, k) = (2048usize, 1024usize);
+        let n = spike_env("COMBS_SPIKE_N", 2000);
+        let reps = spike_env("COMBS_SPIKE_REPS", 3);
+        let geom = Geometry::DEFAULT;
+        let wg = (n_out as u32).div_ceil(geom.rows).max(1);
+        let packed = (n_out * k / 256) * 144;
+        let (data, x) = spike_fixture(n_out, k);
+
+        // ---- (a) today's road -------------------------------------------
+        let w = crate::qmatmul::Q4KWeight::<WgpuRuntime>::from_gguf_bytes(&client, &data, n_out, k)
+            .expect("a synthetic q4_k weight packs");
+        let x_h = client.create_from_slice(f32::as_bytes(&x));
+        // Warm (compiles the pipeline), keep the answer as the reference,
+        // and check it against the host once — a road that agrees with
+        // this one then agrees with the truth.
+        let out_ref = w.decode_gemv_wgsl_at(&client, x_h.clone(), Storage::F32, None, geom);
+        let reference: Vec<f32> = f32::from_bytes(&client.read_one_unchecked(out_ref)).to_vec();
+        let dense = combs_formats::quants::dequantize_q4_k(&data, n_out * k).expect("reference");
+        let mut worst = 0.0f32;
+        for r in 0..n_out {
+            let expect: f32 = (0..k).map(|c| x[c] * dense[r * k + c]).sum();
+            worst = worst.max((reference[r] - expect).abs() / expect.abs().max(1.0));
+        }
+        assert!(worst < 1e-4, "today's road disagrees with the host: rel {worst}");
+        cubecl::future::block_on(client.sync()).expect("sync after warm-up");
+
+        // ---- (b) the raw road -------------------------------------------
+        // The table once more as bare handles (the wrapper's are private),
+        // uploaded through cubecl and resolved to (buffer, offset, size).
+        let (qs, dd, scales) = crate::qmatmul::repack_q4_k(&data).expect("repack");
+        let qs_h = client.create_from_slice(u32::as_bytes(&qs));
+        let dd_h = client.create_from_slice(f32::as_bytes(&dd));
+        let sc_h = client.create_from_slice(u32::as_bytes(&scales));
+        let xb_h = client.create_from_slice(f32::as_bytes(&x));
+        let out_h = client.empty(n_out * core::mem::size_of::<f32>());
+        // Everything cubecl has pending lands before a foreign submit
+        // touches these buffers.
+        cubecl::future::block_on(client.sync()).expect("sync before the raw road");
+        // Binding order is the shader's: x, qs, dd, scales, out, residual
+        // (bound to out when nothing is fused), then the uniform at 6.
+        // The ManagedResource keeps each page alive for the whole run.
+        let resolved: Vec<_> = [&xb_h, &qs_h, &dd_h, &sc_h, &out_h, &out_h]
+            .into_iter()
+            .map(|h| client.get_resource(h.clone()).expect("a handle resolves to its buffer"))
+            .collect();
+
+        let source = DecodeGemvQ4K(Storage::F32, geom).source().complete();
+        // SAFETY: the same trust the vendored server extends to this render
+        // (backend/base.rs create_module: bounds checks off, loop bounding
+        // on in Checked mode, which is how launch_at runs it); every access
+        // in the shader self-guards, per the module contract above.
+        let module = unsafe {
+            dev.create_shader_module_trusted(
+                wgpu::ShaderModuleDescriptor {
+                    label: Some("replay-spike q4k gemv"),
+                    source: wgpu::ShaderSource::Wgsl(source.into()),
+                },
+                wgpu::ShaderRuntimeChecks {
+                    bounds_checks: false,
+                    force_loop_bounding: true,
+                    ..wgpu::ShaderRuntimeChecks::unchecked()
+                },
+            )
+        };
+        let pipeline = dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("replay-spike q4k gemv"),
+            layout: None,
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                zero_initialize_workgroup_memory: false,
+                ..Default::default()
+            },
+            cache: None,
+        });
+        // The scalars as the kernel contract lays them out: u64 slots, low
+        // word first — n_out, k, fuse = 0. One constant uniform, written once.
+        let params: Vec<u8> = [n_out as u64, k as u64, 0u64]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let uniform = dev.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("replay-spike params"),
+            size: 256,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&uniform, 0, &params);
+        let entries = || {
+            resolved
+                .iter()
+                .enumerate()
+                .map(|(i, r)| wgpu::BindGroupEntry {
+                    binding: i as u32,
+                    resource: r.resource().as_wgpu_bind_resource(),
+                })
+                .chain(std::iter::once(wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: uniform.as_entire_binding(),
+                }))
+                .collect::<Vec<_>>()
+        };
+        let layout = pipeline.get_bind_group_layout(0);
+        let bind_group = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &entries(),
+        });
+
+        let query_set = stamps.then(|| {
+            dev.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("replay-spike"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 2,
+            })
+        });
+        let resolve_buf = dev.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("replay-spike resolve"),
+            size: 16,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let map_buf = dev.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("replay-spike map"),
+            size: 16,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let period = queue.get_timestamp_period() as f64;
+
+        // One raw run → (record, finish, submit, poll, gpu span). `fresh`
+        // rebuilds the bind group per dispatch, as the vendored stream does.
+        let run_raw = |fresh: bool| -> (Duration, Duration, Duration, Duration, Option<Duration>) {
+            let t0 = Instant::now();
+            let mut encoder = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("replay-spike"),
+            });
+            {
+                let timestamp_writes = query_set.as_ref().map(|qs| wgpu::ComputePassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: Some(0),
+                    end_of_pass_write_index: Some(1),
+                });
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("replay-spike"),
+                    timestamp_writes,
+                });
+                pass.set_pipeline(&pipeline);
+                for _ in 0..n {
+                    if fresh {
+                        let layout = pipeline.get_bind_group_layout(0);
+                        let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout: &layout,
+                            entries: &entries(),
+                        });
+                        pass.set_bind_group(0, &bg, &[]);
+                    } else {
+                        pass.set_bind_group(0, &bind_group, &[]);
+                    }
+                    pass.dispatch_workgroups(wg, 1, 1);
+                }
+            }
+            if let Some(qs) = &query_set {
+                encoder.resolve_query_set(qs, 0..2, &resolve_buf, 0);
+                encoder.copy_buffer_to_buffer(&resolve_buf, 0, &map_buf, 0, Some(16));
+            }
+            let recorded = t0.elapsed();
+            let command = encoder.finish();
+            let finished = t0.elapsed();
+            let index = queue.submit([command]);
+            let submitted = t0.elapsed();
+            if stamps {
+                map_buf.slice(..).map_async(wgpu::MapMode::Read, |_| ());
+            }
+            dev.poll(wgpu::PollType::Wait { submission_index: Some(index), timeout: None })
+                .expect("poll");
+            let polled = t0.elapsed();
+            let gpu = stamps.then(|| {
+                let ticks: Vec<u64> = map_buf
+                    .slice(..)
+                    .get_mapped_range()
+                    .chunks_exact(8)
+                    .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
+                map_buf.unmap();
+                Duration::from_nanos((ticks[1].saturating_sub(ticks[0]) as f64 * period) as u64)
+            });
+            (recorded, finished - recorded, submitted - finished, polled - submitted, gpu)
+        };
+
+        // Warm the raw road once: first-use costs are not a dispatch cost.
+        let _ = run_raw(false);
+
+        let gpu_line = |g: Option<Duration>| match g {
+            Some(g) => format!(
+                "{:.2} us/dispatch ({:.1} GB/s over {} packed bytes)",
+                spike_us(g, n),
+                packed as f64 / (g.as_secs_f64() / n as f64) / 1e9,
+                packed
+            ),
+            None => "n/a (no TIMESTAMP_QUERY)".to_string(),
+        };
+
+        for rep in 0..reps {
+            // (a)
+            let (d0, s0) = combs_core::gpu_counters();
+            let t0 = Instant::now();
+            for _ in 0..n {
+                let _ = w.decode_gemv_wgsl_at(&client, x_h.clone(), Storage::F32, None, geom);
+            }
+            let a_issue = t0.elapsed();
+            cubecl::future::block_on(client.sync()).expect("sync after the launches");
+            let a_wall = t0.elapsed();
+            let (d1, s1) = combs_core::gpu_counters();
+            assert_eq!(d1 - d0, n as u64, "the window held launches that were not ours");
+            // (a)'s GPU span from the runtime's own timestamp pair — the
+            // first pass only, min(n, tasks_max) dispatches (see BLOCK 1).
+            let (w_ref, x_ref, c2) = (&w, &x_h, client.clone());
+            let ((), prof) = client
+                .profile(
+                    move || {
+                        for _ in 0..n {
+                            let _ = w_ref.decode_gemv_wgsl_at(&c2, x_ref.clone(), Storage::F32, None, geom);
+                        }
+                    },
+                    "replay-spike-a",
+                )
+                .expect("profile");
+            let method = prof.timing_method();
+            let a_span = cubecl::future::block_on(prof.resolve()).duration();
+            let in_pass = n.min(tasks_max);
+
+            // (b) and (c)
+            let (b_rec, b_fin, b_sub, b_poll, b_gpu) = run_raw(false);
+            let (c_rec, c_fin, c_sub, c_poll, c_gpu) = run_raw(true);
+            let b_wall = b_rec + b_fin + b_sub + b_poll;
+            let c_wall = c_rec + c_fin + c_sub + c_poll;
+
+            eprintln!("[spike] rep {rep} · n {n} · tasks_max {tasks_max} · workgroups {wg} x 256");
+            eprintln!(
+                "[spike]   (a) today        cpu issue {:.2} us/launch · wall {:.2} us/launch · {} submits · {:.3} ms",
+                spike_us(a_issue, n), spike_us(a_wall, n), s1 - s0, a_wall.as_secs_f64() * 1e3
+            );
+            eprintln!(
+                "[spike]   (a) gpu span     {:.1} us over the first pass of {in_pass} dispatches = {:.2} us/dispatch ({method} timing)",
+                a_span.as_secs_f64() * 1e6, spike_us(a_span, in_pass)
+            );
+            eprintln!(
+                "[spike]   (b) raw replay   cpu record {:.2} + finish {:.2} + submit {:.2} = {:.2} us/dispatch · poll {:.2} · wall {:.2} us/dispatch · {:.3} ms",
+                spike_us(b_rec, n), spike_us(b_fin, n), spike_us(b_sub, n),
+                spike_us(b_rec + b_fin + b_sub, n), spike_us(b_poll, n), spike_us(b_wall, n),
+                b_wall.as_secs_f64() * 1e3
+            );
+            eprintln!("[spike]   (b) gpu span     {}", gpu_line(b_gpu));
+            if let Some(g) = b_gpu {
+                eprintln!(
+                    "[spike]   (b) host residual (wall - gpu span) {:.2} us/dispatch",
+                    spike_us(b_wall.saturating_sub(g), n)
+                );
+            }
+            eprintln!(
+                "[spike]   (c) raw, fresh bind group each   cpu {:.2} us/dispatch · wall {:.2} us/dispatch · gpu span {} · (c)-(b) cpu {:.2} us/dispatch",
+                spike_us(c_rec + c_fin + c_sub, n), spike_us(c_wall, n), gpu_line(c_gpu),
+                spike_us((c_rec + c_fin + c_sub).saturating_sub(b_rec + b_fin + b_sub), n)
+            );
+            let a_us = spike_us(a_wall, n);
+            let b_us = spike_us(b_wall, n);
+            eprintln!(
+                "[spike]   bar: (b) wall {b_us:.2} us/dispatch [<= 3.00] · (a) wall {a_us:.2} us/dispatch [>= 13.00] -> {}",
+                match (b_us <= 3.0, a_us >= 13.0) {
+                    (true, true) => "both bars met: the graph pays",
+                    (false, true) => "(b) above 3 us: read its gpu span and host residual before deciding",
+                    (true, false) => "(a) below 13 us: today's road is not host-bound at this shape on this driver",
+                    (false, false) => "neither bar met",
+                }
+            );
+        }
+
+        // The raw road computed the same answer (the last run wrote out_h).
+        let got: Vec<f32> = f32::from_bytes(&client.read_one_unchecked(out_h.clone())).to_vec();
+        assert_eq!(got.len(), reference.len());
+        let mut bit_identical = true;
+        let mut worst_raw = 0.0f32;
+        for r in 0..n_out {
+            if got[r].to_bits() != reference[r].to_bits() {
+                bit_identical = false;
+            }
+            worst_raw = worst_raw.max((got[r] - reference[r]).abs() / reference[r].abs().max(1.0));
+        }
+        assert!(worst_raw <= 1e-5, "the raw road disagrees with today's road: rel {worst_raw}");
+        eprintln!(
+            "[spike] raw road output vs today's road: {} (worst rel {worst_raw:e}); today's vs host rel {worst:e}",
+            if bit_identical { "bit-identical" } else { "within 1e-5" }
+        );
+    }
+
     /// The four projection shaders render for f32 EXACTLY as the audited
     /// files did — no `enable`, no f16, no unfilled placeholder — and for
     /// f16 with the directive on line one and the partials still f32.

@@ -253,6 +253,8 @@ pub const DOORS: &[Door] = &[
     Door { kind: Kind::Cell, name: "COMBS_QMATMUL_DEBUG", default: "off", does: "print the first eight matmul calls with their shapes and dtypes", read_at: "combs-models/src/qlinear.rs", measured: None },
     Door { kind: Kind::Cell, name: "COMBS_K6_CELL", default: "off", does: "unlocks the own-process investigation cells in the matmul tests", read_at: "combs-models/src/qlinear.rs", measured: None },
     Door { kind: Kind::Cell, name: "COMBS_WTILE_BENCH", default: "off", does: "runs the klein-shaped weight-tile bench. Explicitly not a gate", read_at: "combs-models/src/qmatmul.rs", measured: None },
+    Door { kind: Kind::Cell, name: "COMBS_SPIKE_N", default: "2000", does: "launches per arm in the replay spike, an own-process ignored test", read_at: "combs-models/src/wgsl/mod.rs", measured: None },
+    Door { kind: Kind::Cell, name: "COMBS_SPIKE_REPS", default: "3", does: "repetitions per arm in the replay spike, an own-process ignored test", read_at: "combs-models/src/wgsl/mod.rs", measured: None },
 
     // ── build stamps: set by the build, read for the manifest ──
     Door { kind: Kind::Stamp, name: "COMBS_BUILD_AT", default: "the build's own", does: "build time, epoch seconds", read_at: "combs-cli/src/build_info.rs", measured: None },
