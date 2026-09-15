@@ -415,6 +415,7 @@ wgsl_kernel_gemv!(DecodeGemvQ8, "decode_gemv_q8.wgsl");
 wgsl_kernel_gemv!(DecodeGemvQ4K, "decode_gemv_q4k.wgsl");
 wgsl_kernel_gemv!(DecodeGemvQ5K, "decode_gemv_q5k.wgsl");
 wgsl_kernel_gemv!(DecodeGemvQ6K, "decode_gemv_q6k.wgsl");
+wgsl_kernel!(ScrubFill, "scrub_fill.wgsl");
 
 /// Door for the split-K decode gemv (`COMBS_WGSL_GEMV=0` restores the
 /// cube untiled kernel); read once, like every door here.
@@ -430,6 +431,8 @@ mod deltanet;
 mod decode_attn_q8;
 mod rmsnorm;
 mod rope;
+#[cfg(test)]
+mod scrub_spike;
 
 pub(crate) use decode_attn::{try_decode_attention, try_prefill_attention, try_sliding_decode_attention};
 pub(crate) use decode_attn_q8::{QuantArena, try_decode_attention_q8};
