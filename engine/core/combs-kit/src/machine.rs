@@ -41,6 +41,8 @@ pub struct Machine {
     /// typed flag, so this reads the raw feature dump — which is why
     /// `DeviceCaps` carries that string at all.
     pub shader_f16: Option<bool>,
+    /// The machine's shape: cores, quota, memory limit, accelerator memory, unified or not.
+    pub profile: crate::profile::Profile,
 }
 
 fn shell(cmd: &str, args: &[&str]) -> Option<String> {
@@ -145,6 +147,7 @@ pub fn read() -> Machine {
             available_memory: combs_core::host::available_memory_bytes().is_some(),
             process_footprint: combs_core::host::process_footprint_bytes().is_some(),
         },
+        profile: crate::profile::read(gpu.get("device_type").and_then(|v| v.as_str()).unwrap_or("")),
         gpu,
         shader_f16,
     }
@@ -171,6 +174,30 @@ pub fn print_human(m: &Machine) {
         Some(true) => println!("  shader f16  yes — f16 storage kernels are reachable on this adapter"),
         Some(false) => println!("  shader f16  no — f16 storage kernels stay doored off here"),
         None => println!("  shader f16  unknown — no adapter to ask"),
+    }
+    let p = &m.profile;
+    let opt = |v: Option<u32>| v.map(|n| n.to_string()).unwrap_or_else(|| "unread".into());
+    println!(
+        "  cores       logical {} · physical {} · packages {} · quota {}",
+        opt(p.cpu.logical),
+        opt(p.cpu.physical),
+        opt(p.cpu.sockets),
+        p.limits.cpu_quota_cores.map(|c| format!("{c} cores")).unwrap_or_else(|| "none set".into())
+    );
+    if !p.cpu.features.is_empty() {
+        println!("  isa         {}", p.cpu.features.join(" "));
+    }
+    if let Some(b) = p.limits.memory_limit_bytes {
+        println!("  mem limit   {:.1} GiB (cgroup)", b as f64 / 1073741824.0);
+    }
+    match (p.accel.bytes, p.accel.source.as_str()) {
+        (Some(b), src) => println!(
+            "  accel mem   {:.1} GiB ({src}){}",
+            b as f64 / 1073741824.0,
+            p.accel.link.as_ref().map(|l| format!(" · link {l}")).unwrap_or_default()
+        ),
+        (None, "unified") => println!("  accel mem   unified — the adapter draws on host memory"),
+        (None, src) => println!("  accel mem   {src}"),
     }
     println!(
         "  probes      available_memory {} · process_footprint {}",
@@ -211,6 +238,7 @@ mod tests {
             probes: Probes { available_memory: false, process_footprint: false },
             gpu: serde_json::Value::Null,
             shader_f16: None,
+            profile: crate::profile::Profile::default(),
         };
         let text = serde_json::to_string(&m).unwrap();
         assert!(text.contains("\"available_bytes\":null"));

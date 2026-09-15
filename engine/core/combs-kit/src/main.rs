@@ -40,6 +40,7 @@ mod model;
 mod ops;
 mod report;
 mod machine;
+mod profile;
 mod micro;
 mod record;
 
