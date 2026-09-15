@@ -52,6 +52,10 @@ pub struct CacheConfig {
     /// layers stay in float (they hold at most `w-1` tokens). Set from
     /// `COMBS_KV_QUANT=1` by the engine.
     pub quantize_kv: bool,
+    /// Clear every KV buffer this cache frees before the pool hands it on: the arena and the sliding window
+    /// when the cache dies, the old arena at growth, the old window at every sliding step. From
+    /// `COMBS_KV_SCRUB` (on unless `0`); tests set it explicitly.
+    pub scrub_on_drop: bool,
 }
 
 impl CacheConfig {
@@ -65,6 +69,7 @@ impl CacheConfig {
             page_size: Self::DEFAULT_PAGE_SIZE,
             kind: CacheKind::Paged,
             quantize_kv: false,
+            scrub_on_drop: crate::wgsl::scrub::kv_scrub_enabled(),
         }
     }
 
@@ -75,6 +80,7 @@ impl CacheConfig {
             page_size: Self::DEFAULT_PAGE_SIZE,
             kind: CacheKind::Contiguous,
             quantize_kv: false,
+            scrub_on_drop: crate::wgsl::scrub::kv_scrub_enabled(),
         }
     }
 
@@ -473,6 +479,8 @@ fn kv_dequantize<B: Backend>(
 pub struct ContiguousKVCache<B: Backend> {
     layers: Vec<Option<(Tensor<B, 4>, Tensor<B, 4>)>>,
     seq_len: usize,
+    /// The scrub door, read once at construction (`COMBS_KV_SCRUB`).
+    scrub_on_drop: bool,
 }
 
 impl<B: Backend> ContiguousKVCache<B> {
@@ -481,7 +489,36 @@ impl<B: Backend> ContiguousKVCache<B> {
         ContiguousKVCache {
             layers: (0..num_layers).map(|_| None).collect(),
             seq_len: 0,
+            scrub_on_drop: crate::wgsl::scrub::kv_scrub_enabled(),
         }
+    }
+}
+
+impl<B: Backend> Drop for ContiguousKVCache<B> {
+    fn drop(&mut self) {
+        if !self.scrub_on_drop {
+            return;
+        }
+        let (mut tensors, mut reached) = (0usize, 0usize);
+        for slot in self.layers.iter_mut() {
+            if let Some((k, v)) = slot.take() {
+                tensors += 2;
+                reached += crate::wgsl::scrub::scrub_pair(k, v);
+            }
+        }
+        scrub_event("contiguous", tensors, reached);
+    }
+}
+
+/// One provenance line per cache death: how many buffers died and how many the fill reached (fewer means a
+/// backend whose buffers the scrub cannot touch — the host backend).
+fn scrub_event(kind: &str, tensors: usize, reached: usize) {
+    if tensors > 0 {
+        combs_core::provenance::event(
+            "engine",
+            "kv.scrub",
+            &[("cache", kind.to_string()), ("tensors", tensors.to_string()), ("reached", reached.to_string())],
+        );
     }
 }
 
@@ -496,12 +533,17 @@ impl<B: Backend> KVCache<B> for ContiguousKVCache<B> {
         scale: f64,
         window: Option<usize>,
     ) -> Tensor<B, 4> {
+        let scrub = self.scrub_on_drop;
         let slot = &mut self.layers[layer];
         let (k_full, v_full) = match slot.take() {
-            Some((k_old, v_old)) => (
-                Tensor::cat(vec![k_old, k], 2),
-                Tensor::cat(vec![v_old, v], 2),
-            ),
+            Some((k_old, v_old)) => {
+                let old = scrub.then(|| (k_old.clone(), v_old.clone()));
+                let full = (Tensor::cat(vec![k_old, k], 2), Tensor::cat(vec![v_old, v], 2));
+                if let Some((a, b)) = old {
+                    crate::wgsl::scrub::scrub_pair(a, b);
+                }
+                full
+            }
             None => (k, v),
         };
         self.seq_len = k_full.dims()[2];
@@ -640,6 +682,22 @@ pub struct PagedKVCache<B: Backend> {
 }
 
 impl<B: Backend> PagedKVCache<B> {
+    /// Clones of `layer`'s float arena tensors (None before its first touch, and for a quantized arena).
+    /// Test-only: the residue tests hold them across a death and read what is left.
+    #[cfg(test)]
+    pub(crate) fn arena_tensors(&self, layer: usize) -> Option<(Tensor<B, 4>, Tensor<B, 4>)> {
+        match self.arenas.get(layer)?.as_ref()? {
+            Arena::Fp { k, v } => Some((k.clone(), v.clone())),
+            Arena::Quant { .. } => None,
+        }
+    }
+
+    /// Clones of `layer`'s sliding window (None without one).
+    #[cfg(test)]
+    pub(crate) fn sliding_tensors(&self, layer: usize) -> Option<(Tensor<B, 4>, Tensor<B, 4>)> {
+        self.sliding.get(layer)?.as_ref().map(|(k, v)| (k.clone(), v.clone()))
+    }
+
     /// Creates an empty paged cache for `num_layers` layers (all global).
     /// Arena tensors are allocated lazily on first use of each layer.
     pub fn new(num_layers: usize, config: CacheConfig) -> Self {
@@ -744,12 +802,18 @@ impl<B: Backend> PagedKVCache<B> {
         w: usize,
     ) -> Tensor<B, 4> {
         let seq = k.dims()[2];
+        let scrub = self.config.scrub_on_drop;
         let slot = &mut self.sliding[layer];
         let (k_full, v_full) = match slot.take() {
-            Some((k_old, v_old)) => (
-                Tensor::cat(vec![k_old, k], 2),
-                Tensor::cat(vec![v_old, v], 2),
-            ),
+            Some((k_old, v_old)) => {
+                // The window this step replaces dies here; the copy reads it before the fill lands.
+                let old = scrub.then(|| (k_old.clone(), v_old.clone()));
+                let full = (Tensor::cat(vec![k_old, k], 2), Tensor::cat(vec![v_old, v], 2));
+                if let Some((a, b)) = old {
+                    crate::wgsl::scrub::scrub_pair(a, b);
+                }
+                full
+            }
             None => (k, v),
         };
         let full_len = k_full.dims()[2];
@@ -850,6 +914,37 @@ impl<B: Backend> PagedKVCache<B> {
     }
 }
 
+impl<B: Backend> Drop for PagedKVCache<B> {
+    fn drop(&mut self) {
+        if !self.config.scrub_on_drop {
+            return;
+        }
+        let (mut tensors, mut reached) = (0usize, 0usize);
+        for arena in self.arenas.iter_mut() {
+            match arena.take() {
+                Some(Arena::Fp { k, v }) => {
+                    tensors += 2;
+                    reached += crate::wgsl::scrub::scrub_pair(k, v);
+                }
+                Some(Arena::Quant { k_packed, k_scales, v_packed, v_scales }) => {
+                    tensors += 4;
+                    reached += crate::wgsl::scrub::scrub_int(k_packed) as usize
+                        + crate::wgsl::scrub::scrub_int(v_packed) as usize
+                        + crate::wgsl::scrub::scrub_pair(k_scales, v_scales);
+                }
+                None => {}
+            }
+        }
+        for slot in self.sliding.iter_mut() {
+            if let Some((k, v)) = slot.take() {
+                tensors += 2;
+                reached += crate::wgsl::scrub::scrub_pair(k, v);
+            }
+        }
+        scrub_event("paged", tensors, reached);
+    }
+}
+
 impl<B: Backend> KVCache<B> for PagedKVCache<B> {
     fn attention_opts(
         &mut self,
@@ -924,11 +1019,18 @@ impl<B: Backend> KVCache<B> for PagedKVCache<B> {
                 Arena::Fp { k: ak, v: av } => {
                     let [old_np, nk, ps, d] = ak.dims();
                     let span = [0..old_np, 0..nk, 0..ps, 0..d];
-                    Arena::Fp {
+                    // The old arena dies here: a handle held across the copy keeps its buffer for the
+                    // scrub, which the stream orders after the copy has read it.
+                    let old = self.config.scrub_on_drop.then(|| (ak.clone(), av.clone()));
+                    let grown = Arena::Fp {
                         k: Tensor::zeros([np, nk, ps, d], &device)
                             .slice_assign(span.clone(), ak),
                         v: Tensor::zeros([np, nk, ps, d], &device).slice_assign(span, av),
+                    };
+                    if let Some((k, v)) = old {
+                        crate::wgsl::scrub::scrub_pair(k, v);
                     }
+                    grown
                 }
                 Arena::Quant {
                     k_packed,
@@ -940,7 +1042,11 @@ impl<B: Backend> KVCache<B> for PagedKVCache<B> {
                     let dg = k_scales.dims()[3];
                     let span_p = [0..old_np, 0..nk, 0..ps, 0..dp];
                     let span_s = [0..old_np, 0..nk, 0..ps, 0..dg];
-                    Arena::Quant {
+                    let old = self
+                        .config
+                        .scrub_on_drop
+                        .then(|| (k_packed.clone(), k_scales.clone(), v_packed.clone(), v_scales.clone()));
+                    let grown = Arena::Quant {
                         k_packed: Tensor::zeros([np, nk, ps, dp], &device)
                             .slice_assign(span_p.clone(), k_packed),
                         k_scales: Tensor::zeros([np, nk, ps, dg], &device)
@@ -949,7 +1055,13 @@ impl<B: Backend> KVCache<B> for PagedKVCache<B> {
                             .slice_assign(span_p, v_packed),
                         v_scales: Tensor::zeros([np, nk, ps, dg], &device)
                             .slice_assign(span_s, v_scales),
+                    };
+                    if let Some((kp, ks, vp, vs)) = old {
+                        crate::wgsl::scrub::scrub_int(kp);
+                        crate::wgsl::scrub::scrub_int(vp);
+                        crate::wgsl::scrub::scrub_pair(ks, vs);
                     }
+                    grown
                 }
             });
         }
@@ -1439,6 +1551,7 @@ mod tests {
                 page_size,
                 kind: CacheKind::Paged,
                 quantize_kv: false,
+                scrub_on_drop: false,
             },
         )
     }
@@ -1554,6 +1667,144 @@ mod tests {
         }
     }
 
+    // ---- the scrub (ignored: each initializes the device and one reads the process-wide dispatch counter) ----
+    //
+    // A clone of the dying tensor is held across the death and read afterwards: with the scrub it reads zeros,
+    // without it the bytes are still there. The pool handing a freed page back with its bytes intact is the
+    // spike's own measurement (wgsl/scrub_spike.rs); these prove the bytes are gone before that can matter.
+
+    fn gpu_sync() {
+        use cubecl::prelude::*;
+        let client = burn::backend::wgpu::WgpuRuntime::client(&burn::backend::wgpu::WgpuDevice::default());
+        cubecl::future::block_on(client.sync()).expect("sync");
+    }
+
+    /// Elements of a tensor that are not zero, read back through the backend.
+    fn nonzero<B: Backend>(t: Tensor<B, 4>) -> usize {
+        t.into_data().convert::<f32>().to_vec::<f32>().expect("f32 data").iter().filter(|x| **x != 0.0).count()
+    }
+
+    /// Feeds `tokens` one-token steps into layer 0 of `cache`, at positions `start..`.
+    fn feed<B: Backend>(cache: &mut PagedKVCache<B>, dev: &B::Device, start: usize, tokens: usize, n_kv: usize, d: usize) {
+        let scale = 1.0 / (d as f64).sqrt();
+        for i in start..start + tokens {
+            let (k, v) = kv_tok_on::<B>(dev, i, n_kv, d);
+            let q = q_tok_on::<B>(dev, i, 4, d);
+            let _ = cache.attention_opts(0, q, k, v, i, scale, None).into_data();
+        }
+    }
+
+    #[test]
+    #[ignore = "gpu: initializes the device itself, so it needs its own process"]
+    fn a_dropped_cache_leaves_no_bytes_in_the_pool() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        type B = combs_core::CombsBackend;
+        let dev: Device<B> = Default::default();
+        let make = |scrub: bool| {
+            let mut cfg = CacheConfig::paged(1024);
+            cfg.scrub_on_drop = scrub;
+            PagedKVCache::<B>::new(1, cfg)
+        };
+        // The control: without the scrub the arena's bytes outlive the cache.
+        let mut c = make(false);
+        feed(&mut c, &dev, 0, 24, 2, 32);
+        let (k, v) = c.arena_tensors(0).expect("a float arena after 24 tokens");
+        drop(c);
+        gpu_sync();
+        assert!(nonzero(k) > 0 && nonzero(v) > 0, "the control holds no bytes: this test cannot judge a scrub");
+
+        let mut c = make(true);
+        feed(&mut c, &dev, 0, 24, 2, 32);
+        let (k, v) = c.arena_tensors(0).expect("a float arena after 24 tokens");
+        drop(c);
+        gpu_sync();
+        assert_eq!((nonzero(k), nonzero(v)), (0, 0), "a dropped cache left bytes in its arena for the next allocation");
+    }
+
+    #[test]
+    #[ignore = "gpu: initializes the device itself, so it needs its own process"]
+    fn growth_scrubs_the_arena_it_leaves() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        type B = combs_core::CombsBackend;
+        let dev: Device<B> = Default::default();
+        let first = INITIAL_ARENA_PAGES * CacheConfig::DEFAULT_PAGE_SIZE;
+        let make = |scrub: bool| {
+            let mut cfg = CacheConfig::paged(4 * first);
+            cfg.scrub_on_drop = scrub;
+            PagedKVCache::<B>::new(1, cfg)
+        };
+        for scrub in [false, true] {
+            let mut c = make(scrub);
+            feed(&mut c, &dev, 0, first, 2, 32);
+            let (k, v) = c.arena_tensors(0).expect("the first arena");
+            let before = k.dims()[0];
+            feed(&mut c, &dev, first, 1, 2, 32);
+            let after = c.arena_tensors(0).expect("the grown arena").0.dims()[0];
+            assert!(after > before, "the arena did not grow past {first} tokens ({before} -> {after} pages)");
+            gpu_sync();
+            let left = (nonzero(k), nonzero(v));
+            if scrub {
+                assert_eq!(left, (0, 0), "growth left the old arena's bytes for the next allocation");
+            } else {
+                assert!(left.0 > 0 && left.1 > 0, "the control holds no bytes: this test cannot judge a scrub");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "gpu: initializes the device itself, so it needs its own process"]
+    fn a_sliding_window_scrubs_the_window_it_replaces() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        type B = combs_core::CombsBackend;
+        let dev: Device<B> = Default::default();
+        let (n_kv, d, w) = (2usize, 64usize, 64usize);
+        let make = |scrub: bool| {
+            let mut cfg = CacheConfig::paged(1024);
+            cfg.scrub_on_drop = scrub;
+            PagedKVCache::<B>::new_with_windows(1, cfg, vec![Some(w)])
+        };
+        for scrub in [false, true] {
+            let mut c = make(scrub);
+            feed(&mut c, &dev, 0, 79, n_kv, d);
+            let (k, v) = c.sliding_tensors(0).expect("a window after 79 tokens");
+            feed(&mut c, &dev, 79, 1, n_kv, d);
+            gpu_sync();
+            let left = (nonzero(k), nonzero(v));
+            if scrub {
+                assert_eq!(left, (0, 0), "a sliding step left the window it replaced for the next allocation");
+            } else {
+                assert!(left.0 > 0 && left.1 > 0, "the control holds no bytes: this test cannot judge a scrub");
+            }
+            drop(c);
+        }
+    }
+
+    #[test]
+    #[ignore = "gpu: reads the process-wide dispatch counter, so it needs its own process"]
+    fn the_scrub_costs_one_dispatch_per_tensor() {
+        if crate::skip_no_gpu() {
+            return;
+        }
+        type B = combs_core::CombsBackend;
+        let dev: Device<B> = Default::default();
+        let mut cfg = CacheConfig::paged(1024);
+        cfg.scrub_on_drop = true;
+        let mut c = PagedKVCache::<B>::new(1, cfg);
+        feed(&mut c, &dev, 0, 24, 2, 32);
+        gpu_sync();
+        let (d0, _) = combs_core::gpu_counters();
+        drop(c);
+        gpu_sync();
+        let (d1, _) = combs_core::gpu_counters();
+        assert_eq!(d1 - d0, 2, "dropping a one-layer float cache scrubs its K and V arenas: two fills");
+    }
+
     /// The fp-vs-quantized attend parity check on the given backend.
     fn quant_parity_on<B: Backend>(dev: &B::Device, tol: f32) {
         let (n_kv, n_q, d) = (2usize, 4usize, 32usize);
@@ -1590,6 +1841,7 @@ mod tests {
             page_size: 2,
             kind: CacheKind::Paged,
             quantize_kv: quantize,
+            scrub_on_drop: false,
         };
         // 256-page capacity, 32-page floor: growth at 33, 65, 129 pages.
         let mut growing = PagedKVCache::<TestBackend>::new(1, config);
@@ -1835,6 +2087,7 @@ mod tests {
             page_size: 2,
             kind: CacheKind::Paged,
             quantize_kv: false,
+            scrub_on_drop: false,
         };
         let mut growing = PagedKVCache::<B>::new(1, config);
         let mut control = PagedKVCache::<B>::new(1, config);

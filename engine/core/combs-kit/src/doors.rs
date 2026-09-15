@@ -114,6 +114,14 @@ pub const DOORS: &[Door] = &[
     },
     Door {
         kind: Kind::Knob,
+        name: "COMBS_KV_SCRUB",
+        default: "on",
+        does: "clear every KV buffer the engine frees before the pool hands it on — a session's arena and sliding window at its end, the old arena at growth, the old window at every sliding step — with one constant fill each; 0 leaves the freed bytes for the next allocation to read",
+        read_at: "combs-models/src/wgsl/scrub.rs, combs-models/src/kv.rs",
+        measured: None,
+    },
+    Door {
+        kind: Kind::Knob,
         name: "COMBS_KV_QUANT",
         default: "off",
         does: "int8 KV on global layers. No-ops silently when head_dim does not divide by 32",

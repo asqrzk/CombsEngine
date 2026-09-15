@@ -431,6 +431,7 @@ mod deltanet;
 mod decode_attn_q8;
 mod rmsnorm;
 mod rope;
+pub(crate) mod scrub;
 #[cfg(test)]
 mod scrub_spike;
 

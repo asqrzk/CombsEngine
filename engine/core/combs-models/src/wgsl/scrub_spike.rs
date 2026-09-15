@@ -12,26 +12,14 @@ use crate::qlinear::{FusedF32, UnfusedF16, UnfusedF32};
 
 const SHAPE: [usize; 4] = [4, 2, 16, 64];
 
-fn grid(words: usize) -> (CubeCount, u64) {
-    let groups = words.div_ceil(256).max(1);
-    if groups <= 65_535 {
-        (CubeCount::Static(groups as u32, 1, 1), groups as u64)
-    } else {
-        (CubeCount::Static(65_535, groups.div_ceil(65_535) as u32, 1), 65_535)
-    }
-}
+use super::scrub::fill_grid as grid;
 
 fn bytes_of(t: &CubeTensor<WgpuRuntime>) -> usize {
     t.meta.num_elements() * t.dtype.size()
 }
 
 fn fill_zero(t: &CubeTensor<WgpuRuntime>) {
-    let bytes = bytes_of(t);
-    assert!(bytes % 4 == 0, "a fill clears whole words: {bytes} bytes");
-    let words = bytes / 4;
-    assert!(words <= u32::MAX as usize, "{words} words do not fit the kernel's slot");
-    let (count, row) = grid(words);
-    launch(&t.client, ScrubFill, count, vec![t.handle.clone().binding()], vec![words as u64, row]);
+    super::scrub::scrub_buffer(t);
     cubecl::future::block_on(t.client.sync()).expect("sync after the fill");
 }
 
