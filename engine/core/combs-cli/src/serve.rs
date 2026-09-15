@@ -42,6 +42,8 @@ struct ServeCounters {
 /// Serves `engine` on `addr` (`host:port`) forever.
 /// `default_prefill_chunk` overrides the engine's chunked-prefill size for
 /// every request (from `combs serve --prefill-chunk-size`).
+/// `anonymous` decides what a request naming no `session_id` does with the
+/// KV session cache (see [`AnonymousSessions`]).
 /// `static_info` is load-time identity for `/v1/stats` — `{weights, device, load}`,
 /// built once in `cmd_serve` (device caps must be captured before the engine
 /// initializes the cubecl runtime; see `cmd_serve`).
@@ -50,6 +52,7 @@ pub fn serve(
     model_id: String,
     addr: &str,
     default_prefill_chunk: Option<usize>,
+    anonymous: AnonymousSessions,
     static_info: Value,
 ) -> Result<()> {
     let server = tiny_http::Server::http(addr).map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
@@ -63,6 +66,7 @@ pub fn serve(
         ("dtype", combs_core::BACKEND.dtype.to_string()),
         ("backend", combs_core::backend_line()),
         ("matmul", combs_models::batched_matmul_summary()),
+        ("anonymous_sessions", anonymous.as_str().to_string()),
     ];
     combs_core::provenance::startup("text", &provenance_config);
     eprintln!("combs serve: listening on http://{addr} (model: {model_id})");
@@ -184,7 +188,7 @@ pub fn serve(
                     if request.as_reader().read_to_string(&mut body).is_err() {
                         json_response(400, error_json("invalid_request", "unreadable body"))
                     } else {
-                        handle_chat(&engine, &model_id, &body, default_prefill_chunk, &counters)
+                        handle_chat(&engine, &model_id, &body, default_prefill_chunk, anonymous, &counters)
                     }
                 }
                 ("POST", "/v1/completions") => {
@@ -197,6 +201,7 @@ pub fn serve(
                             &model_id,
                             &body,
                             default_prefill_chunk,
+                            anonymous,
                             &counters,
                         )
                     }
@@ -815,11 +820,51 @@ fn usage_json_choices(all: &[GenerationStats], session_id: Option<&str>) -> Valu
     })
 }
 
+/// What a request that names no `session_id` does with the KV session cache.
+/// `keep` shares one anonymous rolling session across such requests (one
+/// caller, prefix reuse between its turns); `off` gives each of them a fresh
+/// cache that is never saved back, so no request can reuse another's prompt
+/// or learn its length through `cached_tokens` (several callers, one server).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum AnonymousSessions {
+    Keep,
+    Off,
+}
+
+impl AnonymousSessions {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AnonymousSessions::Keep => "keep",
+            AnonymousSessions::Off => "off",
+        }
+    }
+}
+
+/// Names the request's KV session from its `session_id` (at most 64
+/// characters; an empty id names none) and applies `anonymous` when the
+/// request names none.
+fn apply_session(
+    req: &Value,
+    config: &mut combs_runtime::GenerationConfig,
+    anonymous: AnonymousSessions,
+) {
+    if let Some(sid) = req.get("session_id").and_then(Value::as_str) {
+        let sid: String = sid.chars().take(64).collect();
+        if !sid.is_empty() {
+            config.session_id = Some(sid);
+        }
+    }
+    if config.session_id.is_none() && anonymous == AnonymousSessions::Off {
+        config.session_reuse = false;
+    }
+}
+
 fn handle_chat(
     engine: &Arc<Engine>,
     model_id: &str,
     body: &str,
     default_prefill_chunk: Option<usize>,
+    anonymous: AnonymousSessions,
     counters: &Arc<ServeCounters>,
 ) -> HttpResponse {
     let req: Value = match serde_json::from_str(body) {
@@ -905,12 +950,7 @@ fn handle_chat(
     }
     // Optional named KV session (e.g. one per debate agent) — requests with
     // the same id share a rolling prefix-reuse session.
-    if let Some(sid) = req.get("session_id").and_then(Value::as_str) {
-        let sid: String = sid.chars().take(64).collect();
-        if !sid.is_empty() {
-            config.session_id = Some(sid);
-        }
-    }
+    apply_session(&req, &mut config, anonymous);
 
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let n_choices = match parse_n_choices(&req, stream) {
@@ -1145,6 +1185,7 @@ fn handle_completions(
     model_id: &str,
     body: &str,
     default_prefill_chunk: Option<usize>,
+    anonymous: AnonymousSessions,
     counters: &Arc<ServeCounters>,
 ) -> HttpResponse {
     let req: Value = match serde_json::from_str(body) {
@@ -1172,12 +1213,7 @@ fn handle_completions(
     }
     // Same named-session semantics as chat completions — raw-prompt
     // callers were previously forced onto the anonymous session.
-    if let Some(sid) = req.get("session_id").and_then(Value::as_str) {
-        let sid: String = sid.chars().take(64).collect();
-        if !sid.is_empty() {
-            config.session_id = Some(sid);
-        }
-    }
+    apply_session(&req, &mut config, anonymous);
     if let Some(n) = req.get("logprobs").and_then(Value::as_u64) {
         config.sampling.logprobs = Some(n.min(20) as usize);
     }
@@ -1548,6 +1584,51 @@ impl Read for ChannelReader {
 #[cfg(test)]
 mod tests {
     use super::window_layers;
+    use super::{apply_session, AnonymousSessions};
+    use combs_runtime::GenerationConfig;
+    use serde_json::json;
+
+    #[test]
+    fn an_anonymous_request_neither_reuses_nor_keeps_a_session_when_they_are_off() {
+        let mut config = GenerationConfig::default();
+        apply_session(&json!({"prompt": "hi"}), &mut config, AnonymousSessions::Off);
+        assert_eq!(config.session_id, None);
+        assert!(
+            !config.session_reuse,
+            "an anonymous request must not join or leave behind a shared session"
+        );
+    }
+
+    #[test]
+    fn an_empty_session_id_is_anonymous() {
+        let mut config = GenerationConfig::default();
+        apply_session(&json!({"session_id": ""}), &mut config, AnonymousSessions::Off);
+        assert_eq!(config.session_id, None);
+        assert!(!config.session_reuse, "an empty session_id names no session");
+    }
+
+    #[test]
+    fn a_named_request_keeps_its_session_when_anonymous_ones_are_off() {
+        let mut config = GenerationConfig::default();
+        apply_session(&json!({"session_id": "a"}), &mut config, AnonymousSessions::Off);
+        assert_eq!(config.session_id.as_deref(), Some("a"));
+        assert!(config.session_reuse);
+    }
+
+    #[test]
+    fn keep_leaves_the_anonymous_session_shared() {
+        let mut config = GenerationConfig::default();
+        apply_session(&json!({}), &mut config, AnonymousSessions::Keep);
+        assert_eq!(config.session_id, None);
+        assert!(config.session_reuse);
+    }
+
+    #[test]
+    fn a_session_id_is_cut_at_64_characters() {
+        let mut config = GenerationConfig::default();
+        apply_session(&json!({"session_id": "x".repeat(80)}), &mut config, AnonymousSessions::Keep);
+        assert_eq!(config.session_id.map(|s| s.chars().count()), Some(64));
+    }
 
     #[test]
     fn window_layer_summary_encodes_global_as_zero() {

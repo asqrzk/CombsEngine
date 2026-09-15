@@ -236,6 +236,13 @@ enum Command {
         /// LoRA strength multiplier.
         #[arg(long, default_value_t = 1.0)]
         lora_scale: f32,
+        /// What a request that names no `session_id` does with the KV
+        /// session cache: `keep` shares one anonymous rolling session (one
+        /// caller); `off` gives each such request a fresh cache that is never
+        /// saved back (several callers: no request can reuse or observe
+        /// another's prompt).
+        #[arg(long, value_enum, default_value_t = serve::AnonymousSessions::Keep)]
+        anonymous_sessions: serve::AnonymousSessions,
     },
     /// Scaffold a UI app from the embedded template (interactive or via flags).
     Chew(ChewCommand),
@@ -342,6 +349,7 @@ fn main() -> Result<()> {
             kv_auto,
             lora,
             lora_scale,
+            anonymous_sessions,
         } => {
             let lora = lora.map(|l| resolve_lora_arg(&l)).transpose()?;
             cmd_serve(
@@ -353,6 +361,7 @@ fn main() -> Result<()> {
                 kv_auto,
                 lora,
                 lora_scale,
+                anonymous_sessions,
             )
         }
         Command::Perplexity { model, file, text, chunk, max_tokens } => {
@@ -520,6 +529,7 @@ fn cmd_serve(
     kv_auto: bool,
     lora: Option<PathBuf>,
     lora_scale: f32,
+    anonymous_sessions: serve::AnonymousSessions,
 ) -> Result<()> {
     let model = resolve_model_arg(&model)?;
     let t_load = std::time::Instant::now();
@@ -764,6 +774,7 @@ fn cmd_serve(
         model_id,
         &format!("0.0.0.0:{port}"),
         prefill_chunk_size,
+        anonymous_sessions,
         static_info,
     )
 }
