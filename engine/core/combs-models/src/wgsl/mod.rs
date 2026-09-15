@@ -84,22 +84,35 @@ impl Storage {
     }
 }
 
+/// Where the f16 storage road is blessed, as data: a graphics backend and,
+/// on it, the PCI vendor whose adapters were measured (`None` = every
+/// adapter on that backend), with the evidence. A default is a promise to
+/// every box of that kind, so a row enters only with perplexity identical
+/// and greedy transcripts byte-identical against f32.
+pub(crate) const STORAGE_BLESSED: &[(&str, Option<u32>, &str)] = &[
+    // perplexity identical to four decimals, five of five transcripts
+    // byte-identical; decode doubles at depth
+    ("Metal", None, "§97, §98"),
+    // perplexity identical with the door shut and open and within 0.09% of
+    // f32, greedy text byte-identical to f32; decode 2.0-3.9x the door shut
+    ("Vulkan", Some(0x10de), "§115, §116d"),
+];
+
 /// The storage door's default, as a pure decision so the walk is the
 /// test.
 ///
 /// `COMBS_WGSL_F16=0` shuts it and `=1` opens it anywhere the adapter
-/// admits the type. Unset, it is OPEN on macOS — where AutoGraphicsApi
-/// resolves to Metal and nothing else, and where the road was blessed
-/// (§98: perplexity identical to four decimals, five of five transcripts
-/// byte-identical; §97: decode doubles at depth) — and SHUT elsewhere
-/// until one Vulkan sitting has proven it there. A shader `enable`
-/// directive is exactly the kind of thing a second driver may handle
-/// differently, and a default is a promise to every box at once.
-pub(crate) fn storage_door_default(on_macos: bool, env: Option<&str>) -> bool {
+/// admits the type. Unset, it is OPEN on an adapter whose backend and
+/// vendor [`STORAGE_BLESSED`] names and SHUT on every other: a shader
+/// `enable` directive is exactly the kind of thing a second driver may
+/// handle differently, and a default is a promise to every box at once.
+pub(crate) fn storage_door_default(backend: &str, vendor_id: u32, env: Option<&str>) -> bool {
     match env {
         Some("0") => false,
         Some("1") => true,
-        _ => on_macos,
+        _ => STORAGE_BLESSED
+            .iter()
+            .any(|(b, v, _)| backend.eq_ignore_ascii_case(b) && v.map_or(true, |v| v == vendor_id)),
     }
 }
 
@@ -185,8 +198,9 @@ pub fn gemv_geometry() -> Geometry {
 /// May this box store kernel activations in f16?
 ///
 /// Four conditions, and each is load-bearing. Never in a browser (the
-/// `enable` above). Never when the master WGSL door is shut. Opt-in
-/// while the road is young (`COMBS_WGSL_F16=1`). And only when the
+/// `enable` above). Never when the master WGSL door is shut. Open by
+/// default only where [`STORAGE_BLESSED`] names the adapter (`COMBS_WGSL_F16`
+/// wins both ways). And only when the
 /// ADAPTER admits the type — asked through the same registration the
 /// compiler itself consults, rather than a feature string we parse
 /// ourselves. cubecl requests every adapter feature when it creates the
@@ -200,7 +214,8 @@ pub(crate) fn f16_storage_enabled(
     }
     static ASKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ASKED.get_or_init(|| {
-        storage_door_default(cfg!(target_os = "macos"), std::env::var("COMBS_WGSL_F16").ok().as_deref())
+        let adapter = combs_core::adapter_caps();
+        storage_door_default(&adapter.backend, adapter.vendor_id, std::env::var("COMBS_WGSL_F16").ok().as_deref())
     }) {
         return false;
     }
@@ -1458,10 +1473,27 @@ mod tests {
     /// where it has been blessed and the switch wins in both directions.
     #[test]
     fn the_storage_door_defaults_open_only_where_it_is_blessed() {
-        assert!(storage_door_default(true, None), "blessed on Apple: open by default");
-        assert!(!storage_door_default(false, None), "unproven elsewhere: shut by default");
-        assert!(!storage_door_default(true, Some("0")), "the off switch wins on Apple");
-        assert!(storage_door_default(false, Some("1")), "the on switch wins elsewhere");
+        const BLESSED_VULKAN_VENDOR: u32 = 0x10de;
+        const OTHER_VENDOR: u32 = 0x1002;
+        const THIRD_VENDOR: u32 = 0x8086;
+        assert!(storage_door_default("Metal", 0, None), "blessed on Metal: open by default");
+        assert!(
+            storage_door_default("Vulkan", BLESSED_VULKAN_VENDOR, None),
+            "blessed on Vulkan for this vendor: open by default"
+        );
+        assert!(!storage_door_default("Vulkan", OTHER_VENDOR, None), "unproven for another vendor on the same backend: shut");
+        assert!(!storage_door_default("Vulkan", THIRD_VENDOR, None), "unproven: shut");
+        assert!(!storage_door_default("Dx12", BLESSED_VULKAN_VENDOR, None), "a blessing is a backend and a vendor together: shut");
+        assert!(!storage_door_default("Gl", BLESSED_VULKAN_VENDOR, None), "unproven backend: shut");
+        assert!(!storage_door_default("Metal", 0, Some("0")), "the off switch wins where it is blessed");
+        assert!(storage_door_default("Vulkan", OTHER_VENDOR, Some("1")), "the on switch wins where it is not");
+    }
+
+    #[test]
+    fn every_blessed_row_names_its_evidence() {
+        for (backend, _, evidence) in super::STORAGE_BLESSED {
+            assert!(evidence.starts_with('§'), "the {backend} row names no measurement");
+        }
     }
 
     /// The door takes exactly the cuts the sweep asks about, spelled as

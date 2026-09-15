@@ -284,6 +284,7 @@ async fn caps_from_fresh_adapter() -> DeviceCaps {
         name: info.name.clone(),
         backend: format!("{:?}", info.backend),
         device_type: format!("{:?}", info.device_type),
+        vendor_id: info.vendor,
         driver: format!("{} ({})", info.driver, info.driver_info),
         max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size as u64,
         max_buffer_size: limits.max_buffer_size,
@@ -412,6 +413,8 @@ pub struct DeviceCaps {
     pub backend: String,
     /// Device type ("IntegratedGpu", "DiscreteGpu", ...).
     pub device_type: String,
+    /// PCI vendor id the adapter reports (0 where there is none, as on the CPU floor).
+    pub vendor_id: u32,
     /// Driver name + info string.
     pub driver: String,
     /// `max_storage_buffer_binding_size`: the hard cap on a single GPU
@@ -457,6 +460,7 @@ fn cpu_caps() -> DeviceCaps {
         name: "cpu (ndarray)".to_string(),
         backend: "cpu".to_string(),
         device_type: "Cpu".to_string(),
+        vendor_id: 0,
         driver: "burn ndarray, pure Rust".to_string(),
         // No device buffers exist; zero is the honest answer, and a
         // planner reading these must not conclude a GPU is present.
@@ -479,6 +483,23 @@ pub fn device_caps(device: &CombsDevice) -> DeviceCaps {
     #[cfg(not(feature = "cpu"))]
     {
         context().caps.clone()
+    }
+}
+
+/// The adapter's identity and limits without initializing anything: the
+/// retained context when a setup ran, else a plain adapter query. Safe to
+/// ask after tensors exist, where a second setup would panic.
+pub fn adapter_caps() -> DeviceCaps {
+    #[cfg(feature = "cpu")]
+    {
+        return cpu_caps();
+    }
+    #[cfg(not(feature = "cpu"))]
+    {
+        match CONTEXT.get() {
+            Some(ctx) => ctx.caps.clone(),
+            None => cubecl::future::block_on(caps_from_fresh_adapter()),
+        }
     }
 }
 
@@ -522,6 +543,7 @@ fn caps_from_setup(setup: &WgpuSetup) -> DeviceCaps {
         name: info.name.clone(),
         backend: format!("{:?}", info.backend),
         device_type: format!("{:?}", info.device_type),
+        vendor_id: info.vendor,
         driver: format!("{} ({})", info.driver, info.driver_info),
         max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size as u64,
         max_buffer_size: limits.max_buffer_size,
