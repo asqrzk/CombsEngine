@@ -1,0 +1,823 @@
+//! # Asking the engine, and reading what the asking cost.
+//!
+//! ## Why this is not in `cmds.rs`
+//!
+//! `cmds.rs` drives BINARIES: it finds `combs`, spawns it, watches a log.
+//! This half drives a SOCKET — it speaks the engine's own wire and reads
+//! its accounting. The two share a display and nothing else, and the
+//! rules worth testing here are rules about numbers, not about
+//! processes. So the decisions live in pure functions with their tests
+//! beside them, and the body below is the thin part that holds a socket.
+//!
+//! ## The number this module exists to refuse
+//!
+//! The engine reports `timing.prefill_tok_s`, and it is a trap: it
+//! divides the WHOLE prompt by the time to first token, cached tokens
+//! included. On a warm session that reads as over a thousand tokens a
+//! second for work the engine did not do. Every rate printed here is
+//! computed from what was actually prefilled, and the one rate that
+//! cannot honestly be computed — the decode rate of a one-token answer —
+//! is printed as a dash rather than a zero that reads as slow.
+
+use crate::api::Cost;
+use crate::state::{Liveness, Run};
+use crate::ui;
+
+/// Which seat answers, and when none does, what to type instead.
+///
+/// A record is not a seat. `ps` learned this the hard way: a record, a
+/// pid and a port must all agree before a process counts as ours, and a
+/// pid alone calls a zombie alive. So the caller passes the liveness it
+/// measured and this only decides.
+pub fn seat<'a>(
+    runs: &'a [Run],
+    role: &str,
+    live: impl Fn(&Run) -> Liveness,
+) -> Result<&'a Run, String> {
+    let mine: Vec<&Run> = runs.iter().filter(|r| r.role == role).collect();
+    if mine.is_empty() {
+        return Err(format!(
+            "no {role} engine is recorded — combs-tk up <model> --role {role}"
+        ));
+    }
+    // A seat that is merely recorded is not a seat, so the three states
+    // are told apart by name: waiting on a loading engine is patience,
+    // and clearing a stale record is work.
+    let mut starting = false;
+    for r in mine {
+        match live(r) {
+            Liveness::Up => return Ok(r),
+            Liveness::Starting => starting = true,
+            Liveness::Stale => {}
+        }
+    }
+    if starting {
+        Err(format!(
+            "the {role} engine is still starting — combs-tk ps, then ask again"
+        ))
+    } else {
+        Err(format!(
+            "the {role} engine's record is stale: its process is gone — combs-tk up <model> --role {role}"
+        ))
+    }
+}
+
+/// The answer without the model's thinking.
+///
+/// Qwen3 emits a `<think>` block even when told not to think — an empty
+/// one, which reads as a stutter at the head of every reply. An unclosed
+/// block means the model is thinking still, so everything after the open
+/// tag is folded too rather than printed as if it were the answer.
+pub fn fold_think(text: &str) -> String {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(OPEN) {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + OPEN.len()..];
+        match after.find(CLOSE) {
+            Some(end) => rest = &after[end + CLOSE.len()..],
+            // Still thinking: nothing past the open tag is an answer yet.
+            None => return out.trim().to_string(),
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
+/// What a finish reason costs at the exit.
+///
+/// A truncated answer is not a success. It looks like one — the bytes
+/// arrived, the socket closed cleanly — and a script that believes it
+/// will carry half an answer forward as though it were whole.
+pub fn code_for(finish: Option<&str>) -> i32 {
+    match finish {
+        Some("length") => 3,
+        _ => 0,
+    }
+}
+
+/// The one line a person reads after an answer.
+///
+/// Every rate here is computed from work the engine actually did, and a
+/// rate that cannot be computed is a dash. A zero in that place reads as
+/// "slow" when the truth is "there was nothing to measure".
+pub fn ledger(cost: &Cost, dispatches: Option<f64>) -> String {
+    fn rate(v: Option<f64>) -> String {
+        match v {
+            Some(r) => format!("{r:.1} t/s"),
+            None => "—".to_string(),
+        }
+    }
+    let mut line = format!(
+        "prompt {} · skipped {} · computed {} · prefill {} ({} computed) · answer {} tok / {} / {}",
+        cost.skipped + cost.computed,
+        cost.skipped,
+        cost.computed,
+        ui::ms(cost.prefill_ms),
+        rate(cost.computed_tok_s),
+        cost.answer_tokens,
+        ui::ms(cost.answer_ms),
+        rate(cost.decode_tok_s),
+    );
+    // The engine reports zero dispatches a token for a one-token answer,
+    // and that is not "no work" — the prefill plainly ran. It is a
+    // figure that means nothing at this length, so it reads as a dash
+    // like every other rate that cannot honestly be computed.
+    match dispatches {
+        Some(d) if d > 0.0 => line.push_str(&format!(" · {d:.0} disp/tok")),
+        _ => line.push_str(" · — disp/tok"),
+    }
+    line
+}
+
+/// The spread of a set of readings, and whether it may be headlined.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Spread {
+    pub median: f64,
+    pub low: f64,
+    pub high: f64,
+    /// How far the readings ranged, as a percentage of the median.
+    pub pct: f64,
+    /// How many readings it rests on. Carried because a percentage
+    /// cannot say this by itself, and zero percent of one reading looks
+    /// exactly like perfect agreement.
+    pub readings: usize,
+}
+
+impl Spread {
+    /// Past this band the readings are a range, not a number, and the
+    /// range is what gets printed.
+    pub const BAND: f64 = 10.0;
+
+    /// Whether these readings agree well enough to quote one number.
+    ///
+    /// One reading has nothing to agree with. It still gets reported —
+    /// it is all there is — but it is never called steady: against a
+    /// live engine the lone reading is the cold one, which prefilled at
+    /// 6.5 tokens a second where the warm pair beside it read above 100.
+    pub fn steady(&self) -> bool {
+        self.readings >= 2 && self.pct <= Self::BAND
+    }
+}
+
+/// The readings that count: every one but the first.
+///
+/// Run one of a model pays for a cold cache and a cold autotune, and it
+/// has told four separate lies in this estate's records. A single
+/// reading is still reported — it is all there is — but it is never
+/// called warm.
+pub fn warm(values: &[f64]) -> &[f64] {
+    if values.len() > 1 {
+        &values[1..]
+    } else {
+        values
+    }
+}
+
+/// The median and the range, or None when there is nothing to measure.
+pub fn spread(values: &[f64]) -> Option<Spread> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut v = values.to_vec();
+    // These readings come from the engine's own accounting and are never
+    // NaN, but a total order costs nothing and does not rest on that.
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = v.len() / 2;
+    let median = if v.len() % 2 == 1 {
+        v[mid]
+    } else {
+        (v[mid - 1] + v[mid]) / 2.0
+    };
+    let low = v[0];
+    let high = v[v.len() - 1];
+    let pct = if median > 0.0 {
+        (high - low) / median * 100.0
+    } else {
+        0.0
+    };
+    Some(Spread {
+        median,
+        low,
+        high,
+        pct,
+        readings: v.len(),
+    })
+}
+
+/// A thought folded out of an answer while it is still arriving.
+///
+/// [`fold_think`] needs the whole text and a stream does not have it. A
+/// reader watching tokens land must never see a sentence that a later
+/// `</think>` would take back, so anything that might still turn out to
+/// be a thought is held until it is known — including a tag chopped
+/// across two deltas, which is the ordinary case at a 16-byte chunk.
+#[derive(Debug, Default)]
+pub struct Folder {
+    held: String,
+    thinking: bool,
+}
+
+impl Folder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Take a piece of the stream; hand back only what is safe to print.
+    pub fn push(&mut self, delta: &str) -> String {
+        const OPEN: &str = "<think>";
+        const CLOSE: &str = "</think>";
+        self.held.push_str(delta);
+        let mut out = String::new();
+        loop {
+            let tag = if self.thinking { CLOSE } else { OPEN };
+            match self.held.find(tag) {
+                Some(at) => {
+                    // Everything before an opening tag is answer; before a
+                    // closing tag it is thought, and is dropped.
+                    if !self.thinking {
+                        out.push_str(&self.held[..at]);
+                    }
+                    self.held = self.held[at + tag.len()..].to_string();
+                    self.thinking = !self.thinking;
+                }
+                None => {
+                    // No tag yet — but the tail may be the front of one,
+                    // which at a small chunk size is the ordinary case.
+                    let keep = partial_tag(&self.held, tag);
+                    let cut = self.held.len() - keep;
+                    if !self.thinking {
+                        out.push_str(&self.held[..cut]);
+                    }
+                    self.held = self.held[cut..].to_string();
+                    return out;
+                }
+            }
+        }
+    }
+
+    /// The stream ended. Whatever is left, unless it is a thought that
+    /// never closed — the model was still thinking when it ran out.
+    pub fn finish(&mut self) -> String {
+        if self.thinking {
+            self.held.clear();
+            return String::new();
+        }
+        std::mem::take(&mut self.held)
+    }
+}
+
+/// How many bytes at the end of `s` could still be the front of `tag`.
+///
+/// Held back rather than printed, because a delta boundary falls
+/// wherever the engine's chunking puts it and `<thi` + `nk>` is one tag,
+/// not four characters of answer.
+fn partial_tag(s: &str, tag: &str) -> usize {
+    let max = (tag.len() - 1).min(s.len());
+    (1..=max)
+        .rev()
+        .find(|&n| s.is_char_boundary(s.len() - n) && tag.starts_with(&s[s.len() - n..]))
+        .unwrap_or(0)
+}
+
+// ---- the half that holds a socket ----
+//
+// Everything above is a rule and has its test beside it. Everything
+// below finds a seat, opens a connection and renders — it is proven by
+// running it against a live engine, because that is the only thing that
+// can prove it.
+
+use std::io::Write;
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+use serde_json::json;
+
+use crate::api::{self, Ask, Message};
+use crate::net;
+use crate::render;
+use crate::state;
+use crate::tools::{self, Tool};
+use crate::wire::Frame;
+
+/// A wedged engine must not hold the toolkit forever, but this is an
+/// inactivity timeout and the engine sends a keepalive comment every
+/// 100 ms of idle decode — so it fires only when the engine has truly
+/// stopped talking, never because an answer was long.
+const QUIET_FOR: Duration = Duration::from_secs(300);
+
+fn fail(msg: &str) -> i32 {
+    eprintln!("{} {}", ui::bad("combs-tk:"), msg);
+    1
+}
+
+/// One generation and what it cost.
+struct Reading {
+    text: String,
+    finish: Option<String>,
+    usage: Option<api::Usage>,
+    client_ms: f64,
+}
+
+/// Run one generation, printing the answer as it lands.
+///
+/// The engine's own clock starts after the request leaves its queue, so
+/// the wall measured here is always the longer of the two. Both are
+/// reported: the difference is the queue, and hiding it would make a
+/// busy engine look fast.
+fn generate(port: u16, body: &[u8], show: bool) -> Result<Reading, String> {
+    let mut folder = Folder::new();
+    let mut text = String::new();
+    let mut finish: Option<String> = None;
+    let mut usage: Option<api::Usage> = None;
+    let mut broke: Option<String> = None;
+    let began = Instant::now();
+
+    net::stream(port, "/v1/chat/completions", body, QUIET_FOR, |f| match f {
+        Frame::Content(piece) => {
+            let safe = folder.push(piece);
+            if !safe.is_empty() {
+                text.push_str(&safe);
+                if show {
+                    print!("{safe}");
+                    let _ = std::io::stdout().flush();
+                }
+            }
+        }
+        Frame::Finish(why) => finish = Some(why.clone()),
+        Frame::Usage(v) => usage = api::parse_usage(v),
+        // An in-band error arrives at HTTP 200, so the status line cannot
+        // be trusted to report it and the caller must be told here.
+        Frame::Error(e) => broke = Some(e.clone()),
+        Frame::Calls(_) | Frame::Done => {}
+    })?;
+
+    let tail = folder.finish();
+    if !tail.is_empty() {
+        text.push_str(&tail);
+        if show {
+            print!("{tail}");
+        }
+    }
+    if show {
+        println!();
+        let _ = std::io::stdout().flush();
+    }
+    if let Some(e) = broke {
+        return Err(format!("the engine failed after it had begun answering: {e}"));
+    }
+    Ok(Reading {
+        text,
+        finish,
+        usage,
+        client_ms: began.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
+/// Ask the seat that is up, and price what the asking cost.
+#[allow(clippy::too_many_arguments)]
+pub fn ask(
+    prompt: &str,
+    role: &str,
+    session: Option<&str>,
+    max_tokens: Option<u32>,
+    temperature: Option<f64>,
+    no_think: bool,
+    repeat: usize,
+    json_out: bool,
+) -> i32 {
+    let dir = match state::root() {
+        Ok(d) => d,
+        Err(e) => return fail(&e),
+    };
+    let runs = state::load_all(&dir);
+    let seated = match seat(&runs, role, |r| {
+        state::liveness(state::pid_alive(r.pid), state::port_answers(r.port))
+    }) {
+        Ok(r) => r,
+        // Exit 2, not 1: nothing is wrong with the asking, there is
+        // simply nothing to ask. A script can tell those apart only by
+        // the code.
+        Err(e) => {
+            eprintln!("{} {}", ui::bad("combs-tk:"), e);
+            return 2;
+        }
+    };
+
+    let content = if no_think {
+        format!("{prompt} /no_think")
+    } else {
+        prompt.to_string()
+    };
+    let wanted = Ask {
+        messages: vec![Message { role: "user".into(), content }],
+        max_tokens,
+        temperature,
+        session: session.map(str::to_string),
+        stream: true,
+        ..Ask::default()
+    };
+    let body = match api::chat_body(&wanted) {
+        Ok(b) => b,
+        Err(e) => return fail(&e),
+    };
+    let bytes = body.to_string().into_bytes();
+
+    let repeat = repeat.max(1);
+    if !json_out {
+        println!("{}", ui::head(&render::seat_header("ask", &seated.model)));
+        println!("  {}", ui::dim(&format!("{} on port {}", seated.dtype, seated.port)));
+    }
+
+    let mut readings: Vec<Reading> = Vec::new();
+    for i in 0..repeat {
+        // The answer is shown once: a person wants to read it, not read
+        // it three times. The readings after it are measurement.
+        let r = match generate(seated.port, &bytes, !json_out && i == 0) {
+            Ok(r) => r,
+            Err(e) => return fail(&e),
+        };
+        if !json_out {
+            match &r.usage {
+                Some(u) => println!("  {}", ui::dim(&ledger(&api::cost(u), u.dispatches_per_token))),
+                None => println!(
+                    "  {}",
+                    ui::warn("this generation reported no usage — the numbers below are missing, not zero")
+                ),
+            }
+        }
+        readings.push(r);
+    }
+
+    let rates: Vec<f64> = readings
+        .iter()
+        .filter_map(|r| r.usage.as_ref().and_then(|u| api::cost(u).decode_tok_s))
+        .collect();
+    let steady = spread(warm(&rates));
+
+    if !json_out && repeat > 1 {
+        if let Some(s) = &steady {
+            let line = if s.steady() {
+                ui::good(&format!(
+                    "decode {:.1} t/s, median of {} warm readings",
+                    s.median, s.readings
+                ))
+            } else if s.readings < 2 {
+                // Two generations leave exactly one warm reading, and one
+                // reading has nothing to agree with. Say that, rather
+                // than calling zero percent a range.
+                ui::warn(&format!(
+                    "decode {:.1} t/s from one warm reading — a spread needs two: --repeat 3",
+                    s.median
+                ))
+            } else {
+                ui::warn(&format!(
+                    "decode {:.1}–{:.1} t/s over {} warm readings: a {:.0}% spread is a range, not a number",
+                    s.low, s.high, s.readings, s.pct
+                ))
+            };
+            println!("  {line}");
+        }
+    }
+
+    let finish = readings.last().and_then(|r| r.finish.clone());
+    let code = code_for(finish.as_deref());
+
+    if json_out {
+        let record = json!({
+            "schema": "combs-tk.ask.v1",
+            "seat": seated.model,
+            "role": seated.role,
+            "port": seated.port,
+            "build": { "dtype": seated.dtype, "commit": seated.commit },
+            "readings": readings.iter().map(|r| {
+                let c = r.usage.as_ref().map(api::cost);
+                json!({
+                    "prompt": r.usage.as_ref().map(|u| u.prompt_tokens),
+                    "skipped": c.as_ref().map(|c| c.skipped),
+                    "computed": c.as_ref().map(|c| c.computed),
+                    "prefill_ms": c.as_ref().map(|c| c.prefill_ms),
+                    "computed_tok_s": c.as_ref().and_then(|c| c.computed_tok_s),
+                    "answer_tokens": c.as_ref().map(|c| c.answer_tokens),
+                    "answer_ms": c.as_ref().map(|c| c.answer_ms),
+                    "decode_tok_s": c.as_ref().and_then(|c| c.decode_tok_s),
+                    "dispatches_per_token": r.usage.as_ref().and_then(|u| u.dispatches_per_token),
+                    "session_id": r.usage.as_ref().and_then(|u| u.session_id.clone()),
+                    "client_ms": r.client_ms,
+                    "finish": r.finish,
+                    "answer": r.text,
+                })
+            }).collect::<Vec<_>>(),
+            "warm_decode_tok_s": steady.as_ref().map(|s| json!({
+                "median": s.median,
+                "low": s.low,
+                "high": s.high,
+                "spread_pct": s.pct,
+                // Carried because a percentage cannot say it: zero
+                // percent of one reading looks exactly like agreement.
+                "readings": s.readings,
+                "steady": s.steady(),
+            })),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&record).unwrap_or_else(|_| record.to_string())
+        );
+    } else if code == 3 {
+        eprintln!(
+            "{} {}",
+            ui::bad("combs-tk:"),
+            "the answer stopped at max_tokens: it is half an answer, not a short one"
+        );
+    }
+    code
+}
+
+/// Fetch a model through the engine's own puller.
+pub fn pull(source: &str) -> i32 {
+    let bin = match tools::find(Tool::Engine) {
+        Ok(b) => b,
+        Err(e) => return fail(&e),
+    };
+    // A pull moves gigabytes and reports as it goes. Capturing its output
+    // would hide the one thing worth watching.
+    match Command::new(&bin).arg("pull").arg(source).status() {
+        Ok(s) if s.success() => 0,
+        Ok(s) => fail(&format!(
+            "combs pull {source} exited {}",
+            s.code().unwrap_or(-1)
+        )),
+        Err(e) => fail(&format!("{} could not be run: {e}", bin.display())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Fed one byte at a time, a thought must still leave no trace: the
+    /// reader sees the answer and never the reasoning.
+    #[test]
+    fn a_thought_never_reaches_the_reader_however_it_is_chopped() {
+        let whole = "<think>the capital is Paris</think>Paris.";
+        for chunk in [1usize, 3, 7, 40] {
+            let mut f = Folder::new();
+            let mut out = String::new();
+            let bytes: Vec<char> = whole.chars().collect();
+            for piece in bytes.chunks(chunk) {
+                out.push_str(&f.push(&piece.iter().collect::<String>()));
+            }
+            out.push_str(&f.finish());
+            assert_eq!(out, "Paris.", "a thought leaked at chunk size {chunk}");
+        }
+    }
+
+    /// A tag split across two deltas is still a tag. At a small chunk
+    /// size this is the ordinary case, not the edge.
+    #[test]
+    fn a_tag_split_across_deltas_is_still_a_tag() {
+        let mut f = Folder::new();
+        let mut out = String::new();
+        for d in ["<thi", "nk>hidden</thi", "nk>Hi"] {
+            out.push_str(&f.push(d));
+        }
+        out.push_str(&f.finish());
+        assert_eq!(out, "Hi");
+    }
+
+    /// Text before a thought is the answer and prints; the thought after
+    /// it does not.
+    #[test]
+    fn what_is_not_a_thought_still_reaches_the_reader() {
+        let mut f = Folder::new();
+        let mut out = String::new();
+        out.push_str(&f.push("Hello "));
+        out.push_str(&f.push("<think>hidden</think>"));
+        out.push_str(&f.push("world"));
+        out.push_str(&f.finish());
+        assert!(out.contains("Hello"), "the answer was swallowed: {out:?}");
+        assert!(out.contains("world"), "the answer was swallowed: {out:?}");
+        assert!(!out.contains("hidden"), "the thought leaked: {out:?}");
+    }
+
+    /// A model still thinking when the stream ends has said nothing, and
+    /// a half-thought printed as an answer is how it looks like it lost
+    /// its mind.
+    #[test]
+    fn a_thought_that_never_closed_prints_nothing() {
+        let mut f = Folder::new();
+        let mut out = String::new();
+        out.push_str(&f.push("<think>still going"));
+        out.push_str(&f.finish());
+        assert_eq!(out, "");
+    }
+
+    fn run(role: &str, port: u16) -> Run {
+        Run {
+            role: role.into(),
+            pid: 1,
+            port,
+            model: "qwen3-0.6b-gguf".into(),
+            commit: "abc1234".into(),
+            dtype: "f16".into(),
+            log: PathBuf::from("/dev/null"),
+            started: 0,
+        }
+    }
+
+    /// The refusal has to name the command that fixes it. "no seat" sends
+    /// a person to the source; `combs-tk up <model>` sends them to an
+    /// engine.
+    #[test]
+    fn no_seat_names_the_command_that_makes_one() {
+        let runs = vec![];
+        let e = seat(&runs, "text", |_| Liveness::Up).unwrap_err();
+        assert!(
+            e.contains("combs-tk up"),
+            "a refusal must name the command that makes a seat: {e}"
+        );
+    }
+
+    /// A record whose engine is still coming up is not an error to be
+    /// retried blindly — it is a wait, and the words say which.
+    #[test]
+    fn a_starting_engine_is_told_apart_from_a_missing_one() {
+        let runs = vec![run("text", 9001)];
+        let e = seat(&runs, "text", |_| Liveness::Starting).unwrap_err();
+        assert!(
+            e.contains("starting"),
+            "an engine still coming up must be named as starting: {e}"
+        );
+        let stale = seat(&runs, "text", |_| Liveness::Stale).unwrap_err();
+        assert!(
+            stale.contains("stale") || stale.contains("no longer"),
+            "a dead record must be named as stale: {stale}"
+        );
+    }
+
+    /// The seat answering is the one whose role was asked for, not the
+    /// first record on disk.
+    #[test]
+    fn the_seat_is_the_one_whose_role_was_asked_for() {
+        let runs = vec![run("vision", 9001), run("text", 9002)];
+        let got = seat(&runs, "text", |_| Liveness::Up).expect("a live text seat");
+        assert_eq!(got.port, 9002, "the wrong seat answered");
+    }
+
+    /// The empty thought Qwen3 emits under `/no_think` must not reach the
+    /// reader as a stutter at the head of the answer.
+    #[test]
+    fn an_empty_thought_leaves_no_trace_in_the_answer() {
+        assert_eq!(fold_think("<think>\n\n</think>Paris."), "Paris.");
+    }
+
+    /// A thought with content is folded whole, and a thought still being
+    /// thought folds everything after it — printing a half-thought as the
+    /// answer is how a reasoning model looks like it lost its mind.
+    #[test]
+    fn a_thought_is_folded_whether_or_not_it_finished() {
+        assert_eq!(
+            fold_think("<think>the capital is Paris</think>Paris."),
+            "Paris."
+        );
+        assert_eq!(fold_think("<think>still going"), "");
+        assert_eq!(fold_think("no thought at all"), "no thought at all");
+    }
+
+    /// Truncation is the one finish reason that must not exit zero: the
+    /// answer is half an answer and a script cannot tell by looking.
+    #[test]
+    fn a_truncated_answer_is_not_a_success() {
+        assert_eq!(code_for(Some("stop")), 0);
+        assert_eq!(code_for(Some("tool_calls")), 0);
+        assert_eq!(
+            code_for(Some("length")),
+            3,
+            "a truncated answer must exit non-zero, and 3 is truncation"
+        );
+    }
+
+    /// The ledger prints what was computed, never the engine's own
+    /// prefill rate — which counts cached tokens as work and reads over a
+    /// thousand tokens a second on a warm session.
+    #[test]
+    fn the_ledger_names_the_work_that_was_actually_done() {
+        let c = Cost {
+            skipped: 17,
+            computed: 1,
+            prefill_ms: 10.7,
+            computed_tok_s: Some(93.4),
+            answer_tokens: 24,
+            answer_ms: 251.0,
+            decode_tok_s: Some(91.5),
+        };
+        let line = ledger(&c, Some(916.0));
+        for want in ["prompt 18", "skipped 17", "computed 1", "24 tok"] {
+            assert!(line.contains(want), "the ledger lost {want}: {line}");
+        }
+    }
+
+    /// A one-token answer has no decode rate: the engine's figure covers
+    /// tokens two to N. A zero there reads as "slow" when the truth is
+    /// "not measurable".
+    #[test]
+    fn a_rate_that_cannot_be_measured_is_a_dash_and_not_a_zero() {
+        let c = Cost {
+            skipped: 0,
+            computed: 18,
+            prefill_ms: 140.0,
+            computed_tok_s: Some(128.5),
+            answer_tokens: 1,
+            answer_ms: 0.0,
+            decode_tok_s: None,
+        };
+        let line = ledger(&c, None);
+        assert!(
+            line.contains('—'),
+            "an unmeasurable rate must read as a dash: {line}"
+        );
+        assert!(
+            !line.contains("0.0 t/s"),
+            "an unmeasurable rate must not read as zero: {line}"
+        );
+    }
+
+    /// Run one is never the reading. It pays for a cold cache and a cold
+    /// autotune, and it has lied in this estate's records four separate
+    /// times.
+    #[test]
+    fn the_first_reading_is_dropped_when_there_is_another() {
+        assert_eq!(warm(&[1.0, 2.0, 3.0]).to_vec(), vec![2.0, 3.0]);
+        assert_eq!(warm(&[5.0]).to_vec(), vec![5.0], "one reading is all there is");
+    }
+
+    /// A spread past the band is a range, and the printer must be able to
+    /// tell so without re-deriving it.
+    #[test]
+    fn a_spread_past_the_band_is_not_steady() {
+        let tight = spread(&[100.0, 101.0, 99.0]).expect("three readings");
+        assert_eq!(tight.median, 100.0);
+        assert!(tight.steady(), "2% is not a range: {tight:?}");
+
+        let wide = spread(&[100.0, 180.0, 140.0]).expect("three readings");
+        assert_eq!(wide.median, 140.0);
+        assert!(
+            !wide.steady(),
+            "a 57% spread is a range, not a number: {wide:?}"
+        );
+        assert_eq!(wide.low, 100.0);
+        assert_eq!(wide.high, 180.0);
+    }
+
+    /// Nothing to measure is not a zero.
+    #[test]
+    fn no_readings_have_no_spread() {
+        assert_eq!(spread(&[]), None);
+    }
+
+    /// One reading has nothing to agree with. A spread of zero percent
+    /// across a single generation reads as "steady" when the truth is
+    /// "unmeasured" — and against a live engine the lone reading is the
+    /// cold one, which prefilled at 6.5 t/s where the warm pair read
+    /// above 100. That is the reading that must never be headlined.
+    #[test]
+    fn one_reading_is_not_something_to_call_steady() {
+        let alone = spread(&[93.2]).expect("one reading is still a reading");
+        assert_eq!(alone.median, 93.2, "the number is still reported");
+        assert!(
+            !alone.steady(),
+            "a single reading cannot be steady: {alone:?}"
+        );
+        let pair = spread(&[99.8, 98.6]).expect("two readings");
+        assert!(pair.steady(), "two close readings are steady: {pair:?}");
+    }
+
+    /// The engine reports zero dispatches a token for a one-token
+    /// answer. That is not "no work" — the prefill plainly ran — it is a
+    /// figure that means nothing at this length, and printing it as a
+    /// number invites someone to set it beside a real one.
+    #[test]
+    fn a_dispatch_count_of_zero_is_not_a_measurement() {
+        let c = Cost {
+            skipped: 3,
+            computed: 14,
+            prefill_ms: 2500.0,
+            computed_tok_s: Some(5.6),
+            answer_tokens: 1,
+            answer_ms: 0.0,
+            decode_tok_s: None,
+        };
+        let line = ledger(&c, Some(0.0));
+        assert!(
+            !line.contains("0 disp/tok"),
+            "zero dispatches printed as a measurement: {line}"
+        );
+        assert!(
+            line.contains("— disp/tok"),
+            "an unmeasurable dispatch count must read as a dash: {line}"
+        );
+    }
+}

@@ -27,6 +27,7 @@
 //! Every status names the build behind it — version, dtype, commit —
 //! because "the engine is up" is not a fact until you know which engine.
 
+mod act;
 mod api;
 mod cmds;
 mod net;
@@ -131,6 +132,38 @@ enum Command {
         #[arg(long)]
         arena: Option<usize>,
     },
+    /// Ask the engine that is up, and price what the asking cost.
+    Ask {
+        /// What to ask.
+        prompt: String,
+        /// Which role's engine answers.
+        #[arg(long, default_value = "text")]
+        role: String,
+        /// Name the conversation, so the engine reuses its prefix rather
+        /// than prefilling it again.
+        #[arg(long)]
+        session: Option<String>,
+        /// Stop after this many answer tokens.
+        #[arg(long)]
+        max_tokens: Option<u32>,
+        /// Zero is greedy, and greedy is what a measurement wants.
+        #[arg(long)]
+        temperature: Option<f64>,
+        /// Ask the model not to think first.
+        #[arg(long)]
+        no_think: bool,
+        /// Generations to run. The first is never counted: it pays for a
+        /// cold cache and has lied in this estate's records before.
+        #[arg(long, default_value_t = 1)]
+        repeat: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fetch a model through the engine's own puller.
+    Pull {
+        /// A preset id or `org/name`.
+        source: String,
+    },
 }
 
 fn main() {
@@ -160,6 +193,26 @@ fn main() {
         Command::Measure { model, depths, repeat, arena } => {
             cmds::measure(&model, &depths, repeat, arena)
         }
+        Command::Ask {
+            prompt,
+            role,
+            session,
+            max_tokens,
+            temperature,
+            no_think,
+            repeat,
+            json,
+        } => act::ask(
+            &prompt,
+            &role,
+            session.as_deref(),
+            max_tokens,
+            temperature,
+            no_think,
+            repeat,
+            json,
+        ),
+        Command::Pull { source } => act::pull(&source),
     };
     std::process::exit(code);
 }
