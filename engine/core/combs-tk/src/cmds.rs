@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use crate::render;
 use crate::state::{self, Liveness};
 use crate::tools::{self, Tool};
 use crate::ui::{self, Status};
@@ -205,7 +206,7 @@ pub fn fit(model: &str, context: Option<u64>, kv_per_token: Option<u64>) -> i32 
         Err(e) => return fail(&e),
     };
 
-    println!("{}", ui::head(&format!("fit — {model}")));
+    println!("{}", ui::head(&render::seat_header("fit", model)));
     println!(
         "  {:<22} {} ({} packed, {} widened dense at load)",
         "weights",

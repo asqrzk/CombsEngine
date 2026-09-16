@@ -52,6 +52,67 @@ fn the_shared_resolver_is_a_byte_copy_of_the_cli_s() {
     );
 }
 
+/// Every crate this toolkit is allowed to take, and nothing else.
+///
+/// An ALLOW list, not a deny list, because a deny list only stops the
+/// dependencies somebody already thought of: the guard below it names
+/// six engine and GPU crates, so `ureq`, `tokio` or `sha2` could be
+/// added tomorrow and pass in silence. The toolkit talks to 127.0.0.1
+/// against a server with no TLS and no auth, drives binaries that
+/// already answer every hard question, and is worth keeping near a
+/// megabyte beside an engine of a hundred. Adding a name here is a
+/// decision, and it should read like one.
+const ALLOWED: &[&str] = &["clap", "serde", "serde_json", "console", "libc"];
+
+/// The dependency names a manifest declares, minus the allowed ones.
+/// Pure, so the guard can be shown to catch something before it is
+/// trusted to catch everything.
+fn foreign_deps(manifest: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut in_deps = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_deps = line.contains("dependencies");
+            continue;
+        }
+        if !in_deps || line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((lhs, _)) = line.split_once('=') else {
+            continue;
+        };
+        // `serde.workspace = true` names the crate before the dot.
+        let name = lhs.trim().split('.').next().unwrap_or("").trim();
+        if name.is_empty() || ALLOWED.contains(&name) || found.iter().any(|f| f == name) {
+            continue;
+        }
+        found.push(name.to_string());
+    }
+    found
+}
+
+/// The guard must be shown to catch a smuggled dependency before it is
+/// believed when it says the real manifest is clean — a check that
+/// cannot fail proves nothing about the one it passed.
+#[test]
+fn the_toolkit_takes_only_the_dependencies_it_is_allowed() {
+    let smuggled = "[dependencies]\nclap = \"4\"\nureq = { version = \"3\" }\n";
+    assert_eq!(
+        foreign_deps(smuggled),
+        vec!["ureq".to_string()],
+        "the guard did not catch a dependency nobody allowed"
+    );
+
+    let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+        .expect("read the toolkit's manifest");
+    let foreign = foreign_deps(&manifest);
+    assert!(
+        foreign.is_empty(),
+        "combs-tk has taken dependencies nobody allowed: {foreign:?}"
+    );
+}
+
 /// The toolkit drives binaries; it must not grow a dependency on the
 /// engine crates. Linking combs-core would pull burn, wgpu and cubecl in
 /// for facts the kit already answers, and a toolkit that takes a minute

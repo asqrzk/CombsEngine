@@ -28,6 +28,7 @@
 //! because "the engine is up" is not a fact until you know which engine.
 
 mod cmds;
+mod render;
 mod state;
 mod tools;
 mod ui;
