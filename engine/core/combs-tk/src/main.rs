@@ -30,6 +30,7 @@
 mod act;
 mod api;
 mod cmds;
+mod fence;
 mod net;
 mod render;
 mod state;
