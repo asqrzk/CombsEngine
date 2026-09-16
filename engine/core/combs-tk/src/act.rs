@@ -793,10 +793,28 @@ pub fn judge_call(
         // a typed one. A capability is never a way around the fence.
         _ => {
             let chosen = crate::toolbox::resolve(tool, present)?;
+            let mut line = chosen.line;
+            // An operand comes from the CALL, never from the rung: a host
+            // to ping, a name to look up. It is appended and then the
+            // WHOLE line is judged, so an argument arriving from a model
+            // is not trusted for having arrived through a tool — a host
+            // carrying a chain dies at the character gate rather than
+            // becoming a second command.
+            if let Some(key) = crate::toolbox::find(tool).and_then(|c| c.takes) {
+                let operand = args
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| {
+                        format!("{tool} needs a `{key}`, and this call carries none")
+                    })?;
+                line.push(' ');
+                line.push_str(operand.trim());
+            }
             let policy = p.policy(home);
             Ok(Call {
-                verdict: fence::decide_shell(&chosen.line, &policy),
-                argv: fence::shell_argv(&chosen.line),
+                verdict: fence::decide_shell(&line, &policy),
+                argv: fence::shell_argv(&line),
                 env: fence::fenced_env(),
             })
         }
@@ -826,6 +844,63 @@ pub fn availability(tool: &str, present: impl Fn(&str) -> bool) -> Result<String
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// A capability that needs a host takes it from the call, and the
+    /// host lands at the end of the line the ladder built.
+    #[test]
+    fn a_capability_that_needs_a_host_takes_it_from_the_call() {
+        let c = judge_call(
+            "net.ping",
+            &serde_json::json!({"host": "1.1.1.1"}),
+            &networky(),
+            Path::new("/home/someone"),
+            bsd,
+        )
+        .expect("a judged ping");
+        let line = c.argv.last().expect("a line to run");
+        assert!(line.contains("ping -c"), "{line:?}");
+        assert!(line.ends_with("1.1.1.1"), "the host must reach the line: {line:?}");
+        assert_eq!(c.verdict, Verdict::Allow, "a bounded ping at a literal address is the ordinary reading");
+    }
+
+    /// Needing a host and being given none is a typo, not a run, and the
+    /// refusal names the argument that is missing.
+    #[test]
+    fn a_capability_that_needs_a_host_and_is_given_none_is_refused_by_name() {
+        let e = judge_call(
+            "net.ping",
+            &serde_json::json!({}),
+            &networky(),
+            Path::new("/home/someone"),
+            bsd,
+        )
+        .unwrap_err();
+        assert!(e.contains("host"), "the refusal must name the argument: {e}");
+    }
+
+    /// The rule this whole design rests on: an argument arriving from a
+    /// model is not trusted for having arrived through a tool. The
+    /// composed line goes through the fence like any typed one, so a
+    /// host carrying a chain is refused at the character gate rather
+    /// than becoming a second command.
+    #[test]
+    fn an_operand_cannot_smuggle_shell_syntax_past_the_fence() {
+        for hostile in ["1.1.1.1; rm -rf /", "1.1.1.1 && rm x", "$(rm -rf /)", "a | sh"] {
+            let c = judge_call(
+                "net.ping",
+                &serde_json::json!({ "host": hostile }),
+                &networky(),
+                Path::new("/home/someone"),
+                bsd,
+            )
+            .expect("a judged call");
+            assert!(
+                matches!(c.verdict, Verdict::Refuse(_)),
+                "{hostile:?} was not refused: {:?}",
+                c.verdict
+            );
+        }
+    }
 
     /// A capability with a rung installed says which one answers.
     #[test]

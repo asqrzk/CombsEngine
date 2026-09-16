@@ -50,6 +50,19 @@ pub struct Capability {
     /// reading; the field exists so that stops being an assumption.
     pub read_only: bool,
     pub rungs: &'static [Rung],
+    /// The one argument this capability needs from the CALL rather than
+    /// from its rung: a host to ping, a name to look up.
+    ///
+    /// It is named here and nowhere else, because a second list of which
+    /// tools need a host would be a second truth — and two truths drift
+    /// the first time one of them is updated alone.
+    ///
+    /// The operand is appended and the WHOLE line is then judged by the
+    /// fence, exactly as a typed line is. So a host carrying a semicolon
+    /// is refused at the character gate rather than composed into a
+    /// second command: a capability is not a way around the fence, and
+    /// an argument arriving from a model is not trusted for being one.
+    pub takes: Option<&'static str>,
 }
 
 /// The rung that will answer, and the line it becomes.
@@ -80,6 +93,7 @@ pub const CAPABILITIES: &[Capability] = &[
             Rung { verb: "ifconfig", args: &["-a"] },
             Rung { verb: "ip", args: &["-o", "addr"] },
         ],
+        takes: None,
     },
     Capability {
         name: "net.routes",
@@ -88,6 +102,7 @@ pub const CAPABILITIES: &[Capability] = &[
             Rung { verb: "netstat", args: &["-rn"] },
             Rung { verb: "ip", args: &["route"] },
         ],
+        takes: None,
     },
     Capability {
         name: "net.listeners",
@@ -96,6 +111,7 @@ pub const CAPABILITIES: &[Capability] = &[
             Rung { verb: "lsof", args: &["-nP", "-iTCP", "-sTCP:LISTEN"] },
             Rung { verb: "ss", args: &["-ltn"] },
         ],
+        takes: None,
     },
     Capability {
         name: "net.neighbors",
@@ -104,6 +120,7 @@ pub const CAPABILITIES: &[Capability] = &[
             Rung { verb: "arp", args: &["-an"] },
             Rung { verb: "ip", args: &["neigh"] },
         ],
+        takes: None,
     },
     Capability {
         name: "net.dns",
@@ -112,11 +129,33 @@ pub const CAPABILITIES: &[Capability] = &[
             Rung { verb: "scutil", args: &["--dns"] },
             Rung { verb: "resolvectl", args: &["status"] },
         ],
+        takes: None,
     },
     Capability {
         name: "net.trace",
         read_only: true,
         rungs: &[Rung { verb: "traceroute", args: &["-n", "-w", "1", "-q", "1", "-m", "12"] }],
+        takes: Some("host"),
+    },
+    // The count is bounded at the rung, not left to the caller: an
+    // unbounded probe is a timeout rather than an answer, and the fence
+    // asks about a ping that carries no `-c` for exactly that reason.
+    // The wait figure beside `-W` is the unit that flag actually means
+    // here — milliseconds on this desk, seconds elsewhere.
+    Capability {
+        name: "net.ping",
+        read_only: true,
+        rungs: &[Rung { verb: "ping", args: &["-c", "1", "-W", PING_WAIT] }],
+        takes: Some("host"),
+    },
+    Capability {
+        name: "net.lookup",
+        read_only: true,
+        rungs: &[
+            Rung { verb: "dig", args: &["+short"] },
+            Rung { verb: "host", args: &[] },
+        ],
+        takes: Some("host"),
     },
 ];
 
@@ -213,24 +252,24 @@ mod tests {
         const FINE: &[Rung] = &[Rung { verb: "ls", args: &["-l"] }];
 
         let cases: [(Capability, &str); 4] = [
-            (Capability { name: "noarea", read_only: true, rungs: FINE }, "area.verb"),
-            (Capability { name: "a.b", read_only: false, rungs: FINE }, "not a reading"),
-            (Capability { name: "a.b", read_only: true, rungs: &[] }, "no rungs"),
-            (Capability { name: "a.b", read_only: true, rungs: SLASHED }, "by path"),
+            (Capability { name: "noarea", read_only: true, rungs: FINE, takes: None }, "area.verb"),
+            (Capability { name: "a.b", read_only: false, rungs: FINE, takes: None }, "not a reading"),
+            (Capability { name: "a.b", read_only: true, rungs: &[], takes: None }, "no rungs"),
+            (Capability { name: "a.b", read_only: true, rungs: SLASHED, takes: None }, "by path"),
         ];
         for (c, want) in cases {
             let e = well_formed(&c)
                 .expect_err(&format!("{:?} should not be well formed", c.name));
             assert!(e.contains(want), "the refusal must say {want:?}: {e}");
         }
-        let spaced = Capability { name: "a.b", read_only: true, rungs: SPACED };
+        let spaced = Capability { name: "a.b", read_only: true, rungs: SPACED, takes: None };
         assert!(
             well_formed(&spaced).is_err(),
             "a word with a space in it is two words wearing one coat"
         );
         // And the positive control: a sound one passes, so the check is
         // not simply refusing everything.
-        let good = Capability { name: "net.things", read_only: true, rungs: FINE };
+        let good = Capability { name: "net.things", read_only: true, rungs: FINE, takes: None };
         assert_eq!(well_formed(&good), Ok(()));
     }
 
