@@ -28,6 +28,7 @@
 //! because "the engine is up" is not a fact until you know which engine.
 
 mod act;
+mod agent;
 mod api;
 mod cmds;
 mod fence;
@@ -167,6 +168,34 @@ enum Command {
         /// A preset id or `org/name`.
         source: String,
     },
+    /// Point a model at this machine and let it reach for the probes.
+    ///
+    /// Exits 0 on an answer, 3 when that answer was cut short, and 4
+    /// when the rounds ran out before one was reached — exhaustion is
+    /// never dressed as success.
+    Agent {
+        /// What to find out.
+        goal: String,
+        /// Which profile bounds it.
+        #[arg(long, default_value = "networky")]
+        profile: String,
+        /// Which role's engine answers.
+        #[arg(long, default_value = "text")]
+        role: String,
+        /// How many times it may reach for tools before it must answer.
+        #[arg(long, default_value_t = 6)]
+        rounds: usize,
+        /// Stop each turn after this many answer tokens.
+        #[arg(long)]
+        max_tokens: Option<u32>,
+        /// Ask the model not to think first. A thinking model on a small
+        /// budget spends all of it inside a thought that never closes,
+        /// and the turn arrives empty.
+        #[arg(long)]
+        no_think: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// What a profile may call, and what one call would do.
     Tool {
         #[command(subcommand)]
@@ -254,6 +283,9 @@ fn main() {
             json,
         ),
         Command::Pull { source } => act::pull(&source),
+        Command::Agent { goal, profile, role, rounds, max_tokens, no_think, json } => {
+            act::agent(&goal, &profile, &role, rounds, max_tokens, no_think, json)
+        }
         Command::Tool { what } => match what {
             ToolCmd::List { profile, json } => act::tool_list(&profile, json),
             ToolCmd::Call { name, args, profile, dry_run, yes } => {

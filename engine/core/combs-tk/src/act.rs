@@ -296,6 +296,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::agent;
 use crate::api::{self, Ask, Message};
 use crate::fence::{self, Verdict};
 use crate::net;
@@ -433,7 +434,7 @@ pub fn ask(
         prompt.to_string()
     };
     let wanted = Ask {
-        messages: vec![Message { role: "user".into(), content }],
+        messages: vec![Message::user(content)],
         max_tokens,
         temperature,
         session: session.map(str::to_string),
@@ -840,6 +841,384 @@ pub fn availability(tool: &str, present: impl Fn(&str) -> bool) -> Result<String
     crate::toolbox::resolve(tool, present).map(|c| c.verb)
 }
 
+/// What the model is offered: one entry per tool the profile names AND
+/// the toolbox has actually built.
+///
+/// A profile may name a capability before it exists — that is how a
+/// profile stays true as its tools land — but offering a name nothing
+/// can answer spends a whole round on a refusal the model had no way to
+/// predict. So the offer is the intersection of the two, and the words
+/// describing each tool come from the capability itself rather than
+/// from a second list kept here, which would drift the first time one
+/// of them was edited alone.
+pub fn offer(p: &Profile, present: impl Fn(&str) -> bool) -> Vec<Value> {
+    let mut out = Vec::new();
+    for name in &p.tools {
+        // The fence answers the shell, not a ladder, so its offer is
+        // written here rather than in the toolbox's table.
+        if name == "shell.run" {
+            out.push(json!({
+                "type": "function",
+                "function": {
+                    "name": "shell.run",
+                    "description": "run one read-only shell line on this machine and read what it printed. \
+                                    Pipes between reading verbs are allowed; anything that writes, destroys, \
+                                    reaches the network, or opens a second shell is refused.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "line": { "type": "string", "description": "the line to run, as plain words and pipes" }
+                        },
+                        "required": ["line"]
+                    }
+                }
+            }));
+            continue;
+        }
+        // Only what this machine can actually answer. A profile may name
+        // a capability before it exists — that is how it stays true as
+        // tools land — but offering one nothing answers spends a whole
+        // round on a refusal the model could not have foreseen.
+        if crate::toolbox::resolve(name, &present).is_err() {
+            continue;
+        }
+        let Some(cap) = crate::toolbox::find(name) else {
+            continue;
+        };
+        let mut props = serde_json::Map::new();
+        let mut required: Vec<Value> = Vec::new();
+        if let Some(key) = cap.takes {
+            props.insert(
+                key.to_string(),
+                json!({ "type": "string", "description": format!("the {key} this reading is about") }),
+            );
+            required.push(json!(key));
+        }
+        out.push(json!({
+            "type": "function",
+            "function": {
+                "name": cap.name,
+                "description": cap.about,
+                "parameters": {
+                    "type": "object",
+                    "properties": Value::Object(props),
+                    "required": required
+                }
+            }
+        }));
+    }
+    out
+}
+
+/// What a verdict means when the one asking is a model.
+///
+/// `Ask` is a REFUSAL here, and that is the whole rule: only a person
+/// can consent, and there is nobody inside a tool call. The fence's own
+/// sentence travels back with it so the model can reformulate, rather
+/// than retry blind against a wall it cannot see.
+pub fn model_verdict(v: &Verdict) -> Result<(), String> {
+    match v {
+        Verdict::Allow => Ok(()),
+        Verdict::Refuse(why) => Err(format!("refused: {why}")),
+        // What the fence merely ASKS about is a refusal here. Only a
+        // person can consent, and there is nobody inside a tool call.
+        Verdict::Ask(why) => Err(format!(
+            "refused: {why}. Only a person may take this one; reformulate it as a bounded reading, or leave it for the person to run."
+        )),
+    }
+}
+
+/// How much of one probe's output travels back into the next prompt.
+/// A chatty reading must not starve the others out of the room, and
+/// what was left out is SAID rather than quietly dropped.
+const READING_CAP: usize = 4000;
+
+fn cap_reading(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= READING_CAP {
+        return s.to_string();
+    }
+    let head_n = READING_CAP * 2 / 3;
+    let tail_n = READING_CAP - head_n;
+    let head: String = chars[..head_n].iter().collect();
+    let tail: String = chars[chars.len() - tail_n..].iter().collect();
+    format!(
+        "{head}\n[... {} characters cut from the middle of this reading ...]\n{tail}",
+        chars.len() - head_n - tail_n
+    )
+}
+
+/// Take one call the model asked for, and say what came back.
+///
+/// It never fails the run: a refusal is itself an answer the model can
+/// act on, and it travels back carrying the fence's own words so the
+/// next turn can reformulate instead of retrying blind.
+fn dispatch_one(c: &agent::ToolCall, p: &Profile, home: &Path) -> String {
+    let call = match judge_call(&c.name, &c.args, p, home, on_fenced_path) {
+        Ok(v) => v,
+        Err(e) => return format!("refused: {e}"),
+    };
+    if let Err(why) = model_verdict(&call.verdict) {
+        return why;
+    }
+    let mut cmd = Command::new(&call.argv[0]);
+    cmd.args(&call.argv[1..]);
+    // The doors are absent by construction: the child gets this list
+    // and nothing of ours.
+    cmd.env_clear();
+    for (k, v) in &call.env {
+        cmd.env(k, v);
+    }
+    match cmd.output() {
+        Ok(out) => {
+            let mut said = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+            let err = String::from_utf8_lossy(&out.stderr);
+            if !err.trim().is_empty() {
+                said.push_str("\n[stderr] ");
+                said.push_str(err.trim());
+            }
+            if !out.status.success() {
+                said.push_str(&format!("\n[exit {}]", out.status.code().unwrap_or(-1)));
+            }
+            // Three states, never two: a reading that printed nothing is
+            // not a reading that failed, and neither is an answer.
+            if said.trim().is_empty() {
+                said = "[this reading printed nothing]".into();
+            }
+            cap_reading(&said)
+        }
+        Err(e) => format!("refused: {} could not be run: {e}", call.argv[0]),
+    }
+}
+
+/// One turn of the engine, read whole.
+struct TurnRead {
+    turn: agent::Turn,
+    usage: Option<api::Usage>,
+    /// The calls in the engine's OWN shape, handed straight back on the
+    /// assistant turn — re-serialising ours could change them.
+    raw_calls: Option<Value>,
+}
+
+/// Ask once, without streaming.
+///
+/// Not streamed on purpose: whether this engine splits a `tool_calls`
+/// array across SSE deltas has never been measured here, and a loop
+/// that guessed would be wrong in a way only a long transcript would
+/// reveal. A plain reply carries the whole array at once, and
+/// `wire::frames` already reads that road.
+fn one_turn(port: u16, body: &[u8]) -> Result<TurnRead, String> {
+    let reply = net::exchange(port, "POST", "/v1/chat/completions", body, QUIET_FOR)?;
+    if reply.head.status != 200 {
+        return Err(format!(
+            "the engine answered {}: {}",
+            reply.head.status,
+            net::error_message(&reply.body)
+        ));
+    }
+    let text = String::from_utf8_lossy(&reply.body);
+    let mut out = agent::Turn::default();
+    let mut usage = None;
+    let mut raw_calls = None;
+    for f in crate::wire::frames(&text)? {
+        match f {
+            Frame::Content(s) => out.content.push_str(&s),
+            Frame::Calls(v) => {
+                out.calls = agent::parse_calls(&v)?;
+                raw_calls = Some(v);
+            }
+            Frame::Finish(r) => out.finish = Some(r),
+            Frame::Usage(u) => usage = api::parse_usage(&u),
+            Frame::Error(e) => out.error = Some(e),
+            Frame::Done => {}
+        }
+    }
+    out.content = fold_think(&out.content);
+    Ok(TurnRead { turn: out, usage, raw_calls })
+}
+
+/// Point a model at this machine and let it reach for the probes.
+#[allow(clippy::too_many_arguments)]
+pub fn agent(
+    goal: &str,
+    profile_name: &str,
+    role: &str,
+    rounds: usize,
+    max_tokens: Option<u32>,
+    no_think: bool,
+    json_out: bool,
+) -> i32 {
+    let home = match state::home() {
+        Ok(h) => h,
+        Err(e) => return fail(&e),
+    };
+    let p = match profile::load(profile_name, &home) {
+        Ok(p) => p,
+        Err(e) => return fail(&e),
+    };
+    let dir = match state::root() {
+        Ok(d) => d,
+        Err(e) => return fail(&e),
+    };
+    let runs = state::load_all(&dir);
+    let seated = match seat(&runs, role, |r| {
+        state::liveness(state::pid_alive(r.pid), state::port_answers(r.port))
+    }) {
+        Ok(r) => r,
+        // Exit 2, as `ask` does: nothing is wrong with the asking, there
+        // is simply nothing to ask.
+        Err(e) => {
+            eprintln!("{} {}", ui::bad("combs-tk:"), e);
+            return 2;
+        }
+    };
+
+    // The roots are the person's own home, not the cache home the
+    // profiles live under.
+    let person_home = std::env::var("HOME").unwrap_or_default();
+    let person = Path::new(&person_home);
+
+    let tools = offer(&p, on_fenced_path);
+    if tools.is_empty() {
+        return fail(&format!(
+            "the {} profile names no tool that is built on this machine — combs-tk tool list",
+            p.name
+        ));
+    }
+
+    let max_rounds = rounds.max(1);
+    let mut st = agent::State { rounds_used: 0, max_rounds };
+    // Qwen3 thinks by default, and a thinking model with a small budget
+    // spends the whole of it inside a `<think>` that never closes — the
+    // turn then arrives empty. The switch is the model's own.
+    let asked = if no_think {
+        format!("{goal} /no_think")
+    } else {
+        goal.to_string()
+    };
+    let mut messages = vec![Message::system(p.system.as_str()), Message::user(asked.as_str())];
+    // One named session: the transcript only grows, so its prefix is
+    // reused rather than prefilled again every round.
+    let session = format!("tk:agent:{role}");
+    let mut steps: Vec<Value> = Vec::new();
+
+    if !json_out {
+        println!("{}", ui::head(&render::seat_header("agent", &seated.model)));
+        println!(
+            "  {}",
+            ui::dim(&format!(
+                "{} on port {} · {} tools offered · at most {max_rounds} rounds",
+                seated.dtype,
+                seated.port,
+                tools.len()
+            ))
+        );
+    }
+
+    loop {
+        let wanted = Ask {
+            messages: messages.clone(),
+            max_tokens,
+            // Greedy. A run whose findings move between repeats is not a
+            // reading of this machine.
+            temperature: Some(0.0),
+            session: Some(session.clone()),
+            stream: false,
+            tools: Some(Value::Array(tools.clone())),
+            ..Ask::default()
+        };
+        let body = match api::chat_body(&wanted) {
+            Ok(b) => b,
+            Err(e) => return fail(&e),
+        };
+        let read = match one_turn(seated.port, &body.to_string().into_bytes()) {
+            Ok(r) => r,
+            Err(e) => return fail(&e),
+        };
+        if !json_out {
+            match &read.usage {
+                Some(u) => println!("  {}", ui::dim(&ledger(&api::cost(u), u.dispatches_per_token))),
+                None => println!(
+                    "  {}",
+                    ui::warn("this turn reported no usage — the numbers are missing, not zero")
+                ),
+            }
+        }
+
+        match agent::next(&st, &read.turn) {
+            agent::Action::Dispatch(calls) => {
+                // The assistant turn goes back in the engine's own shape,
+                // or the next turn sees its own request vanish.
+                messages.push(Message::assistant_calls(
+                    read.raw_calls.clone().unwrap_or_else(|| json!([])),
+                ));
+                for c in &calls {
+                    let said = dispatch_one(c, &p, person);
+                    let refused = said.starts_with("refused:");
+                    if !json_out {
+                        let head: String =
+                            said.lines().next().unwrap_or("").chars().take(72).collect();
+                        let painted = if refused { ui::warn(&head) } else { ui::good(&head) };
+                        println!("  {:<18} {painted}", c.name);
+                    }
+                    steps.push(json!({
+                        "round": st.rounds_used,
+                        "tool": c.name.clone(),
+                        "args": c.args.clone(),
+                        "refused": refused,
+                        "said": said.clone(),
+                    }));
+                    messages.push(Message::tool_result(c.id.as_str(), c.name.as_str(), said));
+                }
+                st.rounds_used += 1;
+            }
+            agent::Action::Answer { text, cut } => {
+                if json_out {
+                    let record = json!({
+                        "schema": "combs-tk.agent.v1",
+                        "seat": seated.model,
+                        "role": seated.role,
+                        "build": { "dtype": seated.dtype, "commit": seated.commit },
+                        "profile": p.name,
+                        "goal": goal,
+                        "no_think": no_think,
+                        "rounds_used": st.rounds_used,
+                        "max_rounds": max_rounds,
+                        "steps": steps,
+                        "answer": text,
+                        "cut": cut,
+                    });
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&record).unwrap_or_else(|_| record.to_string())
+                    );
+                } else {
+                    println!();
+                    println!("{text}");
+                    if cut {
+                        eprintln!(
+                            "{} {}",
+                            ui::bad("combs-tk:"),
+                            "the answer stopped at max_tokens: it is half an answer, not a short one"
+                        );
+                    }
+                }
+                return if cut { 3 } else { 0 };
+            }
+            // Never dressed as success: a half-finished investigation
+            // reporting "done" is worse than one reporting nothing.
+            agent::Action::Exhausted => {
+                let why = format!(
+                    "the run spent all {max_rounds} rounds still reaching for tools and never answered — raise --rounds, or narrow the goal"
+                );
+                eprintln!("{} {}", ui::bad("combs-tk:"), why);
+                return 4;
+            }
+            agent::Action::Failed(why) => return fail(&why),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -949,6 +1328,73 @@ mod tests {
     /// `resolvectl`, `nmap` and `rg` are all absent here.
     fn bsd(verb: &str) -> bool {
         ["ifconfig", "netstat", "lsof", "arp", "scutil", "ping", "traceroute"].contains(&verb)
+    }
+
+    /// A profile names eighteen tools and the toolbox has built eight of
+    /// them. Offering the other ten would spend a round on a refusal the
+    /// model could not have predicted, so the offer is the intersection.
+    #[test]
+    fn only_the_tools_that_exist_here_are_offered() {
+        let names: Vec<String> = offer(&networky(), bsd)
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(names.contains(&"net.routes".to_string()), "a built capability is offered: {names:?}");
+        assert!(names.contains(&"shell.run".to_string()), "the fence answers shell.run: {names:?}");
+        assert!(
+            !names.contains(&"net.scan".to_string()),
+            "net.scan is named by the profile and built by nothing: {names:?}"
+        );
+        assert!(
+            !names.contains(&"tk.scout".to_string()),
+            "tk.scout is not built yet and must not be offered: {names:?}"
+        );
+    }
+
+    /// The model must guess at neither what a tool reads nor what it
+    /// needs to be given.
+    #[test]
+    fn an_offer_carries_its_words_and_names_its_operand() {
+        let tools = offer(&networky(), bsd);
+        let ping = tools
+            .iter()
+            .find(|t| t["function"]["name"] == "net.ping")
+            .expect("ping is built on this desk");
+        assert!(
+            !ping["function"]["description"].as_str().unwrap_or("").is_empty(),
+            "a tool with no description is a name the model must guess at"
+        );
+        assert_eq!(
+            ping["function"]["parameters"]["required"],
+            serde_json::json!(["host"]),
+            "a ping that names no host is a typo, and the schema should say so"
+        );
+        let routes = tools
+            .iter()
+            .find(|t| t["function"]["name"] == "net.routes")
+            .expect("routes is built on this desk");
+        assert_eq!(
+            routes["function"]["parameters"]["required"],
+            serde_json::json!([]),
+            "reading the routing table takes no operand"
+        );
+    }
+
+    /// The consent law at the tool boundary. Only a person can say yes,
+    /// and there is nobody inside a tool call — so an `Ask` comes back
+    /// as a refusal, carrying the fence's own sentence.
+    #[test]
+    fn an_ask_is_a_refusal_when_it_is_a_model_asking() {
+        let e = model_verdict(&Verdict::Ask("ping without -c is unbounded".into()))
+            .expect_err("only a person may take a call the fence merely asks about");
+        assert!(e.contains("unbounded"), "the fence's own sentence must survive: {e}");
+        assert!(e.contains("person"), "it must say who may consent: {e}");
+
+        let r = model_verdict(&Verdict::Refuse("rm is never allowed: it destroys".into()))
+            .expect_err("a refusal is a refusal");
+        assert!(r.contains("destroys"), "the reason must reach the model: {r}");
+
+        assert_eq!(model_verdict(&Verdict::Allow), Ok(()), "an allowed call runs");
     }
 
     /// A capability is resolved through its ladder and comes back as a

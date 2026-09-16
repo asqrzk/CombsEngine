@@ -46,6 +46,10 @@ pub struct Rung {
 pub struct Capability {
     /// `area.verb`, the same shape a profile names.
     pub name: &'static str,
+    /// What this reads, in the words the model is offered. A tool with
+    /// no description is a name the model must guess at, and a guessed
+    /// tool is a wasted round.
+    pub about: &'static str,
     /// Whether answering it can change anything. Everything here is a
     /// reading; the field exists so that stops being an assumption.
     pub read_only: bool,
@@ -88,6 +92,7 @@ pub const PING_WAIT: &str = "1";
 pub const CAPABILITIES: &[Capability] = &[
     Capability {
         name: "net.interfaces",
+        about: "every network interface on this machine, with its addresses, flags and MTU",
         read_only: true,
         rungs: &[
             Rung { verb: "ifconfig", args: &["-a"] },
@@ -97,6 +102,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         name: "net.routes",
+        about: "the routing table: which interface carries the default route, and every route beside it",
         read_only: true,
         rungs: &[
             Rung { verb: "netstat", args: &["-rn"] },
@@ -106,6 +112,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         name: "net.listeners",
+        about: "every TCP port this machine is listening on, and which process holds each one",
         read_only: true,
         rungs: &[
             Rung { verb: "lsof", args: &["-nP", "-iTCP", "-sTCP:LISTEN"] },
@@ -115,6 +122,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         name: "net.neighbors",
+        about: "the neighbour table: the machines this one has recently spoken to on its local network",
         read_only: true,
         rungs: &[
             Rung { verb: "arp", args: &["-an"] },
@@ -124,6 +132,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         name: "net.dns",
+        about: "the DNS resolvers this machine uses, per scope",
         read_only: true,
         rungs: &[
             Rung { verb: "scutil", args: &["--dns"] },
@@ -133,6 +142,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         name: "net.trace",
+        about: "the hops between this machine and a host you name",
         read_only: true,
         rungs: &[Rung { verb: "traceroute", args: &["-n", "-w", "1", "-q", "1", "-m", "12"] }],
         takes: Some("host"),
@@ -144,12 +154,14 @@ pub const CAPABILITIES: &[Capability] = &[
     // here — milliseconds on this desk, seconds elsewhere.
     Capability {
         name: "net.ping",
+        about: "whether a host you name answers, and how long one round trip took",
         read_only: true,
         rungs: &[Rung { verb: "ping", args: &["-c", "1", "-W", PING_WAIT] }],
         takes: Some("host"),
     },
     Capability {
         name: "net.lookup",
+        about: "the addresses a name resolves to",
         read_only: true,
         rungs: &[
             Rung { verb: "dig", args: &["+short"] },
@@ -221,6 +233,11 @@ pub fn well_formed(c: &Capability) -> Result<(), String> {
     if c.rungs.is_empty() {
         return Err(format!("{} is a ladder with no rungs", c.name));
     }
+    // A tool with no words is a name the model must guess at, and a
+    // guessed tool is a round spent finding out what it was.
+    if c.about.trim().is_empty() {
+        return Err(format!("{} does not say what it reads", c.name));
+    }
     for r in c.rungs {
         // A verb carrying a path names a binary of someone's choosing;
         // the fence refuses that, and a ladder must not emit one.
@@ -251,25 +268,26 @@ mod tests {
         const SPACED: &[Rung] = &[Rung { verb: "ls", args: &["-l /etc"] }];
         const FINE: &[Rung] = &[Rung { verb: "ls", args: &["-l"] }];
 
-        let cases: [(Capability, &str); 4] = [
-            (Capability { name: "noarea", read_only: true, rungs: FINE, takes: None }, "area.verb"),
-            (Capability { name: "a.b", read_only: false, rungs: FINE, takes: None }, "not a reading"),
-            (Capability { name: "a.b", read_only: true, rungs: &[], takes: None }, "no rungs"),
-            (Capability { name: "a.b", read_only: true, rungs: SLASHED, takes: None }, "by path"),
+        let cases: [(Capability, &str); 5] = [
+            (Capability { name: "noarea", about: "reads a thing", read_only: true, rungs: FINE, takes: None }, "area.verb"),
+            (Capability { name: "a.b", about: "reads a thing", read_only: false, rungs: FINE, takes: None }, "not a reading"),
+            (Capability { name: "a.b", about: "reads a thing", read_only: true, rungs: &[], takes: None }, "no rungs"),
+            (Capability { name: "a.b", about: "reads a thing", read_only: true, rungs: SLASHED, takes: None }, "by path"),
+            (Capability { name: "a.b", about: "", read_only: true, rungs: FINE, takes: None }, "does not say what it reads"),
         ];
         for (c, want) in cases {
             let e = well_formed(&c)
                 .expect_err(&format!("{:?} should not be well formed", c.name));
             assert!(e.contains(want), "the refusal must say {want:?}: {e}");
         }
-        let spaced = Capability { name: "a.b", read_only: true, rungs: SPACED, takes: None };
+        let spaced = Capability { name: "a.b", about: "reads a thing", read_only: true, rungs: SPACED, takes: None };
         assert!(
             well_formed(&spaced).is_err(),
             "a word with a space in it is two words wearing one coat"
         );
         // And the positive control: a sound one passes, so the check is
         // not simply refusing everything.
-        let good = Capability { name: "net.things", read_only: true, rungs: FINE, takes: None };
+        let good = Capability { name: "net.things", about: "reads a thing", read_only: true, rungs: FINE, takes: None };
         assert_eq!(well_formed(&good), Ok(()));
     }
 

@@ -15,10 +15,58 @@
 use serde_json::{json, Value};
 
 /// One turn of a transcript.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// A tool round-trip needs three things the plain shape cannot carry:
+/// the calls an assistant turn asked for, and — on the result coming
+/// back — which call it answers and which tool answered it. The engine
+/// reads all three (`tool_calls`, `tool_call_id`, `name`), and the chat
+/// template renders them, so leaving them out would make a tool result
+/// arrive as anonymous prose.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Message {
     pub role: String,
     pub content: String,
+    /// An assistant turn's calls, in the engine's own wire shape.
+    pub tool_calls: Option<Value>,
+    /// On a `tool` result: the call it answers.
+    pub tool_call_id: Option<String>,
+    /// On a `tool` result: the tool that answered.
+    pub name: Option<String>,
+}
+
+impl Message {
+    pub fn system(text: impl Into<String>) -> Self {
+        Self { role: "system".into(), content: text.into(), ..Self::default() }
+    }
+
+    pub fn user(text: impl Into<String>) -> Self {
+        Self { role: "user".into(), content: text.into(), ..Self::default() }
+    }
+
+    /// The assistant turn that asked for tools.
+    ///
+    /// Content is an empty STRING and never null: the engine reads
+    /// `content` with a serde default, so absent or `""` is fine while a
+    /// null is a 400 — a scar this estate has already paid for once.
+    pub fn assistant_calls(calls: Value) -> Self {
+        Self {
+            role: "assistant".into(),
+            content: String::new(),
+            tool_calls: Some(calls),
+            ..Self::default()
+        }
+    }
+
+    /// What one tool said, tied to the call that asked for it.
+    pub fn tool_result(id: impl Into<String>, name: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            role: "tool".into(),
+            content: text.into(),
+            tool_call_id: Some(id.into()),
+            name: Some(name.into()),
+            ..Self::default()
+        }
+    }
 }
 
 /// What a caller asks for: the fields the engine reads, and none it
@@ -65,7 +113,19 @@ pub fn chat_body(ask: &Ask) -> Result<Value, String> {
     let messages: Vec<Value> = ask
         .messages
         .iter()
-        .map(|m| json!({ "role": m.role, "content": m.content }))
+        .map(|m| {
+            let mut v = json!({ "role": m.role, "content": m.content });
+            if let Some(c) = &m.tool_calls {
+                v["tool_calls"] = c.clone();
+            }
+            if let Some(id) = &m.tool_call_id {
+                v["tool_call_id"] = json!(id);
+            }
+            if let Some(n) = &m.name {
+                v["name"] = json!(n);
+            }
+            v
+        })
         .collect();
     let mut body = json!({
         "model": "combs",
@@ -182,10 +242,41 @@ mod tests {
     use super::*;
 
     fn ask(text: &str) -> Ask {
-        Ask {
-            messages: vec![Message { role: "user".into(), content: text.into() }],
+        Ask { messages: vec![Message::user(text)], ..Ask::default() }
+    }
+
+    /// An assistant turn that asked for tools must carry them, or the
+    /// template renders a turn that called nothing and the model sees
+    /// its own request vanish.
+    #[test]
+    fn an_assistant_turn_carries_the_calls_it_made() {
+        let calls = json!([{ "id": "call_0", "type": "function",
+            "function": { "name": "net.routes", "arguments": "{}" } }]);
+        let a = Ask {
+            messages: vec![Message::user("what routes"), Message::assistant_calls(calls.clone())],
             ..Ask::default()
-        }
+        };
+        let b = chat_body(&a).expect("builds");
+        assert_eq!(b["messages"][1]["tool_calls"], calls, "the calls must reach the engine");
+        assert_eq!(
+            b["messages"][1]["content"], json!(""),
+            "content is an empty string, never null: the engine 400s on a null"
+        );
+    }
+
+    /// A result must name the call it answers. Without the id the model
+    /// gets an anonymous block of text and cannot tell which probe spoke.
+    #[test]
+    fn a_tool_result_names_the_call_it_answers() {
+        let a = Ask {
+            messages: vec![Message::tool_result("call_0", "net.routes", "default utun4")],
+            ..Ask::default()
+        };
+        let b = chat_body(&a).expect("builds");
+        assert_eq!(b["messages"][0]["role"], "tool");
+        assert_eq!(b["messages"][0]["tool_call_id"], "call_0");
+        assert_eq!(b["messages"][0]["name"], "net.routes");
+        assert_eq!(b["messages"][0]["content"], "default utun4");
     }
 
     /// The body carries what the engine reads and nothing it ignores.
