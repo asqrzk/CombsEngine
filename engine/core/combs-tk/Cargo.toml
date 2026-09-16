@@ -1,0 +1,37 @@
+[package]
+name = "combs-tk"
+version = "0.3.0"
+edition.workspace = true
+license.workspace = true
+description = "Combs Toolkit: know the box, run the engine, watch it work"
+
+[[bin]]
+name = "combs-tk"
+path = "src/main.rs"
+
+# The toolkit DRIVES binaries; it does not re-implement them, and it does
+# not link them either. That is why this crate builds in seconds and ships
+# a small binary while `combs` is a hundred megabytes: linking combs-core
+# would pull in burn, wgpu and cubecl for facts the kit already answers
+# through `combs-kit system --json` — the same one implementation the
+# engine, the CLI and the kit share.
+#
+# The boundary is also forced by the tools themselves: a doctor run must
+# own its process (a GPU teardown is not re-entrant), and the kit's
+# one-subject-per-process law means a measurement can never be taken
+# in-process anyway. A toolkit that re-implemented either would be a
+# second answer to a question that already has one.
+[dependencies]
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Colour, width and cursor control for the status block. Already a
+# workspace dependency (the CLI's pull and chew use it), so the display
+# costs no new crate: `clear_last_lines` redraws in place on a terminal,
+# and every line falls back to plain text when stdout is not one.
+console = { workspace = true }
+
+# Process liveness (kill(pid, 0)), signals, and restoring SIGPIPE so
+# piping the toolkit into `head` ends quietly instead of panicking.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

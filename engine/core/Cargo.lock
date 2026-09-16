@@ -1366,6 +1366,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "combs-tk"
+version = "0.3.0"
+dependencies = [
+ "clap",
+ "console",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "combs-wasm"
 version = "0.3.0"
 dependencies = [

@@ -377,6 +377,9 @@ fn cmd_gates(ctx: &Ctx, quick: bool, strict: bool) -> Result<()> {
     // kit's record and child protocol) and no GPU; they ride every gate.
     tier("cli", &["test", "--release", "-p", "combs-cli"]);
     tier("kit", &["test", "--release", "-p", "combs-kit"]);
+    // The toolkit links neither the engine nor the kit and takes no GPU,
+    // so its tests are pure and cost seconds; it rides every gate.
+    tier("tk", &["test", "--release", "-p", "combs-tk"]);
     // xtask's own tests hold the byte-equality drift guards for the build
     // stamp files copied into combs-cli and combs-kit; nothing else runs them.
     tier("xtask", &["test", "-p", "xtask"]);
