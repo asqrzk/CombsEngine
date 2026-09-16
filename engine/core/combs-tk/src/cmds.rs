@@ -120,15 +120,7 @@ pub fn doctor(model: Option<&str>, json: bool) -> i32 {
 }
 
 fn cache_root() -> Result<PathBuf, String> {
-    let home = std::env::var("COMBS_HOME")
-        .map(PathBuf::from)
-        .or_else(|_| {
-            std::env::var("HOME")
-                .or_else(|_| std::env::var("USERPROFILE"))
-                .map(|h| PathBuf::from(h).join(".cache/combs"))
-        })
-        .map_err(|_| "cannot locate a home directory (set COMBS_HOME)".to_string())?;
-    Ok(home.join("models"))
+    Ok(state::home()?.join("models"))
 }
 
 /// Bytes on disk under a directory, one level of nesting deep — enough

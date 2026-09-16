@@ -60,18 +60,38 @@ pub fn identity(path: &str) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// The cache home, from what the environment says. Pure over its two
+/// readings, so the rule is testable without touching the process
+/// environment — which a parallel suite cannot read safely, as this
+/// crate already learned from its counters.
+///
+/// One function, because the same eight lines had been written twice —
+/// here and in the model listing — and a third caller was about to copy
+/// them again. That is how `fit` came to print a home path: the rule
+/// lived at each call site instead of in one place, and the newest site
+/// forgot it.
+pub fn home_from(combs_home: Option<&str>, home: Option<&str>) -> Result<PathBuf, String> {
+    if let Some(c) = combs_home {
+        return Ok(PathBuf::from(c));
+    }
+    home.map(|h| PathBuf::from(h).join(".cache/combs"))
+        .ok_or_else(|| "cannot locate a home directory (set COMBS_HOME)".to_string())
+}
+
+/// The cache home this process uses: `COMBS_HOME`, else the platform's
+/// home with `.cache/combs` beneath it.
+pub fn home() -> Result<PathBuf, String> {
+    let combs = std::env::var("COMBS_HOME").ok();
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok();
+    home_from(combs.as_deref(), home.as_deref())
+}
+
 /// Where runs are remembered. Under the same root the cache uses, so a
 /// person has one directory to look in and one to clear.
 pub fn root() -> Result<PathBuf, String> {
-    let home = std::env::var("COMBS_HOME")
-        .map(PathBuf::from)
-        .or_else(|_| {
-            std::env::var("HOME")
-                .or_else(|_| std::env::var("USERPROFILE"))
-                .map(|h| PathBuf::from(h).join(".cache/combs"))
-        })
-        .map_err(|_| "cannot locate a home directory (set COMBS_HOME)".to_string())?;
-    Ok(home.join("tk/runs"))
+    Ok(home()?.join("tk/runs"))
 }
 
 pub fn save(dir: &Path, run: &Run) -> Result<(), String> {
@@ -206,6 +226,39 @@ pub fn wait_for_start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `COMBS_HOME` is the operator's word and wins outright.
+    #[test]
+    fn combs_home_is_the_home_when_it_is_set() {
+        // Synthetic homes, never this machine's: a tracked file that
+        // carried a real one could not be shared.
+        assert_eq!(
+            home_from(Some("/srv/combs"), Some("/home/someone")),
+            Ok(PathBuf::from("/srv/combs"))
+        );
+    }
+
+    /// Without it the cache lives under the person's home, where the
+    /// engine's own puller already puts the models.
+    #[test]
+    fn without_combs_home_the_cache_lives_under_home() {
+        assert_eq!(
+            home_from(None, Some("/home/someone")),
+            Ok(PathBuf::from("/home/someone/.cache/combs"))
+        );
+    }
+
+    /// No home at all is refused by name: the refusal says which
+    /// variable would fix it, so a person is sent to their shell and not
+    /// to the source.
+    #[test]
+    fn no_home_at_all_is_refused_by_name() {
+        let e = home_from(None, None).unwrap_err();
+        assert!(
+            e.contains("COMBS_HOME"),
+            "the refusal must name the variable that fixes it: {e}"
+        );
+    }
 
     fn run(role: &str, port: u16) -> Run {
         Run {
