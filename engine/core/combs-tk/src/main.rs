@@ -27,11 +27,14 @@
 //! Every status names the build behind it — version, dtype, commit —
 //! because "the engine is up" is not a fact until you know which engine.
 
+mod api;
 mod cmds;
+mod net;
 mod render;
 mod state;
 mod tools;
 mod ui;
+mod wire;
 
 use clap::{Parser, Subcommand};
 

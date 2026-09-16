@@ -1,0 +1,8 @@
+HTTP/1.1 200 OK
+Server: tiny-http (Rust)
+Date: Wed, 16 Sep 2026 13:29:01 GMT
+Content-Type: application/json
+Access-Control-Allow-Origin: *
+Content-Length: 679
+
+{"choices":[{"finish_reason":"length","index":0,"logprobs":null,"message":{"content":"<think>\n\n</think>\n\nCount from one to five:  \n1, 2, 3, 4, 5","role":"assistant"}}],"created":1789565341,"id":"chatcmpl-combs-1789565340","model":"model.gguf","object":"chat.completion","usage":{"cache":{"cached_tokens":0,"pages_used":3},"completion_tokens":24,"dispatch":{"decode_total":21988,"per_token":916.1666666666666,"prefill_total":2385,"submits_per_token":58.5},"prompt_tokens":18,"prompt_tokens_details":{"cached_tokens":0},"session_id":null,"timing":{"decode_tok_s":89.84648470237813,"prefill_tok_s":73.6739457207205,"total_ms":500.312125,"ttft_ms":244.31975},"total_tokens":42}}

@@ -1,0 +1,8 @@
+HTTP/1.1 400 Bad Request
+Server: tiny-http (Rust)
+Date: Wed, 16 Sep 2026 13:29:01 GMT
+Content-Type: application/json
+Access-Control-Allow-Origin: *
+Content-Length: 85
+
+{"error":{"message":"`messages` must be a non-empty array","type":"invalid_request"}}
