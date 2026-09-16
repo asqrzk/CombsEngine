@@ -35,6 +35,7 @@ mod net;
 mod profile;
 mod render;
 mod state;
+mod toolbox;
 mod tools;
 mod ui;
 mod wire;

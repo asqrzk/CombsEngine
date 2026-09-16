@@ -316,6 +316,24 @@ fn fail(msg: &str) -> i32 {
     1
 }
 
+/// Does this verb exist where the fenced child would look for it?
+///
+/// Asked against the fence's OWN pinned PATH rather than the caller's,
+/// because the child is given that PATH and nothing else. Answering from
+/// the ambient environment would let a ladder choose a rung the child
+/// then cannot find — a refusal at exec, long after the decision, and
+/// nowhere near the rule that made it.
+fn on_fenced_path(verb: &str) -> bool {
+    fence::fenced_env()
+        .iter()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, path)| {
+            path.split(':')
+                .any(|dir| std::path::Path::new(dir).join(verb).is_file())
+        })
+        .unwrap_or(false)
+}
+
 /// One generation and what it cost.
 struct Reading {
     text: String,
@@ -556,12 +574,17 @@ pub fn pull(source: &str) -> i32 {
     }
 }
 
-/// Which tools the toolbox has actually built. A profile may name more
-/// than exists — that is the point of naming them ahead — so the list a
-/// person reads says which are real today rather than implying all are.
-const BUILT: &[&str] = &["shell.run"];
+/// What answers this tool on this machine, or why nothing does.
+///
+/// Asked of the toolbox rather than kept in a list beside it. A parallel
+/// list is a second truth, and two truths drift the first time a
+/// capability lands and nobody remembers the other place — which is how
+/// the cache home came to be resolved twice in this same crate.
+fn answers_here(tool: &str) -> Result<String, String> {
+    availability(tool, on_fenced_path)
+}
 
-/// What this profile allows, and which of those exist today.
+/// What this profile allows, and which of those exist here.
 pub fn tool_list(profile_name: &str, json_out: bool) -> i32 {
     let home = match state::home() {
         Ok(h) => h,
@@ -577,10 +600,22 @@ pub fn tool_list(profile_name: &str, json_out: bool) -> i32 {
             "profile": p.name,
             "about": p.about,
             "roots": p.roots,
-            "tools": p.tools.iter().map(|t| json!({
-                "name": t,
-                "built": BUILT.contains(&t.as_str()),
-            })).collect::<Vec<_>>(),
+            "tools": p.tools.iter().map(|t| {
+                let by = answers_here(t);
+                json!({
+                    "name": t,
+                    "built": by.is_ok(),
+                    // Which implementation would answer HERE. Two records
+                    // of the same capability are not comparable without
+                    // it: `netstat -rn` and `ip route` are one fact read
+                    // two ways.
+                    "answered_by": by.as_ref().ok(),
+                    // And when nothing answers, WHY — because "never
+                    // taught" and "nothing installed" send a person to
+                    // different places, and only one is a package manager.
+                    "unavailable": by.as_ref().err(),
+                })
+            }).collect::<Vec<_>>(),
         });
         println!(
             "{}",
@@ -591,10 +626,16 @@ pub fn tool_list(profile_name: &str, json_out: bool) -> i32 {
     println!("{}", ui::head(&format!("{} — {}", p.name, p.about)));
     println!("  {:<10} {}", "roots", p.roots.join(", "));
     for t in &p.tools {
-        let state = if BUILT.contains(&t.as_str()) {
-            ui::good("built")
-        } else {
-            ui::dim("not built yet")
+        let state = match answers_here(t) {
+            Ok(by) => ui::good(&format!("built · {by}")),
+            // Say WHICH failure it is. "nothing here answers it" sent a
+            // person to install `ping` and `dig`, which were already
+            // installed — the toolbox had simply never been taught those
+            // capabilities, and that is not a thing anyone can install.
+            Err(why) if why.contains("not a capability") => {
+                ui::dim("not taught to the toolbox yet")
+            }
+            Err(why) => ui::warn(&why),
         };
         println!("  {t:<18} {state}");
     }
@@ -629,7 +670,7 @@ pub fn tool_call(
     // The roots are the person's own home, not the cache home the
     // profiles live under.
     let person = std::env::var("HOME").unwrap_or_default();
-    let call = match judge_call(tool, &args, &p, Path::new(&person)) {
+    let call = match judge_call(tool, &args, &p, Path::new(&person), on_fenced_path) {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
@@ -709,7 +750,19 @@ pub struct Call {
 
 /// Judge one tool call against a profile. Pure: it spawns nothing, reads
 /// no clock, and touches no socket.
-pub fn judge_call(tool: &str, args: &Value, p: &Profile, home: &Path) -> Result<Call, String> {
+///
+/// `present` answers whether a verb exists on this machine, and is
+/// passed in rather than read for the same reason the ladder takes it:
+/// the rule has to be testable on a box with the opposite set of tools
+/// installed, which is the whole reason a ladder exists at all.
+pub fn judge_call(
+    tool: &str,
+    args: &Value,
+    p: &Profile,
+    home: &Path,
+    present: impl Fn(&str) -> bool,
+) -> Result<Call, String> {
+    let _ = &present;
     // Deny by default, and name the door that was shut. "invalid" sends
     // a person to the source; naming the tool sends them to the profile.
     if !p.allows(tool) {
@@ -731,14 +784,42 @@ pub fn judge_call(tool: &str, args: &Value, p: &Profile, home: &Path) -> Result<
                 env: fence::fenced_env(),
             })
         }
-        // Named by the profile but not built yet. Refused at the CALL
-        // rather than at parse, so a profile may be written ahead of the
-        // tools it describes and stay true as they land.
-        _ => Err(format!(
-            "{tool} is named by the {} profile but is not built yet",
-            p.name
-        )),
+        // A capability: resolved through its ladder, then judged like any
+        // other line. The ladder chooses WHICH implementation answers —
+        // `netstat -rn` here, `ip route` on a box that has neither — and
+        // refuses by name when nothing on this machine can answer at all.
+        //
+        // What comes back is a line the fence judges exactly as it judges
+        // a typed one. A capability is never a way around the fence.
+        _ => {
+            let chosen = crate::toolbox::resolve(tool, present)?;
+            let policy = p.policy(home);
+            Ok(Call {
+                verdict: fence::decide_shell(&chosen.line, &policy),
+                argv: fence::shell_argv(&chosen.line),
+                env: fence::fenced_env(),
+            })
+        }
     }
+}
+
+/// What answers this tool here — or, failing that, WHY nothing does.
+///
+/// Pure, so the two failures can be told apart without a machine that
+/// has the opposite tools installed. The distinction is the whole point:
+/// "the toolbox has never heard of this" and "nothing that answers it is
+/// installed" are different problems, and collapsing them sends a person
+/// to install software they already have.
+pub fn availability(tool: &str, present: impl Fn(&str) -> bool) -> Result<String, String> {
+    // The shell is not a ladder — the fence itself is what answers it.
+    if tool == "shell.run" {
+        return Ok("the fence".into());
+    }
+    // The ladder already words its two failures differently. Carrying
+    // them out rather than flattening them to None is the whole fix:
+    // "never taught" and "nothing installed" send a person to different
+    // places, and only one of them is their package manager.
+    crate::toolbox::resolve(tool, present).map(|c| c.verb)
 }
 
 #[cfg(test)]
@@ -746,8 +827,107 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// A capability with a rung installed says which one answers.
+    #[test]
+    fn availability_names_the_implementation_that_answers() {
+        assert_eq!(availability("net.routes", bsd), Ok("netstat".into()));
+        assert_eq!(availability("net.interfaces", bsd), Ok("ifconfig".into()));
+    }
+
+    /// The fence is not a ladder, but it is what answers `shell.run`.
+    #[test]
+    fn the_fence_is_what_answers_a_shell_line() {
+        assert!(availability("shell.run", bsd).is_ok());
+    }
+
+    /// A tool nothing has taught the toolbox is NOT the same as one
+    /// whose implementations are missing — and the words must say which,
+    /// or a person goes and installs something they already have.
+    #[test]
+    fn a_tool_the_toolbox_never_learned_is_told_apart_from_a_missing_one() {
+        let unknown = availability("net.scan", bsd).unwrap_err();
+        assert!(
+            unknown.contains("not a capability"),
+            "an unlearned tool must say so: {unknown}"
+        );
+
+        let missing = availability("net.routes", |_| false).unwrap_err();
+        assert!(
+            missing.contains("installed"),
+            "a missing implementation must say so: {missing}"
+        );
+        assert!(
+            missing.contains("netstat"),
+            "and name what it looked for: {missing}"
+        );
+        assert_ne!(
+            unknown, missing,
+            "the two failures must not read the same"
+        );
+    }
+
     fn networky() -> Profile {
         profile::parse(profile::NETWORKY).expect("the shipped profile parses")
+    }
+
+    /// What this desk actually has. Measured, not assumed: `ip`, `ss`,
+    /// `resolvectl`, `nmap` and `rg` are all absent here.
+    fn bsd(verb: &str) -> bool {
+        ["ifconfig", "netstat", "lsof", "arp", "scutil", "ping", "traceroute"].contains(&verb)
+    }
+
+    /// A capability is resolved through its ladder and comes back as a
+    /// line the fence has judged — not as "not built yet".
+    #[test]
+    fn a_capability_resolves_through_its_ladder_and_is_judged() {
+        let c = judge_call(
+            "net.routes",
+            &serde_json::json!({}),
+            &networky(),
+            Path::new("/home/someone"),
+            bsd,
+        )
+        .expect("this desk can read its own routes");
+        assert_eq!(c.verdict, Verdict::Allow);
+        let line = c.argv.last().expect("a line to run");
+        assert!(
+            line.contains("netstat -rn"),
+            "the ladder's chosen line must be the one that runs: {line:?}"
+        );
+    }
+
+    /// The same capability on a machine with the opposite toolset picks
+    /// the other rung — that is the whole reason a ladder exists.
+    #[test]
+    fn the_other_machines_rung_answers_there() {
+        let gnu = |v: &str| ["ip", "ss", "resolvectl"].contains(&v);
+        let c = judge_call(
+            "net.routes",
+            &serde_json::json!({}),
+            &networky(),
+            Path::new("/home/someone"),
+            gnu,
+        )
+        .expect("a linux box can read its own routes");
+        let line = c.argv.last().expect("a line to run");
+        assert!(line.contains("ip route"), "{line:?}");
+    }
+
+    /// A capability nothing on this machine can answer is refused by
+    /// name, and the refusal names what it looked for — so a person is
+    /// sent to their package manager, not to the source.
+    #[test]
+    fn a_capability_with_no_implementation_here_is_refused_by_name() {
+        let e = judge_call(
+            "net.routes",
+            &serde_json::json!({}),
+            &networky(),
+            Path::new("/home/someone"),
+            |_| false,
+        )
+        .unwrap_err();
+        assert!(e.contains("net.routes"), "the refusal must name it: {e}");
+        assert!(e.contains("netstat"), "and what it looked for: {e}");
     }
 
     /// Deny by default, and the refusal names the door that was shut
@@ -759,24 +939,30 @@ mod tests {
             &serde_json::json!({}),
             &networky(),
             Path::new("/home/someone"),
+            bsd,
         )
         .unwrap_err();
         assert!(e.contains("tk.measure"), "the refusal must name the tool: {e}");
     }
 
-    /// A tool the profile allows but nothing has built yet is refused at
-    /// the CALL, by name — so a profile may be written ahead of its
-    /// tools and stay true as they land.
+    /// A tool the profile allows but the toolbox has never heard of is
+    /// refused at the CALL, by name — so a profile may be written ahead
+    /// of its tools and stay true as they land.
+    ///
+    /// `net.scan` rather than `net.routes`: the toolbox knows the routes
+    /// now, so naming that one here would test the opposite of what it
+    /// says the moment the ladder is wired.
     #[test]
     fn a_tool_that_is_named_but_not_built_is_refused_at_the_call() {
         let e = judge_call(
-            "net.routes",
+            "net.scan",
             &serde_json::json!({}),
             &networky(),
             Path::new("/home/someone"),
+            bsd,
         )
         .unwrap_err();
-        assert!(e.contains("net.routes"), "the refusal must name the tool: {e}");
+        assert!(e.contains("net.scan"), "the refusal must name the tool: {e}");
     }
 
     /// The verdict travels with the argv it would have run, so a dry run
@@ -788,6 +974,7 @@ mod tests {
             &serde_json::json!({"line": "netstat -an | grep LISTEN"}),
             &networky(),
             Path::new("/home/someone"),
+            bsd,
         )
         .expect("a judged call");
         assert_eq!(c.verdict, Verdict::Allow);
@@ -813,6 +1000,7 @@ mod tests {
             &serde_json::json!({"line": "rm -rf /"}),
             &networky(),
             Path::new("/home/someone"),
+            bsd,
         )
         .expect("a judged call");
         assert!(matches!(c.verdict, Verdict::Refuse(_)), "{:?}", c.verdict);
@@ -826,6 +1014,7 @@ mod tests {
             &serde_json::json!({}),
             &networky(),
             Path::new("/home/someone"),
+            bsd,
         )
         .unwrap_err();
         assert!(
