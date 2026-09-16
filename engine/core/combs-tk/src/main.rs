@@ -32,6 +32,7 @@ mod api;
 mod cmds;
 mod fence;
 mod net;
+mod profile;
 mod render;
 mod state;
 mod tools;
