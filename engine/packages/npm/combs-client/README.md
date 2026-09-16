@@ -5,11 +5,11 @@ servers (`combs serve`, OpenAI-compatible HTTP/SSE). Zero dependencies;
 runs in browsers, Node 18+, Deno and Bun.
 
 ```bash
-npm install combs-client
+npm install @combs-edge/combs-client
 ```
 
 ```js
-import { CombsClient } from "combs-client";
+import { CombsClient } from "@combs-edge/combs-client";
 
 const client = new CombsClient({ baseUrl: "http://localhost:8080" });
 

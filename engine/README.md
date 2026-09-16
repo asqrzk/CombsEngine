@@ -7,14 +7,15 @@ Combs Engine runs large language models **on-device** with a single Rust core co
 ```bash
 # Scaffold a full chat UI — one command does everything:
 # copies the template, writes config, runs npm install, starts the dev server
-combs chew chat-ui my-app --yes
+combs chew chat-ui --dir my-app --model smollm2-135m --yes
 
 # ...or a multi-agent debate UI
-combs chew debate-ui my-debate --topic "Pineapple on pizza" --turns 6
+combs chew debate-ui --dir my-debate --model smollm2-135m \
+                     --topic "Pineapple on pizza" --turns 6
 
 # ...or a two-role roleplay UI — each role runs on its OWN engine process
 # (the UI asks for the roles, then spawns a second `combs serve` on a new port)
-combs chew roleplay-ui my-roleplay --model smollm2-135m
+combs chew roleplay-ui --dir my-roleplay --model smollm2-135m
 
 # Download + cache a model preset (Hugging Face → ~/.cache/combs/models)
 combs pull smollm2-135m
@@ -47,22 +48,22 @@ Pick whatever fits your stack — every option installs the same `combs` binary:
 | Channel | Command | Notes |
 |---|---|---|
 | **Prebuilt binary** | download from [GitHub Releases](https://github.com/asqrzk/CombsEngine/releases) | macOS arm64/x86_64, Linux x86_64, Windows x86_64 — built natively per-OS by CI |
-| **npm** | `npm install -g combs-engine` | wrapper downloads the matching release binary ([source](Packages/npm/combs-engine)) |
-| **npm** (JS client) | `npm install combs-client` | zero-dep browser/Node client for `combs serve` — used by the chew UI template ([source](Packages/npm/combs-client)) |
-| **pip** | `pip install combs-engine` | same, for Python environments ([source](Packages/pypi/combs-engine)) |
-| **cargo** | `cargo install --path Engine/Core/combs-cli` | builds from source — works on **any** OS with a Rust toolchain |
-| **JSR** (TS libs) | `deno add @combs/core @combs/graph ...` | the 6 framework packages, published via `deno publish` in `Js/` |
+| **npm** | `npm install -g @combs-edge/combs-engine` | wrapper downloads the matching release binary ([source](packages/npm/combs-engine)) |
+| **npm** (JS client) | `npm install @combs-edge/combs-client` | zero-dep browser/Node client for `combs serve` — used by the chew UI template ([source](packages/npm/combs-client)) |
+| **pip** | `pip install combs-engine` | same, for Python environments ([source](packages/pypi/combs-engine)) |
+| **cargo** | `cargo install --path core/combs-cli` | builds from source — works on **any** OS with a Rust toolchain |
+| **JSR** (TS libs) | `deno add @combs/core @combs/graph ...` | the 10 framework packages, published via `deno publish` in `js/` |
 
 ### Building from source (including non-macOS)
 
-The engine builds natively on any platform wgpu supports (Metal, Vulkan,
-DX12) — no cross-compilation is involved when you build **on** the machine
-you target:
+The engine builds natively on any platform wgpu supports (Metal on Apple
+platforms, Vulkan elsewhere) — no cross-compilation is involved when you
+build **on** the machine you target:
 
 ```bash
 # Linux / Windows / macOS — same steps everywhere
 git clone https://github.com/asqrzk/CombsEngine.git
-cd CombsEngine/Engine/Core
+cd CombsEngine/engine/core
 cargo build --release -p combs-cli        # CLI:  ./target/release/combs[.exe]
 cargo build --release -p combs-ffi        # C ABI: libcombs_ffi.{so,dylib,dll}
 ```
@@ -83,41 +84,41 @@ Four layers. Compute lives exclusively in **L0** — every layer above is thin o
 │     Svelte 5 UI template · Android (JNI/Kotlin) ·           │
 │     iOS (Swift) · Web Worker transport                      │
 ├─────────────────────────────────────────────────────────────┤
-│ L2 — Deno / TypeScript Framework   (Engine/Js)              │
+│ L2 — Deno / TypeScript Framework   (engine/js)              │
 │     @combs/core · @combs/graph · @combs/agents ·            │
 │     @combs/runtime · @combs/flows · @combs/telemetry        │
 ├─────────────────────────────────────────────────────────────┤
 │ L1 — C ABI / JSON-FFI                (combs-ffi)            │
-│     combs_engine_create · combs_chat_completion_stream ·    │
+│     combs_engine_create · combs_chat_completion ·           │
 │     OpenAI-compatible server (`combs serve`)                │
 ├─────────────────────────────────────────────────────────────┤
-│ L0 — Rust GPU Core                   (Engine/Core)          │
-│     Burn 0.21 · CubeCL · wgpu (Metal/Vulkan/DX12/WebGPU)    │
+│ L0 — Rust GPU Core                   (engine/core)          │
+│     Burn 0.21 · CubeCL · wgpu (Metal/Vulkan/WebGPU)         │
 │     Paged KV cache · full sampler · GGUF/SafeTensors        │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 | Layer | Location | What it is |
 |---|---|---|
-| L0 Core | [`Core/`](Core) | Cargo workspace: `combs-core`, `combs-formats`, `combs-models`, `combs-runtime`, `combs-ffi`, `combs-cli`, `xtask` |
-| L2 Framework | [`Js/`](Js) | Deno workspace of 6 `@combs/*` packages |
-| L3 UI | [`Ui/`](Ui) | Svelte 5 + Vite template consumed by `combs chew` |
-| L3 Android | [`Android/`](Android) | JNI glue + Kotlin API over the FFI `.so` |
-| L3 iOS | [`Ios/`](Ios) | Swift wrapper over the FFI static lib |
+| L0 Core | [`core/`](core) | Cargo workspace (15 members): `combs-core`, `combs-formats`, `combs-media`, `combs-models`, `combs-runtime`, `combs-diffusion`, `combs-ffi`, `combs-wasm`, `combs-cli`, `combs-kit`, `combs-mesh`, `combs-mesh-ffi`, `combs-graphkit`, `combs-graphkit-ffi`, `xtask` |
+| L2 Framework | [`js/`](js) | Deno workspace of 10 `@combs/*` packages |
+| L3 UI | [`ui/`](ui) | Svelte 5 + Vite template consumed by `combs chew` |
+| L3 Android | [`android/`](android) | JNI glue + Kotlin API over the FFI `.so` |
+| L3 iOS | [`ios/`](ios) | Swift wrapper over the FFI static lib |
 
 ## What's Available
 
-### L0 — Rust Core (`Engine/Core`)
+### L0 — Rust Core (`engine/core`)
 
 - **Inference engine** — Llama-family architectures on Burn 0.21 + CubeCL/wgpu; validated with SmolLM2 on Apple Silicon (Metal). New architectures = one line in the `ModelRegistry`.
-- **Model formats** — SafeTensors (Hugging Face layout) and **GGUF v3** (Q8_0 / Q4_0 / F16 / F32) through a single `ModelSource` adapter trait. `combs run --model anything.gguf` just works.
+- **Model formats** — SafeTensors (Hugging Face layout) and **GGUF v2/v3** (F32 / F16 / BF16, Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0, Q4_K / Q5_K / Q6_K) through a single `ModelSource` adapter trait. `combs run --model anything.gguf` just works.
 - **Memory** — paged KV cache (page-16 arenas, LIFO free-list, prefix-safe `popn`), chunked prefill, quantized linear layers with weights packed in VRAM.
 - **Sampling** — temperature, top-k, top-p, min-p, repetition/frequency/presence penalties windowed over recent history (`repeat_last_n`, stop tokens exempt), seeded (byte-identical) generation, stop strings & stop tokens, UTF-8-safe incremental detokenization for streaming.
-- **CLI (`combs`)** — `run` · `serve` · `perplexity` · `transcribe` · `pull` (HF download → local cache; presets, adapters, or any repo) · `devices` · `chew` · `generate-image` · `generate-audio` · `serve-images` · `serve-audio` · `convert`.
-- **OpenAI-compatible server** — `POST /v1/chat/completions` (SSE streaming + non-streaming), `GET /v1/models`, `GET /v1/sessions` (list/release KV sessions), `GET /v1/stats` (cancelled-vs-error totals, per-layer KV arena state per session), `GET /health`.
-- **`xtask`** — cross-platform build orchestrator: `cargo xtask matrix` shows live toolchain detection; `cargo xtask bundle` produces `dist/<platform>/{lib, combs.h}` for every target.
+- **CLI (`combs`)** — `run` · `serve` · `perplexity` · `doctor` · `inspect` · `build-info` · `devices` · `transcribe` · `pull` (HF download → local cache; presets, adapters, or any repo) · `chew` · `generate-image` · `generate-audio` · `serve-images` · `serve-audio`, plus `convert` (declared but not implemented — it says so and exits 2).
+- **OpenAI-compatible server** — `POST /v1/chat/completions` (SSE streaming + non-streaming), `POST /v1/completions`, `POST /v1/embeddings`, `POST /v1/tokenize`, `GET /v1/models`, `GET /v1/model/info`, `GET /v1/sessions` + `DELETE` (list/release KV sessions), `GET /v1/kv/events` (behind `COMBS_KV_EVENTS`), `GET /v1/stats` (cancelled-vs-error totals, per-layer KV arena state per session), `GET /health`.
+- **`xtask`** — cross-platform build orchestrator: `cargo xtask matrix` shows live toolchain detection; `cargo xtask bundle` produces `dist/host/{combs, combs-f32}` plus `dist/<platform>/{lib, combs.h}` for every target.
 
-### L2 — TypeScript Framework (`Engine/Js`)
+### L2 — TypeScript Framework (`engine/js`)
 
 | Package | Purpose |
 |---|---|
@@ -128,6 +129,9 @@ Four layers. Compute lives exclusively in **L0** — every layer above is thin o
 | `@combs/flows` | `createWorkflow` (steps/loops/checks), `createRoleplayChat`, `addMemory` |
 | `@combs/telemetry` | Scoped logging, OpenTelemetry-shaped spans, metrics |
 | `@combs/zerotrust` | Zero-trust crypto core: identity (ECDSA+ECDH), sealed envelopes, at-rest keystore, capability tokens — pure WebCrypto, browser/Node/Deno |
+| `@combs/observe` | Realtime observability bus — EventBus, instrument middleware, sinks (memory/NDJSON/WebSocket), redaction; powers the Control Tower |
+| `@combs/mesh` | CombsMesh emoji client — FFI `Mesh` wrapper, pure-TS Unicode PUA codec, MCP server mode, `MeshPeer` WS connector |
+| `@combs/memory` | Knowledge-graph memory — SQLite entities/relations, ranked recall, repository ingestion (`graphify`), at-rest crypto door, MCP stdio server |
 
 ### L3 — UI & Shells
 
@@ -135,11 +139,11 @@ Four layers. Compute lives exclusively in **L0** — every layer above is thin o
   - 🔐 first-run keypair ritual (ECDSA P-256 signing + ECDH P-256 encryption keys) — **always on, no configuration escapes it**; a model must always be chosen explicitly (`--model`, mandatory with `--yes`)
   - 🪪 **device passkey** (WebAuthn via [SimpleWebAuthn](https://github.com/MasterKale/SimpleWebAuthn)): every permission approval — model downloads, agent internet access, storage — is confirmed with Touch ID / Windows Hello / a security key, verified server-side by the proxy
   - 🛡️ **backend permission proxy** (`server/proxy.mjs`): the browser never touches the internet or disk directly — every request goes through `POST /api/relay`, every file write through `/api/files/*`, and the proxy enforces the grants server-side. The frontend only renders the dialog and forwards decisions
-  - 🔒 **zero-trust storage** ([`combs-zerotrust`](Packages/npm/combs-zerotrust)): everything written to disk or localStorage is AES-256-GCM encrypted with per-blob wrapped keys + SHA-256 integrity hashes; tampered data is rejected on read (409), never served
+  - 🔒 **zero-trust storage** ([`@combs-edge/combs-zerotrust`](packages/npm/combs-zerotrust)): everything written to disk or localStorage is AES-256-GCM encrypted with per-blob wrapped keys + SHA-256 integrity hashes; tampered data is rejected on read (409), never served
   - 🤖 **E2E agent channels**: agent subprocesses exchange public keys once (permission-checked) and then communicate only in sealed envelopes (ephemeral ECDH → HKDF → AES-GCM + hash + ECDSA signature) — no re-permission for replies, tampering rejected
   - 🌐 **sandboxed internet for agents** (token1/token2): agents never get raw web access — a per-agent sandbox proxy with allowlists, secret-leak guardrails and an encrypted audit log brokers it, with responses re-encrypted to the main tab
   - 📊 realtime network + storage monitor fed by the proxy (`/api/monitor`) — the backend sees every byte, so it's the source of truth
-  - 📦 talks to `combs serve` via the official [`combs-client`](Packages/npm/combs-client) npm package
+  - 📦 talks to `combs serve` via the official [`@combs-edge/combs-client`](packages/npm/combs-client) npm package
   - 🎭 **roleplay mode**: define two roles in the UI → the proxy spawns a second `combs serve` subprocess on its own port (permission-gated `system:subprocess`) — separate process, separate GPU device per role; engines cleaned up on exit
   - 🌗 dark/light themes, responsive, chat & multi-agent debate & roleplay views
 - **Android** — JNI bridge + Kotlin `CombsEngine` API.
@@ -163,8 +167,7 @@ Measured on Apple Silicon (wgpu → Metal), SmolLM2-135M-Instruct:
 |---|---|
 | SafeTensors (HF layout) | ✅ full |
 | GGUF — F32 / F16 | ✅ full |
-| GGUF — Q8_0 / Q4_0 | ✅ full |
-| GGUF — Q4_K / Q5_K / Q6_K | 🚧 planned |
+| GGUF — Q4_0 / Q5_0 / Q8_0 / Q4_K / Q5_K / Q6_K | ✅ full, fused dequant-matmul kernels — weights stay packed in VRAM (Q8_0 and the K-quants also have a WGSL decode gemv) |
 
 Model presets **must** use instruction-tuned variants (e.g. `SmolLM2-135M-Instruct`) — base models echo prompts in chat mode.
 
@@ -183,18 +186,16 @@ Run `cargo xtask matrix` for live detection of your local toolchains.
 ## Development
 
 ```bash
-# Rust — 53 tests (release profile saves disk)
+# Rust — the full workspace suite (release profile saves disk)
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"   # rustup is keg-only on macOS
 cargo test --release --workspace
 
-# TypeScript — 33 tests
-cd Js && deno task test
+# TypeScript — 90 tests
+cd engine/js && deno task test
 
 # Cross-build everything into dist/
 cargo xtask bundle
 ```
-
-Repo conventions live in the root [`AGENTS.md`](../AGENTS.md).
 
 ## Contributing
 
@@ -212,9 +213,9 @@ Good first contributions: additional GGUF K-quant dequant kernels, new model arc
 ### Releasing
 
 - **CLI binaries**: `git tag v0.x.0 && git push origin v0.x.0` → the release workflow builds macOS/Linux/Windows natively and attaches `combs-<version>-<platform>-<arch>` archives to the GitHub Release.
-- **npm**: `Packages/npm/combs-client` and `Packages/npm/combs-zerotrust` (the libraries the chew UIs depend on) plus `Packages/npm/combs-engine` (CLI wrapper; postinstall fetches the release asset). Full step-by-step for every channel: **[Packages/RELEASING.md](Packages/RELEASING.md)**.
-- **PyPI**: bump `Packages/pypi/combs-engine/pyproject.toml`, `python -m build && twine upload dist/*`.
-- **JSR (TS packages)**: bump each `Js/<pkg>/deno.json` version, then `deno publish` from `Js/` (workspace-aware, publishes all six `@combs/*` packages).
+- **npm**: `packages/npm/combs-client` and `packages/npm/combs-zerotrust` (the libraries the chew UIs depend on) plus `packages/npm/combs-engine` (CLI wrapper; postinstall fetches the release asset). Full step-by-step for every channel: **[packages/RELEASING.md](packages/RELEASING.md)**.
+- **PyPI**: bump `packages/pypi/combs-engine/pyproject.toml`, `python -m build && twine upload dist/*`.
+- **JSR (TS packages)**: bump each `js/<pkg>/deno.json` version, then `deno publish` from `js/` (workspace-aware, publishes all ten `@combs/*` packages).
 
 Please report bugs and request features via **GitHub Issues**.
 

@@ -27,21 +27,25 @@ Combs Engine runs large language models **on-device** with a single Rust core co
 | **GitHub Releases** | prebuilt binaries per platform | [releases](https://github.com/asqrzk/CombsEngine/releases) |
 
 Platform-by-platform from-scratch instructions (macOS / Linux / Windows, binaries or source): [INSTALL.md](INSTALL.md).
+Every subcommand, flag and environment door, checked against the binary: [CLI.md](CLI.md).
 
 Or build from source:
 
 ```bash
-# Build the CLI
+# Build the CLI (the cargo workspace is engine/core)
+cd engine/core
 cargo xtask build --release
 
 # Run a model (HF directory or .gguf file — auto-detected)
-./target/release/combs run --model ~/.cache/combs/models/smollm2-135m --chat
+./target/release/combs run --model ~/.cache/combs/models/smollm2-135m \
+                           --prompt "Hello" --chat
 
 # Scaffold a full chat UI (Svelte 5, dark/light, auth, permissions)
-./target/release/combs chew chat-ui my-app --yes
+./target/release/combs chew chat-ui --dir my-app --model smollm2-135m --yes
 
 # ...or a multi-agent debate UI
-./target/release/combs chew debate-ui my-debate --topic "Pineapple on pizza" --turns 6
+./target/release/combs chew debate-ui --dir my-debate --model smollm2-135m \
+                                      --topic "Pineapple on pizza" --turns 6
 
 # Serve an OpenAI-compatible API
 ./target/release/combs serve --model ~/.cache/combs/models/smollm2-135m --port 11434
@@ -65,19 +69,19 @@ Four layers. Compute lives exclusively in **L0** — every layer above is thin o
 │     @combs/observe · @combs/zerotrust · @combs/mesh         │
 ├─────────────────────────────────────────────────────────────┤
 │ L1 — C ABI / JSON-FFI                (combs-ffi)            │
-│     combs_engine_create · combs_chat_completion_stream ·    │
+│     combs_engine_create · combs_chat_completion ·           │
 │     OpenAI-compatible server (`combs serve`)                │
 ├─────────────────────────────────────────────────────────────┤
 │ L0 — Rust GPU Core                   (engine/core)          │
-│     Burn 0.21 · CubeCL · wgpu (Metal/Vulkan/DX12/WebGPU)    │
+│     Burn 0.21 · CubeCL · wgpu (Metal/Vulkan/WebGPU)         │
 │     Paged KV cache · full sampler · GGUF/SafeTensors        │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 | Layer | Location | What it is |
 |---|---|---|
-| L0 Core | [`engine/core`](engine/core) | Cargo workspace: `combs-core`, `combs-formats`, `combs-media`, `combs-models`, `combs-runtime`, `combs-ffi`, `combs-mesh`, `combs-mesh-ffi`, `combs-cli`, `xtask` |
-| L2 Framework | [`engine/js`](engine/js) | Deno workspace of 9 `@combs/*` packages |
+| L0 Core | [`engine/core`](engine/core) | Cargo workspace (15 members): `combs-core`, `combs-formats`, `combs-media`, `combs-models`, `combs-runtime`, `combs-diffusion`, `combs-ffi`, `combs-wasm`, `combs-cli`, `combs-kit`, `combs-mesh`, `combs-mesh-ffi`, `combs-graphkit`, `combs-graphkit-ffi`, `xtask` |
+| L2 Framework | [`engine/js`](engine/js) | Deno workspace of 10 `@combs/*` packages |
 | L3 UI | [`engine/ui`](engine/ui) | Svelte 5 + Vite template consumed by `combs chew` |
 | L3 Android | [`engine/android`](engine/android) | JNI glue + Kotlin API over the FFI `.so` |
 | L3 iOS | [`engine/ios`](engine/ios) | Swift wrapper over the FFI static lib |
@@ -103,7 +107,7 @@ Four layers. Compute lives exclusively in **L0** — every layer above is thin o
 - **Memory** — paged KV cache (page-16 arenas, LIFO free-list, prefix-safe `popn`), chunked prefill, quantized linear layers with weights packed in VRAM.
 - **Sampling** — temperature, top-k, top-p, min-p, repetition/frequency/presence penalties **bounded to a recent window** (`repeat_last_n`, default 128; `0` restores whole-context) with stop tokens always exempt — so long chats can't penalize their own ability to stop — plus logit_bias, per-token logprobs, seeded (byte-identical) generation, stop strings & stop tokens; opt-in prompt-lookup speculative decoding for greedy runs (`COMBS_SPEC=1`).
 - **Streaming that survives UTF-8** — the incremental detokenizer holds back split multi-byte characters (every emoji, CJK on byte-level vocabs) until they complete, so streamed text never shows replacement chars or drops characters; buffered and streamed output are byte-identical.
-- **CLI (`combs`)** — `run` · `serve` · `perplexity` · `transcribe` · `pull` · `devices` · `chew` · `generate-image` · `generate-audio` · `serve-images` · `serve-audio` · `convert`.
+- **CLI (`combs`)** — `run` · `serve` · `perplexity` · `doctor` · `inspect` · `build-info` · `devices` · `transcribe` · `pull` · `chew` · `generate-image` · `generate-audio` · `serve-images` · `serve-audio`, plus `convert` (declared but not implemented — it says so and exits 2). Full reference: [CLI.md](CLI.md).
 - **OpenAI-compatible server** — `/v1/chat/completions` (SSE + non-streaming, native **tool calling** through each model's own chat template, `response_format` json_object/json_schema constrained output, logprobs, `n` choices), `/v1/completions` (raw prompt / FIM), `/v1/embeddings` (pooling detection, matryoshka `dimensions`, base64), `/v1/models` + `/v1/model/info` (per-model capability advertisement), `/v1/sessions` (list + release KV sessions), `/v1/tokenize` (the ids this model's own chat path would prefill, for a prefix-aware router), `/v1/kv/events` (the KV pages this engine holds, as a sequenced log — behind `COMBS_KV_EVENTS`), `/v1/stats` (totals with cancelled-vs-error accounting, per-session KV pages with measured per-layer arena state, attention geometry, last-request timings), `/health` — plus `/v1/images/generations`, `/v1/audio/speech`, and `/v1/audio/transcriptions` (multipart or raw WAV) on the media workers.
 - **`xtask`** — cross-platform build orchestrator: `cargo xtask matrix` shows live toolchain detection; `cargo xtask bundle` produces `dist/host/{combs, combs-f32}` (the default `combs` computes in f16, with image generation pinned to f32 internally; `combs-f32` is the full-precision build) plus `dist/<platform>/{lib, combs.h}` for every target.
 - **CombsMesh emoji engine (`combs-mesh`)** — binary `.cmse` block format (10 block types: text/image/todo/functions/api/lifecycle/character/emotion/encryption/orchestration), Unicode PUA tag-character encoding, AES-256-GCM/ChaCha20 crypto with HKDF subkeys, CPU + wgpu sprite renderers, content-addressed registry, wasm32-clean with wasm-bindgen bindings; C ABI via `combs-mesh-ffi` (`combsmesh_*` + `combsmesh_op_json`).
@@ -121,6 +125,7 @@ Four layers. Compute lives exclusively in **L0** — every layer above is thin o
 | `@combs/observe` | Realtime observability bus (isomorphic core) — EventBus, instrument middleware (`wrapEngine`/`instrumentFetch`/`span`), sinks (memory/NDJSON/WebSocket), redaction; powers the Control Tower |
 | `@combs/mesh` | CombsMesh emoji client — FFI `Mesh` wrapper, pure-TS Unicode PUA codec (byte-parity with Rust), MCP server mode, `MeshPeer` WS connector with sha256-verified fetch |
 | `@combs/memory` | Knowledge-graph memory — SQLite entities/relations with a usage-driven lifecycle, ranked recall, repository ingestion (`graphify`), at-rest crypto door, embeddings-hybrid retrieval, and an MCP stdio server exposing the graph as tools |
+| `@combs/zerotrust` | Zero-trust crypto core: identity (ECDSA+ECDH), sealed envelopes, at-rest keystore, capability tokens — pure WebCrypto, browser/Node/Deno |
 
 ### L3 — UI & Shells
 
@@ -151,8 +156,10 @@ Measured on Apple Silicon (wgpu → Metal), SmolLM2-135M-Instruct:
 |---|---|
 | SafeTensors (HF layout) | ✅ full |
 | GGUF — F32 / F16 | ✅ full |
-| GGUF — Q4_0 / Q5_0 / Q8_0 | ✅ full, fused GPU kernels |
-| GGUF — Q4_K / Q5_K / Q6_K | ✅ full, fused GPU kernels |
+| GGUF — Q4_0 / Q5_0 / Q8_0 / Q4_K / Q5_K / Q6_K | ✅ full, fused dequant-matmul kernels — weights stay packed in VRAM |
+
+Q8_0, Q4_K, Q5_K and Q6_K additionally take a hand-written WGSL gemv on the
+single-token decode step; Q4_0 and Q5_0 use their fused CubeCL matmul there too.
 
 Model presets **must** use instruction-tuned variants (e.g. `SmolLM2-135M-Instruct`) — base models echo prompts in chat mode.
 
@@ -163,7 +170,7 @@ Model presets **must** use instruction-tuned variants (e.g. `SmolLM2-135M-Instru
 | macOS arm64 / x86_64 | `libcombs_ffi.dylib` | ✅ built & tested |
 | iOS arm64 | `libcombs_ffi.a` | ✅ builds |
 | Android arm64 | `libcombs_ffi.so` | ✅ builds (NDK) |
-| Linux / Windows x86_64 | — | ✅ `cargo check` clean (linking needs native toolchain) |
+| Linux / Windows x86_64 | `libcombs_ffi.so` / `combs_ffi.dll` | ✅ built natively by the CI release workflow |
 | Web (wasm32) | `combs_wasm` module (34 MB) | ✅ 7B mounts + chats in a tab (streamed, suite-gated) |
 
 Run `cargo xtask matrix` for live detection of your local toolchains.
@@ -175,8 +182,8 @@ Run `cargo xtask matrix` for live detection of your local toolchains.
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"   # rustup is keg-only on macOS
 cargo test --release --workspace
 
-# TypeScript — 33 tests
-cd Js && deno task test
+# TypeScript — 90 tests
+cd engine/js && deno task test
 
 # Cross-build everything into dist/
 cargo xtask bundle
@@ -193,7 +200,7 @@ Contributions are welcome! To get started:
 5. **Run the full suite** (`cargo test --release --workspace` and `deno task test`) before opening a PR.
 6. Open a **pull request** with a clear description of the change.
 
-Good first contributions: additional GGUF K-quant dequant kernels, new model architectures for the registry, platform shell improvements.
+Good first contributions: a WGSL decode gemv for Q4_0/Q5_0 (Q8_0 and the K-quants already have one), new model architectures for the registry, platform shell improvements.
 
 Please report bugs and request features via **GitHub Issues**.
 

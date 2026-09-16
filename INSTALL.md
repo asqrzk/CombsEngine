@@ -139,7 +139,8 @@ Expand-Archive combs-<version>-windows-x86_64.zip
 ```
 
 Each archive also carries the C FFI libraries (`libcombs_ffi.*` /
-`combs_ffi.dll` + `combs.h`, and the CombsMesh pair) for embedding.
+`combs_ffi.dll`, and the CombsMesh pair with `combsmesh.h`) for embedding.
+The `combs.h` header is in the repository at `engine/core/include/combs.h`.
 
 macOS Gatekeeper may quarantine a downloaded binary; clear it with
 `xattr -d com.apple.quarantine <path>/combs` if launch is blocked.
@@ -182,10 +183,11 @@ Notes:
 ```bash
 # Pull a preset from Hugging Face into the local cache
 combs pull smollm2-135m            # small, quick first run
-combs pull qwen2.5-coder-7b        # 4.4 GB download, wants ~6 GB free memory
+combs pull qwen3-8b-gguf           # 5.0 GB download; see --context-size if memory is tight
 
-# One-shot chat in the terminal
-combs run --model ~/.cache/combs/models/smollm2-135m --chat
+# One prompt, one answer (--chat wraps it in the model's chat template)
+combs run --model ~/.cache/combs/models/smollm2-135m \
+          --prompt "Hello" --chat
 
 # Serve the OpenAI-compatible API
 combs serve --model ~/.cache/combs/models/smollm2-135m --port 11434
@@ -208,11 +210,14 @@ The core runs on wgpu and uses whatever your OS exposes:
 |---|---|---|
 | macOS | Metal | nothing — Apple Silicon and Intel both work out of the box |
 | Linux | Vulkan | Vulkan drivers: `mesa-vulkan-drivers` (Debian/Ubuntu), `vulkan-radeon` / vendor NVIDIA driver as appropriate |
-| Windows | DX12 / Vulkan | a current GPU driver (standard on any desktop) |
+| Windows | Vulkan | a current GPU driver (standard on any desktop) |
 
-No adapter at all (a headless server without Vulkan)? GPU inference
-cannot run there; kernels require a device. CPU fallback is on the
-roadmap, not shipped.
+No adapter at all (a headless server without Vulkan)? The GPU kernels
+require a device, so the normal binary cannot run there. For exactly that
+case the release carries a **CPU-floor build** for Linux
+(`combs-<version>-linux-x86_64-cpu.tar.gz`, and the `aarch64` twin): it
+computes on the CPU — far slower, and the two image commands are compiled
+out of it — but it serves text without a GPU.
 
 ## 7. Route E — the CombsLLM web platform (optional)
 
@@ -227,14 +232,15 @@ deno task hive     # starts the engine (if not already healthy) + platform
 # → http://localhost:8787  (first run: create your passkey)
 ```
 
-`COMBS_BIN` / `COMBS_MODEL` override which binary and model the hive
-boots. To point at an engine you started yourself, set
+`COMBS_BIN` / `COMBS_ENGINE_DIR` override which binary and model directory
+the hive boots. To point at an engine you started yourself, set
 `COMBS_ENGINE_URL`.
 
 ## 8. Troubleshooting
 
 - **`combs: command not found` after npm install** — the npm global bin
-  dir isn't on PATH (`npm bin -g` shows it); with nvm, re-run
+  dir isn't on PATH (`npm prefix -g` prints the prefix; the binaries are in
+  its `bin/`); with nvm, re-run
   `nvm use --lts`. On Windows, reopen the terminal.
 - **Rust build fails immediately on Windows with `link.exe` not
   found** — the MSVC Build Tools C++ workload is missing (§1 note).
