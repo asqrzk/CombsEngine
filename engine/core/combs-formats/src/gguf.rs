@@ -880,8 +880,23 @@ fn build_model_metadata(kv: &HashMap<String, MetaValue>) -> Result<ModelMetadata
              key/value heads must divide the query heads"
         )));
     }
-    let layers = field("block_count")
+    let blocks = field("block_count")
         .ok_or_else(|| FormatError::MissingField("block_count".into()))? as usize;
+    // A multi-token-prediction block is counted in `block_count` and is
+    // not a layer of the model: it is a speculation head, and nothing in
+    // the forward pass reads it. Newer qwen35 files carry one and say so.
+    //
+    // Believing the count whole refused a real file: the engine built a
+    // thirty-third layer, the attention interval made it a DeltaNet one,
+    // and it then demanded `linear_attn.in_proj_qkv` from a block that
+    // holds an ordinary attention layer beside the prediction head.
+    //
+    // Floored at one rather than refused: a file claiming more heads than
+    // blocks is malformed, and it will fail at tensor load naming the
+    // block it cannot find, which is a better message than any this seam
+    // could invent.
+    let predict_heads = field("nextn_predict_layers").unwrap_or(0) as usize;
+    let layers = blocks.saturating_sub(predict_heads).max(1);
     let ctx = field("context_length").unwrap_or(2048) as usize;
     let ffn = field("feed_forward_length").unwrap_or_else(|| hidden.saturating_mul(4) as u64) as usize;
     let vocab = match kv.get(&format!("{prefix}.vocab_size")) {
@@ -2629,6 +2644,79 @@ mod hostile_header_tests {
         let mut g = G::new(1, 0);
         g.tensor("t.weight", dims, ty, offset).pad32();
         g.0
+    }
+
+    /// A qwen35 header with the geometry llama.cpp writes. `nextn` is
+    /// the multi-token-prediction head the newer files carry: a whole
+    /// extra block, counted in `block_count`, that no part of the
+    /// forward pass reads.
+    fn qwen35(blocks: u32, nextn: Option<u32>) -> Vec<u8> {
+        let tokens = ["<s>", "a", "b", "c", "d", "e", "f", "</s>"];
+        // Seventeen base pairs. The count must match exactly: declare one
+        // too few and the reader walks off the end of the metadata and
+        // reads the next key as a tensor descriptor, which is how this
+        // fixture first failed.
+        let mut g = G::new(1, 17 + nextn.is_some() as u64);
+        g.kv_str("general.architecture", "qwen35")
+            .kv_u32("qwen35.embedding_length", 2560)
+            .kv_u32("qwen35.attention.head_count", 16)
+            .kv_u32("qwen35.attention.head_count_kv", 4)
+            .kv_u32("qwen35.attention.key_length", 256)
+            .kv_u32("qwen35.attention.value_length", 256)
+            .kv_u32("qwen35.block_count", blocks)
+            .kv_u32("qwen35.context_length", 4096)
+            .kv_u32("qwen35.feed_forward_length", 9216)
+            .kv_u32("qwen35.full_attention_interval", 4)
+            .kv_u32("qwen35.ssm.group_count", 16)
+            .kv_u32("qwen35.ssm.time_step_rank", 32)
+            .kv_u32("qwen35.ssm.state_size", 128)
+            .kv_u32("qwen35.ssm.inner_size", 4096)
+            .kv_u32("qwen35.ssm.conv_kernel", 4)
+            .kv_u32("tokenizer.ggml.eos_token_id", 7);
+        if let Some(n) = nextn {
+            g.kv_u32("qwen35.nextn_predict_layers", n);
+        }
+        g.kv_strs("tokenizer.ggml.tokens", &tokens);
+        g.tensor("output_norm.weight", &[2560], GGML_F32, 0).pad32();
+        for _ in 0..2560 {
+            g.f32(1.0);
+        }
+        g.0
+    }
+
+    /// A multi-token-prediction block is counted in `block_count` but is
+    /// not a layer of the model: it is a speculation head, and nothing
+    /// in the forward pass reads it.
+    ///
+    /// Believing the count whole refused a real file. The engine built a
+    /// thirty-third layer, the attention interval made it a DeltaNet
+    /// one, and it then demanded `linear_attn.in_proj_qkv` from a block
+    /// that holds an ordinary attention layer beside the prediction
+    /// head. The file declares how many such blocks it carries; this
+    /// reads what it declares instead of assuming.
+    #[test]
+    fn a_prediction_head_is_counted_by_the_file_but_is_not_a_layer() {
+        let src = GgufSource::from_bytes(qwen35(33, Some(1)))
+            .expect("a qwen35 file with a prediction head parses");
+        assert_eq!(
+            src.metadata().num_hidden_layers,
+            32,
+            "33 blocks less 1 prediction head is 32 layers"
+        );
+    }
+
+    /// The control: with no such key the count stands whole. A
+    /// subtraction that fired on an ordinary file would quietly drop a
+    /// real layer — the same defect wearing the other face.
+    #[test]
+    fn a_file_with_no_prediction_head_keeps_every_block() {
+        let src = GgufSource::from_bytes(qwen35(32, None))
+            .expect("an ordinary qwen35 file parses");
+        assert_eq!(
+            src.metadata().num_hidden_layers,
+            32,
+            "no prediction head means no subtraction"
+        );
     }
 
     /// A small whole llama file; `heads`/`kv_heads` and the scores array are the knobs.
