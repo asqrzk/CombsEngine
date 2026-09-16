@@ -122,6 +122,14 @@ pub const DOORS: &[Door] = &[
     },
     Door {
         kind: Kind::Knob,
+        name: "COMBS_KV_EVENTS",
+        default: "off",
+        does: "index the KV pages the live sessions hold and publish them on /v1/kv/events, as a sequenced log a cache-aware router's indexer applies; off indexes nothing and the route refuses by name",
+        read_at: "combs-runtime/src/kvevents.rs, combs-runtime/src/engine.rs",
+        measured: None,
+    },
+    Door {
+        kind: Kind::Knob,
         name: "COMBS_KV_QUANT",
         default: "off",
         does: "int8 KV on global layers. No-ops silently when head_dim does not divide by 32",

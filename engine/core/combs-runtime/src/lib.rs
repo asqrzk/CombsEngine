@@ -10,6 +10,7 @@
 mod constraint;
 mod detok;
 mod engine;
+mod kvevents;
 mod local;
 mod logits;
 mod request;
@@ -39,6 +40,7 @@ pub use engine::{
 };
 #[cfg(not(target_family = "wasm"))]
 pub use engine::Engine;
+pub use kvevents::{KvEvent, KvEventsPage, SeqEvent, kv_page_hash, page_hashes};
 
 pub use local::{LocalEngine, StepEvent};
 pub use request::{

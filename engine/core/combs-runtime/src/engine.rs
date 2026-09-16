@@ -35,6 +35,7 @@ mod native_driver_imports {
 
     pub(super) use crate::constraint::TokenByteTable;
     pub(super) use crate::sampler::TokenLogprobs;
+    pub(super) use crate::kvevents::{kv_events_enabled, KvEventLog, KvEventsPage, KvIndex};
     pub(super) use crate::step::{self, begin_generation, SessionSet, Submitted, MAX_SESSIONS};
 }
 
@@ -285,6 +286,15 @@ enum Command {
 /// Under `--features f16` each cached token costs half the memory, so the
 /// default cap doubles to 64k — the "spend the freed VRAM on longer context"
 /// win. An explicit `--context-size` still overrides either default.
+/// Page events kept for readers that fall behind, and the tokens
+/// their `Stored` lines may carry between them. Past either the
+/// oldest events go and a reader that missed them is resynced from
+/// what is held rather than handed a gap.
+#[cfg(not(target_family = "wasm"))]
+const KV_EVENT_RING: usize = 4096;
+#[cfg(not(target_family = "wasm"))]
+const KV_EVENT_RING_TOKENS: usize = 1 << 20;
+
 #[cfg(not(feature = "f16"))]
 const DEFAULT_KV_ARENA_CAP: usize = 32768;
 #[cfg(feature = "f16")]
@@ -405,6 +415,10 @@ pub struct Engine {
     supports_embeddings: bool,
     /// Pooling convention detected from the checkpoint artifacts.
     default_pooling: Pooling,
+    /// The page log `/v1/kv/events` serves: written by the worker after
+    /// every generation and every session release, and only when
+    /// `COMBS_KV_EVENTS` armed the index behind it.
+    kv_events: Arc<KvEventLog>,
     #[allow(dead_code)] // facade used by later phases for arena management
     pool: BufferPool,
 }
@@ -600,12 +614,17 @@ impl Engine {
             ..EngineStatsSnapshot::default()
         }));
 
+        // The page log outlives every request: a router's indexer reads
+        // it by sequence number, so it is the engine's, not a run's.
+        let kv_events = Arc::new(KvEventLog::new(KV_EVENT_RING, KV_EVENT_RING_TOKENS));
+
         let (tx, rx) = mpsc::channel();
         let worker = {
             let tokenizer = tokenizer.clone();
             let device = device.clone();
             let max_position_embeddings = source.metadata().max_position_embeddings;
             let stats = stats.clone();
+            let kv_events = kv_events.clone();
             std::thread::Builder::new()
                 .name("combs-engine".to_string())
                 .spawn(move || {
@@ -617,6 +636,7 @@ impl Engine {
                         max_position_embeddings,
                         rx,
                         stats,
+                        kv_events,
                     );
                 })
                 .map_err(|e| EngineError::WorkerGone(format!("spawning worker: {e}")))?
@@ -651,6 +671,7 @@ impl Engine {
             stats,
             supports_embeddings,
             default_pooling,
+            kv_events,
             pool: BufferPool::new(),
         })
     }
@@ -674,6 +695,20 @@ impl Engine {
     /// The KV cache configuration new sessions are created with.
     pub fn cache_config(&self) -> CacheConfig {
         self.cache_config
+    }
+
+    /// Whether `COMBS_KV_EVENTS` armed the page index. A shut door is
+    /// not an empty log: nothing is indexed and nothing is published.
+    pub fn kv_events_armed(&self) -> bool {
+        kv_events_enabled()
+    }
+
+    /// The page events after `since`, waiting up to `wait` for one to
+    /// land. A shut door answers at once, however long the caller was
+    /// willing to wait for a log nobody writes.
+    pub fn kv_events(&self, since: u64, wait: Duration) -> KvEventsPage {
+        let wait = if kv_events_enabled() { wait } else { Duration::ZERO };
+        self.kv_events.since(since, wait)
     }
 
     /// Per-layer attention window layout resolved for this model — the
@@ -1064,10 +1099,15 @@ fn worker_loop(
     max_position_embeddings: usize,
     rx: mpsc::Receiver<Command>,
     stats: Arc<Mutex<EngineStatsSnapshot>>,
+    kv_events: Arc<KvEventLog>,
 ) {
     // Rolling KV sessions — survive across requests so multi-turn callers
     // (and named per-agent sessions) only prefill the new prompt suffix.
     let mut sessions = SessionSet::new();
+    // The page index a router's indexer reads through the log. Armed
+    // only behind the door, so nothing is hashed on an engine nobody
+    // routes to.
+    let mut kv_index = kv_events_enabled().then(|| KvIndex::new(cache_config.page_size));
     // Token→bytes table for constrained decoding: derived from the
     // tokenizer on the first constrained request, then reused for the
     // worker's lifetime (vocab-sized, so built once, never per request).
@@ -1107,6 +1147,9 @@ fn worker_loop(
                     BufferPool::new().cleanup(&device);
                 }
                 update_stats(&stats, &result, &sessions, &device);
+                // Published before the reply so a caller that reads the
+                // log the moment its answer lands sees its own pages.
+                publish_kv_events(&kv_events, kv_index.as_mut(), &sessions, false);
                 // `req.pieces` closes when `req` drops at the end of this
                 // iteration; the reply is queued first, so the caller always
                 // sees all pieces followed by the result.
@@ -1140,6 +1183,7 @@ fn worker_loop(
                 let _ = reply.send(result);
             }
             Command::ClearSessions { id, reply } => {
+                let cleared_all = id.is_none();
                 let removed = match id {
                     Some(key) => sessions.take(&key).map(|_| 1).unwrap_or(0),
                     None => sessions.clear_all(),
@@ -1154,6 +1198,9 @@ fn worker_loop(
                     // is per-stream, and the arenas live on the worker's —
                     // a caller-side gpu_memory cannot see what just freed.
                     snap.gpu = combs_core::gpu_memory(&device);
+                }
+                if removed > 0 {
+                    publish_kv_events(&kv_events, kv_index.as_mut(), &sessions, cleared_all);
                 }
                 let _ = reply.send(removed);
             }
@@ -1391,6 +1438,27 @@ fn detect_pooling(dir: Option<&std::path::Path>) -> Pooling {
         return Pooling::Mean;
     }
     Pooling::Last
+}
+
+#[cfg(not(target_family = "wasm"))]
+/// Diffs the live sessions against the index's last look and appends
+/// what changed to the log. `cleared` reports the whole table going at
+/// once, which a reader applies in one line instead of a removal per
+/// page. A shut door leaves both untouched.
+fn publish_kv_events(
+    log: &KvEventLog,
+    index: Option<&mut KvIndex>,
+    sessions: &SessionSet,
+    cleared: bool,
+) {
+    let Some(index) = index else { return };
+    let events = if cleared {
+        index.clear()
+    } else {
+        let histories: Vec<&[u32]> = sessions.iter().map(|(_, s)| s.history.as_slice()).collect();
+        index.reconcile(histories)
+    };
+    log.record(events);
 }
 
 #[cfg(not(target_family = "wasm"))]

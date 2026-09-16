@@ -20,7 +20,7 @@ use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 
 use combs_media::{ImagePreprocessor, PixelBatch, SiglipPreprocessor};
 use combs_models::image_prompt_expansion;
-use combs_runtime::{Engine, GenerationConfig, GenerationStats};
+use combs_runtime::{Engine, GenerationConfig, GenerationStats, KvEvent, SeqEvent};
 
 use crate::http::{cors_header, error_json, json_response, respond_preflight, HttpResponse};
 
@@ -180,6 +180,9 @@ pub fn serve(
                 ("GET", "/v1/model/info") => model_info(&engine, &model_id, &static_info),
                 ("GET", "/v1/stats") => stats_response(&engine, &model_id, &counters, &static_info),
                 ("GET", "/v1/sessions") => sessions_response(&engine),
+                ("GET", p) if p == "/v1/kv/events" || p.starts_with("/v1/kv/events?") => {
+                    kv_events_response(&engine, p)
+                }
                 ("DELETE", p) if p == "/v1/sessions" || p.starts_with("/v1/sessions/") => {
                     clear_sessions_response(&engine, p)
                 }
@@ -204,6 +207,14 @@ pub fn serve(
                             anonymous,
                             &counters,
                         )
+                    }
+                }
+                ("POST", "/v1/tokenize") => {
+                    let mut body = String::new();
+                    if request.as_reader().read_to_string(&mut body).is_err() {
+                        json_response(400, error_json("invalid_request", "unreadable body"))
+                    } else {
+                        handle_tokenize(&engine, &body)
                     }
                 }
                 ("POST", "/v1/embeddings") => {
@@ -548,6 +559,158 @@ fn clear_sessions_response(engine: &Arc<Engine>, path: &str) -> HttpResponse {
         ),
         Err(e) => json_response(500, error_json("engine_error", &e.to_string())),
     }
+}
+
+/// `POST /v1/tokenize` — the ids this model's own chat path would
+/// prefill, for a router that scores by prefix: `{"messages": […],
+/// "tools": […]}` renders exactly as `/v1/chat/completions` does, or
+/// `{"prompt": "…"}` tokenizes a raw string. Answers ids only; the
+/// rendered prompt is never echoed back.
+fn handle_tokenize(engine: &Arc<Engine>, body: &str) -> HttpResponse {
+    let req: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return json_response(400, error_json("invalid_request", &format!("bad JSON: {e}")));
+        }
+    };
+
+    let text = match req.get("messages").and_then(Value::as_array) {
+        Some(messages) if !messages.is_empty() => {
+            // The chat path's own rules, or the ids would differ from the
+            // ones it prefills — which is the whole contract here.
+            let tool_choice_none = req
+                .get("tool_choice")
+                .and_then(Value::as_str)
+                .is_some_and(|c| c == "none");
+            let tools: Option<Value> = req
+                .get("tools")
+                .filter(|t| t.as_array().is_some_and(|a| !a.is_empty()) && !tool_choice_none)
+                .cloned();
+            if tools.is_some() && !engine.supports_tools() {
+                return json_response(
+                    400,
+                    error_json(
+                        "invalid_request",
+                        "this model's chat template has no tool support — use a \
+                         tool-trained model (qwen2.5/qwen3/llama-3.x)",
+                    ),
+                );
+            }
+            match build_prompt(engine, messages, tools.as_ref()) {
+                Ok((prompt, images)) if images.is_empty() => prompt,
+                Ok(_) => {
+                    return json_response(
+                        400,
+                        error_json(
+                            "invalid_request",
+                            "tokenize takes text turns only — an image turn's tokens \
+                             depend on the pixels, which this route never reads",
+                        ),
+                    );
+                }
+                Err(msg) => return json_response(400, error_json("invalid_request", &msg)),
+            }
+        }
+        _ => match req.get("prompt").and_then(Value::as_str) {
+            Some(p) => p.to_string(),
+            None => {
+                return json_response(
+                    400,
+                    error_json(
+                        "invalid_request",
+                        "one of `messages` (a non-empty array) or `prompt` (a string)",
+                    ),
+                );
+            }
+        },
+    };
+
+    match engine.encode(&text) {
+        Ok(ids) => json_response(
+            200,
+            json!({
+                "object": "tokenize",
+                "count": ids.len(),
+                "token_ids": ids,
+            }),
+        ),
+        Err(e) => json_response(
+            500,
+            error_json("engine_error", &format!("tokenization failed: {e}")),
+        ),
+    }
+}
+
+/// `since` and `wait_ms` out of a `/v1/kv/events?…` query. A reader that
+/// asks for neither gets the whole ring and no wait; a long poll is
+/// capped so a stuck reader cannot hold a thread forever.
+fn kv_events_query(path: &str) -> (u64, u64) {
+    let mut since = 0u64;
+    let mut wait_ms = 0u64;
+    if let Some((_, query)) = path.split_once('?') {
+        for pair in query.split('&') {
+            match pair.split_once('=') {
+                Some(("since", v)) => since = v.parse().unwrap_or(0),
+                Some(("wait_ms", v)) => wait_ms = v.parse().unwrap_or(0),
+                _ => {}
+            }
+        }
+    }
+    (since, wait_ms.min(30_000))
+}
+
+/// One event as a router's indexer reads it. Page keys travel as decimal
+/// STRINGS: they are 64-bit, and a JSON number loses the low bits in any
+/// reader whose numbers are doubles.
+fn kv_event_json(e: &SeqEvent) -> Value {
+    let keys = |hashes: &[u64]| -> Vec<String> { hashes.iter().map(u64::to_string).collect() };
+    match &e.event {
+        KvEvent::Stored {
+            hashes,
+            parent,
+            token_ids,
+        } => json!({
+            "seq": e.seq,
+            "type": "stored",
+            "hashes": keys(hashes),
+            "parent": parent.map(|p| p.to_string()),
+            "token_ids": token_ids,
+        }),
+        KvEvent::Removed { hashes } => json!({
+            "seq": e.seq,
+            "type": "removed",
+            "hashes": keys(hashes),
+        }),
+        KvEvent::Cleared => json!({ "seq": e.seq, "type": "cleared" }),
+    }
+}
+
+/// `GET /v1/kv/events?since=N&wait_ms=M` — the KV pages this engine
+/// holds, as a sequenced log. `resync` says the reader fell behind the
+/// ring and is being told what is held instead of what changed.
+fn kv_events_response(engine: &Arc<Engine>, path: &str) -> HttpResponse {
+    if !engine.kv_events_armed() {
+        return json_response(
+            503,
+            error_json(
+                "kv_events_off",
+                "this engine indexes no KV pages — start it with COMBS_KV_EVENTS=1",
+            ),
+        );
+    }
+    let (since, wait_ms) = kv_events_query(path);
+    let page = engine.kv_events(since, Duration::from_millis(wait_ms));
+    json_response(
+        200,
+        json!({
+            "object": "kv.events",
+            "page_size": engine.cache_config().page_size,
+            "since": since,
+            "newest": page.newest(since),
+            "resync": page.resync,
+            "events": page.events.iter().map(kv_event_json).collect::<Vec<_>>(),
+        }),
+    )
 }
 
 /// Compact per-layer window summary: 0 = global arena, w = sliding.
@@ -1585,8 +1748,21 @@ impl Read for ChannelReader {
 mod tests {
     use super::window_layers;
     use super::{apply_session, AnonymousSessions};
+    use super::kv_events_query;
     use combs_runtime::GenerationConfig;
     use serde_json::json;
+
+    #[test]
+    fn a_reader_that_asks_for_nothing_gets_the_whole_log_and_no_wait() {
+        assert_eq!(kv_events_query("/v1/kv/events"), (0, 0));
+        assert_eq!(kv_events_query("/v1/kv/events?"), (0, 0));
+        assert_eq!(kv_events_query("/v1/kv/events?since=12"), (12, 0));
+        assert_eq!(kv_events_query("/v1/kv/events?since=12&wait_ms=250"), (12, 250));
+        assert_eq!(kv_events_query("/v1/kv/events?wait_ms=250&since=12"), (12, 250));
+        // Junk reads as absent, and no reader holds a thread forever.
+        assert_eq!(kv_events_query("/v1/kv/events?since=x&other=1"), (0, 0));
+        assert_eq!(kv_events_query("/v1/kv/events?wait_ms=999999"), (0, 30_000));
+    }
 
     #[test]
     fn an_anonymous_request_neither_reuses_nor_keeps_a_session_when_they_are_off() {
