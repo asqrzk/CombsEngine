@@ -162,9 +162,90 @@ impl Profile {
     }
 }
 
+/// Where a profile by that name may live.
+///
+/// The person's own copy wins over the one shipped in the crate, so
+/// editing a profile never means editing the binary. Pure over the home
+/// it is given, so a test never reads this machine's.
+///
+/// A name is a name: anything that could climb, or carry a separator,
+/// yields nowhere to look rather than a path somewhere it was never
+/// meant to reach.
+pub fn search_paths(name: &str, home: &Path) -> Vec<PathBuf> {
+    // A name is a name. Anything empty, hidden, or carrying a separator
+    // is not one, and yields nowhere to look rather than a path built
+    // out of it — the same reason the fence refuses a verb with a slash.
+    let plain = !name.is_empty()
+        && !name.starts_with('.')
+        && !name.contains('/')
+        && !name.contains('\\')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
+    if !plain {
+        return Vec::new();
+    }
+    vec![home.join("tk/profiles").join(format!("{name}.json"))]
+}
+
+/// The profile by that name: the person's own if they have written one,
+/// else the one shipped in the crate.
+pub fn load(name: &str, home: &Path) -> Result<Profile, String> {
+    for p in search_paths(name, home) {
+        if let Ok(text) = std::fs::read_to_string(&p) {
+            return parse(&text).map_err(|e| format!("{}: {e}", p.display()));
+        }
+    }
+    if name == "networky" {
+        return parse(NETWORKY);
+    }
+    Err(format!(
+        "no profile named {name:?}; the toolkit ships `networky`, and a person's own live under tk/profiles"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A profile is looked for under the same home as the runs and the
+    /// models, so a person has one directory to look in.
+    #[test]
+    fn a_persons_own_profile_is_looked_for_under_the_same_home() {
+        let paths = search_paths("networky", Path::new("/home/someone/.cache/combs"));
+        assert_eq!(
+            paths,
+            vec![PathBuf::from(
+                "/home/someone/.cache/combs/tk/profiles/networky.json"
+            )]
+        );
+    }
+
+    /// A name that could climb is not a name, and yields nowhere to look
+    /// rather than somewhere it was never meant to reach.
+    #[test]
+    fn a_profile_name_that_could_climb_finds_nowhere() {
+        let home = Path::new("/home/someone/.cache/combs");
+        for bad in ["../../etc/passwd", "net/work", "", ".", ".."] {
+            assert!(
+                search_paths(bad, home).is_empty(),
+                "{bad:?} should find nowhere to look"
+            );
+        }
+    }
+
+    /// With no file of the person's own, the shipped profile answers;
+    /// a name nobody ships is refused naming what was asked for.
+    #[test]
+    fn the_shipped_profile_answers_when_the_person_has_written_none() {
+        let p = load("networky", Path::new("/nowhere/at/all")).expect("the shipped one");
+        assert_eq!(p.name, "networky");
+        let e = load("nosuch", Path::new("/nowhere/at/all")).unwrap_err();
+        assert!(
+            e.contains("nosuch"),
+            "the refusal must name what was asked for: {e}"
+        );
+    }
 
     /// The shipped profile must parse, or nothing ships.
     #[test]

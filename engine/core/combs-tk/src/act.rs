@@ -290,13 +290,16 @@ fn partial_tag(s: &str, tag: &str) -> usize {
 // can prove it.
 
 use std::io::Write;
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::api::{self, Ask, Message};
+use crate::fence::{self, Verdict};
 use crate::net;
+use crate::profile::{self, Profile};
 use crate::render;
 use crate::state;
 use crate::tools::{self, Tool};
@@ -553,10 +556,283 @@ pub fn pull(source: &str) -> i32 {
     }
 }
 
+/// Which tools the toolbox has actually built. A profile may name more
+/// than exists — that is the point of naming them ahead — so the list a
+/// person reads says which are real today rather than implying all are.
+const BUILT: &[&str] = &["shell.run"];
+
+/// What this profile allows, and which of those exist today.
+pub fn tool_list(profile_name: &str, json_out: bool) -> i32 {
+    let home = match state::home() {
+        Ok(h) => h,
+        Err(e) => return fail(&e),
+    };
+    let p = match profile::load(profile_name, &home) {
+        Ok(p) => p,
+        Err(e) => return fail(&e),
+    };
+    if json_out {
+        let record = json!({
+            "schema": "combs-tk.tools.v1",
+            "profile": p.name,
+            "about": p.about,
+            "roots": p.roots,
+            "tools": p.tools.iter().map(|t| json!({
+                "name": t,
+                "built": BUILT.contains(&t.as_str()),
+            })).collect::<Vec<_>>(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&record).unwrap_or_else(|_| record.to_string())
+        );
+        return 0;
+    }
+    println!("{}", ui::head(&format!("{} — {}", p.name, p.about)));
+    println!("  {:<10} {}", "roots", p.roots.join(", "));
+    for t in &p.tools {
+        let state = if BUILT.contains(&t.as_str()) {
+            ui::good("built")
+        } else {
+            ui::dim("not built yet")
+        };
+        println!("  {t:<18} {state}");
+    }
+    0
+}
+
+/// Judge one tool call, and — unless this is a dry run — take it.
+///
+/// The exit code is the contract. A dry run exits 1 having spawned
+/// nothing, because a dry run that exited 0 would read as "it ran"; a
+/// refusal exits 1; an ask without a person's consent exits 1, because
+/// only a person can consent and there is nobody inside a tool call.
+pub fn tool_call(
+    tool: &str,
+    args_json: &str,
+    profile_name: &str,
+    dry_run: bool,
+    yes: bool,
+) -> i32 {
+    let home = match state::home() {
+        Ok(h) => h,
+        Err(e) => return fail(&e),
+    };
+    let p = match profile::load(profile_name, &home) {
+        Ok(p) => p,
+        Err(e) => return fail(&e),
+    };
+    let args: Value = match serde_json::from_str(args_json) {
+        Ok(v) => v,
+        Err(e) => return fail(&format!("--args is not JSON: {e}")),
+    };
+    // The roots are the person's own home, not the cache home the
+    // profiles live under.
+    let person = std::env::var("HOME").unwrap_or_default();
+    let call = match judge_call(tool, &args, &p, Path::new(&person)) {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
+    };
+
+    let names: Vec<&str> = call.env.iter().map(|(k, _)| k.as_str()).collect();
+    let show = || {
+        println!("  {:<10} {}", "argv", call.argv.join(" "));
+        println!("  {:<10} {}", "env", names.join(" "));
+    };
+
+    match &call.verdict {
+        Verdict::Refuse(why) => {
+            println!("{}", ui::head(&format!("tool call {tool}")));
+            println!("  {:<10} {}", "verdict", ui::bad("refused"));
+            println!("  {:<10} {why}", "because");
+            show();
+            println!("  {}", ui::dim("nothing was spawned"));
+            1
+        }
+        Verdict::Ask(why) if !yes => {
+            println!("{}", ui::head(&format!("tool call {tool}")));
+            println!("  {:<10} {}", "verdict", ui::warn("asks"));
+            println!("  {:<10} {why}", "because");
+            show();
+            println!(
+                "  {}",
+                ui::dim("nothing was spawned — pass --yes to take it yourself")
+            );
+            1
+        }
+        _ if dry_run => {
+            println!("{}", ui::head(&format!("tool call {tool} — dry run")));
+            let word = match &call.verdict {
+                Verdict::Allow => ui::good("allowed"),
+                _ => ui::warn("asks, and --yes was given"),
+            };
+            println!("  {:<10} {word}", "verdict");
+            show();
+            println!("  {}", ui::dim("nothing was spawned"));
+            1
+        }
+        _ => {
+            let mut cmd = Command::new(&call.argv[0]);
+            cmd.args(&call.argv[1..]);
+            // The doors are absent by construction: the child is given
+            // this list and nothing of ours.
+            cmd.env_clear();
+            for (k, v) in &call.env {
+                cmd.env(k, v);
+            }
+            match cmd.output() {
+                Ok(out) => {
+                    print!("{}", String::from_utf8_lossy(&out.stdout));
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    if !err.trim().is_empty() {
+                        eprint!("{err}");
+                    }
+                    out.status.code().unwrap_or(1)
+                }
+                Err(e) => fail(&format!("{} could not be run: {e}", call.argv[0])),
+            }
+        }
+    }
+}
+
+/// What a tool call would do, decided before anything is spawned.
+///
+/// The decision is kept apart from the doing so a person can see it
+/// without taking it. That is what makes every refusal the fence makes
+/// reproducible by hand: no model in the loop, and nothing run.
+#[derive(Debug)]
+pub struct Call {
+    pub verdict: Verdict,
+    pub argv: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+/// Judge one tool call against a profile. Pure: it spawns nothing, reads
+/// no clock, and touches no socket.
+pub fn judge_call(tool: &str, args: &Value, p: &Profile, home: &Path) -> Result<Call, String> {
+    // Deny by default, and name the door that was shut. "invalid" sends
+    // a person to the source; naming the tool sends them to the profile.
+    if !p.allows(tool) {
+        return Err(format!(
+            "{tool} is not in the {} profile: what a profile does not name cannot be called",
+            p.name
+        ));
+    }
+    match tool {
+        "shell.run" => {
+            let line = args
+                .get("line")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("{tool} needs a `line` to judge, and this call carries none"))?;
+            let policy = p.policy(home);
+            Ok(Call {
+                verdict: fence::decide_shell(line, &policy),
+                argv: fence::shell_argv(line),
+                env: fence::fenced_env(),
+            })
+        }
+        // Named by the profile but not built yet. Refused at the CALL
+        // rather than at parse, so a profile may be written ahead of the
+        // tools it describes and stay true as they land.
+        _ => Err(format!(
+            "{tool} is named by the {} profile but is not built yet",
+            p.name
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn networky() -> Profile {
+        profile::parse(profile::NETWORKY).expect("the shipped profile parses")
+    }
+
+    /// Deny by default, and the refusal names the door that was shut
+    /// rather than calling the whole thing invalid.
+    #[test]
+    fn a_tool_the_profile_does_not_name_is_refused_by_name() {
+        let e = judge_call(
+            "tk.measure",
+            &serde_json::json!({}),
+            &networky(),
+            Path::new("/home/someone"),
+        )
+        .unwrap_err();
+        assert!(e.contains("tk.measure"), "the refusal must name the tool: {e}");
+    }
+
+    /// A tool the profile allows but nothing has built yet is refused at
+    /// the CALL, by name — so a profile may be written ahead of its
+    /// tools and stay true as they land.
+    #[test]
+    fn a_tool_that_is_named_but_not_built_is_refused_at_the_call() {
+        let e = judge_call(
+            "net.routes",
+            &serde_json::json!({}),
+            &networky(),
+            Path::new("/home/someone"),
+        )
+        .unwrap_err();
+        assert!(e.contains("net.routes"), "the refusal must name the tool: {e}");
+    }
+
+    /// The verdict travels with the argv it would have run, so a dry run
+    /// shows both the answer and the thing it answered about.
+    #[test]
+    fn a_judged_call_carries_the_argv_it_did_not_run() {
+        let c = judge_call(
+            "shell.run",
+            &serde_json::json!({"line": "netstat -an | grep LISTEN"}),
+            &networky(),
+            Path::new("/home/someone"),
+        )
+        .expect("a judged call");
+        assert_eq!(c.verdict, Verdict::Allow);
+        assert!(c.argv.contains(&"-f".to_string()), "{:?}", c.argv);
+        assert!(
+            c.argv.last().expect("a line to run").starts_with("command "),
+            "{:?}",
+            c.argv
+        );
+        let keys: Vec<&str> = c.env.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(
+            !keys.contains(&"BASH_ENV"),
+            "a shell door reached the child: {keys:?}"
+        );
+    }
+
+    /// A refused line is still a judged call: someone reproducing a
+    /// refusal wants to see what would have run.
+    #[test]
+    fn a_refused_line_is_still_a_judged_call() {
+        let c = judge_call(
+            "shell.run",
+            &serde_json::json!({"line": "rm -rf /"}),
+            &networky(),
+            Path::new("/home/someone"),
+        )
+        .expect("a judged call");
+        assert!(matches!(c.verdict, Verdict::Refuse(_)), "{:?}", c.verdict);
+    }
+
+    /// A tool that takes a line and is given none is a typo, not a run.
+    #[test]
+    fn shell_run_without_a_line_is_refused_by_name() {
+        let e = judge_call(
+            "shell.run",
+            &serde_json::json!({}),
+            &networky(),
+            Path::new("/home/someone"),
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("line"),
+            "the refusal must name the missing field: {e}"
+        );
+    }
 
     /// Fed one byte at a time, a thought must still leave no trace: the
     /// reader sees the answer and never the reasoning.

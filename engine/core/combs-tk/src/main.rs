@@ -166,6 +166,44 @@ enum Command {
         /// A preset id or `org/name`.
         source: String,
     },
+    /// What a profile may call, and what one call would do.
+    Tool {
+        #[command(subcommand)]
+        what: ToolCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ToolCmd {
+    /// The tools this profile allows, and which of them exist today.
+    List {
+        /// Which profile to read.
+        #[arg(long, default_value = "networky")]
+        profile: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Judge one call — and take it, unless this is a dry run.
+    ///
+    /// A dry run exits 1 having spawned nothing: a dry run that exited 0
+    /// would read as "it ran". This is how any refusal the fence makes is
+    /// reproduced by hand, with no model in the loop.
+    Call {
+        /// The tool, as `area.verb`.
+        name: String,
+        /// Its arguments, as JSON.
+        #[arg(long, default_value = "{}")]
+        args: String,
+        /// Which profile to judge against.
+        #[arg(long, default_value = "networky")]
+        profile: String,
+        /// Judge it and print what would run, without running it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Take a call the fence only asks about. Only a person may.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn main() {
@@ -215,6 +253,12 @@ fn main() {
             json,
         ),
         Command::Pull { source } => act::pull(&source),
+        Command::Tool { what } => match what {
+            ToolCmd::List { profile, json } => act::tool_list(&profile, json),
+            ToolCmd::Call { name, args, profile, dry_run, yes } => {
+                act::tool_call(&name, &args, &profile, dry_run, yes)
+            }
+        },
     };
     std::process::exit(code);
 }
