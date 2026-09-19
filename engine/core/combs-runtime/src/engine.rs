@@ -406,6 +406,11 @@ pub struct Engine {
     template: Option<crate::template::ChatTemplate>,
     template_warned: std::sync::Once,
     default_config: GenerationConfig,
+    /// Which tool-call dialect this seat speaks, and who decided —
+    /// settled once at load so no request re-sniffs a template, and so a
+    /// dialect nobody teaches is refused while a person is still watching
+    /// the model come up.
+    dialect: crate::dialect::Chosen,
     cache_config: CacheConfig,
     tx: mpsc::Sender<Command>,
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -657,6 +662,19 @@ impl Engine {
             )
         });
 
+        // The dialect this seat speaks, settled once: a door set for this
+        // process, then a card travelling beside the weights, then the
+        // template's own evidence. Refused here, not at the first tool
+        // call — a seat that cannot honour its configuration should say so
+        // while it is coming up.
+        let card = source.card().map_err(EngineError::Card)?;
+        let dialect = crate::dialect::choose(
+            crate::dialect::door().as_deref(),
+            card.as_ref().and_then(|c| c.tool_dialect.as_deref()),
+            spec.chat_template.as_deref(),
+        )
+        .map_err(EngineError::Card)?;
+
         Ok(Engine {
             device,
             tokenizer,
@@ -665,6 +683,7 @@ impl Engine {
             template,
             template_warned: std::sync::Once::new(),
             default_config: default_config_from(source.sampler_defaults().as_ref()),
+            dialect,
             cache_config,
             tx,
             worker: Mutex::new(Some(worker)),
@@ -878,10 +897,17 @@ impl Engine {
             || self.spec.special_token_id("<think>").is_some()
     }
 
-    /// The tool-call phrasing this model's template teaches (drives the
-    /// streaming parser).
+    /// The tool-call phrasing this seat speaks (drives the streaming
+    /// parser). Settled at load from the door, the card and the template,
+    /// in that order — never re-sniffed per request.
     pub fn tool_call_style(&self) -> crate::ToolCallStyle {
-        crate::ToolCallStyle::detect(self.spec.chat_template.as_deref())
+        self.dialect.style
+    }
+
+    /// The dialect and who chose it, for the stats line. A configuration
+    /// that is read and never said is one nobody can debug.
+    pub fn tool_dialect(&self) -> crate::dialect::Chosen {
+        self.dialect
     }
 
     /// Default generation config: [`GenerationConfig::default`] merged with

@@ -73,6 +73,8 @@ pub struct LocalEngine {
     spec: TokenizerSpec,
     template: Option<crate::template::ChatTemplate>,
     default_config: GenerationConfig,
+    /// Which tool-call dialect this seat speaks, and who decided.
+    dialect: crate::dialect::Chosen,
     cache_config: CacheConfig,
     sessions: SessionSet,
     token_table: Option<Arc<TokenByteTable>>,
@@ -159,6 +161,16 @@ impl LocalEngine {
             )
         });
 
+        // Settled once at load: a door for this process, then a card
+        // beside the weights, then the template's own evidence.
+        let card = source.card().map_err(EngineError::Card)?;
+        let dialect = crate::dialect::choose(
+            crate::dialect::door().as_deref(),
+            card.as_ref().and_then(|c| c.tool_dialect.as_deref()),
+            spec.chat_template.as_deref(),
+        )
+        .map_err(EngineError::Card)?;
+
         Ok(LocalEngine {
             device,
             model,
@@ -167,6 +179,7 @@ impl LocalEngine {
             spec,
             template,
             default_config: default_config_from(source.sampler_defaults().as_ref()),
+            dialect,
             cache_config,
             sessions: SessionSet::new(),
             token_table: None,
@@ -527,6 +540,6 @@ impl ChatHost for LocalEngine {
     }
 
     fn tool_call_style(&self) -> ToolCallStyle {
-        ToolCallStyle::detect(self.spec.chat_template.as_deref())
+        self.dialect.style
     }
 }

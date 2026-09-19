@@ -804,6 +804,27 @@ fn cmd_inspect(model: PathBuf, as_json: bool) -> Result<()> {
     let spec = source.tokenizer()?;
     let template = spec.chat_template.as_deref().unwrap_or("");
     let weights = weights_report(&source);
+
+    // The dialect this file would be read with, resolved exactly as a
+    // seat resolves it — so a card can be checked without loading a
+    // model, which is the whole point of having a card at all. `inspect`
+    // builds its source from bytes rather than a path, so the card is
+    // read from the path directly instead of through the source.
+    let card_dialect = match combs_formats::ModelCard::beside(&path) {
+        Ok(card) => card.and_then(|c| c.tool_dialect),
+        Err(e) => {
+            // A diagnostic tool reports a broken card; it does not refuse
+            // to describe the file because of one.
+            eprintln!("[combs/inspect] {e}");
+            None
+        }
+    };
+    let dialect = combs_runtime::dialect::choose(
+        combs_runtime::dialect::door().as_deref(),
+        card_dialect.as_deref(),
+        spec.chat_template.as_deref(),
+    );
+
     let report = serde_json::json!({
         "file": path.display().to_string(),
         "bytes": total,
@@ -824,13 +845,24 @@ fn cmd_inspect(model: PathBuf, as_json: bool) -> Result<()> {
             "thinking": template.contains("think"),
         },
         "add_bos": spec.add_bos,
+        // Which tool-call dialect this file teaches, and who decided. The
+        // template alone is evidence, not a statement; a card beside the
+        // weights outranks it and a door outranks both.
+        "tool_dialect": match &dialect {
+            Ok(c) => serde_json::json!({"name": c.style.name(), "source": c.from.as_str()}),
+            Err(e) => serde_json::json!({"refused": e}),
+        },
         "weights": weights,
     });
     if as_json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
+        let dialect_said = match &dialect {
+            Ok(c) => format!(" | dialect {} ({})", c.style.name(), c.from.as_str()),
+            Err(e) => format!(" | dialect REFUSED: {e}"),
+        };
         println!(
-            "{} — {} | ctx {} | vocab {} | {} tensors | template: {}{}{}",
+            "{} — {} | ctx {} | vocab {} | {} tensors | template: {}{}{}{}",
             path.file_name()
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_default(),
@@ -849,6 +881,7 @@ fn cmd_inspect(model: PathBuf, as_json: bool) -> Result<()> {
             } else {
                 ""
             },
+            dialect_said,
         );
     }
     Ok(())

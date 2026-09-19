@@ -117,8 +117,16 @@ fn normalize_arguments(v: &serde_json::Value) -> serde_json::Value {
 /// How a model family phrases tool calls in generated text, detected from
 /// the chat template SOURCE (the same file that teaches the model the
 /// phrasing).
+///
+/// This is the KEY into [`crate::dialect`], where each family's reading
+/// lives in its own file. Adding a family means adding a variant here and
+/// an implementation there — never an arm inside somebody else's parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolCallStyle {
+    /// `<tool_call><function=NAME><parameter=KEY>…</parameter></function></tool_call>`
+    /// (qwen3.5/qwen3.8). Must be asked for BEFORE `Hermes`: its
+    /// templates carry `<tool_call>` too.
+    XmlFunction,
     /// `<tool_call>{"name":…,"arguments":{…}}</tool_call>`, repeated for
     /// parallel calls (qwen2.5/qwen3/hermes/smollm3/ernie).
     Hermes,
@@ -131,14 +139,23 @@ pub enum ToolCallStyle {
 }
 
 impl ToolCallStyle {
+    /// Walks the dialect registry in its order, most specific first, and
+    /// takes the first family that says this template teaches it.
     pub fn detect(template_source: Option<&str>) -> Self {
-        match template_source {
-            Some(t) if t.contains("<tool_call>") => ToolCallStyle::Hermes,
-            Some(t) if t.contains("ipython") && t.contains("\"parameters\"") => {
-                ToolCallStyle::LlamaJson
+        let Some(t) = template_source else {
+            return ToolCallStyle::None;
+        };
+        for dialect in crate::dialect::registry() {
+            if dialect.teaches(t) {
+                return dialect.style();
             }
-            _ => ToolCallStyle::None,
         }
+        ToolCallStyle::None
+    }
+
+    /// The name a card or a door uses for this style.
+    pub fn name(self) -> &'static str {
+        crate::dialect::for_style(self).name()
     }
 }
 
@@ -150,173 +167,50 @@ pub enum ToolEvent {
     Call(ToolCall),
 }
 
-/// Streaming tool-call parser sitting between detokenization and emission.
-/// Text passes through untouched except while a marker prefix is plausible
-/// (only the ambiguous tail is held back) or a call body is being
-/// buffered. [`ToolCallParser::finish`] flushes any unterminated buffer as
-/// plain content — malformed output degrades to text, it is never
-/// swallowed.
+/// Streaming tool-call parser sitting between detokenization and
+/// emission. Text passes through untouched except while a marker prefix
+/// is plausible (only the ambiguous tail is held back) or a call body is
+/// being buffered. [`ToolCallParser::finish`] flushes any unterminated
+/// buffer as plain content — malformed output degrades to text, it is
+/// never swallowed.
+///
+/// The READING belongs to the dialect ([`crate::dialect`]); this is the
+/// one interface every caller holds, whichever family is seated. The
+/// signatures here are the ones the serving layer already had, so
+/// teaching the engine a new family moves nothing at a call site.
 pub struct ToolCallParser {
     style: ToolCallStyle,
-    buf: String,
-    in_call: bool,
-    started: bool,
-    buffer_all: bool,
-    calls: usize,
+    inner: Box<dyn crate::dialect::DialectParser>,
 }
-
-const OPEN: &str = "<tool_call>";
-const CLOSE: &str = "</tool_call>";
 
 impl ToolCallParser {
     pub fn new(style: ToolCallStyle) -> Self {
         ToolCallParser {
             style,
-            buf: String::new(),
-            in_call: false,
-            started: false,
-            buffer_all: false,
-            calls: 0,
+            inner: crate::dialect::for_style(style).parser(),
         }
+    }
+
+    /// Which family's reading this parser is doing.
+    pub fn style(&self) -> ToolCallStyle {
+        self.style
     }
 
     /// Number of complete tool calls parsed so far.
     pub fn calls_seen(&self) -> usize {
-        self.calls
+        self.inner.calls_seen()
     }
 
     /// Feeds one detokenized piece; returns events ready to emit.
     pub fn push(&mut self, piece: &str) -> Vec<ToolEvent> {
-        match self.style {
-            ToolCallStyle::None => vec![ToolEvent::Content(piece.to_string())],
-            ToolCallStyle::Hermes => {
-                self.buf.push_str(piece);
-                self.drain_hermes()
-            }
-            ToolCallStyle::LlamaJson => {
-                if self.buffer_all {
-                    self.buf.push_str(piece);
-                    return Vec::new();
-                }
-                if !self.started {
-                    self.buf.push_str(piece);
-                    let trimmed = self.buf.trim_start();
-                    if trimmed.is_empty() {
-                        return Vec::new(); // still only whitespace
-                    }
-                    self.started = true;
-                    if trimmed.starts_with('{') {
-                        self.buffer_all = true;
-                        return Vec::new();
-                    }
-                    let flushed = std::mem::take(&mut self.buf);
-                    return vec![ToolEvent::Content(flushed)];
-                }
-                vec![ToolEvent::Content(piece.to_string())]
-            }
-        }
+        self.inner.push(piece)
     }
 
     /// Flushes at end of generation. Unterminated call bodies and
     /// unparseable buffers come back as plain content.
     pub fn finish(&mut self) -> Vec<ToolEvent> {
-        match self.style {
-            ToolCallStyle::None => Vec::new(),
-            ToolCallStyle::Hermes => {
-                let mut out = Vec::new();
-                if self.in_call {
-                    let body = std::mem::take(&mut self.buf);
-                    out.push(ToolEvent::Content(format!("{OPEN}{body}")));
-                    self.in_call = false;
-                } else if !self.buf.is_empty() {
-                    out.push(ToolEvent::Content(std::mem::take(&mut self.buf)));
-                }
-                out
-            }
-            ToolCallStyle::LlamaJson => {
-                if !self.buffer_all {
-                    return Vec::new();
-                }
-                let body = std::mem::take(&mut self.buf);
-                match parse_call_json(body.trim()) {
-                    Some(call) => {
-                        self.calls += 1;
-                        vec![ToolEvent::Call(call)]
-                    }
-                    None => vec![ToolEvent::Content(body)],
-                }
-            }
-        }
+        self.inner.finish()
     }
-
-    fn drain_hermes(&mut self) -> Vec<ToolEvent> {
-        let mut out = Vec::new();
-        loop {
-            if self.in_call {
-                let Some(end) = self.buf.find(CLOSE) else { break };
-                let body: String = self.buf.drain(..end + CLOSE.len()).collect();
-                let inner = &body[..end];
-                self.in_call = false;
-                match parse_call_json(inner.trim()) {
-                    Some(mut call) => {
-                        if call.id.is_empty() {
-                            call.id = format!("call_{}", self.calls);
-                        }
-                        self.calls += 1;
-                        out.push(ToolEvent::Call(call));
-                    }
-                    // Unparseable body degrades to visible text.
-                    None => out.push(ToolEvent::Content(format!("{OPEN}{body}"))),
-                }
-            } else if let Some(start) = self.buf.find(OPEN) {
-                if start > 0 {
-                    let prefix: String = self.buf.drain(..start).collect();
-                    out.push(ToolEvent::Content(prefix));
-                }
-                self.buf.drain(..OPEN.len());
-                self.in_call = true;
-            } else {
-                // Emit everything except the longest tail that could still
-                // grow into the open marker.
-                let hold = ambiguous_tail(&self.buf, OPEN);
-                let safe = self.buf.len() - hold;
-                if safe > 0 {
-                    let prefix: String = self.buf.drain(..safe).collect();
-                    out.push(ToolEvent::Content(prefix));
-                }
-                break;
-            }
-        }
-        out
-    }
-}
-
-/// Longest suffix of `buf` that is a proper prefix of `marker` (ASCII
-/// marker ⇒ any match ends on a char boundary).
-fn ambiguous_tail(buf: &str, marker: &str) -> usize {
-    let max = (marker.len() - 1).min(buf.len());
-    for l in (1..=max).rev() {
-        if marker.as_bytes()[..l] == buf.as_bytes()[buf.len() - l..] {
-            return l;
-        }
-    }
-    0
-}
-
-/// Accepts `{"name": …, "arguments": {…}}` (hermes) and
-/// `{"name": …, "parameters": {…}}` (llama).
-fn parse_call_json(s: &str) -> Option<ToolCall> {
-    let v: serde_json::Value = serde_json::from_str(s).ok()?;
-    let name = v.get("name")?.as_str()?.to_string();
-    let arguments = v
-        .get("arguments")
-        .or_else(|| v.get("parameters"))
-        .cloned()
-        .unwrap_or(serde_json::Value::Object(Default::default()));
-    Some(ToolCall {
-        id: String::new(),
-        function: ToolFunction { name, arguments },
-    })
 }
 
 #[cfg(test)]

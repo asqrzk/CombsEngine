@@ -347,6 +347,20 @@ fn stats_response(
                 "kv_env": std::env::var("COMBS_KV").ok(),
                 "attn_env": std::env::var("COMBS_ATTN").ok(),
                 "quant_kernels": std::env::var_os("COMBS_NO_QUANT_KERNELS").is_none(),
+                // The width the batched prefill dequantizes to. A door the
+                // app sets for its whole process, and until now one the
+                // engine honoured without ever saying so — which left a
+                // caller no way to confirm it took.
+                "prefill_operand": std::env::var("COMBS_QMATMUL_OPERAND").ok(),
+            },
+            // Which tool-call dialect this seat speaks, and who decided:
+            // a door for this process, a card beside the weights, or the
+            // template's own evidence. Said out loud because a
+            // configuration that is read in silence is one nobody can
+            // debug from the outside.
+            "tool_dialect": {
+                "name": engine.tool_call_style().name(),
+                "source": engine.tool_dialect().from.as_str(),
             },
         }),
     )

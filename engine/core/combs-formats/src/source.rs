@@ -27,6 +27,19 @@ pub trait ModelSource: Send + Sync {
     /// Sampler defaults from `generation_config.json`, if present.
     fn sampler_defaults(&self) -> Option<SamplerConfig>;
 
+    /// The card sitting beside these weights, if one is there.
+    ///
+    /// A card carries what the weight file cannot say about itself — the
+    /// tool-call dialect first among them. `Ok(None)` means no card;
+    /// `Err` means a card exists and could not be read, which is a
+    /// refusal rather than an absence: someone wrote it meaning it to be
+    /// used, and ignoring it would read as a setting that did not take.
+    ///
+    /// Sources whose weights do not live in a file keep this default.
+    fn card(&self) -> std::result::Result<Option<crate::ModelCard>, String> {
+        Ok(None)
+    }
+
     /// Raw *packed* quantized bytes for a tensor, when this source stores it
     /// in a quant format that has a device kernel (GGUF Q4_0/Q4_K/Q6_K).
     /// `None` means "no packed representation" — the caller falls back to
@@ -407,6 +420,9 @@ impl<T: ModelSource + ?Sized> ModelSource for Box<T> {
     }
     fn sampler_defaults(&self) -> Option<SamplerConfig> {
         (**self).sampler_defaults()
+    }
+    fn card(&self) -> std::result::Result<Option<crate::ModelCard>, String> {
+        (**self).card()
     }
     // Every method must be forwarded, including defaulted ones: a missing
     // forward silently pins callers of `Box<dyn ModelSource>` to the trait

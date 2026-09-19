@@ -7,6 +7,7 @@
 //! mmap-backed, zero-copy views). GGUF / ONNX / litertlm adapters plug in
 //! here later by implementing the same trait.
 
+mod card;
 mod flatbuf;
 mod gguf;
 mod litertlm;
@@ -22,6 +23,7 @@ mod spm;
 mod tflite;
 mod tokenizer;
 
+pub use card::{CardThinking, ModelCard};
 pub use gguf::{GgufHeaderInfo, GgufSource, read_gguf_header};
 
 /// Reference CPU dequantizers for GGUF quant formats. These scalar

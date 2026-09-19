@@ -8,6 +8,7 @@
 //! Batching and the action scheduler are Phase 3.
 
 mod constraint;
+pub mod dialect;
 mod detok;
 mod engine;
 mod kvevents;
@@ -61,6 +62,7 @@ pub use template::ChatTemplate;
 pub use toolcall::{
     ChatMessage, ToolCall, ToolCallParser, ToolCallStyle, ToolEvent, ToolFunction,
 };
+pub use dialect::{DialectParser, Off, Thinking, ToolDialect};
 #[cfg(not(target_family = "wasm"))]
 pub use transcribe::{SpeechEngine, TranscribeGates, Transcript};
 
@@ -78,6 +80,13 @@ pub enum EngineError {
     /// Tokenizer failure.
     #[error("tokenizer error: {0}")]
     Tokenizer(String),
+
+    /// The card beside the weights, or a door naming a tool dialect,
+    /// could not be honoured. A refusal rather than a quiet fallback:
+    /// someone wrote it meaning it to be used, and a setting that did not
+    /// take is worse than one that was refused out loud.
+    #[error("model card: {0}")]
+    Card(String),
 
     /// Media payload (audio) could not be decoded.
     #[error("media error: {0}")]

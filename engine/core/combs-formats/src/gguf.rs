@@ -1945,6 +1945,16 @@ impl GgufSource {
 }
 
 impl ModelSource for GgufSource {
+    /// The card beside this file, by the same sibling rule as the
+    /// tokenizer sidecar. A source read from bytes rather than a path has
+    /// nowhere to look, and says so by answering `None`.
+    fn card(&self) -> std::result::Result<Option<crate::ModelCard>, String> {
+        match &self.path {
+            Some(p) => crate::ModelCard::beside(p),
+            None => Ok(None),
+        }
+    }
+
     fn metadata(&self) -> &ModelMetadata {
         &self.metadata
     }
