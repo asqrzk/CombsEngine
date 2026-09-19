@@ -99,9 +99,17 @@ pub const DOORS: &[Door] = &[
     Door {
         kind: Kind::Knob,
         name: "COMBS_WGSL_PREFILL",
-        default: "on",
-        does: "paged causal prefill attention",
+        default: "off",
+        does: "paged causal prefill attention — opt-in, and the one wgsl door that works the other way round: only the literal 1 opens it, where its siblings open unless set to 0",
         read_at: "combs-models/src/wgsl/decode_attn.rs",
+        measured: None,
+    },
+    Door {
+        kind: Kind::Knob,
+        name: "COMBS_TOOL_DIALECT",
+        default: "unset",
+        does: "names the tool-call dialect this seat speaks, outranking both the card beside the weights and the chat template's own evidence. Set it when a model's template lies about its phrasing, or to shut tool parsing off entirely with `none`. An unknown name is refused at load, naming every name that would have worked",
+        read_at: "combs-runtime/src/dialect/choose.rs",
         measured: None,
     },
     Door {
