@@ -178,7 +178,9 @@ pub fn serve(
                     json!({"object": "list", "data": [model_card(&engine, &model_id)]}),
                 ),
                 ("GET", "/v1/model/info") => model_info(&engine, &model_id, &static_info),
-                ("GET", "/v1/stats") => stats_response(&engine, &model_id, &counters, &static_info),
+                ("GET", "/v1/stats") => {
+                    stats_response(&engine, &model_id, &counters, &static_info, anonymous)
+                }
                 ("GET", "/v1/sessions") => sessions_response(&engine),
                 ("GET", p) if p == "/v1/kv/events" || p.starts_with("/v1/kv/events?") => {
                     kv_events_response(&engine, p)
@@ -247,6 +249,7 @@ fn stats_response(
     model_id: &str,
     counters: &ServeCounters,
     static_info: &Value,
+    anonymous: AnonymousSessions,
 ) -> HttpResponse {
     let snap = engine.stats_snapshot();
     let cc = engine.cache_config();
@@ -347,6 +350,14 @@ fn stats_response(
                 "kv_env": std::env::var("COMBS_KV").ok(),
                 "attn_env": std::env::var("COMBS_ATTN").ok(),
                 "quant_kernels": std::env::var_os("COMBS_NO_QUANT_KERNELS").is_none(),
+                // What a request naming no session gets. Reported because a
+                // product can restart a worker carrying a new argv and call
+                // it restarted, while nothing reads the value back off a
+                // live engine — so a door change was "we asked for it",
+                // never "it took". The words are `as_str`'s, the same ones
+                // the startup provenance line prints, so the log and the
+                // route cannot drift apart.
+                "anonymous_sessions": anonymous.as_str(),
                 // The width the batched prefill dequantizes to. A door the
                 // app sets for its whole process, and until now one the
                 // engine honoured without ever saying so — which left a

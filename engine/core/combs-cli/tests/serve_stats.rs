@@ -93,3 +93,74 @@ fn stats_carries_the_manifest_and_the_env_flags_under_distinct_keys() {
     let _ = child.wait();
     result.expect("stats assertions");
 }
+
+/// The anonymous-session mode must be READABLE, not merely configurable.
+///
+/// The platform can restart a worker carrying a new `--anonymous-sessions`
+/// argv and call it "restarted" — but nothing reads the value back off a
+/// LIVE engine, so a door change is "we asked for it", never "it took".
+/// The readback it does have compares two fields, neither of them this
+/// one. The engine already knows the answer and says it once, at startup,
+/// into a log no door-verifier can read. This puts it where the platform
+/// already looks: `.build`.
+///
+/// Two ports, and neither is the one above: a borrowed port is not yours
+/// a moment later, and this suite has already paid for that once.
+#[test]
+fn the_stats_build_block_names_the_anonymous_session_mode() {
+    let Some(model) = smollm2() else {
+        eprintln!("skipping: smollm2-360m gguf not cached");
+        return;
+    };
+
+    for (flag, want, port) in [(None, "keep", 18095_u16), (Some("off"), "off", 18096_u16)] {
+        let mut args = vec![
+            "serve".to_string(),
+            "--model".to_string(),
+            model.to_str().unwrap().to_string(),
+            "--port".to_string(),
+            port.to_string(),
+        ];
+        if let Some(mode) = flag {
+            args.push("--anonymous-sessions".to_string());
+            args.push(mode.to_string());
+        }
+
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_combs"))
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn serve");
+
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let healthy = loop {
+            if let Some((200, _)) = http_get(port, "/health") {
+                break true;
+            }
+            if Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        };
+
+        let result = std::panic::catch_unwind(|| {
+            assert!(healthy, "serve never became healthy");
+            let (status, body) = http_get(port, "/v1/stats").expect("stats");
+            assert_eq!(status, 200);
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("stats json");
+
+            let got = json["build"]["anonymous_sessions"].as_str();
+            assert_eq!(
+                got,
+                Some(want),
+                "a door that cannot be read back cannot be verified, only assumed: {}",
+                json["build"]
+            );
+        });
+
+        let _ = child.kill();
+        let _ = child.wait();
+        result.expect("anonymous-session mode on /v1/stats");
+    }
+}
