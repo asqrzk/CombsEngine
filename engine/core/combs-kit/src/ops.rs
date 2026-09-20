@@ -120,7 +120,7 @@ pub const OPS: &[Op] = &[
         wher: "macos / metal",
         state: State::Works,
         reason: "rmsnorm, attention and the three projection gemvs read and write f16 in place with f32 arithmetic; perplexity identical to four decimals, five of five transcripts byte-identical; decode doubles at 2.2k. On by default here",
-        evidence: "MEASUREMENTS §96, §97, §98, §100",
+        evidence: "the ledger §96, §97, §98, §100",
     },
     Op {
         id: "f16-storage-kernels",
@@ -128,7 +128,7 @@ pub const OPS: &[Op] = &[
         wher: "vulkan / dx12 (linux, windows, android)",
         state: State::Unproven,
         reason: "the kernels exist and the adapter check is the same, but a shader `enable` directive is exactly what a second driver may handle differently. Off by default there until one sitting; COMBS_WGSL_F16=1 opens it for the sitting",
-        evidence: "MEASUREMENTS §97; the matrix's own rule that a default is a promise to every box",
+        evidence: "the ledger §97; the matrix's own rule that a default is a promise to every box",
     },
     Op {
         id: "fused-f16-backend",
@@ -136,7 +136,7 @@ pub const OPS: &[Op] = &[
         wher: "any",
         state: State::Refused,
         reason: "the fused reduce's autotune resolves a global argument that was never registered, and that failure then desynchronises the fusion queue so every later operation panics. The worker dies before the first token",
-        evidence: "MEASUREMENTS §91; UPSTREAM-ISSUES #6",
+        evidence: "the ledger §91; the upstream-issues log #6",
     },
     Op {
         id: "bf16-anywhere",
@@ -144,7 +144,7 @@ pub const OPS: &[Op] = &[
         wher: "any",
         state: State::Unavailable,
         reason: "the WGSL compiler rejects it, and the failed autotune poisons the process rather than falling back",
-        evidence: "MEASUREMENTS §65",
+        evidence: "the ledger §65",
     },
     Op {
         id: "f8-f4-compute",
@@ -168,7 +168,7 @@ pub const OPS: &[Op] = &[
         wher: "any, head_dim divisible by 32",
         state: State::Works,
         reason: "global layers quantize; the arena shrinks by roughly the ratio the cache module documents",
-        evidence: "MEASUREMENTS §88",
+        evidence: "the ledger §88",
     },
     Op {
         id: "int8-kv",

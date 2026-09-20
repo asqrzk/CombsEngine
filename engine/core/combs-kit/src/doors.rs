@@ -46,7 +46,7 @@ pub const DOORS: &[Door] = &[
         default: "on",
         does: "the master door over every hand-written WGSL kernel; 0 sends every kernel back to the burn path",
         read_at: "combs-models/src/wgsl/mod.rs",
-        measured: Some("MEASUREMENTS §90, §92"),
+        measured: Some("the ledger §90, §92"),
     },
     Door {
         kind: Kind::Knob,
@@ -54,7 +54,7 @@ pub const DOORS: &[Door] = &[
         default: "on",
         does: "the packed-weight decode gemv kernels (q8_0, q4_k, q6_k)",
         read_at: "combs-models/src/wgsl/mod.rs",
-        measured: Some("MEASUREMENTS §9"),
+        measured: Some("the ledger §9"),
     },
     Door {
         kind: Kind::Knob,
@@ -70,7 +70,7 @@ pub const DOORS: &[Door] = &[
         default: "on",
         does: "the fused RMSNorm kernel; accepts f16 since §92",
         read_at: "combs-models/src/wgsl/rmsnorm.rs",
-        measured: Some("MEASUREMENTS §92"),
+        measured: Some("the ledger §92"),
     },
     Door {
         kind: Kind::Knob,
@@ -78,7 +78,7 @@ pub const DOORS: &[Door] = &[
         default: "off",
         does: "1 runs the Gated DeltaNet decode step as two WGSL dispatches (qwen35); opt-in: it cuts dispatches but decodes slower than the generic-op road today",
         read_at: "combs-models/src/wgsl/deltanet.rs",
-        measured: Some("MEASUREMENTS §113"),
+        measured: Some("the ledger §113"),
     },
     Door {
         kind: Kind::Knob,
@@ -86,7 +86,7 @@ pub const DOORS: &[Door] = &[
         default: "on",
         does: "the fused rope kernel for q and k in one dispatch; accepts f16 since §92",
         read_at: "combs-models/src/wgsl/rope.rs",
-        measured: Some("MEASUREMENTS §92"),
+        measured: Some("the ledger §92"),
     },
     Door {
         kind: Kind::Knob,
@@ -94,7 +94,7 @@ pub const DOORS: &[Door] = &[
         default: "on",
         does: "paged decode attention, including the split-K and int8 variants",
         read_at: "combs-models/src/wgsl/decode_attn.rs",
-        measured: Some("MEASUREMENTS §9"),
+        measured: Some("the ledger §9"),
     },
     Door {
         kind: Kind::Knob,
@@ -142,7 +142,7 @@ pub const DOORS: &[Door] = &[
         default: "off",
         does: "int8 KV on global layers. No-ops silently when head_dim does not divide by 32",
         read_at: "combs-models/src/kv.rs",
-        measured: Some("MEASUREMENTS §88"),
+        measured: Some("the ledger §88"),
     },
     Door {
         kind: Kind::Knob,
@@ -158,7 +158,7 @@ pub const DOORS: &[Door] = &[
         default: "f32",
         does: "f16 operands into the batched prefill matmul, f32 accumulate",
         read_at: "combs-models/src/qlinear.rs",
-        measured: Some("MEASUREMENTS §65"),
+        measured: Some("the ledger §65"),
     },
     Door {
         kind: Kind::Knob,
@@ -174,7 +174,7 @@ pub const DOORS: &[Door] = &[
         default: "exclusive",
         does: "exclusive pages, or cubecl's sub-slice pools",
         read_at: "combs-core/src/lib.rs",
-        measured: Some("MEASUREMENTS §37"),
+        measured: Some("the ledger §37"),
     },
     Door {
         kind: Kind::Knob,
@@ -182,7 +182,7 @@ pub const DOORS: &[Door] = &[
         default: "16 (the house default; cubecl's own is 32)",
         does: "dispatches per queue submit. The decode step ends in a blocking readback, so coarse batching serializes encode against execute",
         read_at: "combs-core/src/lib.rs",
-        measured: Some("MEASUREMENTS §90 — 16 measured best here; the optimum is a property of the driver"),
+        measured: Some("the ledger §90 — 16 measured best here; the optimum is a property of the driver"),
     },
     Door {
         kind: Kind::Knob,
@@ -238,7 +238,7 @@ pub const DOORS: &[Door] = &[
         default: "on where it is blessed (Metal; Vulkan on PCI vendor 0x10de); off on every other adapter; 0/1 wins",
         does: "let the hand-written kernels store activations in f16 instead of casting around an f32 launch; arithmetic stays f32 either way. Attention reads the f16 arena in place, which is where decode doubles at depth",
         read_at: "combs-models/src/wgsl/mod.rs f16_storage_enabled, STORAGE_BLESSED",
-        measured: Some("MEASUREMENTS §96, §97, §98, §115, §116d"),
+        measured: Some("the ledger §96, §97, §98, §115, §116d"),
     },
 
     // ── knobs the table lacked until the drift test named them ──
@@ -247,7 +247,7 @@ pub const DOORS: &[Door] = &[
     Door { kind: Kind::Knob, name: "COMBS_PERSISTENT_LOAD", default: "on", does: "0 turns off the persistent load path in the device context", read_at: "combs-core/src/lib.rs:618", measured: None },
     Door { kind: Kind::Knob, name: "COMBS_STAGE_REPACK", default: "device", does: "host stages the weight repack through host memory instead of on the device", read_at: "combs-models/src/qmatmul.rs:1239", measured: None },
     Door { kind: Kind::Knob, name: "COMBS_REPACK_SLAB", default: "engine's own", does: "slab size for the device-side weight repack", read_at: "combs-models/src/qmatmul.rs", measured: None },
-    Door { kind: Kind::Knob, name: "COMBS_QMATMUL_STRATEGY", default: "autotune", does: "cube forces the cube matmul strategy instead of letting autotune choose", read_at: "combs-models/src/qlinear.rs:218", measured: Some("MEASUREMENTS §70") },
+    Door { kind: Kind::Knob, name: "COMBS_QMATMUL_STRATEGY", default: "autotune", does: "cube forces the cube matmul strategy instead of letting autotune choose", read_at: "combs-models/src/qlinear.rs:218", measured: Some("the ledger §70") },
     Door { kind: Kind::Knob, name: "COMBS_QMATMUL_CUBE_K", default: "engine's own", does: "the k split for the cube matmul path", read_at: "combs-models/src/qlinear.rs", measured: None },
     Door { kind: Kind::Knob, name: "COMBS_QMATMUL_PAD_ROWS", default: "off", does: "pads rows into the batched matmul rather than refusing a ragged shape", read_at: "combs-models/src/qlinear.rs", measured: None },
     Door { kind: Kind::Knob, name: "COMBS_NO_TILED_MATMUL", default: "off", does: "1 disables the tiled quant matmul and takes the untiled cube path", read_at: "combs-models/src/qmatmul.rs:165", measured: None },

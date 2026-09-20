@@ -77,7 +77,7 @@ pub(crate) fn try_rms_norm<B: Backend, const D: usize>(
     // The f16 backend the app ships takes the same launch with a cast on
     // either side. It used to be refused here, and the refusal cost it
     // the whole burn chain — about thirty dispatches a layer where four
-    // will do (MEASUREMENTS §90, §92).
+    // will do (the ledger §90, §92).
     if TypeId::of::<B>() == TypeId::of::<UnfusedF16>() {
         let x: Tensor<UnfusedF16, D> = cast_any(x)?;
         let w: Tensor<UnfusedF16, 1> = cast_any(weight)?;

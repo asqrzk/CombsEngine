@@ -41,12 +41,12 @@ use burn::backend::wgpu::{
 ///
 /// It is NOT faster here: without fusion it pays 1.3-4.2x the dispatches
 /// per token and runs that much slower on every seat measured
-/// (MEASUREMENTS §90). The road back is the seam, not the fusion layer —
+/// (the ledger §90). The road back is the seam, not the fusion layer —
 /// the `try_*` doors that refuse f16 today.
 ///
 /// Note: f16 uses the **unfused** `CubeBackend` type directly because
 /// burn-fusion 0.21 cannot carry it. Measured, not assumed
-/// (MEASUREMENTS §91, UPSTREAM-ISSUES #6): the fused reduce's autotune
+/// (the ledger §91, the upstream-issues log #6): the fused reduce's autotune
 /// launch plan resolves a global argument that was never registered
 /// (`resolve_arg`, len 1 index 1) and the failure then desynchronises
 /// burn-fusion's queue, so the worker dies before the first token.
@@ -185,7 +185,7 @@ static CONTEXT: std::sync::OnceLock<DeviceContext> = std::sync::OnceLock::new();
 /// policy is chosen. Native defaults to exclusive pages — the footprint
 /// proof measured it at identical decode speed with reserved tracking
 /// live bytes almost exactly (721 vs 1862 MB after a qwen3-0.6b load
-/// under sub-slices; MEASUREMENTS §37). `COMBS_MEM_POOLS=subslices`
+/// under sub-slices; the ledger §37). `COMBS_MEM_POOLS=subslices`
 /// restores cubecl's sub-slice pools; `=exclusive` names the default
 /// explicitly. The wasm build has no environment and takes cubecl's
 /// wasm default, which is already exclusive pages.
@@ -195,7 +195,7 @@ static CONTEXT: std::sync::OnceLock<DeviceContext> = std::sync::OnceLock::new();
 /// the decode step ends in a blocking readback, so the whole token's
 /// dispatches must reach the driver before the GPU can finish — batching
 /// them coarsely serializes CPU encode against GPU execute instead of
-/// overlapping the two. Measured on this desk (MEASUREMENTS §90, the
+/// overlapping the two. Measured on this desk (the ledger §90, the
 /// dispatch meter), qwen3-0.6b decode against `tasks_max`:
 ///
 /// ```text
@@ -666,7 +666,7 @@ impl BufferPool {
     /// calls — meant for weight loading. On by default natively: the
     /// footprint proof showed reserved landing exactly on live bytes
     /// with no transient pinned (712.7 = 712.7 MB vs 721.5 doored off;
-    /// MEASUREMENTS §39). `COMBS_PERSISTENT_LOAD=0` opts out. The wasm
+    /// the ledger §39). `COMBS_PERSISTENT_LOAD=0` opts out. The wasm
     /// build keeps the plain path until the mode is proven in a browser.
     pub fn pin_persistent<R>(
         &self,

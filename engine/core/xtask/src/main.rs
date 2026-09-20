@@ -724,7 +724,7 @@ fn cmd_bundle(ctx: &Ctx) -> Result<()> {
     // perplexity deltas under 0.2%; diffusion is pinned to f32 internally
     // either way); `combs-f32` ships alongside. "Faster throughout" used
     // to stand here and was wrong: without fusion the f16 build paid 1.3-
-    // 4.2x the dispatches (MEASUREMENTS §90) until the kernel doors took
+    // 4.2x the dispatches (the ledger §90) until the kernel doors took
     // f16 (§92, §96, §97). Halved dense weights and a halved KV arena are
     // what it buys; the speed question is measured per seat, not assumed.
     {

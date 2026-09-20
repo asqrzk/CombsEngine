@@ -4,7 +4,7 @@
 //! bytes after load must stay within 1.25× of it, generation may grow
 //! the pool, and dropping the session (which fires the worker's
 //! `BufferPool::cleanup`) must hand memory back rather than hoard it —
-//! the failure mode that took the machine down twice (MEASUREMENTS §30).
+//! the failure mode that took the machine down twice (the ledger §30).
 //!
 //! Requires a real model and a GPU, so ignored by default:
 //!
