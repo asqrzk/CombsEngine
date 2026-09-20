@@ -35,6 +35,30 @@ pub struct Op {
 
 pub const OPS: &[Op] = &[
     Op {
+        id: "text-classifier",
+        title: "answer a typed decision over tethered options",
+        wher: "embed-cosine road, any platform",
+        state: State::Refused,
+        reason: "it classifies by TOPIC. On the seed suite every one of six mentions fired the action it merely mentions, and the speech-act question that exists to catch them cannot separate them either: p(is_request) runs 0.555..0.961 on real requests and 0.095..0.849 on mentions, medians 0.718 against 0.680. The bands overlap, so no threshold divides them — raising the floor buys one contrast and loses five genuine requests. The interface and the gate are sound; similarity over sentence embeddings is not a reading of a speech act",
+        evidence: "combs-classify/tests/data/classify-seed.jsonl (unsub-c1); combs-cli/src/classify.rs; a seating of the cached embedding checkpoint",
+    },
+    Op {
+        id: "text-classifier",
+        title: "answer a typed decision over tethered options",
+        wher: "trained encoder with scoring heads",
+        state: State::Unproven,
+        reason: "the road the refused row points at: an encoder read bidirectionally with heads over the tether markers, which is what the published blueprints score with. Nothing here has run it",
+        evidence: "no sitting yet; the seed suite is the bar it must clear",
+    },
+    Op {
+        id: "jev-system-one",
+        title: "call the hosted typed-decision model this design follows",
+        wher: "any",
+        state: State::Unavailable,
+        reason: "a hosted API only: no weights, no parameter count and no architecture are published, so there is nothing to load and nothing to prove against. Unproven would be a lie",
+        evidence: "the vendor's own announcement; the interface is public and is what combs-classify copies",
+    },
+    Op {
         id: "llm-memory-preflight",
         title: "refuse to serve a model that will not fit host memory",
         wher: "macos",
