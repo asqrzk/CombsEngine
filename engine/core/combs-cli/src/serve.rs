@@ -61,6 +61,11 @@ pub fn serve(
         in_flight: AtomicU64::new(0),
     });
     let static_info = Arc::new(static_info);
+    // One option-vector cache for the life of the server: a question
+    // asked twice embeds its options once. It sits ABOVE the engine's
+    // single-flight worker because it is keyed by request content, not
+    // by anything the worker holds.
+    let classifier = Arc::new(crate::classify::Classifier::new());
     let provenance_config = vec![
         ("model", model_id.clone()),
         ("dtype", combs_core::BACKEND.dtype.to_string()),
@@ -163,6 +168,7 @@ pub fn serve(
         let model_id = model_id.clone();
         let counters = counters.clone();
         let static_info = static_info.clone();
+        let classifier = classifier.clone();
         std::thread::spawn(move || {
             let url = request.url().to_string();
             let method = request.method().as_str().to_string();
@@ -225,6 +231,14 @@ pub fn serve(
                         json_response(400, error_json("invalid_request", "unreadable body"))
                     } else {
                         handle_embeddings(&engine, &model_id, &body)
+                    }
+                }
+                ("POST", "/v1/classify") => {
+                    let mut body = String::new();
+                    if request.as_reader().read_to_string(&mut body).is_err() {
+                        json_response(400, error_json("invalid_request", "unreadable body"))
+                    } else {
+                        crate::classify::handle_classify(&engine, &model_id, &body, &classifier)
                     }
                 }
                 _ => json_response(404, error_json("not_found", "unknown endpoint")),
@@ -398,6 +412,8 @@ fn capabilities_json(engine: &Arc<Engine>) -> Value {
         "tools": engine.supports_tools(),
         "constraints": ["json_object", "json_schema"],
         "embeddings": engine.supports_embeddings(),
+        "classify": engine.supports_embeddings(),
+        "classify_backend": if engine.supports_embeddings() { "embed-cosine" } else { "none" },
         "pooling": match engine.default_pooling() {
             combs_runtime::Pooling::Last => "last",
             combs_runtime::Pooling::Mean => "mean",

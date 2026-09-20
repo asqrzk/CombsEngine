@@ -15,6 +15,7 @@ use combs_runtime::{Engine, GenerationConfig};
 
 mod build_info;
 mod chew;
+mod classify;
 mod doctor;
 mod fit;
 mod generate_audio;

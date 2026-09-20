@@ -1,0 +1,538 @@
+//! `POST /v1/classify` — typed decisions on the seated model, gated.
+//!
+//! The rung this serves needs NO new weights: the state and each
+//! option's tether are embedded by the model already loaded, and the
+//! answer is a softmax over their cosine similarities. That is the
+//! cheapest honest classifier this estate can offer, and it is honest
+//! about what it is — `calibrated: false` until a temperature is
+//! fitted, and a `backend` field naming the road it took.
+//!
+//! What never happens here: an option's IDENTIFIER is never embedded.
+//! The scorer reads [`combs_classify::Opt::scored_text`], which is the
+//! tether's meaning and its near-miss anchors, so a state that merely
+//! MENTIONS a topic can land on an anchor instead of the action. The
+//! identifier comes back in the answer as a routing key and nothing
+//! else.
+//!
+//! The option vectors are cached by content, above the engine's
+//! single-flight worker: a question asked twice embeds its options
+//! once, and only the state is paid for on the second call.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use serde_json::{json, Value};
+
+use combs_classify::{
+    check_distribution, confidence, decide, expected_level, softmax_scaled, tether, Decision,
+    Implication, Kind, Opt, Thresholds,
+};
+use combs_runtime::{EmbedOptions, Engine};
+
+use crate::http::{error_json, json_response, HttpResponse};
+
+/// Cosine similarities sit in a narrow band (roughly 0.3..0.8 for a
+/// sentence encoder), so a softmax straight over them is nearly
+/// uniform. This divides them into a usable range. It is a SHAPE
+/// parameter, not a calibration: `calibrated` stays false until a
+/// temperature is fitted against labels.
+const DEFAULT_TEMPERATURE: f32 = 0.05;
+
+/// Options a single question may carry here. The constrained decoder's
+/// own enum cap, so a question this road accepts is one the rung above
+/// it could also serve.
+const MAX_OPTIONS: usize = combs_classify::bars::MAX_OPTIONS;
+
+/// Texts embedded in one call. The engine's embeddings road takes at
+/// most this many, and a request past it is refused by name rather than
+/// silently truncated.
+const MAX_TEXTS: usize = 64;
+
+/// One question as the wire declares it.
+struct Question {
+    name: String,
+    kind: Kind,
+    instructions: String,
+    /// `choice` and `score` carry options; a `noul` is folded into a
+    /// two-option choice whose first option is the proposition.
+    options: Vec<Opt>,
+}
+
+struct Request {
+    state: String,
+    questions: Vec<Question>,
+    temperature: f32,
+    thresholds: Thresholds,
+}
+
+/// The option-vector cache: content-keyed, so the same question asked
+/// again costs one embedding of the state and nothing else.
+#[derive(Default)]
+pub struct Classifier {
+    options: Mutex<HashMap<u64, Arc<Vec<Vec<f32>>>>>,
+}
+
+impl Classifier {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    fn get(&self, key: u64) -> Option<Arc<Vec<Vec<f32>>>> {
+        self.options.lock().ok()?.get(&key).cloned()
+    }
+    fn put(&self, key: u64, vectors: Arc<Vec<Vec<f32>>>) {
+        if let Ok(mut m) = self.options.lock() {
+            // A bound, so a long-running server cannot grow a cache
+            // without end; the next question re-embeds, which costs one
+            // call and never a wrong answer.
+            if m.len() >= 256 {
+                m.clear();
+            }
+            m.insert(key, vectors);
+        }
+    }
+}
+
+/// FNV-1a over the strings that decide a vector. No new dependency, and
+/// a collision costs a wrong cache hit, so the key covers every input
+/// the embedding depends on.
+fn key_of(kind: Kind, instructions: &str, texts: &[String]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |b: &[u8]| {
+        for &byte in b {
+            h ^= byte as u64;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+    };
+    eat(match kind {
+        Kind::Choice => b"choice",
+        Kind::Score => b"score",
+        Kind::Noul => b"noul",
+    });
+    eat(b"\x1f");
+    eat(instructions.as_bytes());
+    for t in texts {
+        eat(b"\x1f");
+        eat(t.as_bytes());
+    }
+    h
+}
+
+fn bad(msg: &str) -> (u16, Value) {
+    (400, error_json("invalid_request", msg))
+}
+
+fn parse_kind(s: &str) -> Option<Kind> {
+    match s {
+        "choice" => Some(Kind::Choice),
+        "score" => Some(Kind::Score),
+        "noul" => Some(Kind::Noul),
+        _ => None,
+    }
+}
+
+fn parse_opt(v: &Value, question: &str, i: usize) -> Result<Opt, (u16, Value)> {
+    serde_json::from_value::<Opt>(v.clone()).map_err(|e| {
+        bad(&format!(
+            "question {question:?} option {i}: {e} — an option is {{\"id\", \"tether\": {{\"means\", \"not\", \"requires\"}}}}"
+        ))
+    })
+}
+
+/// Read a request, refusing by name before anything is embedded.
+fn parse_request(body: &str) -> Result<Request, (u16, Value)> {
+    let v: Value = serde_json::from_str(body).map_err(|e| bad(&format!("bad JSON: {e}")))?;
+
+    let state = match v.get("state") {
+        Some(Value::String(s)) if !s.trim().is_empty() => s.clone(),
+        Some(Value::Object(o)) if o.contains_key("image") || o.contains_key("image_url") => {
+            return Err(bad("this seat classifies text only: an image state needs an image encoder"));
+        }
+        _ => return Err(bad("`state` must be a non-empty string")),
+    };
+
+    let Some(Value::Array(qs)) = v.get("questions") else {
+        return Err(bad("`questions` must be an array of at least one question"));
+    };
+    if qs.is_empty() {
+        return Err(bad("`questions` must be an array of at least one question"));
+    }
+
+    let declared: Vec<String> = qs
+        .iter()
+        .filter_map(|q| q.get("name").and_then(Value::as_str).map(str::to_string))
+        .collect();
+
+    let mut questions = Vec::with_capacity(qs.len());
+    for q in qs {
+        let name = q
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| bad("every question needs a `name`"))?
+            .to_string();
+        let kind = q
+            .get("type")
+            .and_then(Value::as_str)
+            .and_then(parse_kind)
+            .ok_or_else(|| bad(&format!("question {name:?}: `type` must be choice, score or noul")))?;
+        let instructions =
+            q.get("instructions").and_then(Value::as_str).unwrap_or_default().to_string();
+
+        let options: Vec<Opt> = match kind {
+            Kind::Noul => {
+                // A noul is one proposition. Scoring it by similarity
+                // needs something to be similar AGAINST, so its tether
+                // must carry at least one contrary anchor; inventing a
+                // negation here would be the gate guessing.
+                let t: tether::Tether = q
+                    .get("tether")
+                    .ok_or_else(|| bad(&format!("question {name:?}: a noul needs a `tether`")))
+                    .and_then(|t| {
+                        serde_json::from_value(t.clone())
+                            .map_err(|e| bad(&format!("question {name:?} tether: {e}")))
+                    })?;
+                if t.not.is_empty() {
+                    return Err(bad(&format!(
+                        "question {name:?}: a noul needs at least one contrary in `tether.not` to score against"
+                    )));
+                }
+                let contrary = t.not.join("; ");
+                vec![
+                    Opt {
+                        id: "true".to_string(),
+                        tether: tether::Tether {
+                            means: t.means.clone(),
+                            not: Vec::new(),
+                            requires: Vec::new(),
+                        },
+                    },
+                    Opt {
+                        id: "false".to_string(),
+                        tether: tether::Tether {
+                            means: contrary,
+                            not: Vec::new(),
+                            requires: Vec::new(),
+                        },
+                    },
+                ]
+            }
+            _ => {
+                let arr = q
+                    .get("options")
+                    .or_else(|| q.get("levels"))
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        bad(&format!("question {name:?}: `options` must be an array"))
+                    })?;
+                let mut out = Vec::with_capacity(arr.len());
+                for (i, o) in arr.iter().enumerate() {
+                    out.push(parse_opt(o, &name, i)?);
+                }
+                out
+            }
+        };
+
+        // The tether's own refusals: a label with no meaning, two
+        // options meaning the same thing, an implication naming a
+        // question nobody asked, and the option cap.
+        tether::validate(&options, &declared, MAX_OPTIONS)
+            .map_err(|e| bad(&format!("question {name:?}: {e}")))?;
+
+        questions.push(Question { name, kind, instructions, options });
+    }
+
+    let temperature = v
+        .get("temperature")
+        .and_then(Value::as_f64)
+        .map(|t| t as f32)
+        .unwrap_or(DEFAULT_TEMPERATURE);
+    if !(temperature.is_finite() && temperature > 0.0) {
+        return Err(bad("`temperature` must be a positive number"));
+    }
+
+    let mut thresholds = Thresholds::default();
+    if let Some(t) = v.get("thresholds") {
+        if let Some(c) = t.get("confidence").and_then(Value::as_f64) {
+            thresholds.confidence = c as f32;
+        }
+        if let Some(tau) = t.get("tau").and_then(Value::as_f64) {
+            thresholds.tau = tau as f32;
+        }
+    }
+
+    Ok(Request { state, questions, temperature, thresholds })
+}
+
+/// The embeddings this model returns are L2-normalised, so the cosine
+/// is the dot product. Said here because it is load-bearing: if that
+/// ever stops being true, this is wrong rather than merely imprecise.
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// `Instruct: …\nQuery: …` — the query-side convention the cached
+/// embedding checkpoint was trained with. Options are embedded plainly:
+/// they are documents, not queries.
+fn state_text(instructions: &str, state: &str) -> String {
+    if instructions.trim().is_empty() {
+        state.to_string()
+    } else {
+        format!("Instruct: {}\nQuery: {}", instructions.trim(), state)
+    }
+}
+
+/// Answer one classify request.
+pub fn handle_classify(
+    engine: &Arc<Engine>,
+    model_id: &str,
+    body: &str,
+    classifier: &Arc<Classifier>,
+) -> HttpResponse {
+    if !engine.supports_embeddings() {
+        return json_response(
+            400,
+            error_json(
+                "invalid_request",
+                "this model does not expose hidden states, so it cannot classify on this road",
+            ),
+        );
+    }
+    let req = match parse_request(body) {
+        Ok(r) => r,
+        Err((code, v)) => return json_response(code, v),
+    };
+
+    // One embedding of the state per distinct instruction, and one set
+    // of option vectors per question (cached). Everything that must be
+    // embedded is gathered first so the engine is asked once.
+    let mut want: Vec<String> = Vec::new();
+    let mut state_at: Vec<usize> = Vec::with_capacity(req.questions.len());
+    let mut option_key: Vec<u64> = Vec::with_capacity(req.questions.len());
+    let mut option_at: Vec<Option<(usize, usize)>> = Vec::with_capacity(req.questions.len());
+
+    for q in &req.questions {
+        let st = state_text(&q.instructions, &req.state);
+        let at = match want.iter().position(|w| *w == st) {
+            Some(i) => i,
+            None => {
+                want.push(st);
+                want.len() - 1
+            }
+        };
+        state_at.push(at);
+
+        let texts: Vec<String> = q.options.iter().map(|o| o.scored_text()).collect();
+        let key = key_of(q.kind, &q.instructions, &texts);
+        option_key.push(key);
+        if classifier.get(key).is_some() {
+            option_at.push(None);
+        } else {
+            let start = want.len();
+            want.extend(texts);
+            option_at.push(Some((start, q.options.len())));
+        }
+    }
+
+    if want.len() > MAX_TEXTS {
+        return json_response(
+            400,
+            error_json(
+                "budget",
+                &format!(
+                    "this request needs {} embeddings and the road takes {MAX_TEXTS}: ask fewer questions, or fewer options at once",
+                    want.len()
+                ),
+            ),
+        );
+    }
+
+    let out = match engine.embed_texts(&want, &EmbedOptions::default()) {
+        Ok(o) => o,
+        Err(e) => {
+            return json_response(500, error_json("engine_error", &e.to_string()));
+        }
+    };
+    if out.vectors.len() != want.len() {
+        return json_response(
+            500,
+            error_json("engine_error", "the embeddings road returned a different count than it was asked for"),
+        );
+    }
+
+    // Distributions first, so an implication can read a question that
+    // comes later in the request than the option requiring it.
+    let mut dist: Vec<Vec<f32>> = Vec::with_capacity(req.questions.len());
+    for (qi, q) in req.questions.iter().enumerate() {
+        let vectors: Arc<Vec<Vec<f32>>> = match option_at[qi] {
+            Some((start, n)) => {
+                let v = Arc::new(out.vectors[start..start + n].to_vec());
+                classifier.put(option_key[qi], v.clone());
+                v
+            }
+            None => match classifier.get(option_key[qi]) {
+                Some(v) => v,
+                // A cache swept between the look and the read: embed
+                // nothing again, refuse rather than answer from a guess.
+                None => {
+                    return json_response(
+                        503,
+                        error_json("engine_error", "the option cache moved under this request; try again"),
+                    )
+                }
+            },
+        };
+        let state_vec = &out.vectors[state_at[qi]];
+        let sims: Vec<f32> = vectors.iter().map(|v| cosine(state_vec, v)).collect();
+        let p = softmax_scaled(&sims, req.temperature);
+        if let Err(e) = check_distribution(&p) {
+            return json_response(500, error_json("engine_error", &format!("question {:?}: {e}", q.name)));
+        }
+        dist.push(p);
+    }
+
+    // Each question's probability of its FIRST option, which for a noul
+    // is the proposition itself — what an implication reads.
+    let p_true: HashMap<&str, f32> = req
+        .questions
+        .iter()
+        .enumerate()
+        .map(|(i, q)| (q.name.as_str(), dist[i].first().copied().unwrap_or(0.0)))
+        .collect();
+
+    let mut answers = Vec::with_capacity(req.questions.len());
+    for (qi, q) in req.questions.iter().enumerate() {
+        let p = &dist[qi];
+        let (top_i, top_p) = p
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::MIN), |b, (i, &v)| if v > b.1 { (i, v) } else { b });
+        let conf = confidence(p);
+        let mut sorted: Vec<f32> = p.clone();
+        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let margin = sorted.first().copied().unwrap_or(0.0) - sorted.get(1).copied().unwrap_or(0.0);
+
+        let implications: Vec<Implication> = q.options[top_i]
+            .tether
+            .requires
+            .iter()
+            .map(|r| Implication {
+                requires: r.clone(),
+                p: p_true.get(r.as_str()).copied().unwrap_or(0.0),
+                tau: req.thresholds.tau,
+            })
+            .collect();
+
+        let decision = decide(conf, req.thresholds.confidence, &implications);
+
+        let distribution: serde_json::Map<String, Value> = q
+            .options
+            .iter()
+            .zip(p.iter())
+            .map(|(o, &v)| (o.id.clone(), json!(v)))
+            .collect();
+
+        let mut a = json!({
+            "name": q.name,
+            "type": match q.kind { Kind::Choice => "choice", Kind::Score => "score", Kind::Noul => "noul" },
+            "top": q.options[top_i].id,
+            "p_top": top_p,
+            "distribution": Value::Object(distribution),
+            "confidence": conf,
+            "margin": margin,
+            "calibrated": false,
+            "temperature": req.temperature,
+            "decision": decision.word(),
+            "reason": match &decision { Decision::Act => Value::Null, d => json!(d.reason()) },
+            "implications": implications.iter().map(|i| json!({
+                "requires": i.requires, "p": i.p, "tau": i.tau, "holds": i.holds(), "gated": i.gated()
+            })).collect::<Vec<_>>(),
+        });
+        if q.kind == Kind::Score {
+            a["expected_level"] = json!(expected_level(p));
+        }
+        answers.push(a);
+    }
+
+    json_response(
+        200,
+        json!({
+            "model": model_id,
+            "backend": "embed-cosine",
+            "answers": answers,
+            "usage": {
+                "prompt_tokens": out.prompt_tokens,
+                "questions": req.questions.len(),
+                "embeddings": want.len(),
+            },
+        }),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn q_choice() -> String {
+        r#"{"state":"I want to cancel my subscription",
+            "questions":[{"name":"intent","type":"choice","instructions":"what does the person want",
+              "options":[
+                {"id":"escalate_user_planning_unsubscription","tether":{"means":"the person is asking us to end their subscription now","not":["quoting or translating a sentence about unsubscribing"]}},
+                {"id":"none_of_these","tether":{"means":"something else entirely"}}
+              ]}]}"#
+            .to_string()
+    }
+
+    #[test]
+    fn a_request_parses_and_never_embeds_an_identifier() {
+        let r = parse_request(&q_choice()).expect("a well-formed request");
+        assert_eq!(r.questions.len(), 1);
+        for o in &r.questions[0].options {
+            let text = o.scored_text();
+            assert!(!text.contains(&o.id), "the identifier reached the scorer: {text}");
+        }
+    }
+
+    #[test]
+    fn an_option_with_no_meaning_is_refused_before_anything_is_embedded() {
+        let body = r#"{"state":"x","questions":[{"name":"q","type":"choice","options":[{"id":"a","tether":{"means":""}}]}]}"#;
+        let (code, v) = parse_request(body).err().expect("a label with no meaning");
+        assert_eq!(code, 400);
+        assert!(v.to_string().contains("meaning"), "{v}");
+    }
+
+    #[test]
+    fn a_noul_without_a_contrary_is_refused_by_name() {
+        let body = r#"{"state":"x","questions":[{"name":"is_request","type":"noul","tether":{"means":"the person is asking for something"}}]}"#;
+        let (code, v) = parse_request(body).err().expect("a noul with nothing to score against");
+        assert_eq!(code, 400);
+        assert!(v.to_string().contains("contrary"), "{v}");
+    }
+
+    #[test]
+    fn an_implication_naming_an_unasked_question_is_refused() {
+        let body = r#"{"state":"x","questions":[{"name":"intent","type":"choice","options":[
+            {"id":"a","tether":{"means":"the person wants a thing","requires":["is_request"]}}]}]}"#;
+        let (_, v) = parse_request(body).err().expect("an implication with no question");
+        assert!(v.to_string().contains("is_request"), "{v}");
+    }
+
+    #[test]
+    fn an_image_state_is_refused_by_name_on_a_text_seat() {
+        let body = r#"{"state":{"image":"AAAA"},"questions":[{"name":"q","type":"choice","options":[{"id":"a","tether":{"means":"a thing"}}]}]}"#;
+        let (code, v) = parse_request(body).err().expect("an image on a text seat");
+        assert_eq!(code, 400);
+        assert!(v.to_string().contains("image encoder"), "{v}");
+    }
+
+    #[test]
+    fn the_option_cache_key_covers_every_text_it_depends_on() {
+        let a = key_of(Kind::Choice, "ins", &["one".into(), "two".into()]);
+        let b = key_of(Kind::Choice, "ins", &["one".into(), "three".into()]);
+        let c = key_of(Kind::Choice, "other", &["one".into(), "two".into()]);
+        let d = key_of(Kind::Noul, "ins", &["one".into(), "two".into()]);
+        assert_ne!(a, b, "a changed option must change the key");
+        assert_ne!(a, c, "changed instructions must change the key");
+        assert_ne!(a, d, "a changed kind must change the key");
+        assert_eq!(a, key_of(Kind::Choice, "ins", &["one".into(), "two".into()]));
+    }
+}

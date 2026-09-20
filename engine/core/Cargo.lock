@@ -1168,6 +1168,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "combs-classify"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "combs-cli"
 version = "0.3.0"
 dependencies = [
@@ -1175,6 +1183,7 @@ dependencies = [
  "base64 0.22.1",
  "burn",
  "clap",
+ "combs-classify",
  "combs-core",
  "combs-diffusion",
  "combs-formats",

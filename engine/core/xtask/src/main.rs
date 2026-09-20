@@ -380,6 +380,10 @@ fn cmd_gates(ctx: &Ctx, quick: bool, strict: bool) -> Result<()> {
     // The toolkit links neither the engine nor the kit and takes no GPU,
     // so its tests are pure and cost seconds; it rides every gate.
     tier("tk", &["test", "--release", "-p", "combs-tk"]);
+    // The gate crate links neither the engine nor a tensor: its tests are
+    // pure arithmetic over a distribution and cost a second. It rides
+    // every gate, because a wrong rule here becomes a wrong action.
+    tier("classify", &["test", "--release", "-p", "combs-classify"]);
     // xtask's own tests hold the byte-equality drift guards for the build
     // stamp files copied into combs-cli and combs-kit; nothing else runs them.
     tier("xtask", &["test", "-p", "xtask"]);

@@ -1,0 +1,20 @@
+[package]
+name = "combs-classify"
+version = "0.3.0"
+edition.workspace = true
+license.workspace = true
+description = "Combs Classify: the gate a typed decision passes before anyone acts on it"
+
+# The gate is ARITHMETIC over a distribution, so it links nothing that
+# holds a tensor: serde to read a request and write an answer, and
+# nothing else. Two reasons, both already paid for elsewhere here.
+#
+# The first is the test loop. A gate is where a wrong rule becomes a
+# wrong action, so its rules want a red watched in seconds rather than
+# in the minutes a tensor crate costs to build. The second is where it
+# gets linked: the serve route needs it, the kit's suite needs it, and
+# a router would too; a crate that pulled burn in would make each of
+# them pay for a tensor none of them touches.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

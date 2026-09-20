@@ -6,6 +6,7 @@ members = [
     "combs-media",
     "combs-models",
     "combs-runtime",
+    "combs-classify",
     "combs-ffi",
     "combs-wasm",
     "combs-cli",
