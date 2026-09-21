@@ -65,11 +65,32 @@ struct Request {
     thresholds: Thresholds,
 }
 
+/// Which scorer answers `/v1/classify` on this build. One constant, so
+/// the answer's own `backend` field and the stats route cannot drift
+/// apart and describe two different roads. `embed-cosine` is the
+/// bi-encoder the ledger's §126 refused by its own suite.
+pub const BACKEND: &str = "embed-cosine";
+
+/// What the classify road has cost since load. Read by `/v1/stats`, so
+/// a sitting can say whether the classifier ran, how much of it the
+/// cache answered, and which scorer answered it — questions §126 could
+/// only answer by reading a console.
+#[derive(Debug, Clone, Default)]
+pub struct ClassifyStats {
+    pub requests: u64,
+    pub questions: u64,
+    pub cache_entries: usize,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_clears: u64,
+}
+
 /// The option-vector cache: content-keyed, so the same question asked
 /// again costs one embedding of the state and nothing else.
 #[derive(Default)]
 pub struct Classifier {
     options: Mutex<HashMap<u64, Arc<Vec<Vec<f32>>>>>,
+    counts: Mutex<ClassifyStats>,
 }
 
 impl Classifier {
@@ -77,7 +98,15 @@ impl Classifier {
         Self::default()
     }
     fn get(&self, key: u64) -> Option<Arc<Vec<Vec<f32>>>> {
-        self.options.lock().ok()?.get(&key).cloned()
+        let hit = self.options.lock().ok()?.get(&key).cloned();
+        if let Ok(mut c) = self.counts.lock() {
+            if hit.is_some() {
+                c.cache_hits += 1;
+            } else {
+                c.cache_misses += 1;
+            }
+        }
+        hit
     }
     fn put(&self, key: u64, vectors: Arc<Vec<Vec<f32>>>) {
         if let Ok(mut m) = self.options.lock() {
@@ -86,15 +115,45 @@ impl Classifier {
             // call and never a wrong answer.
             if m.len() >= 256 {
                 m.clear();
+                if let Ok(mut c) = self.counts.lock() {
+                    c.cache_clears += 1;
+                }
             }
             m.insert(key, vectors);
+            if let Ok(mut c) = self.counts.lock() {
+                c.cache_entries = m.len();
+            }
         }
+    }
+    /// Counted where the request is parsed, so a refused body is not
+    /// counted as a classification.
+    fn counted(&self, questions: usize) {
+        if let Ok(mut c) = self.counts.lock() {
+            c.requests += 1;
+            c.questions += questions as u64;
+        }
+    }
+    /// A copy for the stats route; the lock is held for microseconds.
+    pub fn stats(&self) -> ClassifyStats {
+        self.counts.lock().map(|c| c.clone()).unwrap_or_default()
     }
 }
 
-/// FNV-1a over the strings that decide a vector. No new dependency, and
-/// a collision costs a wrong cache hit, so the key covers every input
-/// the embedding depends on.
+/// FNV-1a over bytes. No new dependency, and the only hash this file
+/// needs: one for the cache key, one for naming a state in the log
+/// without writing the state down.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        h ^= byte as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
+}
+
+/// FNV-1a over the strings that decide a vector. A collision costs a
+/// wrong cache hit, so the key covers every input the embedding depends
+/// on.
 fn key_of(kind: Kind, instructions: &str, texts: &[String]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut eat = |b: &[u8]| {
@@ -301,6 +360,25 @@ pub fn handle_classify(
         Ok(r) => r,
         Err((code, v)) => return json_response(code, v),
     };
+    // Counted here and not at the route: a body the parser refused was
+    // never a classification, and counting it would make a suite of
+    // malformed requests look like a suite of answered ones.
+    classifier.counted(req.questions.len());
+    // The state itself NEVER reaches the log — it is the user's text. Its
+    // length and a content hash are enough to tell two runs apart, to
+    // find the call a record's figure came from, and to say nothing
+    // about what a person wrote.
+    let turn = combs_core::provenance::turn(
+        "classify",
+        "classify",
+        &[
+            ("backend", BACKEND.to_string()),
+            ("questions", req.questions.len().to_string()),
+            ("state_len", req.state.len().to_string()),
+            ("state_fnv", format!("{:016x}", fnv1a(req.state.as_bytes()))),
+            ("temperature", format!("{:.4}", req.temperature)),
+        ],
+    );
 
     // One embedding of the state per distinct instruction, and one set
     // of option vectors per question (cached). Everything that must be
@@ -349,19 +427,24 @@ pub fn handle_classify(
     let out = match engine.embed_texts(&want, &EmbedOptions::default()) {
         Ok(o) => o,
         Err(e) => {
+            turn.failed(&e.to_string());
             return json_response(500, error_json("engine_error", &e.to_string()));
         }
     };
     if out.vectors.len() != want.len() {
-        return json_response(
-            500,
-            error_json("engine_error", "the embeddings road returned a different count than it was asked for"),
-        );
+        let why = "the embeddings road returned a different count than it was asked for";
+        turn.failed(why);
+        return json_response(500, error_json("engine_error", why));
     }
 
     // Distributions first, so an implication can read a question that
     // comes later in the request than the option requiring it.
     let mut dist: Vec<Vec<f32>> = Vec::with_capacity(req.questions.len());
+    // The scores BEFORE the temperature. A distribution alone cannot be
+    // re-derived or re-calibrated after the fact: two different score
+    // vectors can soften to the same probabilities, so a harness given
+    // only `distribution` cannot check the softmax it was told was used.
+    let mut raw: Vec<Vec<f32>> = Vec::with_capacity(req.questions.len());
     for (qi, q) in req.questions.iter().enumerate() {
         let vectors: Arc<Vec<Vec<f32>>> = match option_at[qi] {
             Some((start, n)) => {
@@ -374,10 +457,9 @@ pub fn handle_classify(
                 // A cache swept between the look and the read: embed
                 // nothing again, refuse rather than answer from a guess.
                 None => {
-                    return json_response(
-                        503,
-                        error_json("engine_error", "the option cache moved under this request; try again"),
-                    )
+                    let why = "the option cache moved under this request; try again";
+                    turn.failed(why);
+                    return json_response(503, error_json("engine_error", why));
                 }
             },
         };
@@ -385,9 +467,12 @@ pub fn handle_classify(
         let sims: Vec<f32> = vectors.iter().map(|v| cosine(state_vec, v)).collect();
         let p = softmax_scaled(&sims, req.temperature);
         if let Err(e) = check_distribution(&p) {
-            return json_response(500, error_json("engine_error", &format!("question {:?}: {e}", q.name)));
+            let why = format!("question {:?}: {e}", q.name);
+            turn.failed(&why);
+            return json_response(500, error_json("engine_error", &why));
         }
         dist.push(p);
+        raw.push(sims);
     }
 
     // Each question's probability of its FIRST option, which for a noul
@@ -430,6 +515,15 @@ pub fn handle_classify(
             .zip(p.iter())
             .map(|(o, &v)| (o.id.clone(), json!(v)))
             .collect();
+        // The raw score each probability came from, by the same key. On
+        // this road a cosine; on a trained scorer, its head's logit.
+        // Named for what it is so nobody reads it as a probability.
+        let similarities: serde_json::Map<String, Value> = q
+            .options
+            .iter()
+            .zip(raw[qi].iter())
+            .map(|(o, &v)| (o.id.clone(), json!(v)))
+            .collect();
 
         let mut a = json!({
             "name": q.name,
@@ -437,6 +531,7 @@ pub fn handle_classify(
             "top": q.options[top_i].id,
             "p_top": top_p,
             "distribution": Value::Object(distribution),
+            "similarities": Value::Object(similarities),
             "confidence": conf,
             "margin": margin,
             "calibrated": false,
@@ -450,14 +545,37 @@ pub fn handle_classify(
         if q.kind == Kind::Score {
             a["expected_level"] = json!(expected_level(p));
         }
+        // At Debug, the numbers behind one answer — raw scores included,
+        // so a suspect verdict can be re-derived from the log alone.
+        combs_core::provenance::event(
+            "classify",
+            "classify.question",
+            &[
+                ("name", q.name.clone()),
+                ("top", q.options[top_i].id.clone()),
+                ("p_top", format!("{top_p:.6}")),
+                ("confidence", format!("{conf:.6}")),
+                ("margin", format!("{margin:.6}")),
+                ("decision", decision.word().to_string()),
+                (
+                    "raw",
+                    raw[qi].iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(","),
+                ),
+            ],
+        );
         answers.push(a);
     }
 
+    turn.ok(&[
+        ("answers", answers.len().to_string()),
+        ("prompt_tokens", out.prompt_tokens.to_string()),
+        ("embeddings", want.len().to_string()),
+    ]);
     json_response(
         200,
         json!({
             "model": model_id,
-            "backend": "embed-cosine",
+            "backend": BACKEND,
             "answers": answers,
             "usage": {
                 "prompt_tokens": out.prompt_tokens,
@@ -534,5 +652,47 @@ mod tests {
         assert_ne!(a, c, "changed instructions must change the key");
         assert_ne!(a, d, "a changed kind must change the key");
         assert_eq!(a, key_of(Kind::Choice, "ins", &["one".into(), "two".into()]));
+    }
+
+    /// A sitting must be able to say whether the classifier ran, and how
+    /// much of it the cache answered. §126's run could only answer that
+    /// by reading a console, so a record could not carry it.
+    #[test]
+    fn the_classifier_counts_what_it_did_and_what_the_cache_answered() {
+        let c = Classifier::new();
+        assert_eq!(c.stats().requests, 0, "a fresh classifier has done nothing");
+
+        c.counted(3);
+        c.counted(1);
+        let s = c.stats();
+        assert_eq!((s.requests, s.questions), (2, 4), "requests and questions are counted apart");
+
+        let key = key_of(Kind::Choice, "ins", &["one".into()]);
+        assert!(c.get(key).is_none(), "a cold key misses");
+        c.put(key, Arc::new(vec![vec![0.0f32]]));
+        assert!(c.get(key).is_some(), "a warm key hits");
+        let s = c.stats();
+        assert_eq!((s.cache_misses, s.cache_hits, s.cache_entries), (1, 1, 1));
+        assert_eq!(s.cache_clears, 0, "nothing was evicted yet");
+
+        // The bound is a real eviction, and the record says it happened
+        // rather than leaving a later miss looking like a cold start.
+        for i in 0..256u64 {
+            c.put(key.wrapping_add(i + 1), Arc::new(vec![vec![0.0f32]]));
+        }
+        assert_eq!(c.stats().cache_clears, 1, "the bound cleared the cache once");
+    }
+
+    /// One name for the road, so the answer and the stats route cannot
+    /// describe two different scorers. A record that says `embed-cosine`
+    /// must not have been produced by anything else.
+    #[test]
+    fn one_constant_names_the_scorer_for_both_the_answer_and_the_stats() {
+        assert_eq!(BACKEND, "embed-cosine");
+        let src = include_str!("classify.rs");
+        assert!(
+            !src.contains("\"backend\": \"embed"),
+            "the answer must name the road through BACKEND, not a second literal"
+        );
     }
 }

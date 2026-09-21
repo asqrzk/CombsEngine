@@ -25,6 +25,7 @@ mod native_driver_imports {
     pub(super) use std::sync::atomic::AtomicBool;
     pub(super) use std::sync::{mpsc, Arc, Mutex};
     pub(super) use std::thread::JoinHandle;
+    pub(super) use std::time::Instant;
 
     pub(super) use burn::tensor::{backend::Backend as _, Tensor, TensorData};
     pub(super) use combs_core::{BufferPool, CombsBackend, CombsDevice};
@@ -353,6 +354,31 @@ pub struct EngineStatsSnapshot {
     /// The weights alone — the part that must be live right after load
     /// (the arena grows lazily toward the rest).
     pub estimated_weight_bytes: u64,
+    /// What the embedding road has cost, kept APART from the generation
+    /// totals above. An embed request is not a generation: it decodes
+    /// nothing, so folding it into `requests_total` would make a seat
+    /// that only classifies look like a seat that only generates, and a
+    /// classify sitting could not say whether the classifier ran at all.
+    pub embeddings: EmbedStats,
+}
+
+/// What the embedding road has cost since load. Sibling to the
+/// generation totals, never folded into them.
+#[derive(Debug, Clone, Default)]
+pub struct EmbedStats {
+    /// Completed embed calls (one per request, whatever its batch).
+    pub requests: u64,
+    /// Texts embedded across those calls.
+    pub texts: u64,
+    /// Input tokens across those texts.
+    pub prompt_tokens: u64,
+    /// GPU dispatches the embed road cost, measured. Zero on the cpu
+    /// floor and in a browser build.
+    pub dispatches: u64,
+    /// Wall time of the most recent embed call, milliseconds.
+    pub last_ms: f64,
+    /// Embed calls that ended in an engine error.
+    pub errors: u64,
 }
 
 /// Timing/count summary of one completed generation.
@@ -1182,6 +1208,11 @@ fn worker_loop(
                 let _ = req.reply.send(result);
             }
             Command::Embed { texts, opts, reply } => {
+                // Bracketed the way a generation is: the counter delta is
+                // this call's dispatches, and the pool is resampled after,
+                // because an embed allocates transients like any forward.
+                let (d0, _) = combs_core::gpu_counters();
+                let began = Instant::now();
                 let result = run_embed(
                     model.as_mut(),
                     &tokenizer,
@@ -1191,6 +1222,19 @@ fn worker_loop(
                     &texts,
                     &opts,
                 );
+                let (d1, _) = combs_core::gpu_counters();
+                if let Ok(mut snap) = stats.lock() {
+                    let e = &mut snap.embeddings;
+                    e.requests += 1;
+                    e.texts += texts.len() as u64;
+                    e.dispatches += d1.saturating_sub(d0);
+                    e.last_ms = began.elapsed().as_secs_f64() * 1e3;
+                    match &result {
+                        Ok(out) => e.prompt_tokens += out.prompt_tokens as u64,
+                        Err(_) => e.errors += 1,
+                    }
+                    snap.gpu = combs_core::gpu_memory(&device);
+                }
                 let _ = reply.send(result);
             }
             Command::Perplexity {

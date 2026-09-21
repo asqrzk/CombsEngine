@@ -224,6 +224,12 @@ fn tokenize_answers_the_chat_paths_own_ids_and_the_page_log_names_what_the_engin
         return;
     };
 
+    // The room is NAMED. This test prefills ~80 tokens and generates a
+    // few dozen, and was inheriting the engine's default arena — 7,168 MB
+    // on this seat, which the memory preflight rightly refuses on a desk
+    // that has just built a release, leaving "serve never became healthy"
+    // as the only clue. A test that does not say what it needs is at the
+    // mercy of what the desk happens to have free.
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_combs"))
         .args([
             "serve",
@@ -231,6 +237,8 @@ fn tokenize_answers_the_chat_paths_own_ids_and_the_page_log_names_what_the_engin
             model.to_str().unwrap(),
             "--port",
             &PORT.to_string(),
+            "--context-size",
+            "4096",
         ])
         .env("COMBS_KV_EVENTS", "1")
         .stdout(std::process::Stdio::null())

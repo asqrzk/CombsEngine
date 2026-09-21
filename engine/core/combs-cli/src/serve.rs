@@ -185,7 +185,7 @@ pub fn serve(
                 ),
                 ("GET", "/v1/model/info") => model_info(&engine, &model_id, &static_info),
                 ("GET", "/v1/stats") => {
-                    stats_response(&engine, &model_id, &counters, &static_info, anonymous)
+                    stats_response(&engine, &model_id, &counters, &static_info, anonymous, &classifier)
                 }
                 ("GET", "/v1/sessions") => sessions_response(&engine),
                 ("GET", p) if p == "/v1/kv/events" || p.starts_with("/v1/kv/events?") => {
@@ -264,8 +264,10 @@ fn stats_response(
     counters: &ServeCounters,
     static_info: &Value,
     anonymous: AnonymousSessions,
+    classifier: &Arc<crate::classify::Classifier>,
 ) -> HttpResponse {
     let snap = engine.stats_snapshot();
+    let cls = classifier.stats();
     let cc = engine.cache_config();
     let meta = engine.metadata();
     let hit_rate = if snap.prompt_tokens_total > 0 {
@@ -312,6 +314,34 @@ fn stats_response(
             "architecture": &meta.architecture,
             "uptime_s": counters.started.elapsed().as_secs(),
             "in_flight": counters.in_flight.load(Ordering::Relaxed),
+            // Siblings of "totals", never folded into it. An embed call
+            // decodes nothing, so counting it as a request would make a
+            // seat that only classifies read like one that only
+            // generates — and a classify sitting could not say from the
+            // route whether the classifier ran at all.
+            "embeddings": {
+                "requests": snap.embeddings.requests,
+                "errors": snap.embeddings.errors,
+                "texts": snap.embeddings.texts,
+                "prompt_tokens": snap.embeddings.prompt_tokens,
+                "dispatches": snap.embeddings.dispatches,
+                "last_ms": snap.embeddings.last_ms,
+            },
+            "classify": {
+                "requests": cls.requests,
+                "questions": cls.questions,
+                // Which scorer answers on this seat. `embed-cosine` is
+                // the bi-encoder road the ledger's §126 refused; it is
+                // named so a record cannot be read as if a trained
+                // scorer produced it.
+                "backend": crate::classify::BACKEND,
+                "cache": {
+                    "entries": cls.cache_entries,
+                    "hits": cls.cache_hits,
+                    "misses": cls.cache_misses,
+                    "clears": cls.cache_clears,
+                },
+            },
             "totals": {
                 "requests": snap.requests_total,
                 "errors": snap.errors_total,

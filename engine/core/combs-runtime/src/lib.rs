@@ -36,7 +36,7 @@ mod transcribe;
 pub use combs_models::{CacheConfig, CacheKind};
 pub use constraint::{CompiledSchema, ConstraintSpec, ConstraintState, TokenByteTable};
 pub use engine::{
-    EmbedOptions, EmbedOutput, EngineStatsSnapshot, GenerationConfig, GenerationStats,
+    EmbedOptions, EmbedOutput, EmbedStats, EngineStatsSnapshot, GenerationConfig, GenerationStats,
     LastGeneration, PerplexityOutput, Pooling, SessionInfo, check_context_len, default_arena_len,
 };
 #[cfg(not(target_family = "wasm"))]
