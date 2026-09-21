@@ -18,3 +18,9 @@ description = "Combs Classify: the gate a typed decision passes before anyone ac
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+# The parity fixture is JSON and an integration test does not inherit
+# the crate's own dependencies. Same crate, already built; the allow
+# list in tests/deps.rs covers this section too.
+[dev-dependencies]
+serde_json = { workspace = true }
