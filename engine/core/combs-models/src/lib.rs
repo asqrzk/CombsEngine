@@ -36,12 +36,16 @@ pub use llama::LlamaModel;
 pub use qwen35::Qwen35Model;
 pub use norm::rms_norm;
 pub use staged::flush_device;
-pub use qlinear::{batched_matmul_summary, quant_census, Linear, QuantLinearOp, try_quant_linear};
+pub use qlinear::{
+    batched_matmul_summary, packed_device_bytes, quant_census, Linear, QuantLinearOp,
+    try_quant_linear,
+};
 pub use qmatmul::{
     Q4KWeight, Q5KWeight, Q6KWeight, Q40Weight, Q50Weight, Q80Weight, dequantize_q4_0_gpu,
     dequantize_q4_k_gpu, dequantize_q5_0_gpu, dequantize_q5_k_gpu, dequantize_q6_k_gpu,
     dequantize_q8_0_gpu,
     repack_q4_0, repack_q4_k, repack_q5_0, repack_q6_k, repack_q8_0,
+    Q4K_DEVICE_SUPERBLOCK_BYTES,
 };
 pub use quant_linear::QuantizedLinear;
 pub use registry::ModelRegistry;

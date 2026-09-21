@@ -158,7 +158,7 @@ pub const DOORS: &[Door] = &[
         default: "f32",
         does: "f16 operands into the batched prefill matmul, f32 accumulate",
         read_at: "combs-models/src/qlinear.rs",
-        measured: Some("the ledger §65"),
+        measured: Some("the ledger §65, §110, §134"),
     },
     Door {
         kind: Kind::Knob,

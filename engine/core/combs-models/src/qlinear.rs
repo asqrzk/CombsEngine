@@ -747,6 +747,30 @@ fn debug_quant(name: &str, outcome: &str) {
     }
 }
 
+/// Bytes of packed quant tables this process has placed on the device.
+/// The denominator a bandwidth figure needs, and not the same number as
+/// the GGUF file's: the repack widens Q8_0's block scale from f16 to f32
+/// (36 B per 32 weights against the file's 34, +5.88%) and Q4_K's
+/// superblock to 148 B against 144 (+2.78%). A GB/s computed over file
+/// bytes therefore reads low — by 5.56% on Q8_0, 2.70% on Q4_K — which
+/// is how §130 was read, and §135 restates it over these bytes.
+///
+/// Each allocation is counted ONCE, at the two seams that build one: a
+/// tied lm_head shares the embedding's `Arc` (one table, one copy in
+/// VRAM) and is not counted twice.
+static PACKED_DEVICE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn count_packed_device_bytes(n: usize) {
+    PACKED_DEVICE_BYTES.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Total of the above, in bytes. Process-wide and never reset — like
+/// [`quant_census`] it answers "what did THIS process load", which is
+/// why the kit gives every reading its own process.
+pub fn packed_device_bytes() -> usize {
+    PACKED_DEVICE_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The dispatch census so far, most common first — e.g.
 /// `"packed on device=196, no packed quant tensor=4"`. Empty when no
 /// quantized linear has been considered.
@@ -821,6 +845,7 @@ pub fn try_quant_linear<B: Backend>(
         return Ok(None);
     };
     debug_quant(name, "packed on device");
+    count_packed_device_bytes(w.vram_bytes());
     let lin = CubeQuantLinear { w: Arc::new(w) };
 
     if TypeId::of::<B>() == TypeId::of::<FusedF32>() {

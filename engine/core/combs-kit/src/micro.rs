@@ -19,6 +19,20 @@ use crate::record::{Run, Value};
 
 pub const CELLS: &[&str] = &["dispatch", "bus", "gemv", "gemv-cuts", "submits"];
 
+/// Q4_K on the device, taken from the engine so the two cannot drift:
+/// 148 B per 256 weights. The FILE packs the same superblock in 144 —
+/// the repack widens it by 2.78% — so a GB/s divided by file bytes
+/// reads 2.70% LOW, which is how every `*_gbs` figure back to §90 was
+/// computed. The kernel reads these bytes; the rate is over these bytes.
+const Q4K_DEVICE_SUPERBLOCK: usize = combs_models::Q4K_DEVICE_SUPERBLOCK_BYTES;
+
+/// Rides every record that carries a corrected rate, so a reader
+/// diffing this cell against §90-§131 sees the step and its size
+/// instead of a 2.7% improvement that never happened.
+const DENOMINATOR_NOTE: &str = "rates are over DEVICE bytes (q4_k 148 B/superblock) from this \
+    build on; sittings up to §134 divided by the file's 144 B — 2.78% fewer bytes — and so read \
+    2.70% low. The `_us` measurements are unchanged and stay comparable.";
+
 /// One cell, inside a child. Never call from the parent.
 pub fn run_cell(cell: &str) -> Run {
     let mut values = Vec::new();
@@ -56,17 +70,19 @@ pub fn run_cell(cell: &str) -> Run {
             // qwen3-0.6b's projection shapes: hidden 1024, intermediate 3072.
             for (label, n_out, k) in [("q_proj", 2048usize, 1024usize), ("up_proj", 3072, 1024), ("down_proj", 1024, 3072)] {
                 let per = combs_models::gemv_cell(n_out, k, 200);
-                let packed_bytes = (n_out * k / 256) * 144;
+                let packed_bytes = (n_out * k / 256) * Q4K_DEVICE_SUPERBLOCK;
                 values.push(Value::measured(format!("{label}_us"), per.as_secs_f64() * 1e6, "us"));
                 values.push(Value::derived(
                     format!("{label}_gbs"),
                     packed_bytes as f64 / per.as_secs_f64() / 1e9,
                     "GB/s",
-                    "packed q4_k bytes / time per rep",
+                    "q4_k DEVICE bytes (148 B/superblock) / time per rep",
                 ));
             }
+            notes.push(DENOMINATOR_NOTE.to_string());
         }
         "gemv-cuts" => {
+            notes.push(DENOMINATOR_NOTE.to_string());
             // The experiment §102 asked for: does the narrow projection
             // want more workgroups or more work per lane? The two cuts
             // either side of the default answer opposite ways, so the
@@ -79,7 +95,7 @@ pub fn run_cell(cell: &str) -> Run {
             ] {
                 for (rows, lanes) in [(8u32, 32u32), (16, 16), (32, 8)] {
                     let (per, worst) = combs_models::gemv_cell_at(n_out, k, 200, rows, lanes);
-                    let packed = (n_out * k / 256) * 144;
+                    let packed = (n_out * k / 256) * Q4K_DEVICE_SUPERBLOCK;
                     values.push(Value::measured(
                         format!("{label}_r{rows}l{lanes}_us"),
                         per.as_secs_f64() * 1e6,
@@ -89,7 +105,7 @@ pub fn run_cell(cell: &str) -> Run {
                         format!("{label}_r{rows}l{lanes}_gbs"),
                         packed as f64 / per.as_secs_f64() / 1e9,
                         "GB/s",
-                        "packed q4_k bytes / time per rep",
+                        "q4_k DEVICE bytes (148 B/superblock) / time per rep",
                     ));
                     // A cut that computes the wrong answer quickly is
                     // not a faster kernel; the error rides the record.
@@ -125,5 +141,41 @@ pub fn print_run(run: &Run) {
     println!("  {:<10} {}", run.id, line.join(" | "));
     for n in &run.notes {
         println!("  {:<10} note: {n}", "");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The denominator a rate is divided by must be the bytes the kernel
+    /// READS, which the repack widens past the file's. §90 through §134
+    /// divided by 144 and read 2.78% low; the constant now comes from
+    /// the engine's own `vram_bytes` arithmetic so the two cannot part
+    /// company again, and the record says the step happened.
+    #[test]
+    fn a_rate_is_over_device_bytes_not_file_bytes() {
+        const FILE_SUPERBLOCK: usize = 144;
+        assert_eq!(Q4K_DEVICE_SUPERBLOCK, 148, "128 B quants + 12 B scales + 8 B d/dmin");
+        assert!(
+            Q4K_DEVICE_SUPERBLOCK > FILE_SUPERBLOCK,
+            "the repack widens the superblock; a rate over file bytes under-reports"
+        );
+        let low = (FILE_SUPERBLOCK as f64 / Q4K_DEVICE_SUPERBLOCK as f64 - 1.0).abs() * 100.0;
+        assert!((low - 2.70).abs() < 0.05, "the understatement is ~2.7%, got {low:.2}%");
+        assert!(DENOMINATOR_NOTE.contains("148"), "the note names the layout it switched to");
+    }
+
+    /// Every cell either measures or says why — an empty run with no note
+    /// is how a silent skip became a number once before.
+    #[test]
+    fn an_unknown_cell_refuses_by_name_instead_of_measuring_nothing() {
+        let run = run_cell("not-a-cell");
+        assert!(run.values.is_empty());
+        assert!(
+            run.notes.iter().any(|n| n.contains("unknown cell")),
+            "{:?}",
+            run.notes
+        );
     }
 }

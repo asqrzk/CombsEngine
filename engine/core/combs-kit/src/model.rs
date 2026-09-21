@@ -249,6 +249,25 @@ pub fn run_one(subject: &Subject) -> Run {
             stats.prefill_dispatches as f64,
             "dispatches",
         ),
+        // How many decode steps the throughput figure is actually over.
+        // `decode_tok_s` is (generated - 1)/decode_time — the first token
+        // is prefill's — so `--tokens 16` times FIFTEEN steps while
+        // llama-bench's `-n 16` times sixteen. The records carried the
+        // ratio without carrying that; now they carry both.
+        Value::measured(
+            "decode_tokens_timed",
+            stats.generated_tokens.saturating_sub(1) as f64,
+            "tokens",
+        ),
+        // The bandwidth denominator, read from the device and not from
+        // the file: the repack widens Q8_0's scale f16 -> f32 (+5.88%)
+        // and Q4_K's superblock to 148 B from 144 (+2.78%), so a GB/s
+        // over GGUF bytes under-reports the traffic.
+        Value::measured(
+            "packed_device_bytes",
+            combs_models::packed_device_bytes() as f64,
+            "bytes",
+        ),
     ];
     // Derived, and it says so: this is the number that turns a dispatch
     // count into a decision about whether a seat is launch-bound or
@@ -338,15 +357,14 @@ pub fn run_one(subject: &Subject) -> Run {
     // to be.
     engine.shutdown();
 
-    let mut config = subject.to_json_for_record();
-    if let Some(obj) = config.as_object_mut() {
-        obj.insert(
-            "doors".into(),
-            serde_json::Value::Object(doors.into_iter().map(|(k, v)| (k, serde_json::Value::String(v))).collect()),
-        );
-        obj.insert("quant_dispatch".into(), serde_json::Value::String(census));
-        obj.insert("loaded".into(), loaded);
-    }
+    // The batched-matmul road's EFFECTIVE configuration — threshold,
+    // kernel, operand width — read from the same function `combs serve`
+    // stamps at startup. `env_requested` says what was asked; this says
+    // what took effect. §110 blessed a 1.9x prefill door and seven
+    // anchor sittings then ran with it off, unrecorded, because the
+    // record carried only the ask.
+    let matmul = combs_models::batched_matmul_summary();
+    let config = record_config(subject, doors, census, matmul, loaded);
 
     Run {
         id: subject.id.clone(),
@@ -357,6 +375,29 @@ pub fn run_one(subject: &Subject) -> Run {
         values,
         notes,
     }
+}
+
+/// The record's `config`: the subject by name, then what was ACTUALLY
+/// live in the measuring process — the doors, the kernel census, the
+/// batched-matmul road in effect, and the model as loaded.
+fn record_config(
+    subject: &crate::child::Subject,
+    doors: Vec<(String, String)>,
+    census: String,
+    matmul: String,
+    loaded: serde_json::Value,
+) -> serde_json::Value {
+    let mut config = subject.to_json_for_record();
+    if let Some(obj) = config.as_object_mut() {
+        obj.insert(
+            "doors".into(),
+            serde_json::Value::Object(doors.into_iter().map(|(k, v)| (k, serde_json::Value::String(v))).collect()),
+        );
+        obj.insert("quant_dispatch".into(), serde_json::Value::String(census));
+        obj.insert("matmul".into(), serde_json::Value::String(matmul));
+        obj.insert("loaded".into(), loaded);
+    }
+    config
 }
 
 /// Several readings of one subject, merged into a Run whose values
@@ -491,6 +532,9 @@ pub fn print_run(run: &Run) {
                 println!("  {:<8} dispatch {c}", "");
             }
         }
+        if let Some(m) = run.config.get("matmul").and_then(|v| v.as_str()) {
+            println!("  {:<8} matmul {m}", "");
+        }
     }
     println!(
         "  {:<8} prompt {:>6.0} | prefill {:>7.1} tok/s | ttft {:>7.0} ms | decode {:>7.2} tok/s | {:>8.1} disp/tok | {:>6.1} us/disp | pool {:>7.0} MB{tail}",
@@ -575,5 +619,38 @@ mod tests {
     #[test]
     fn a_path_that_is_not_a_packed_directory_is_left_alone() {
         assert_eq!(resolve("/nowhere/at/all").unwrap(), "/nowhere/at/all");
+    }
+
+    /// The record must name the batched-matmul road IN EFFECT — threshold,
+    /// kernel and operand width — not only the doors that were asked for.
+    /// §110 blessed a 1.9x prefill door on 2026-09-13; seven anchor
+    /// sittings then ran with it off and nothing in the record said so,
+    /// because `env_requested` records the ask and nothing recorded the
+    /// effect. The string is the one `combs serve` stamps at startup.
+    #[test]
+    fn a_record_config_names_the_effective_prefill_operand() {
+        let subject = crate::child::Subject {
+            id: "d4".into(),
+            model: "some-seat".into(),
+            prompt_tokens: 4,
+            max_tokens: 16,
+            arena: Some(16_384),
+        };
+        let live = combs_models::batched_matmul_summary();
+        assert!(
+            live.contains("operands") || live.contains("OFF"),
+            "the summary names the operand width or says the road is off: {live:?}"
+        );
+        let config = record_config(
+            &subject,
+            vec![("wgsl".into(), "true".into())],
+            "packed on device=1".into(),
+            live.clone(),
+            serde_json::json!({}),
+        );
+        assert_eq!(config["matmul"].as_str(), Some(live.as_str()), "{config}");
+        assert_eq!(config["quant_dispatch"].as_str(), Some("packed on device=1"));
+        assert_eq!(config["doors"]["wgsl"].as_str(), Some("true"));
+        assert_eq!(config["arena"].as_u64(), Some(16_384), "the subject's own fields survive");
     }
 }

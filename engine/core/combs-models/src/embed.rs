@@ -289,6 +289,10 @@ pub fn try_quant_embedding<B: Backend>(
         debug_embed(name, "no gather kernel for this format; dense");
         return Ok(None);
     }
+    // Read before the table is handed on, counted only once the seat
+    // actually takes it: a table built and then abandoned below never
+    // served a token and must not swell the bandwidth denominator.
+    let table_bytes = w.vram_bytes();
     let w = Arc::new(w);
 
     let Some(head) = quant_linear_from_weight::<B>(w.clone()) else {
@@ -304,6 +308,11 @@ pub fn try_quant_embedding<B: Backend>(
     };
     if op.is_some() {
         debug_embed(name, "packed table + gather kernel + tied gemv head");
+        // The tied head reads THIS table every decode step, so it is
+        // device traffic like any weight — and `quant_linear_from_weight`
+        // shares the `Arc` rather than building a second copy, so this
+        // is the one place it can be counted.
+        crate::qlinear::count_packed_device_bytes(table_bytes);
     }
     Ok(op.map(|op| (Embedding::Packed(op), head)))
 }

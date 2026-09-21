@@ -1049,6 +1049,14 @@ impl<R: Runtime> Q80Weight<R> {
 
 /// Values per K-quant superblock.
 pub const K_SUPERBLOCK: usize = 256;
+
+/// Device bytes per Q4_K superblock: 128 B of quants + 12 B of packed
+/// 6-bit scales + 8 B of d/dmin. The FILE holds the same 256 weights in
+/// 144 B — the repack widens it — so a bandwidth figure divided by file
+/// bytes reads 2.78% low. Public because the instrument that computes
+/// GB/s must divide by the bytes the kernel actually reads, and the two
+/// numbers must not be able to drift apart.
+pub const Q4K_DEVICE_SUPERBLOCK_BYTES: usize = 128 + 12 + 8;
 /// Bytes per GGUF Q4_K superblock: f16 d + f16 dmin + 12B scales + 128B quants.
 pub const Q4_K_BLOCK_BYTES: usize = 144;
 /// Bytes per GGUF Q5_K superblock: Q4_K's layout + 32B high bits.
@@ -2288,7 +2296,7 @@ impl<R: Runtime> Q4KWeight<R> {
 
     /// Bytes in VRAM: 148 per 256 weights (4.63 bits/weight).
     pub fn vram_bytes(&self) -> usize {
-        (self.n_out * self.k / K_SUPERBLOCK) * (128 + 12 + 8)
+        (self.n_out * self.k / K_SUPERBLOCK) * Q4K_DEVICE_SUPERBLOCK_BYTES
     }
 
     /// Split-K decode gemv through the Combs Kernel — see
