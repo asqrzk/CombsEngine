@@ -31,6 +31,12 @@ use crate::{bars, brier, ece, Kind};
 pub struct QuestionSpec {
     pub name: String,
     pub kind: Kind,
+    /// What the scorer is being asked, in the caller's own words.
+    /// Optional because v1 carried none — which for a cosine is merely
+    /// unused text, and for a trained cross-encoder is a prompt shape it
+    /// was never fitted on.
+    #[serde(default)]
+    pub instructions: Option<String>,
     #[serde(default)]
     pub options: Vec<Opt>,
     #[serde(default)]
@@ -56,17 +62,53 @@ pub struct Expect {
     pub fires: bool,
 }
 
+/// An option that must NEVER be the answer for this item, whatever the
+/// right answer turns out to be.
+///
+/// v1 could only say "not this one", because a near miss had nowhere
+/// correct to land — every contrast was scored purely by what it must
+/// not do. v2 gives each one a right answer AND keeps the old bar as
+/// this field, so relabelling an item cannot quietly drop what v1
+/// asserted about it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Never {
+    pub question: String,
+    pub option: String,
+}
+
+/// The near-miss modes, which are the noul tether's own `not` clauses:
+/// a quotation or translation, a question about meaning, a description
+/// of something past, and a refusal. An item named by its mode says
+/// WHICH near miss defeated a scorer, where `contrast-of:` could only
+/// say that one did.
+pub const NEAR_MISS_KINDS: &[&str] = &[
+    "contrast-of:",
+    "translation-of:",
+    "definition-of:",
+    "past-of:",
+    "negation-of:",
+];
+
 /// One labelled state.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Item {
     pub id: String,
-    /// `base` | `paraphrase-of:<id>` | `contrast-of:<id>`
+    /// `base` | `paraphrase-of:<id>` | one of [`NEAR_MISS_KINDS`] + `<id>`
     pub kind: String,
     pub state: String,
     pub expect: Expect,
     /// In the split a temperature may be fitted on.
     #[serde(default)]
     pub calib: bool,
+    /// An option this item must never take (v2).
+    #[serde(default)]
+    pub never: Option<Never>,
+    /// FNV-1a 64 of this state as suite v1 carried it, where the state
+    /// was carried over verbatim. A suite that edits a state it claims
+    /// to have inherited is a suite whose numbers cannot be compared
+    /// with the run that measured the original.
+    #[serde(default)]
+    pub from_v1: Option<u64>,
 }
 
 impl Item {
@@ -78,7 +120,31 @@ impl Item {
         self.kind.starts_with("paraphrase-of:")
     }
     pub fn is_contrast(&self) -> bool {
-        self.kind.starts_with("contrast-of:")
+        NEAR_MISS_KINDS.iter().any(|k| self.kind.starts_with(k))
+    }
+
+    /// Which near miss this is, by name — `translation`, `definition`,
+    /// `past`, `negation`, or the untyped `contrast` v1 shipped.
+    pub fn near_miss_mode(&self) -> Option<&str> {
+        self.kind
+            .split_once("-of:")
+            .filter(|(mode, _)| NEAR_MISS_KINDS.iter().any(|k| k.starts_with(mode)))
+            .map(|(mode, _)| mode)
+            .filter(|mode| *mode != "paraphrase")
+    }
+
+    /// The (question, option) pair this item must never answer with.
+    ///
+    /// One rule for both suites: v2 says it outright in `never`, and v1
+    /// says it by expecting its own option NOT to fire.
+    pub fn forbidden(&self) -> Option<(&str, &str)> {
+        if let Some(n) = &self.never {
+            return Some((n.question.as_str(), n.option.as_str()));
+        }
+        if self.is_contrast() && !self.expect.fires {
+            return Some((self.expect.question.as_str(), self.expect.option.as_str()));
+        }
+        None
     }
 }
 
@@ -126,8 +192,7 @@ pub fn parse(jsonl: &str) -> Result<(Header, Vec<Item>), String> {
             if header.is_some() {
                 return Err(format!("line {}: a second header", n + 1));
             }
-            header =
-                Some(serde_json::from_value(v).map_err(|e| format!("line {}: {e}", n + 1))?);
+            header = Some(serde_json::from_value(v).map_err(|e| format!("line {}: {e}", n + 1))?);
             continue;
         }
         items.push(serde_json::from_value(v).map_err(|e| format!("line {}: {e}", n + 1))?);
@@ -139,11 +204,14 @@ pub fn parse(jsonl: &str) -> Result<(Header, Vec<Item>), String> {
     Ok((header, items))
 }
 
-/// Did the expected option fire for this item?
-fn fired(obs: &Observed, expect: &Expect) -> bool {
+/// Did this option take this question, and act on it?
+///
+/// Takes the pair rather than an `Expect`, because the question a near
+/// miss must NEVER answer is not the one it is expected to answer.
+fn fired_option(obs: &Observed, question: &str, option: &str) -> bool {
     obs.answers
         .iter()
-        .any(|a| a.question == expect.question && a.top == expect.option && a.decision == "act")
+        .any(|a| a.question == question && a.top == option && a.decision == "act")
 }
 
 fn find<'a>(observed: &'a [Observed], id: &str) -> Option<&'a Observed> {
@@ -165,11 +233,17 @@ pub fn check_schema(h: &Header, items: &[Item], observed: &[Observed]) -> Verdic
         };
         for a in &obs.answers {
             let Some(q) = h.questions.iter().find(|q| q.name == a.question) else {
-                bad.push(format!("{}: answered a question nobody asked: {}", item.id, a.question));
+                bad.push(format!(
+                    "{}: answered a question nobody asked: {}",
+                    item.id, a.question
+                ));
                 continue;
             };
             if q.kind == Kind::Choice && !q.options.iter().any(|o| o.id == a.top) {
-                bad.push(format!("{}: named an option nobody declared: {}", item.id, a.top));
+                bad.push(format!(
+                    "{}: named an option nobody declared: {}",
+                    item.id, a.top
+                ));
             }
             if !a.p_top.is_finite() || !(0.0..=1.0).contains(&a.p_top) {
                 bad.push(format!("{}: a top probability of {}", item.id, a.p_top));
@@ -180,9 +254,16 @@ pub fn check_schema(h: &Header, items: &[Item], observed: &[Observed]) -> Verdic
         claim: "every answer names a declared option".to_string(),
         holds: bad.is_empty(),
         evidence: if bad.is_empty() {
-            format!("{} items, every answer inside the declared answer space", items.len())
+            format!(
+                "{} items, every answer inside the declared answer space",
+                items.len()
+            )
         } else {
-            format!("{} answers outside the answer space: {}", bad.len(), bad.join("; "))
+            format!(
+                "{} answers outside the answer space: {}",
+                bad.len(),
+                bad.join("; ")
+            )
         },
     }
 }
@@ -193,10 +274,13 @@ pub fn check_contrast(_h: &Header, items: &[Item], observed: &[Observed]) -> Ver
     let mut fired_ones: Vec<String> = Vec::new();
     let mut unanswered: Vec<String> = Vec::new();
     let mut n = 0usize;
-    for item in items.iter().filter(|i| i.is_contrast()) {
+    for item in items {
+        let Some((question, option)) = item.forbidden() else {
+            continue;
+        };
         n += 1;
         match find(observed, &item.id) {
-            Some(obs) if fired(obs, &item.expect) => fired_ones.push(item.id.clone()),
+            Some(obs) if fired_option(obs, question, option) => fired_ones.push(item.id.clone()),
             Some(_) => {}
             None => unanswered.push(item.id.clone()),
         }
@@ -208,7 +292,11 @@ pub fn check_contrast(_h: &Header, items: &[Item], observed: &[Observed]) -> Ver
         evidence: if holds {
             format!("{n} contrast pairs, none of them fired")
         } else {
-            let mut s = format!("{} of {n} mentions fired: {}", fired_ones.len(), fired_ones.join(", "));
+            let mut s = format!(
+                "{} of {n} mentions fired: {}",
+                fired_ones.len(),
+                fired_ones.join(", ")
+            );
             if !unanswered.is_empty() {
                 s.push_str(&format!("; unanswered: {}", unanswered.join(", ")));
             }
@@ -230,7 +318,9 @@ pub fn check_monotonicity(h: &Header, items: &[Item], observed: &[Observed]) -> 
             continue;
         };
         let q = item.expect.question.as_str();
-        let (Some(pa), Some(ba)) = (answer_for(p, q), answer_for(b, q)) else { continue };
+        let (Some(pa), Some(ba)) = (answer_for(p, q), answer_for(b, q)) else {
+            continue;
+        };
         n += 1;
         if pa.top != ba.top {
             changed.push(format!(
@@ -248,7 +338,10 @@ pub fn check_monotonicity(h: &Header, items: &[Item], observed: &[Observed]) -> 
         }
     }
     let holds = changed.is_empty() && drifted.is_empty();
-    let mut evidence = format!("{n} paraphrases, max drift {max_drift:.2} (bound {:.2})", h.delta);
+    let mut evidence = format!(
+        "{n} paraphrases, max drift {max_drift:.2} (bound {:.2})",
+        h.delta
+    );
     if !changed.is_empty() {
         evidence.push_str(&format!("; changed answer: {}", changed.join(", ")));
     }
@@ -271,18 +364,31 @@ pub fn check_implications(h: &Header, items: &[Item], observed: &[Observed]) -> 
     let mut broken: Vec<String> = Vec::new();
     let mut judged = 0usize;
     for item in items {
-        let Some(obs) = find(observed, &item.id) else { continue };
-        let Some(a) = answer_for(obs, &item.expect.question) else { continue };
+        let Some(obs) = find(observed, &item.id) else {
+            continue;
+        };
+        let Some(a) = answer_for(obs, &item.expect.question) else {
+            continue;
+        };
         if a.decision != "act" {
             continue;
         }
-        let Some(q) = h.questions.iter().find(|q| q.name == item.expect.question) else { continue };
-        let Some(opt) = q.options.iter().find(|o| o.id == a.top) else { continue };
+        let Some(q) = h.questions.iter().find(|q| q.name == item.expect.question) else {
+            continue;
+        };
+        let Some(opt) = q.options.iter().find(|o| o.id == a.top) else {
+            continue;
+        };
         for r in &opt.tether.requires {
-            let Some(req) = answer_for(obs, r) else { continue };
+            let Some(req) = answer_for(obs, r) else {
+                continue;
+            };
             judged += 1;
             if req.decision != "act" {
-                broken.push(format!("{} fired {} while {r} did not hold", item.id, a.top));
+                broken.push(format!(
+                    "{} fired {} while {r} did not hold",
+                    item.id, a.top
+                ));
             }
         }
     }
@@ -294,7 +400,11 @@ pub fn check_implications(h: &Header, items: &[Item], observed: &[Observed]) -> 
         } else if broken.is_empty() {
             format!("{judged} implications, every one held")
         } else {
-            format!("{} implications broken: {}", broken.len(), broken.join("; "))
+            format!(
+                "{} implications broken: {}",
+                broken.len(),
+                broken.join("; ")
+            )
         },
     }
 }
@@ -305,8 +415,12 @@ pub fn check_implications(h: &Header, items: &[Item], observed: &[Observed]) -> 
 pub fn check_calibration(_h: &Header, items: &[Item], observed: &[Observed]) -> Verdict {
     let mut pairs: Vec<(f32, bool)> = Vec::new();
     for item in items {
-        let Some(obs) = find(observed, &item.id) else { continue };
-        let Some(a) = answer_for(obs, &item.expect.question) else { continue };
+        let Some(obs) = find(observed, &item.id) else {
+            continue;
+        };
+        let Some(a) = answer_for(obs, &item.expect.question) else {
+            continue;
+        };
         let hit = if item.expect.fires {
             a.top == item.expect.option
         } else {

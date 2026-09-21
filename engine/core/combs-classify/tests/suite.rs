@@ -46,18 +46,37 @@ fn the_seed_fixture_parses_and_carries_the_translation_contrast() {
     let (h, items) = read();
     assert_eq!(h.suite, "seed-v1");
     assert!(h.delta > 0.0, "the fixture must name its drift bound");
-    assert!(items.len() >= 20, "the seed is thinner than it claims: {} items", items.len());
+    assert!(
+        items.len() >= 20,
+        "the seed is thinner than it claims: {} items",
+        items.len()
+    );
 
-    let c1 = items.iter().find(|i| i.id == "unsub-c1").expect("the translation contrast is item 1's pair");
+    let c1 = items
+        .iter()
+        .find(|i| i.id == "unsub-c1")
+        .expect("the translation contrast is item 1's pair");
     assert!(c1.is_contrast(), "unsub-c1 must be a contrast: {}", c1.kind);
     assert_eq!(c1.of(), Some("unsub-b1"));
-    assert!(!c1.expect.fires, "a translation request must not be expected to fire an escalation");
-    assert!(c1.state.to_lowercase().contains("arabic"), "the state must be the translation one");
+    assert!(
+        !c1.expect.fires,
+        "a translation request must not be expected to fire an escalation"
+    );
+    assert!(
+        c1.state.to_lowercase().contains("arabic"),
+        "the state must be the translation one"
+    );
 
     // Every base has at least one paraphrase and exactly one contrast.
     for base in items.iter().filter(|i| i.kind == "base") {
-        let paras = items.iter().filter(|i| i.is_paraphrase() && i.of() == Some(&base.id)).count();
-        let contrasts = items.iter().filter(|i| i.is_contrast() && i.of() == Some(&base.id)).count();
+        let paras = items
+            .iter()
+            .filter(|i| i.is_paraphrase() && i.of() == Some(&base.id))
+            .count();
+        let contrasts = items
+            .iter()
+            .filter(|i| i.is_contrast() && i.of() == Some(&base.id))
+            .count();
         assert!(paras >= 2, "{} has {paras} paraphrases", base.id);
         assert_eq!(contrasts, 1, "{} has {contrasts} contrasts", base.id);
     }
@@ -72,11 +91,14 @@ fn every_option_in_the_seed_carries_a_tether() {
     let declared: Vec<String> = h.questions.iter().map(|q| q.name.clone()).collect();
     for q in &h.questions {
         if q.options.is_empty() {
-            assert!(q.tether.is_some(), "question {} carries neither options nor a tether", q.name);
+            assert!(
+                q.tether.is_some(),
+                "question {} carries neither options nor a tether",
+                q.name
+            );
             continue;
         }
-        validate(&q.options, &declared, 64)
-            .unwrap_or_else(|e| panic!("question {}: {e}", q.name));
+        validate(&q.options, &declared, 64).unwrap_or_else(|e| panic!("question {}: {e}", q.name));
     }
 }
 
@@ -87,11 +109,21 @@ fn the_contrast_check_catches_a_mention_that_fired() {
     // The exact failure this suite exists to catch: the translation
     // request fires the escalation.
     let c1 = observed.iter_mut().find(|o| o.item == "unsub-c1").unwrap();
-    c1.answers = vec![ans("intent", "escalate_user_planning_unsubscription", 0.74, 0.55, "act")];
+    c1.answers = vec![ans(
+        "intent",
+        "escalate_user_planning_unsubscription",
+        0.74,
+        0.55,
+        "act",
+    )];
 
     let v = check_contrast(&h, &items, &observed);
     assert!(!v.holds, "a mention that fired must be caught");
-    assert!(v.evidence.contains("unsub-c1"), "the evidence must name the item: {}", v.evidence);
+    assert!(
+        v.evidence.contains("unsub-c1"),
+        "the evidence must name the item: {}",
+        v.evidence
+    );
 }
 
 #[test]
@@ -99,7 +131,11 @@ fn the_contrast_check_passes_when_every_mention_stays_shut() {
     let (h, items) = read();
     let observed = answers_that_work(&items);
     let v = check_contrast(&h, &items, &observed);
-    assert!(v.holds, "a rung that keeps every mention shut must pass: {}", v.evidence);
+    assert!(
+        v.holds,
+        "a rung that keeps every mention shut must pass: {}",
+        v.evidence
+    );
 }
 
 #[test]
@@ -110,8 +146,15 @@ fn the_monotonicity_check_catches_a_paraphrase_that_changed_its_answer() {
     p.answers = vec![ans("intent", "request_refund", 0.81, 0.70, "act")];
 
     let v = check_monotonicity(&h, &items, &observed);
-    assert!(!v.holds, "a paraphrase that changed its top option must be caught");
-    assert!(v.evidence.contains("unsub-p1"), "the evidence must name the item: {}", v.evidence);
+    assert!(
+        !v.holds,
+        "a paraphrase that changed its top option must be caught"
+    );
+    assert!(
+        v.evidence.contains("unsub-p1"),
+        "the evidence must name the item: {}",
+        v.evidence
+    );
 }
 
 #[test]
@@ -120,16 +163,29 @@ fn the_monotonicity_check_catches_a_paraphrase_that_drifted_too_far() {
     let mut observed = answers_that_work(&items);
     // Same top option, but the probability wandered well past delta.
     let p = observed.iter_mut().find(|o| o.item == "unsub-p2").unwrap();
-    p.answers = vec![ans("intent", "escalate_user_planning_unsubscription", 0.30, 0.20, "act")];
+    p.answers = vec![ans(
+        "intent",
+        "escalate_user_planning_unsubscription",
+        0.30,
+        0.20,
+        "act",
+    )];
 
     let v = check_monotonicity(&h, &items, &observed);
-    assert!(!v.holds, "a drift of 0.56 past a bound of 0.15 must be caught");
+    assert!(
+        !v.holds,
+        "a drift of 0.56 past a bound of 0.15 must be caught"
+    );
     assert!(
         v.evidence.contains("unsub-p2"),
         "the evidence must name the item: {}",
         v.evidence
     );
-    assert!(v.evidence.contains("0.15"), "the evidence must name the bound: {}", v.evidence);
+    assert!(
+        v.evidence.contains("0.15"),
+        "the evidence must name the bound: {}",
+        v.evidence
+    );
 }
 
 #[test]
@@ -166,7 +222,10 @@ fn the_calibration_check_reports_its_numbers_and_refuses_an_overconfident_rung()
         .collect();
 
     let v = check_calibration(&h, &items, &observed);
-    assert!(!v.holds, "a rung certain and wrong half the time must be caught");
+    assert!(
+        !v.holds,
+        "a rung certain and wrong half the time must be caught"
+    );
     assert!(
         v.evidence.to_lowercase().contains("ece"),
         "the evidence must report ECE: {}",
@@ -201,6 +260,174 @@ fn fixtures_stay_under_the_ceiling() {
         );
         total += meta.len();
     }
-    assert!(total <= DIR_CEILING, "tests/data totals {total} bytes (ceiling {DIR_CEILING})");
-    assert!(total > 0, "tests/data unexpectedly empty — the ceiling test lost its subject");
+    assert!(
+        total <= DIR_CEILING,
+        "tests/data totals {total} bytes (ceiling {DIR_CEILING})"
+    );
+    assert!(
+        total > 0,
+        "tests/data unexpectedly empty — the ceiling test lost its subject"
+    );
+}
+
+// --- suite v2: the near misses, typed ------------------------------------
+
+const SEED_V2: &str = include_str!("data/classify-seed-v2.jsonl");
+
+fn read_v2() -> (Header, Vec<Item>) {
+    parse(SEED_V2).expect("the v2 fixture parses")
+}
+
+/// The same hash the engine stamps a state with, so a state carried from
+/// one suite to the next can be shown to be the same bytes.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        h ^= byte as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+#[test]
+fn v2_carries_every_v1_state_unedited() {
+    // THE bar for comparing the two runs. v2 re-labels six of v1's items
+    // and re-types all six; if it also re-worded one, the two suites
+    // would be measuring different inputs while claiming to share them,
+    // and no cell could be read across them.
+    let (_, v1) = read();
+    let (_, v2) = read_v2();
+    let carried: Vec<&Item> = v2.iter().filter(|i| i.from_v1.is_some()).collect();
+    assert_eq!(
+        carried.len(),
+        v1.len(),
+        "v2 claims to carry {} of v1's {} states",
+        carried.len(),
+        v1.len()
+    );
+
+    for item in &carried {
+        let original = v1.iter().find(|o| o.id == item.id).unwrap_or_else(|| {
+            panic!("{} claims to come from v1, which has no such item", item.id)
+        });
+        assert_eq!(
+            item.from_v1,
+            Some(fnv1a(original.state.as_bytes())),
+            "{}: the state was edited on its way from v1",
+            item.id
+        );
+        assert_eq!(item.state, original.state, "{}", item.id);
+    }
+}
+
+#[test]
+fn every_near_miss_says_which_near_miss_it_is_and_what_it_must_never_answer() {
+    let (h, items) = read_v2();
+    assert_eq!(h.suite, "seed-v2");
+    assert_eq!(items.len(), 30);
+
+    // Every question tells the scorer what it is being asked. v1 carried
+    // no instructions at all, which for a trained cross-encoder is a
+    // prompt it was never fitted on.
+    for q in &h.questions {
+        let ins = q.instructions.as_deref().unwrap_or("");
+        assert!(
+            !ins.trim().is_empty(),
+            "question {} carries no instructions",
+            q.name
+        );
+    }
+
+    let mut modes: Vec<&str> = items.iter().filter_map(|i| i.near_miss_mode()).collect();
+    modes.sort_unstable();
+    modes.dedup();
+    assert_eq!(
+        modes,
+        vec!["definition", "negation", "past", "translation"],
+        "v2 must name all four near-miss modes and retire the untyped one"
+    );
+
+    for item in items.iter().filter(|i| i.is_contrast()) {
+        let base_id = item.of().expect("a near miss names its base");
+        let base = items
+            .iter()
+            .find(|b| b.id == base_id)
+            .expect("its base exists");
+        let never = item
+            .never
+            .as_ref()
+            .unwrap_or_else(|| panic!("{} carries no `never`", item.id));
+        // The bar v1 asserted about this state, kept: the action its
+        // base asks for is the one it must never take.
+        assert_eq!(never.option, base.expect.option, "{}", item.id);
+        assert_eq!(never.question, "intent");
+        // And it now has somewhere right to land, which v1 never gave it.
+        assert_ne!(item.expect.option, never.option, "{}", item.id);
+        assert!(
+            item.expect.fires,
+            "{} should have a right answer, not only a wrong one",
+            item.id
+        );
+        assert_eq!(item.forbidden(), Some(("intent", never.option.as_str())));
+    }
+}
+
+#[test]
+fn the_two_new_options_are_asked_for_in_their_own_right() {
+    // An option that only ever appears as the correct answer to a
+    // re-labelled near miss is never tested positively, so top-1 on the
+    // bases would not cover it.
+    let (h, items) = read_v2();
+    let intent = h
+        .questions
+        .iter()
+        .find(|q| q.name == "intent")
+        .expect("intent");
+    for id in ["translate_text", "explain_or_define"] {
+        assert!(
+            intent.options.iter().any(|o| o.id == id),
+            "{id} is not declared"
+        );
+        let bases = items
+            .iter()
+            .filter(|i| i.kind == "base" && i.expect.option == id)
+            .count();
+        assert!(bases >= 1, "{id} has no base item");
+    }
+    for base in items.iter().filter(|i| i.kind == "base") {
+        let paras = items
+            .iter()
+            .filter(|i| i.is_paraphrase() && i.of() == Some(&base.id))
+            .count();
+        assert!(paras >= 2, "{} has {paras} paraphrases", base.id);
+    }
+}
+
+#[test]
+fn the_contrast_check_reads_v2s_never_and_catches_a_scorer_that_takes_it() {
+    let (h, items) = read_v2();
+
+    // A rung that answers every item correctly.
+    let good = answers_that_work(&items);
+    let v = check_contrast(&h, &items, &good);
+    assert!(v.holds, "{}", v.evidence);
+
+    // The same rung, except the translation request is taken as an
+    // unsubscription — the exact failure §126 measured, now expressed
+    // against `never` rather than against `fires: false`.
+    let mut bad = good.clone();
+    let at = items
+        .iter()
+        .position(|i| i.id == "unsub-c1")
+        .expect("unsub-c1");
+    bad[at].answers = vec![ans(
+        "intent",
+        "escalate_user_planning_unsubscription",
+        0.98,
+        0.94,
+        "act",
+    )];
+    let v = check_contrast(&h, &items, &bad);
+    assert!(!v.holds, "the check did not catch a mention that fired");
+    assert!(v.evidence.contains("unsub-c1"), "{}", v.evidence);
 }

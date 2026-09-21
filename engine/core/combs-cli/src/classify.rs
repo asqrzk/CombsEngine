@@ -146,7 +146,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &byte in bytes {
         h ^= byte as u64;
-        h = h.wrapping_mul(0x1000_0000_01b3);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
 }
@@ -159,7 +159,7 @@ fn key_of(kind: Kind, instructions: &str, texts: &[String]) -> u64 {
     let mut eat = |b: &[u8]| {
         for &byte in b {
             h ^= byte as u64;
-            h = h.wrapping_mul(0x1000_0000_01b3);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
         }
     };
     eat(match kind {
@@ -204,7 +204,9 @@ fn parse_request(body: &str) -> Result<Request, (u16, Value)> {
     let state = match v.get("state") {
         Some(Value::String(s)) if !s.trim().is_empty() => s.clone(),
         Some(Value::Object(o)) if o.contains_key("image") || o.contains_key("image_url") => {
-            return Err(bad("this seat classifies text only: an image state needs an image encoder"));
+            return Err(bad(
+                "this seat classifies text only: an image state needs an image encoder",
+            ));
         }
         _ => return Err(bad("`state` must be a non-empty string")),
     };
@@ -233,9 +235,16 @@ fn parse_request(body: &str) -> Result<Request, (u16, Value)> {
             .get("type")
             .and_then(Value::as_str)
             .and_then(parse_kind)
-            .ok_or_else(|| bad(&format!("question {name:?}: `type` must be choice, score or noul")))?;
-        let instructions =
-            q.get("instructions").and_then(Value::as_str).unwrap_or_default().to_string();
+            .ok_or_else(|| {
+                bad(&format!(
+                    "question {name:?}: `type` must be choice, score or noul"
+                ))
+            })?;
+        let instructions = q
+            .get("instructions")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
 
         let options: Vec<Opt> = match kind {
             Kind::Noul => {
@@ -297,7 +306,12 @@ fn parse_request(body: &str) -> Result<Request, (u16, Value)> {
         tether::validate(&options, &declared, MAX_OPTIONS)
             .map_err(|e| bad(&format!("question {name:?}: {e}")))?;
 
-        questions.push(Question { name, kind, instructions, options });
+        questions.push(Question {
+            name,
+            kind,
+            instructions,
+            options,
+        });
     }
 
     let temperature = v
@@ -319,7 +333,12 @@ fn parse_request(body: &str) -> Result<Request, (u16, Value)> {
         }
     }
 
-    Ok(Request { state, questions, temperature, thresholds })
+    Ok(Request {
+        state,
+        questions,
+        temperature,
+        thresholds,
+    })
 }
 
 /// The embeddings this model returns are L2-normalised, so the cosine
@@ -487,10 +506,11 @@ pub fn handle_classify(
     let mut answers = Vec::with_capacity(req.questions.len());
     for (qi, q) in req.questions.iter().enumerate() {
         let p = &dist[qi];
-        let (top_i, top_p) = p
-            .iter()
-            .enumerate()
-            .fold((0usize, f32::MIN), |b, (i, &v)| if v > b.1 { (i, v) } else { b });
+        let (top_i, top_p) =
+            p.iter().enumerate().fold(
+                (0usize, f32::MIN),
+                |b, (i, &v)| if v > b.1 { (i, v) } else { b },
+            );
         let conf = confidence(p);
         let mut sorted: Vec<f32> = p.clone();
         sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
@@ -559,7 +579,11 @@ pub fn handle_classify(
                 ("decision", decision.word().to_string()),
                 (
                     "raw",
-                    raw[qi].iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(","),
+                    raw[qi]
+                        .iter()
+                        .map(|v| format!("{v:.6}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
                 ),
             ],
         );
@@ -606,7 +630,10 @@ mod tests {
         assert_eq!(r.questions.len(), 1);
         for o in &r.questions[0].options {
             let text = o.scored_text();
-            assert!(!text.contains(&o.id), "the identifier reached the scorer: {text}");
+            assert!(
+                !text.contains(&o.id),
+                "the identifier reached the scorer: {text}"
+            );
         }
     }
 
@@ -621,7 +648,9 @@ mod tests {
     #[test]
     fn a_noul_without_a_contrary_is_refused_by_name() {
         let body = r#"{"state":"x","questions":[{"name":"is_request","type":"noul","tether":{"means":"the person is asking for something"}}]}"#;
-        let (code, v) = parse_request(body).err().expect("a noul with nothing to score against");
+        let (code, v) = parse_request(body)
+            .err()
+            .expect("a noul with nothing to score against");
         assert_eq!(code, 400);
         assert!(v.to_string().contains("contrary"), "{v}");
     }
@@ -630,7 +659,9 @@ mod tests {
     fn an_implication_naming_an_unasked_question_is_refused() {
         let body = r#"{"state":"x","questions":[{"name":"intent","type":"choice","options":[
             {"id":"a","tether":{"means":"the person wants a thing","requires":["is_request"]}}]}]}"#;
-        let (_, v) = parse_request(body).err().expect("an implication with no question");
+        let (_, v) = parse_request(body)
+            .err()
+            .expect("an implication with no question");
         assert!(v.to_string().contains("is_request"), "{v}");
     }
 
@@ -651,7 +682,10 @@ mod tests {
         assert_ne!(a, b, "a changed option must change the key");
         assert_ne!(a, c, "changed instructions must change the key");
         assert_ne!(a, d, "a changed kind must change the key");
-        assert_eq!(a, key_of(Kind::Choice, "ins", &["one".into(), "two".into()]));
+        assert_eq!(
+            a,
+            key_of(Kind::Choice, "ins", &["one".into(), "two".into()])
+        );
     }
 
     /// A sitting must be able to say whether the classifier ran, and how
@@ -665,7 +699,11 @@ mod tests {
         c.counted(3);
         c.counted(1);
         let s = c.stats();
-        assert_eq!((s.requests, s.questions), (2, 4), "requests and questions are counted apart");
+        assert_eq!(
+            (s.requests, s.questions),
+            (2, 4),
+            "requests and questions are counted apart"
+        );
 
         let key = key_of(Kind::Choice, "ins", &["one".into()]);
         assert!(c.get(key).is_none(), "a cold key misses");
@@ -680,7 +718,11 @@ mod tests {
         for i in 0..256u64 {
             c.put(key.wrapping_add(i + 1), Arc::new(vec![vec![0.0f32]]));
         }
-        assert_eq!(c.stats().cache_clears, 1, "the bound cleared the cache once");
+        assert_eq!(
+            c.stats().cache_clears,
+            1,
+            "the bound cleared the cache once"
+        );
     }
 
     /// One name for the road, so the answer and the stats route cannot
@@ -689,6 +731,24 @@ mod tests {
     #[test]
     fn one_constant_names_the_scorer_for_both_the_answer_and_the_stats() {
         assert_eq!(BACKEND, "embed-cosine");
+        // FNV-1a's published vectors, because a hash named after an
+        // algorithm should be that algorithm. The multiplier here read
+        // `0x1000_0000_01b3` for one digit group too long — a fine hash,
+        // and not the one two other places in this estate compute, which
+        // is how a state fingerprint stops being comparable across
+        // tools. Found by a suite fixture whose hashes were generated
+        // outside Rust and disagreed.
+        assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a(b"foobar"), 0x8594_4171_f739_67e8);
+        // The model card names the same road. A literal there would let
+        // `/v1/models` and `/v1/classify` disagree about the scorer.
+        assert!(
+            !std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/serve.rs"))
+                .expect("serve.rs")
+                .contains("\"classify_backend\": if engine.supports_embeddings() { \"embed"),
+            "serve.rs spells the backend as a literal instead of naming BACKEND"
+        );
         let src = include_str!("classify.rs");
         assert!(
             !src.contains("\"backend\": \"embed"),
