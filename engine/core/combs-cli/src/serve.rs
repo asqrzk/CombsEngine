@@ -443,7 +443,14 @@ fn capabilities_json(engine: &Arc<Engine>) -> Value {
         "constraints": ["json_object", "json_schema"],
         "embeddings": engine.supports_embeddings(),
         "classify": engine.supports_embeddings(),
-        "classify_backend": if engine.supports_embeddings() { "embed-cosine" } else { "none" },
+        // The road by NAME, from the one constant that names it, so a
+        // card and an answer cannot come to disagree about which scorer
+        // a caller is talking to.
+        "classify_backend": if engine.supports_embeddings() {
+            crate::classify::BACKEND
+        } else {
+            "none"
+        },
         "pooling": match engine.default_pooling() {
             combs_runtime::Pooling::Last => "last",
             combs_runtime::Pooling::Mean => "mean",
