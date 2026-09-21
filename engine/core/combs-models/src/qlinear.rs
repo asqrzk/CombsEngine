@@ -863,6 +863,27 @@ pub fn try_quant_linear<B: Backend>(
 #[cfg(test)]
 mod tests {
 
+    /// The batched road's whole correctness rides on one feature flag.
+    ///
+    /// `MatmulStrategy::default()` is `Autotune` only when burn-cubecl is
+    /// built with `autotune`; without it the default is `Cube`, the
+    /// diagnostic road this file warns about above — and every batched
+    /// prefill call would take it in silence. That feature reached us by
+    /// inheriting a vendored default list, not by being asked for, so a
+    /// tidy-up of one dependency line could have turned it off with
+    /// nothing failing. It is named in `Cargo.toml` now, and this is what
+    /// notices if it stops being.
+    #[test]
+    fn the_batched_road_gets_the_autotuned_matmul_by_default() {
+        assert!(
+            matches!(MatmulStrategy::default(), MatmulStrategy::Autotune),
+            "burn-cubecl lost its `autotune` feature: the batched matmul would \
+             silently take the Cube road (see the COMBS_QMATMUL_STRATEGY door above)"
+        );
+        // And the door still overrides it, refusing anything else by name.
+        assert!(matches!(matmul_strategy_for(2560), MatmulStrategy::Autotune));
+    }
+
     /// `forward_add` is `forward` plus the residual, on both unfused arms
     /// and at both shapes — the decode shape takes the epilogue, the
     /// prefill shape the default road, and the answer must not know which.
