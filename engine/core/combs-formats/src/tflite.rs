@@ -320,6 +320,7 @@ fn metadata_from_params(p: &LlmParameters) -> Result<ModelMetadata> {
         rope_scaling: crate::metadata::RopeScaling::None,
         linear_attention: None,
         rotary_dim: None,
+        encoder: None,
     })
 }
 

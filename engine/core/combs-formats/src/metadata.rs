@@ -56,6 +56,10 @@ pub struct ModelMetadata {
     /// Head dimensions RoPE turns when only part of each head rotates
     /// (Qwen3.5: 64 of 256); `None` = the whole head.
     pub rotary_dim: Option<usize>,
+    /// A BIDIRECTIONAL encoder's own geometry (ModernBERT today); `None`
+    /// for every generative model. Present means the seat decodes
+    /// nothing: it reads a whole sequence at once and answers from it.
+    pub encoder: Option<EncoderConfig>,
 }
 
 /// One hybrid family's Gated DeltaNet geometry (see
@@ -238,6 +242,114 @@ pub struct VisionConfig {
     pub image_token_id: u32,
 }
 
+/// A bidirectional encoder's geometry, parsed from `config.json` when
+/// `model_type == "modernbert"`.
+///
+/// It is read INSTEAD of the generative fields, never beside them, and
+/// that is the whole reason it exists: a ModernBERT config carries a
+/// `rms_norm_eps` of nothing and no `rope_theta` at all, so the two
+/// knobs a llama-shaped reader would reach for are silently plausible
+/// and both wrong. This encoder normalises with LayerNorm, not RMSNorm,
+/// and turns TWO rope bases — one for the layers that attend to the
+/// whole sequence, another for the layers that slide.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EncoderConfig {
+    /// Every Nth layer attends globally; the rest slide. Only consulted
+    /// when `layer_types` is empty.
+    pub global_attn_every_n_layers: usize,
+    /// Half of HF's `local_attention`: a sliding layer sees keys within
+    /// ±this many positions. HF states the whole width; the kernel wants
+    /// the radius, and halving it at the reader means nobody halves it
+    /// twice.
+    pub local_window: usize,
+    /// RoPE base for the layers that attend to everything.
+    pub global_rope_theta: f64,
+    /// RoPE base for the layers that slide.
+    pub local_rope_theta: f64,
+    /// LayerNorm epsilon.
+    pub norm_eps: f64,
+    /// Whether the LayerNorms carry biases (ModernBERT-large: they do not).
+    pub norm_bias: bool,
+    /// Whether the attention projections carry biases.
+    pub attention_bias: bool,
+    /// Whether the MLP carries biases.
+    pub mlp_bias: bool,
+    /// `[CLS]`, `[SEP]` and `[PAD]`, by id. A marker sequence splices
+    /// these by NUMBER and never by string — `[MASK]` is `lstrip: true`
+    /// in the tokenizer, so writing the text would not round-trip.
+    pub cls_id: u32,
+    pub sep_id: u32,
+    pub pad_id: u32,
+    /// The explicit per-layer list when the config carries one (`true` =
+    /// global); empty when only `global_attn_every_n_layers` is given.
+    /// The list is the authority where both are present.
+    pub layer_types: Vec<bool>,
+}
+
+impl EncoderConfig {
+    /// Whether layer `i` attends to the whole sequence.
+    pub fn is_global_layer(&self, i: usize) -> bool {
+        if let Some(&global) = self.layer_types.get(i) {
+            return global;
+        }
+        self.global_attn_every_n_layers <= 1 || i % self.global_attn_every_n_layers == 0
+    }
+
+    /// Parses the encoder section of a `config.json`; `None` for every
+    /// architecture that is not one.
+    fn from_hf_config(config: &serde_json::Value) -> Result<Option<Self>> {
+        if config.get("model_type").and_then(|v| v.as_str()) != Some("modernbert") {
+            return Ok(None);
+        }
+        let u = |key: &str| config.get(key).and_then(|x| x.as_u64());
+        let flag = |key: &str, default: bool| config.get(key).and_then(|x| x.as_bool()).unwrap_or(default);
+        // Two spellings in the wild. transformers <= 4.x writes the bases
+        // flat; 5.x nests them under `rope_parameters` by layer type, and
+        // the laya checkpoint's config is the nested one — a reader that
+        // knew only the flat names would take BOTH defaults and turn every
+        // layer at 10000.
+        let theta = |flat: &str, nested: &str, default: f64| -> f64 {
+            if let Some(v) = config.get(flat).and_then(|x| x.as_f64()) {
+                return v;
+            }
+            config
+                .get("rope_parameters")
+                .and_then(|r| r.get(nested))
+                .and_then(|r| r.get("rope_theta"))
+                .and_then(|x| x.as_f64())
+                .unwrap_or(default)
+        };
+        let layer_types: Vec<bool> = config
+            .get("layer_types")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().map(|t| t.as_str() == Some("full_attention")).collect())
+            .unwrap_or_default();
+        let id = |key: &str| -> Result<u32> {
+            u(key)
+                .map(|x| x as u32)
+                .ok_or_else(|| FormatError::MissingField(key.to_string()))
+        };
+        Ok(Some(EncoderConfig {
+            global_attn_every_n_layers: u("global_attn_every_n_layers").unwrap_or(3) as usize,
+            local_window: (u("local_attention").unwrap_or(128) / 2) as usize,
+            global_rope_theta: theta("global_rope_theta", "full_attention", 160000.0),
+            local_rope_theta: theta("local_rope_theta", "sliding_attention", 10000.0),
+            norm_eps: config
+                .get("norm_eps")
+                .or_else(|| config.get("layer_norm_eps"))
+                .and_then(|x| x.as_f64())
+                .unwrap_or(1e-5),
+            norm_bias: flag("norm_bias", false),
+            attention_bias: flag("attention_bias", false),
+            mlp_bias: flag("mlp_bias", false),
+            cls_id: id("cls_token_id")?,
+            sep_id: id("sep_token_id")?,
+            pad_id: id("pad_token_id")?,
+            layer_types,
+        }))
+    }
+}
+
 /// Attention RoPE/scale settings that vary by layer type (Gemma2/3):
 /// `pattern`-th layers are "global" (full attention, `rope_theta`); the
 /// rest are "local" (sliding-window attention, `rope_local_theta`).
@@ -409,6 +521,7 @@ impl ModelMetadata {
             rope_scaling: RopeScaling::default(),
             linear_attention: None,
             rotary_dim: None,
+            encoder: None,
         }
     }
 
@@ -552,6 +665,10 @@ impl ModelMetadata {
             rope_scaling: RopeScaling::parse(text)?,
             linear_attention: None,
             rotary_dim: None,
+            // Read from the WHOLE config, not the nested text section: a
+            // ModernBERT config has no text section, and the special ids
+            // this needs sit at the top level.
+            encoder: EncoderConfig::from_hf_config(config)?,
         })
     }
 }
@@ -770,5 +887,92 @@ mod hybrid_tests {
             ..AttentionPattern::default()
         };
         assert_eq!(m.kv_layers(), 2, "gemma: every sixth layer is global");
+    }
+
+    /// The real ModernBERT-large config the laya checkpoint ships, not a
+    /// hand-written stand-in — because the thing worth catching here is a
+    /// key that moved, and a stand-in would move with the reader.
+    #[test]
+    fn a_modernbert_config_is_read_as_an_encoder_and_not_as_a_decoder() {
+        let raw = include_str!("../tests/fixtures/modernbert_large_config.json");
+        let cfg: serde_json::Value = serde_json::from_str(raw).expect("the fixture parses");
+        let m = ModelMetadata::from_hf_config(&cfg, None).expect("a modernbert config");
+        let e = m.encoder.as_ref().expect("model_type modernbert means an encoder");
+
+        assert_eq!(e.global_attn_every_n_layers, 3);
+        // HF states the whole window; the kernel wants the radius. Halved
+        // once, here, so nobody halves it twice.
+        assert_eq!(e.local_window, 64, "local_attention 128 is +/-64");
+        // This config is transformers 5.x, which nests the bases under
+        // `rope_parameters` by layer type. A reader that knew only the
+        // flat `global_rope_theta`/`local_rope_theta` spelling would take
+        // BOTH defaults and turn every layer at 10000.
+        assert_eq!(e.global_rope_theta, 160000.0, "the global base is not the default");
+        assert_eq!(e.local_rope_theta, 10000.0);
+        assert_eq!(e.norm_eps, 1e-5);
+        assert!(!e.norm_bias && !e.attention_bias && !e.mlp_bias, "ModernBERT-large carries no biases");
+        assert_eq!((e.cls_id, e.sep_id, e.pad_id), (50281, 50282, 50283));
+
+        // The explicit list is the authority, and it agrees with the
+        // every-third rule on this checkpoint.
+        assert_eq!(e.layer_types.len(), 28);
+        for i in 0..28 {
+            assert_eq!(e.is_global_layer(i), i % 3 == 0, "layer {i}");
+        }
+
+        // The knobs a llama-shaped reader would reach for are absent from
+        // this config, so they are whatever the defaults say — plausible,
+        // and both wrong. The encoder must be read through `encoder`.
+        assert!(cfg.get("rope_theta").is_none(), "there is no single rope base to read");
+        assert!(cfg.get("rms_norm_eps").is_none(), "this encoder normalises with LayerNorm");
+    }
+
+    /// Both spellings of the rope bases, because the flat one is what
+    /// every ModernBERT config written before transformers 5 carries.
+    #[test]
+    fn the_flat_rope_spelling_is_read_too_and_wins_over_the_nested_one() {
+        // The shared fields are still read first — an encoder config
+        // carries hidden_size and its layer count like any other.
+        let base = serde_json::json!({
+            "model_type": "modernbert",
+            "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 4,
+            "num_attention_heads": 4, "vocab_size": 32, "max_position_embeddings": 128,
+            "cls_token_id": 1, "sep_token_id": 2, "pad_token_id": 3,
+            "global_rope_theta": 160000.0, "local_rope_theta": 10000.0,
+            "local_attention": 128,
+        });
+        let m = ModelMetadata::from_hf_config(&base, None).expect("flat spelling");
+        let e = m.encoder.expect("an encoder");
+        assert_eq!((e.global_rope_theta, e.local_rope_theta), (160000.0, 10000.0));
+        assert!(e.layer_types.is_empty(), "no list given");
+        assert!(e.is_global_layer(0) && !e.is_global_layer(1) && e.is_global_layer(3));
+    }
+
+    /// A generative config must not grow an encoder, or every llama would
+    /// suddenly claim to decode nothing.
+    #[test]
+    fn a_generative_config_carries_no_encoder() {
+        let cfg = serde_json::json!({
+            "model_type": "llama", "hidden_size": 64, "intermediate_size": 128,
+            "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 4,
+            "vocab_size": 32, "max_position_embeddings": 128,
+        });
+        let m = ModelMetadata::from_hf_config(&cfg, None).expect("a llama config");
+        assert!(m.encoder.is_none());
+    }
+
+    /// An encoder config missing a special id is refused BY NAME: a
+    /// marker sequence splices these by number, and a guessed [SEP] would
+    /// put the options in the wrong half of the sequence.
+    #[test]
+    fn an_encoder_config_without_its_special_ids_is_refused_by_name() {
+        let cfg = serde_json::json!({
+            "model_type": "modernbert",
+            "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 4,
+            "num_attention_heads": 4, "vocab_size": 32, "max_position_embeddings": 128,
+            "cls_token_id": 1, "sep_token_id": 2,
+        });
+        let err = ModelMetadata::from_hf_config(&cfg, None).unwrap_err();
+        assert!(format!("{err}").contains("pad_token_id"), "{err}");
     }
 }

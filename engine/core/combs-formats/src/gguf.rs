@@ -976,6 +976,9 @@ fn build_model_metadata(kv: &HashMap<String, MetaValue>) -> Result<ModelMetadata
         rope_scaling: gguf_rope_scaling(kv, &prefix)?,
         linear_attention,
         rotary_dim,
+        // A GGUF file describes a generative model; a bidirectional
+        // encoder is a safetensors checkpoint with its own config.json.
+        encoder: None,
     })
 }
 

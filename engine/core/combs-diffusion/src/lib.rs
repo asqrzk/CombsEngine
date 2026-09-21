@@ -144,6 +144,7 @@ pub(crate) fn diffusion_metadata(architecture: &str) -> ModelMetadata {
         rope_scaling: combs_formats::RopeScaling::default(),
         linear_attention: None,
         rotary_dim: None,
+        encoder: None,
     }
 }
 
