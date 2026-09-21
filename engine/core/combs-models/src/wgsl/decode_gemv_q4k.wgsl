@@ -58,20 +58,29 @@ fn main(
   let k = params.k.x;
   let chunks = k / 32u;
 
+  // cc = abs_c % 8u is loop-invariant per lane: k % 256 == 0 is enforced
+  // at pack time (qmatmul.rs), so chunks is a multiple of 8 and
+  // row·chunks % 8 == 0 for every row — leaving cc == c % 8, and c steps
+  // by LANES (itself a multiple of 8) starting at `lane`, so cc == lane
+  // % 8 on every iteration. j, t and shift follow, and so does the
+  // branch direction inside k4_scale/k4_min: computing them once here
+  // removes a divergent branch from the hot loop instead of re-taking it
+  // once per chunk.
+  let cc = lane % 8u;
+  let j = cc / 2u;
+  let t = cc % 2u;
+  let shift = t * 4u;
+
   var acc = 0.0;
   if (row < params.n_out.x) {
     for (var c = lane; c < chunks; c += LANES) {
       let abs_c = row * chunks + c;
       let sb = abs_c / 8u;
-      let cc = abs_c % 8u;
-      let j = cc / 2u;
-      let t = cc % 2u;
       let dsc = dd[sb * 2u] * f32(k4_scale(sb * 12u, cc));
       let dmn = dd[sb * 2u + 1u] * f32(k4_min(sb * 12u, cc));
       // 32 nibble-bytes of group j start at byte sb·128 + j·32.
       let wb = sb * 32u + j * 8u;
       let xb = c * 8u;
-      let shift = t * 4u;
       var s1 = 0.0;
       var s2 = 0.0;
       for (var w = 0u; w < 8u; w += 1u) {

@@ -617,6 +617,83 @@ pub fn gemv_cell(n_out: usize, k: usize, reps: usize) -> std::time::Duration {
     gemv_cell_at(n_out, k, reps, Geometry::DEFAULT.rows, Geometry::DEFAULT.lanes).0
 }
 
+/// Any of the four packed decode gemvs, at the SHIPPED Metal rendering
+/// (`Storage::F16` — `QuantWeight::matmul_device_f16_add`'s own choice,
+/// not `gemv_cell_at`'s `Storage::F32`) and covering Q8_0 as well as the
+/// three K-quants. `gemv_cell`/`gemv_cell_at` are left exactly as they
+/// were: every ledger section that cites them, back to §90, stays
+/// comparable. This is the separate instrument for grading a kernel
+/// change against what a real f16 seat actually runs, and for reading a
+/// per-format bandwidth contrast directly rather than inferring one from
+/// end-to-end residuals (the ledger's §130). Fixture and tolerance mirror
+/// `f16_storage_gemv_matches_the_host_on_rounded_input` exactly, so a
+/// failure here means the same thing that test failing would mean.
+/// Returns (per-rep time, max relative error against the host reference).
+pub fn gemv_cell_shipped(format: &str, n_out: usize, k: usize, reps: usize, rows: u32, lanes: u32) -> (std::time::Duration, f32) {
+    use cubecl::prelude::*;
+    let geom = Geometry { rows, lanes };
+    let device = Default::default();
+    let client = WgpuRuntime::client(&device);
+    let (block_bytes, scale_offsets): (usize, &[usize]) = match format {
+        "q8_0" => (34, &[0]),
+        "q4_k" => (144, &[0, 2]),
+        "q5_k" => (176, &[0, 2]),
+        "q6_k" => (210, &[208]),
+        other => panic!("gemv_cell_shipped: unknown format {other:?} (want q8_0, q4_k, q5_k or q6_k)"),
+    };
+    let blocks = if format == "q8_0" { n_out * k / 32 } else { n_out * k / 256 };
+    let mut data: Vec<u8> = (0..blocks * block_bytes).map(|i| ((i * 37 + 11) % 251) as u8).collect();
+    for b in 0..blocks {
+        for (which, &off) in scale_offsets.iter().enumerate() {
+            let bits: u16 = if which == 0 { 0x3C00 } else { 0x3400 };
+            data[b * block_bytes + off..b * block_bytes + off + 2].copy_from_slice(&bits.to_le_bytes());
+        }
+    }
+    // The activation, f16-rounded and scaled down exactly as the correctness test does — an f16 dot product
+    // over unit-scale synthetic weights otherwise overflows f16's range (see that test's own note).
+    let x: Vec<f32> = (0..k).map(|i| f32::from(burn::tensor::f16::from_f32((((i as f32 * 0.311).sin() * 1.4) - 0.1) / 32.0))).collect();
+    let x_bytes: Vec<u8> = x.iter().flat_map(|v| burn::tensor::f16::from_f32(*v).to_le_bytes()).collect();
+
+    // One pack-correctness-and-time run per format, sharing everything but the weight type: `decode_gemv_wgsl_at`
+    // is `pub(crate)` per weight struct, not unified on the `QuantWeight` enum, so the format still selects the
+    // type once here — but never twice, the way the first draft of this function did.
+    macro_rules! run {
+        ($weight_ty:ty, $dequant:path) => {{
+            let w = <$weight_ty>::from_gguf_bytes(&client, &data, n_out, k).expect("a synthetic weight packs");
+            let dense = $dequant(&data, n_out * k).expect("reference");
+
+            let x_h = client.create_from_slice(&x_bytes);
+            let out_h = w.decode_gemv_wgsl_at(&client, x_h, Storage::F16, None, geom);
+            let bytes = cubecl::future::block_on(client.read_async(vec![out_h])).expect("readback");
+            let got: Vec<f32> = bytes[0].chunks_exact(2).map(|c| f32::from(burn::tensor::f16::from_le_bytes([c[0], c[1]]))).collect();
+            let mut worst = 0.0f32;
+            for r in 0..n_out {
+                let expect: f32 = (0..k).map(|c| x[c] * dense[r * k + c]).sum();
+                let rel = (got[r] - expect).abs() / expect.abs().max(1.0);
+                if rel > worst {
+                    worst = rel;
+                }
+            }
+
+            let x_h = client.create_from_slice(&x_bytes);
+            let _ = w.decode_gemv_wgsl_at(&client, x_h.clone(), Storage::F16, None, geom);
+            cubecl::future::block_on(client.sync()).expect("sync after warm-up");
+            let started = std::time::Instant::now();
+            for _ in 0..reps {
+                let _ = w.decode_gemv_wgsl_at(&client, x_h.clone(), Storage::F16, None, geom);
+            }
+            cubecl::future::block_on(client.sync()).expect("sync after the reps");
+            (started.elapsed() / reps as u32, worst)
+        }};
+    }
+    match format {
+        "q8_0" => run!(crate::qmatmul::Q80Weight<WgpuRuntime>, combs_formats::quants::dequantize_q8_0),
+        "q4_k" => run!(crate::qmatmul::Q4KWeight<WgpuRuntime>, combs_formats::quants::dequantize_q4_k),
+        "q5_k" => run!(crate::qmatmul::Q5KWeight<WgpuRuntime>, combs_formats::quants::dequantize_q5_k),
+        _ => run!(crate::qmatmul::Q6KWeight<WgpuRuntime>, combs_formats::quants::dequantize_q6_k),
+    }
+}
+
 #[allow(dead_code)]
 fn gemv_cell_unused(n_out: usize, k: usize, reps: usize) -> std::time::Duration {
     use cubecl::prelude::*;
@@ -2339,6 +2416,23 @@ mod tests {
                     "{format} f16 gemv wrong at row {r}: got {g}, expected {expect}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn gemv_cell_shipped_matches_the_host_reference_on_every_format() {
+        // O10 from the K-quant gemv audit: `gemv_cell_at` only ever timed
+        // Q4_K at Storage::F32, never the shipped f16 rendering, and had
+        // no Q8_0 arm. This is the correctness half of the fix it
+        // demanded — the timing half only a live desk can prove — so a
+        // future measurement is graded against the kernel that actually
+        // ships, not a cheaper rendering of it.
+        if crate::skip_no_gpu() {
+            return;
+        }
+        for format in ["q8_0", "q4_k", "q5_k", "q6_k"] {
+            let (_dur, worst) = gemv_cell_shipped(format, 64, 512, 1, Geometry::DEFAULT.rows, Geometry::DEFAULT.lanes);
+            assert!(worst.is_finite() && worst <= 1e-3, "{format}: gemv_cell_shipped disagreed with the host reference by {worst}");
         }
     }
 

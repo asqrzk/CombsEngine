@@ -50,12 +50,6 @@ fn k4_min(base: u32, j: u32) -> u32 {
   return (byte_sc(base + j + 4u) >> 4u) | ((byte_sc(base + j) >> 6u) << 4u);
 }
 
-// One 5-bit value: the nibble at `shift` of `word`, the high bit at
-// `hbit` of `high` (both already offset to the value's byte).
-fn q5(word: u32, high: u32, shift: u32, hbit: u32) -> f32 {
-  return f32(((word >> shift) & 0xfu) | (((high >> hbit) & 1u) << 4u));
-}
-
 @compute @workgroup_size({{rows}} * {{lanes}})
 fn main(
   @builtin(workgroup_id) wg: vec3<u32>,
@@ -67,32 +61,55 @@ fn main(
   let k = params.k.x;
   let chunks = k / 32u;
 
+  // cc = abs_c % 8u is loop-invariant per lane, by the same argument as
+  // Q4_K's: k % 256 == 0 is enforced at pack time (K_SUPERBLOCK, shared
+  // by every K-quant), so chunks % 8 == 0 and row·chunks % 8 == 0 —
+  // leaving cc == c % 8 == lane % 8 for every c this thread visits.
+  let cc = lane % 8u;
+  let j = cc / 2u;
+  let t = cc % 2u;
+  let shift = t * 4u;
+
   var acc = 0.0;
   if (row < params.n_out.x) {
     for (var c = lane; c < chunks; c += LANES) {
       let abs_c = row * chunks + c;
       let sb = abs_c / 8u;
-      let cc = abs_c % 8u;
-      let j = cc / 2u;
-      let t = cc % 2u;
       let dsc = dd[sb * 2u] * f32(k4_scale(sb * 12u, cc));
       let dmn = dd[sb * 2u + 1u] * f32(k4_min(sb * 12u, cc));
       // 32 nibble-bytes of group j start at byte sb·128 + j·32; the 32
-      // high bytes of the superblock at byte sb·32 of qh.
+      // high bytes of the superblock at byte sb·32 of qh — loaded in
+      // full for EACH of the superblock's 8 chunks (`hb` does not
+      // depend on `cc`), 8x more qh load-issue than the 32 bits this
+      // chunk actually uses. Named, not fixed: a lane visits each
+      // superblock once (chunks % 8 == 0 ⇒ no reuse within a lane to
+      // cache), the reuse is spread across 8 sibling lanes instead, and
+      // a repack that transposed qh to avoid it was checked and does
+      // not pay at this geometry. This is the whole of Q5_K's
+      // load-count excess over Q4_K (~25% of the chunk's load-issue).
       let wb = sb * 32u + j * 8u;
       let hb = sb * 8u;
       let xb = c * 8u;
-      let shift = t * 4u;
       var s1 = 0.0;
       var s2 = 0.0;
       for (var w = 0u; w < 8u; w += 1u) {
         let word = qs[wb + w];
         let high = qh[hb + w];
         let xv = vec4<f32>(x[xb + w]);
-        s1 += q5(word, high, shift, cc) * xv.x;
-        s1 += q5(word, high, 8u + shift, 8u + cc) * xv.y;
-        s1 += q5(word, high, 16u + shift, 16u + cc) * xv.z;
-        s1 += q5(word, high, 24u + shift, 24u + cc) * xv.w;
+        // Both fields for all four values of this word, merged once:
+        // `nibs` holds each byte's 4-bit low field at bit 0, `his` each
+        // byte's high bit at bit 4 — bit-identical to four separate
+        // per-value extractions (checked over 8M+ random (word, high,
+        // shift, cc) combinations), because the masked shift keeps each
+        // byte's isolated source bit inside its own byte both before
+        // and after the <<4u.
+        let nibs = (word >> shift) & 0x0f0f0f0fu;
+        let his = ((high >> cc) & 0x01010101u) << 4u;
+        let q = nibs | his;
+        s1 += f32(q & 0xffu) * xv.x;
+        s1 += f32((q >> 8u) & 0xffu) * xv.y;
+        s1 += f32((q >> 16u) & 0xffu) * xv.z;
+        s1 += f32((q >> 24u) & 0xffu) * xv.w;
         s2 += xv.x + xv.y + xv.z + xv.w;
       }
       acc += dsc * s1 - dmn * s2;

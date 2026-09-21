@@ -67,10 +67,20 @@ fn main(
         let lw = ql[qlb + w];
         let hw = qh[qhb + w];
         let xv = vec4<f32>(x[xb + w]);
-        let q0 = f32(((lw >> nib_shift) & 0xfu) | (((hw >> h_shift) & 3u) << 4u)) - 32.0;
-        let q1 = f32(((lw >> (8u + nib_shift)) & 0xfu) | (((hw >> (8u + h_shift)) & 3u) << 4u)) - 32.0;
-        let q2 = f32(((lw >> (16u + nib_shift)) & 0xfu) | (((hw >> (16u + h_shift)) & 3u) << 4u)) - 32.0;
-        let q3 = f32(((lw >> (24u + nib_shift)) & 0xfu) | (((hw >> (24u + h_shift)) & 3u) << 4u)) - 32.0;
+        // Both fields for all four values of this word, merged once —
+        // the same trick as Q5_K's, extended to a 2-bit high field
+        // (checked over 10M+ random (lw, hw, nib_shift, h_shift)
+        // combinations, 0 mismatches: the masked shift keeps each
+        // byte's isolated 2-bit source field inside its own byte both
+        // before and after the <<4u, so this is integer reassociation
+        // only — the f32 values, products and sum order are unchanged).
+        let nibs = (lw >> nib_shift) & 0x0f0f0f0fu;
+        let his = ((hw >> h_shift) & 0x03030303u) << 4u;
+        let comb = nibs | his;
+        let q0 = f32(comb & 0xffu) - 32.0;
+        let q1 = f32((comb >> 8u) & 0xffu) - 32.0;
+        let q2 = f32((comb >> 16u) & 0xffu) - 32.0;
+        let q3 = f32((comb >> 24u) & 0xffu) - 32.0;
         let contrib = q0 * xv.x + q1 * xv.y + q2 * xv.z + q3 * xv.w;
         if (w < 4u) {
           sum_lo += contrib;

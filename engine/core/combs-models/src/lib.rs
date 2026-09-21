@@ -50,7 +50,7 @@ pub use wgsl::probe_report as wgsl_probe_report;
 // The kit's micro cells: the launch floor, the bus, and the gemv against
 // its packed bytes. Public for the same reason the probe is — a stranger's
 // box must be able to answer them.
-pub use wgsl::{active_doors, bus_cell, dispatch_latency, gemv_cell, gemv_cell_at};
+pub use wgsl::{active_doors, bus_cell, dispatch_latency, gemv_cell, gemv_cell_at, gemv_cell_shipped};
 pub use rope::RotaryEmbedding;
 pub use smolvlm::{SmolVlmModel, image_prompt_expansion, pixels_to_tensor};
 pub use whisper::{WhisperModel, load_speech_model};
