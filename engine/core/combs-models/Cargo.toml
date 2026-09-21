@@ -29,6 +29,10 @@ thiserror.workspace = true
 
 [dev-dependencies]
 wgpu = "29"
+# The laya parity fixture is JSON, recorded by the reference
+# implementation; an integration test does not inherit the crate's own
+# dependencies and combs-formats pulls serde_json in regardless.
+serde_json = { workspace = true }
 anyhow.workspace = true
 burn = { version = "0.21.0", default-features = false, features = ["ndarray", "std"] }
 tokenizers.workspace = true

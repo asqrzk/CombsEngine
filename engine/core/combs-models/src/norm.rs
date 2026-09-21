@@ -1,6 +1,6 @@
 //! RMSNorm (Llama-style, no learnable bias).
 
-use burn::tensor::{Tensor, backend::Backend};
+use burn::tensor::{backend::Backend, Tensor};
 
 use crate::precision::{to_f32, to_float};
 
@@ -49,6 +49,38 @@ pub fn gemma_rms_norm<B: Backend, const D: usize>(
     rms_norm(x, weight.add_scalar(1.0), eps)
 }
 
+/// LayerNorm whose bias may not exist.
+///
+/// ModernBERT's norms carry a weight and no bias; the torch head's carry
+/// both. `norm_bias` in the config decides which, and a port that
+/// assumed either would be wrong on half the checkpoint.
+pub fn layer_norm_opt<B: Backend, const D: usize>(
+    x: Tensor<B, D>,
+    weight: Tensor<B, 1>,
+    bias: Option<Tensor<B, 1>>,
+    eps: f64,
+) -> Tensor<B, D> {
+    let dims = x.dims();
+    let hidden = dims[D - 1];
+    let out_dtype = x.dtype();
+    let xf = to_f32(x);
+    let mean = xf.clone().mean_dim(D - 1);
+    let centered = xf - mean;
+    // Population variance, as torch's LayerNorm takes it (biased): the
+    // unbiased form differs by hidden/(hidden-1) and would drift a port
+    // by a constant factor that is small enough to look like noise.
+    let var = centered.clone().powf_scalar(2.0).mean_dim(D - 1);
+    let inv_std = var.add_scalar(eps).sqrt().recip();
+
+    let mut shape = [1usize; D];
+    shape[D - 1] = hidden;
+    let mut y = centered * inv_std * to_f32(weight).reshape(shape);
+    if let Some(b) = bias {
+        y = y + to_f32(b).reshape(shape);
+    }
+    to_float(y, out_dtype)
+}
+
 /// LayerNorm (SigLIP-style, learnable weight + bias):
 /// `y = (x - μ) / sqrt(σ² + eps) * w + b`, statistics over the last dim.
 pub fn layer_norm<B: Backend, const D: usize>(
@@ -69,8 +101,8 @@ pub fn layer_norm<B: Backend, const D: usize>(
 
     let mut shape = [1usize; D];
     shape[D - 1] = hidden;
-    let y = centered * inv_std * to_f32(weight).reshape(shape.clone())
-        + to_f32(bias).reshape(shape);
+    let y =
+        centered * inv_std * to_f32(weight).reshape(shape.clone()) + to_f32(bias).reshape(shape);
     to_float(y, out_dtype)
 }
 

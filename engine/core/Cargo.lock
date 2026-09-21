@@ -1347,6 +1347,7 @@ dependencies = [
  "combs-core",
  "combs-formats",
  "cubecl",
+ "serde_json",
  "thiserror 2.0.19",
  "tokenizers",
  "wgpu",

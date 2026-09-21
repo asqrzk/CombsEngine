@@ -13,6 +13,7 @@ mod kv;
 mod llama;
 mod qwen35;
 mod matmul;
+mod modernbert;
 mod norm;
 mod precision;
 mod qkernel;
@@ -34,6 +35,7 @@ pub use kv::{
     PagedKVCache,
 };
 pub use llama::LlamaModel;
+pub use modernbert::{EncoderGeometry, ModernBert};
 pub use qwen35::Qwen35Model;
 pub use norm::rms_norm;
 pub use staged::flush_device;
