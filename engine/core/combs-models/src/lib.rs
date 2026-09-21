@@ -24,6 +24,7 @@ mod wgsl;
 mod rope;
 mod smolvlm;
 pub mod staged;
+mod system_one;
 mod traits;
 mod whisper;
 
@@ -57,6 +58,13 @@ pub use wgsl::probe_report as wgsl_probe_report;
 pub use wgsl::{active_doors, bus_cell, dispatch_latency, gemv_cell, gemv_cell_at, gemv_cell_shipped};
 pub use rope::RotaryEmbedding;
 pub use smolvlm::{SmolVlmModel, image_prompt_expansion, pixels_to_tensor};
+// The System 1 seat's tensor manifest: public because the puller and the
+// strict load both grade a checkpoint against it, and a stranger's
+// checkpoint must be refusable by name.
+pub use system_one::{
+    manifest as decision_manifest, LayaShape, ACT_FEATURES, ACT_HIDDEN, CARRIED_NOT_READ,
+    ENCODER_PREFIX, HEAD_FFN_MULTIPLE, NUM_ACTS, NUM_QUESTION_TYPES,
+};
 pub use whisper::{WhisperModel, load_speech_model};
 pub use traits::{GenerativeModel, SpeechToTextModel};
 
