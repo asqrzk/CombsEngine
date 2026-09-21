@@ -36,9 +36,20 @@ pub const ENCODER_PREFIX: &str = "encoder.";
 /// scalar per type.
 pub const NUM_QUESTION_TYPES: usize = 3;
 
-/// Acts the head chooses between: answer, or escalate. The cost of the
-/// second is what `rl_agent_config.json::act_costs` prices.
-pub const NUM_ACTS: usize = 2;
+/// The two counts the head's shape depends on, which sit in
+/// `rl_agent_config.json` rather than in the encoder's `config.json`.
+///
+/// Named fields rather than two bare `usize`, because swapping them
+/// would build a manifest that is wrong and still plausible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadShape {
+    /// Layers in the transformer head over the markers.
+    pub layers: usize,
+    /// Acts the head chooses between: one per act the config prices,
+    /// plus answering, which costs nothing and is not in the table. This
+    /// checkpoint prices one act and so has two.
+    pub acts: usize,
+}
 
 /// Width of the act head's hidden layer.
 pub const ACT_HIDDEN: usize = 256;
@@ -91,16 +102,18 @@ pub struct LayaShape {
     pub head_layers: usize,
     /// The head's feed-forward width.
     pub head_ffn: usize,
+    /// Acts the act head reads out.
+    pub num_acts: usize,
 }
 
 impl LayaShape {
-    /// Reads the encoder half from parsed metadata; the head's depth
-    /// comes from `rl_agent_config.json::head_layers`, which this crate
-    /// does not parse.
+    /// Reads the encoder half from parsed metadata; the head's two
+    /// counts come from `rl_agent_config.json`, which this crate does
+    /// not parse.
     ///
     /// Refuses any metadata without an encoder section — a generative
     /// model has no markers to score.
-    pub fn from_metadata(meta: &ModelMetadata, head_layers: usize) -> Result<Self, ModelError> {
+    pub fn from_metadata(meta: &ModelMetadata, head: HeadShape) -> Result<Self, ModelError> {
         let enc = meta.encoder.as_ref().ok_or_else(|| {
             ModelError::Unsupported(format!(
                 "{} is not a bidirectional encoder: a typed-decision checkpoint reads a whole \
@@ -116,8 +129,9 @@ impl LayaShape {
             norm_bias: enc.norm_bias,
             attention_bias: enc.attention_bias,
             mlp_bias: enc.mlp_bias,
-            head_layers,
+            head_layers: head.layers,
             head_ffn: HEAD_FFN_MULTIPLE * meta.hidden_size,
+            num_acts: head.acts,
         })
     }
 }
@@ -198,7 +212,7 @@ pub fn manifest(shape: &LayaShape) -> Vec<(String, Vec<usize>)> {
     // act_head: Linear(0) -> GELU(1) -> Linear(2), reading the pooled
     // vector with the four decision features glued on.
     linear(&mut out, "act_head.0", [ACT_HIDDEN, h + ACT_FEATURES], true);
-    linear(&mut out, "act_head.2", [NUM_ACTS, ACT_HIDDEN], true);
+    linear(&mut out, "act_head.2", [shape.num_acts, ACT_HIDDEN], true);
 
     out.push(("type_emb.weight".to_string(), vec![NUM_QUESTION_TYPES, h]));
     out.push(("temperature".to_string(), vec![NUM_QUESTION_TYPES]));
@@ -280,7 +294,10 @@ mod tests {
             pad_id: 50283,
             layer_types: Vec::new(),
         });
-        LayaShape::from_metadata(&m, 2).expect("an encoder has a decision shape")
+        // `head_layers: 2` and one priced act — plus answering — as
+        // `rl_agent_config.json` states them.
+        LayaShape::from_metadata(&m, HeadShape { layers: 2, acts: 2 })
+            .expect("an encoder has a decision shape")
     }
 
     #[test]
@@ -375,7 +392,8 @@ mod tests {
     #[test]
     fn a_generative_config_has_no_decision_manifest() {
         let m = ModelMetadata::diffusion_placeholder("llama");
-        let refused = LayaShape::from_metadata(&m, 2).expect_err("a decoder scores no markers");
+        let refused = LayaShape::from_metadata(&m, HeadShape { layers: 2, acts: 2 })
+            .expect_err("a decoder scores no markers");
         assert!(
             refused.to_string().contains("llama"),
             "the refusal names the architecture: {refused}"

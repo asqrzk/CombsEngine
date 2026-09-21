@@ -62,8 +62,8 @@ pub use smolvlm::{SmolVlmModel, image_prompt_expansion, pixels_to_tensor};
 // strict load both grade a checkpoint against it, and a stranger's
 // checkpoint must be refusable by name.
 pub use system_one::{
-    manifest as decision_manifest, LayaShape, ACT_FEATURES, ACT_HIDDEN, CARRIED_NOT_READ,
-    ENCODER_PREFIX, HEAD_FFN_MULTIPLE, NUM_ACTS, NUM_QUESTION_TYPES,
+    manifest as decision_manifest, HeadShape, LayaShape, ACT_FEATURES, ACT_HIDDEN,
+    CARRIED_NOT_READ, ENCODER_PREFIX, HEAD_FFN_MULTIPLE, NUM_QUESTION_TYPES,
 };
 pub use whisper::{WhisperModel, load_speech_model};
 pub use traits::{GenerativeModel, SpeechToTextModel};
