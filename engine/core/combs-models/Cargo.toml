@@ -25,6 +25,11 @@ burn-ir = { version = "0.21.0" }
 cubecl = { version = "0.10.0", default-features = false, features = ["wgpu", "std"] }
 combs-core.workspace = true
 combs-formats = { path = "../combs-formats", version = "0.3.0" }
+# The System 1 seat's batch and its readout are plain text and
+# arithmetic, and live in the crate built to hold them; this crate holds
+# the tensors that consume them. combs-classify links serde and nothing
+# else, so the edge costs no build time and there is no cycle.
+combs-classify = { path = "../combs-classify", version = "0.3.0" }
 thiserror.workspace = true
 
 [dev-dependencies]
@@ -33,6 +38,7 @@ wgpu = "29"
 # implementation; an integration test does not inherit the crate's own
 # dependencies and combs-formats pulls serde_json in regardless.
 serde_json = { workspace = true }
+combs-classify = { path = "../combs-classify", version = "0.3.0" }
 anyhow.workspace = true
 burn = { version = "0.21.0", default-features = false, features = ["ndarray", "std"] }
 tokenizers.workspace = true

@@ -13,6 +13,7 @@ mod kv;
 mod llama;
 mod qwen35;
 mod matmul;
+mod decision;
 mod modernbert;
 mod norm;
 mod precision;
@@ -35,6 +36,7 @@ pub use kv::{
     PagedKVCache,
 };
 pub use llama::LlamaModel;
+pub use decision::{DecisionLogits, LayaModel, TypedDecisionModel};
 pub use modernbert::{EncoderGeometry, ModernBert};
 pub use qwen35::Qwen35Model;
 pub use norm::rms_norm;

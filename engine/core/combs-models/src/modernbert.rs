@@ -90,7 +90,7 @@ pub struct ModernBert<B: Backend> {
 /// score, and two masks over the same position (a sliding band and a
 /// padded key) would overflow at the full value. Both choices exp to
 /// zero, so nothing downstream can tell them apart.
-const MASKED: f32 = f32::MIN / 2.0;
+pub(crate) const MASKED: f32 = f32::MIN / 2.0;
 
 impl<B: Backend> ModernBert<B> {
     /// Loads every tensor the encoder needs, under `prefix` — `encoder.`

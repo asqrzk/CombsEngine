@@ -1344,6 +1344,7 @@ dependencies = [
  "burn-cubecl-fusion",
  "burn-fusion",
  "burn-ir",
+ "combs-classify",
  "combs-core",
  "combs-formats",
  "cubecl",

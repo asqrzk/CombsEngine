@@ -12,8 +12,9 @@
 //! padded, so the key-padding mask has to be real.
 
 use burn::tensor::{Tensor, TensorData};
+use combs_classify::sequence::DecisionBatch;
 use combs_formats::SafetensorsSource;
-use combs_models::{EncoderGeometry, ModernBert};
+use combs_models::{EncoderGeometry, LayaModel, ModernBert, TypedDecisionModel};
 
 type B = burn::backend::NdArray<f32>;
 
@@ -206,4 +207,95 @@ fn the_sliding_band_is_a_band_and_not_a_triangle() {
         moved > 1e-4,
         "position 0 did not move when a LATER token changed: this encoder is attending causally, not in a band"
     );
+}
+
+#[test]
+fn the_heads_reproduce_layas_logits_and_its_act_decision() {
+    // The encoder test above holds the body. This holds everything laya
+    // puts on top of it, and the order it puts it in: the type added at
+    // every position, the head over the WHOLE sequence with the padding
+    // mask, the markers gathered AFTER that head, and the act features
+    // read from the RAW logits with the pooled vector taken post-head.
+    // Each of those is a place a reasonable reading goes backwards
+    // without changing any shape.
+    let fx = fixture();
+    let dir = staged();
+    let source = SafetensorsSource::load(&dir).expect("the staged checkpoint opens");
+    let device = Default::default();
+    let head_layers = fx["geometry"]["head_layers"].as_u64().expect("head_layers") as usize;
+    let model = LayaModel::<B>::load(&source, &device, head_layers).expect("the model loads");
+
+    let rows: Vec<Vec<i64>> = serde_json::from_value(fx["input_ids"].clone()).expect("ids");
+    let att: Vec<Vec<u8>> = serde_json::from_value(fx["attention_mask"].clone()).expect("mask");
+    let pos: Vec<Vec<u32>> = serde_json::from_value(fx["marker_pos"].clone()).expect("marker_pos");
+    let msk: Vec<Vec<bool>> =
+        serde_json::from_value(fx["marker_mask"].clone()).expect("marker_mask");
+    let qt: Vec<u32> = serde_json::from_value(fx["qtype"].clone()).expect("qtype");
+
+    let batch = DecisionBatch {
+        rows: rows.len(),
+        len: rows[0].len(),
+        markers: pos[0].len(),
+        input_ids: rows.iter().flatten().map(|&i| i as u32).collect(),
+        attention: att.concat(),
+        marker_pos: pos.concat(),
+        marker_mask: msk.concat(),
+        qtype: qt,
+    };
+
+    let out = model.decide(&batch).expect("it answers");
+
+    let want_logits = floats(&fx["logits"]);
+    let have_logits: Vec<f32> = out.logits.iter().flatten().copied().collect();
+    let (gap, at) = worst(&have_logits, &want_logits);
+    println!(
+        "  logits   worst {gap:.3e} at {at} (got {:.5}, want {:.5})",
+        have_logits[at], want_logits[at]
+    );
+    // The masked slot carries -1e4 in both, which is the check that a
+    // marker nobody asked for scores nothing rather than scoring the
+    // hidden state that happened to sit at position zero.
+    assert!(
+        want_logits.iter().any(|&l| l <= -1e3),
+        "the fixture has no masked slot, so this proves nothing about one"
+    );
+    assert!(
+        gap <= 5e-3,
+        "logits: worst {gap:.3e} at {at} — got {}, want {}",
+        have_logits[at],
+        want_logits[at]
+    );
+
+    // The tempered readout, which is what a caller actually sees.
+    let temperature: Vec<f32> =
+        serde_json::from_value(fx["temperature"].clone()).expect("temperature");
+    let want_probs: Vec<Vec<f32>> = serde_json::from_value(fx["probs"].clone()).expect("probs");
+    for (r, want) in want_probs.iter().enumerate() {
+        let k = want.len();
+        let t = temperature[batch.qtype[r] as usize];
+        let got = combs_classify::system_one::readout(&out.logits[r][..k], t);
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (g - w).abs() <= 1e-4,
+                "row {r} option {i}: p {g:.6} against laya's {w:.6}"
+            );
+        }
+    }
+    println!("  probs    reproduced at every option of every row");
+
+    let want_act = floats(&fx["act"]);
+    let have_act: Vec<f32> = out.act.iter().flatten().copied().collect();
+    let (gap, at) = worst(&have_act, &want_act);
+    println!(
+        "  act      worst {gap:.3e} at {at} (got {:.5}, want {:.5})",
+        have_act[at], want_act[at]
+    );
+    // A saturated act head agrees with any implementation; the fixture
+    // is generated at a scale that keeps it off the rails, and this is
+    // where that is checked rather than assumed.
+    assert!(
+        want_act.iter().all(|&a| (0.02..=0.98).contains(&a)),
+        "the fixture's act head is saturated, so this bound proves little: {want_act:?}"
+    );
+    assert!(gap <= 1e-3, "act: worst {gap:.3e} at {at}");
 }
