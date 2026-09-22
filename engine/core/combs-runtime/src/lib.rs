@@ -22,6 +22,12 @@ mod sampler;
 mod spec;
 mod step;
 mod stop;
+// The System 1 seat reads checkpoints off disk and times itself with a
+// std clock, which COMPILES in a browser and panics the moment it is
+// called. It also decodes nothing a browser asks for: `combs-wasm` uses
+// none of its exports. Native-only, like `spec` and `transcribe` beside
+// it — the gate it was missing.
+#[cfg(not(target_family = "wasm"))]
 mod system_one;
 mod time;
 mod template;
@@ -59,6 +65,7 @@ pub use sampler::{
     sampler_from_params,
 };
 pub use stop::{StopDetector, StopStringMatcher};
+#[cfg(not(target_family = "wasm"))]
 pub use system_one::{
     default_warm_shapes, warm_batch, BatchShape, Decided, DecisionAnswer, DecisionEngine,
     DecisionQuestion, WarmPass, WarmReport,

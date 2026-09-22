@@ -25,6 +25,7 @@ mod native_driver_imports {
     pub(super) use std::sync::atomic::AtomicBool;
     pub(super) use std::sync::{mpsc, Arc, Mutex};
     pub(super) use std::thread::JoinHandle;
+    // clock: native — this whole module is cfg'd off wasm above.
     pub(super) use std::time::Instant;
 
     pub(super) use burn::tensor::{backend::Backend as _, Tensor, TensorData};

@@ -15,6 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
+// clock: native — `mod system_one` is cfg'd off wasm in lib.rs.
 use std::time::Instant;
 
 use combs_classify::sequence::{

@@ -6,6 +6,7 @@
 //! no consumer can misread as a cap of nothing. (The misread cost the
 //! cpu floor every model it was built to serve.)
 
+#[cfg(any(feature = "cpu", not(target_family = "wasm")))]
 use combs_core::CombsDevice;
 
 #[derive(Debug, Clone, Copy)]
@@ -18,10 +19,16 @@ pub struct DeviceBudget {
     pub buffer_limit: Option<u64>,
 }
 
+#[cfg(any(feature = "cpu", not(target_family = "wasm")))]
 fn present(cap: u64) -> Option<u64> {
     (cap > 0).then_some(cap)
 }
 
+/// Native (or `cpu`) only, like the `device_caps` it reads: the blocking
+/// capability query has no browser form. `DeviceBudget` and `present`
+/// stay available everywhere, because they are arithmetic over numbers
+/// a caller already holds.
+#[cfg(any(feature = "cpu", not(target_family = "wasm")))]
 pub fn device_budget(device: &CombsDevice) -> DeviceBudget {
     let caps = combs_core::device_caps(device);
     DeviceBudget {

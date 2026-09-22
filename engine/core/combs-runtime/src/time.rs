@@ -30,6 +30,9 @@ pub(crate) use web_time::{Instant, SystemTime, UNIX_EPOCH};
 /// it is the instrument that would have caught this before it shipped.
 #[cfg(test)]
 mod tests {
+    /// The marker that waives a line, and says who to blame for it.
+    const WAIVER: &str = "clock: native";
+
     #[test]
     fn no_crate_file_reads_std_time_directly() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -43,8 +46,23 @@ mod tests {
                 continue;
             }
             let text = std::fs::read_to_string(&path).expect("read file");
-            for (n, line) in text.lines().enumerate() {
+            let lines: Vec<&str> = text.lines().collect();
+            for (n, line) in lines.iter().enumerate() {
                 if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                // A line scan cannot see a `cfg`, so code that is already
+                // native-only reads here as an offender. The waiver is a
+                // comment on the line or just above it, naming WHY the
+                // clock is reachable only off the browser — the same shape
+                // the dtype lint uses. A waiver is a claim someone wrote
+                // down, which is the point: it can be read and disputed,
+                // where a silent exception cannot.
+                let waived = line.contains(WAIVER)
+                    || n > 0
+                        && lines[n - 1].trim_start().starts_with("//")
+                        && lines[n - 1].contains(WAIVER);
+                if waived {
                     continue;
                 }
                 if line.contains("std::time::Instant") || line.contains("std::time::SystemTime") {
@@ -60,7 +78,8 @@ mod tests {
         assert!(
             offenders.is_empty(),
             "these read a std clock directly, which panics in a browser — \
-             use crate::time instead:\n  {}",
+             use crate::time instead, or waive with a `{WAIVER}` comment \
+             naming why this file never reaches a browser:\n  {}",
             offenders.join("\n  ")
         );
     }

@@ -474,6 +474,14 @@ fn cpu_caps() -> DeviceCaps {
     }
 }
 
+/// The device's identity and limits, blocking on setup if none ran.
+///
+/// Native (or `cpu`) only, which is what it always was in fact: the
+/// non-cpu body blocks on `context()`, itself `cfg(not(wasm))`, so on a
+/// browser build this never compiled — it simply was not gated, and
+/// nothing gated the browser build either. A browser awaits
+/// [`device_caps_async`], as that function's own doc already said.
+#[cfg(any(feature = "cpu", not(target_family = "wasm")))]
 pub fn device_caps(device: &CombsDevice) -> DeviceCaps {
     let _ = device; // one device per process; the context holds it
     #[cfg(feature = "cpu")]
