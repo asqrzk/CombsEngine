@@ -30,6 +30,16 @@ pub const MIN_AGREEMENT: f32 = 0.95;
 /// that needs no new model at all.
 pub const MAX_OPTIONS: usize = 64;
 
+/// Questions in one request, past which the request is refused whole.
+///
+/// A System 1 seat answers every question of a request in ONE forward
+/// pass, one row per question — so the question count is the batch
+/// size, and nothing else bounded it (the cosine road's cap counts
+/// embeddings, which that seat never makes). The gateway keeps the
+/// same number under `MAX_QUESTIONS` (combs-inference `serve.conf`),
+/// by hand, in two trees: a test pins each so a drift is a failure.
+pub const MAX_QUESTIONS: usize = 16;
+
 /// The default confidence floor and implication floor: ZERO, which is
 /// today's behaviour — act on the top option, with the implication rule
 /// still binding. A deployment raises them from its own sweep; a guessed

@@ -48,6 +48,10 @@ const MAX_OPTIONS: usize = combs_classify::bars::MAX_OPTIONS;
 /// silently truncated.
 const MAX_TEXTS: usize = 64;
 
+/// Questions in one request, on either road. The System 1 seat runs one
+/// row per question in a single pass and nothing else bounded it.
+const MAX_QUESTIONS: usize = combs_classify::bars::MAX_QUESTIONS;
+
 /// One question as the wire declares it.
 pub(crate) struct Question {
     pub(crate) name: String,
@@ -216,6 +220,18 @@ pub(crate) fn parse_request(body: &str) -> Result<Request, (u16, Value)> {
     };
     if qs.is_empty() {
         return Err(bad("`questions` must be an array of at least one question"));
+    }
+    if qs.len() > MAX_QUESTIONS {
+        return Err((
+            400,
+            error_json(
+                "budget",
+                &format!(
+                    "this request asks {} questions and the road takes {MAX_QUESTIONS}: ask fewer at once",
+                    qs.len()
+                ),
+            ),
+        ));
     }
 
     let declared: Vec<String> = qs
@@ -622,6 +638,40 @@ mod tests {
                 {"id":"none_of_these","tether":{"means":"something else entirely"}}
               ]}]}"#
             .to_string()
+    }
+
+    /// The seventeenth question is refused before any is scored, by
+    /// name and with the number: a System 1 seat would have run all
+    /// seventeen as one batch with nothing to stop it.
+    #[test]
+    fn seventeen_questions_are_refused_before_any_is_scored() {
+        // Each question is WELL FORMED, so the cap is what refuses the
+        // body — not a tether a hostile caller forgot.
+        let well_formed = |i: usize| {
+            format!(
+                r#"{{"name":"q{i}","type":"noul","instructions":"is it so",
+                     "tether":{{"means":"the statement holds","not":["it does not"]}}}}"#
+            )
+        };
+        let qs: Vec<String> = (0..17).map(well_formed).collect();
+        let body = format!(r#"{{"state":"a state","questions":[{}]}}"#, qs.join(","));
+        let Err((code, v)) = parse_request(&body) else {
+            panic!("seventeen questions must be refused before any is scored");
+        };
+        assert_eq!(code, 400);
+        assert_eq!(v["error"]["type"], "budget");
+        let msg = v["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.contains("17") && msg.contains("16"), "{msg}");
+
+        let sixteen: Vec<String> = (0..16).map(well_formed).collect();
+        let body = format!(
+            r#"{{"state":"a state","questions":[{}]}}"#,
+            sixteen.join(",")
+        );
+        assert!(
+            parse_request(&body).is_ok(),
+            "sixteen is the cap, not past it"
+        );
     }
 
     #[test]
