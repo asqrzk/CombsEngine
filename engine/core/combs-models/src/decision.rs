@@ -331,7 +331,11 @@ impl<B: Backend> TypedDecisionModel for LayaModel<B> {
             Some(&self.scorer.hidden.b),
         ));
         let scored = linear(s, &self.scorer.out.w, Some(&self.scorer.out.b));
-        let mut logits: Vec<f32> = scored
+        // WIDENED before it is read: on an f16 build every tensor here
+        // is f16, and asking for f32 out of one is a type error rather
+        // than a conversion — which took the whole f16 seat down at the
+        // first request, listening and answering nothing but a refusal.
+        let mut logits: Vec<f32> = to_f32(scored)
             .reshape([rows * kmax])
             .into_data()
             .to_vec()
@@ -388,7 +392,7 @@ impl<B: Backend> TypedDecisionModel for LayaModel<B> {
         ));
         let act_logits = linear(a, &self.act_head.out.w, Some(&self.act_head.out.b));
         let n_act = act_logits.dims()[2];
-        let act_flat: Vec<f32> = softmax(act_logits.reshape([rows, n_act]), 1)
+        let act_flat: Vec<f32> = to_f32(softmax(act_logits.reshape([rows, n_act]), 1))
             .reshape([rows * n_act])
             .into_data()
             .to_vec()
