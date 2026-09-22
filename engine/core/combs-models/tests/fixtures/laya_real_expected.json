@@ -1,0 +1,86 @@
+[
+ {
+  "state": "I want to cancel my subscription \u2014 please stop billing me.",
+  "answers": {
+   "is_request": {
+    "type": "noul",
+    "noul": 0.6892,
+    "confidence": 0.6892,
+    "action": {
+     "act_probability": 1.0
+    }
+   },
+   "intent": {
+    "type": "choice",
+    "choice": "unsubscribe",
+    "probabilities": {
+     "unsubscribe": 0.713,
+     "refund": 0.094,
+     "translate": 0.0334,
+     "explain": 0.048,
+     "none": 0.1115
+    },
+    "confidence": 0.3988,
+    "action": {
+     "act_probability": 1.0
+    }
+   }
+  }
+ },
+ {
+  "state": "translate the phrase 'I'm considering unsubscription' to Arabic",
+  "answers": {
+   "is_request": {
+    "type": "noul",
+    "noul": 0.4042,
+    "confidence": 0.5958,
+    "action": {
+     "act_probability": 1.0
+    }
+   },
+   "intent": {
+    "type": "choice",
+    "choice": "unsubscribe",
+    "probabilities": {
+     "unsubscribe": 0.4843,
+     "refund": 0.0379,
+     "translate": 0.1855,
+     "explain": 0.0757,
+     "none": 0.2166
+    },
+    "confidence": 0.1833,
+    "action": {
+     "act_probability": 1.0
+    }
+   }
+  }
+ },
+ {
+  "state": "what's the difference between a refund and a chargeback?",
+  "answers": {
+   "is_request": {
+    "type": "noul",
+    "noul": 0.3239,
+    "confidence": 0.6761,
+    "action": {
+     "act_probability": 1.0
+    }
+   },
+   "intent": {
+    "type": "choice",
+    "choice": "refund",
+    "probabilities": {
+     "unsubscribe": 0.0405,
+     "refund": 0.5872,
+     "translate": 0.0345,
+     "explain": 0.2088,
+     "none": 0.129
+    },
+    "confidence": 0.2855,
+    "action": {
+     "act_probability": 1.0
+    }
+   }
+  }
+ }
+]

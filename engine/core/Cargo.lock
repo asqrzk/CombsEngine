@@ -1360,6 +1360,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "burn",
+ "combs-classify",
  "combs-core",
  "combs-formats",
  "combs-media",

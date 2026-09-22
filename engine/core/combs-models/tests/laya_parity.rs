@@ -223,7 +223,8 @@ fn the_heads_reproduce_layas_logits_and_its_act_decision() {
     let source = SafetensorsSource::load(&dir).expect("the staged checkpoint opens");
     let device = Default::default();
     let head_layers = fx["geometry"]["head_layers"].as_u64().expect("head_layers") as usize;
-    let model = LayaModel::<B>::load(&source, &device, head_layers).expect("the model loads");
+    let meta = combs_formats::ModelSource::metadata(&source).clone();
+    let model = LayaModel::<B>::load(&source, &device, meta, head_layers).expect("the model loads");
 
     let rows: Vec<Vec<i64>> = serde_json::from_value(fx["input_ids"].clone()).expect("ids");
     let att: Vec<Vec<u8>> = serde_json::from_value(fx["attention_mask"].clone()).expect("mask");

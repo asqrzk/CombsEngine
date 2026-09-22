@@ -154,8 +154,17 @@ pub struct LayaModel<B: Backend> {
 impl<B: Backend> LayaModel<B> {
     /// Loads the whole checkpoint. `head_layers` comes from
     /// `rl_agent_config.json`, which this crate does not parse.
-    pub fn load(source: &dyn ModelSource, device: &Device<B>, head_layers: usize) -> Result<Self> {
-        let metadata = ModelSource::metadata(source).clone();
+    ///
+    /// `metadata` is handed over rather than read off the source: a laya
+    /// checkpoint keeps its encoder config under `encoder/` while its
+    /// weights sit at the root, so where the config lives is the
+    /// caller's problem and the model only needs the geometry it states.
+    pub fn load(
+        source: &dyn ModelSource,
+        device: &Device<B>,
+        metadata: ModelMetadata,
+        head_layers: usize,
+    ) -> Result<Self> {
         let cfg = metadata.encoder.clone().ok_or_else(|| {
             ModelError::Unsupported(format!(
                 "{} is not a bidirectional encoder: a typed-decision model scores markers, and a \

@@ -22,6 +22,7 @@ mod sampler;
 mod spec;
 mod step;
 mod stop;
+mod system_one;
 mod time;
 mod template;
 mod toolcall;
@@ -58,6 +59,7 @@ pub use sampler::{
     sampler_from_params,
 };
 pub use stop::{StopDetector, StopStringMatcher};
+pub use system_one::{DecisionAnswer, DecisionEngine, DecisionQuestion};
 pub use template::ChatTemplate;
 pub use toolcall::{
     ChatMessage, ToolCall, ToolCallParser, ToolCallStyle, ToolEvent, ToolFunction,
