@@ -132,6 +132,11 @@ enum Command {
         /// Emit the full manifest as JSON instead of one line.
         #[arg(long)]
         json: bool,
+        /// Exit 4 after printing when this binary was built from a
+        /// dirty tree — a record cannot cite such a build, and a runner
+        /// should stop before its first cell rather than after its last.
+        #[arg(long)]
+        refuse_dirty: bool,
     },
     /// Download a model into the local cache (~/.cache/combs/models).
     Pull {
@@ -316,11 +321,17 @@ fn main() -> Result<()> {
         Command::Run(args) => cmd_run(args),
         Command::Devices => cmd_devices(),
         Command::Doctor(args) => doctor::run(args),
-        Command::BuildInfo { json } => {
+        Command::BuildInfo { json, refuse_dirty } => {
+            // Print first, refuse second: the record then holds the
+            // stamp that explains its own refusal.
             if json {
                 println!("{:#}", build_info::manifest());
             } else {
                 println!("{}", build_info::summary());
+            }
+            if let Err(why) = build_info::verdict(build_info::DIRTY, refuse_dirty) {
+                eprintln!("combs build-info: {why}");
+                combs_core::exit::exit_process(4);
             }
             Ok(())
         }

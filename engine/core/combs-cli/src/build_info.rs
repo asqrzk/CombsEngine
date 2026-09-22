@@ -86,9 +86,36 @@ pub fn summary() -> String {
     )
 }
 
+/// Whether a record may cite this build. A `+dirty` stamp cost a whole
+/// sitting once (s138's first seating was discarded for it), and until
+/// now nothing but a reader's eye stood between a dirty binary and a
+/// record — `dirty` was a string in a log line. With `refuse` the
+/// runner asks, and a dirty build is refused BY NAME before a cell runs.
+pub fn verdict(dirty: &str, refuse: bool) -> Result<(), String> {
+    if refuse && dirty == "true" {
+        return Err(format!(
+            "built from a dirty tree ({}): a record cannot cite it — commit first, rebuild, then measure",
+            summary()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dirty build is refused only when the caller asks, and the
+    /// refusal says why; a clean build passes either way.
+    #[test]
+    fn a_dirty_build_is_refused_by_name_only_when_asked() {
+        let why = verdict("true", true).expect_err("a dirty build, asked to refuse");
+        assert!(why.contains("dirty"), "{why}");
+        assert!(why.contains("record"), "{why}");
+        assert!(verdict("true", false).is_ok(), "nobody asked");
+        assert!(verdict("false", true).is_ok(), "a clean build");
+        assert!(verdict("false", false).is_ok());
+    }
 
     /// The manifest must describe THIS binary, not a placeholder: if
     /// build.rs stopped running, these would be empty and every record
