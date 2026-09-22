@@ -161,6 +161,16 @@ struct Counters {
     questions: AtomicU64,
     errors: AtomicU64,
     last_ms: AtomicU64,
+    /// Answers refused because they were not answers: a distribution
+    /// that does not sum, carries a NaN, or does not have one
+    /// probability per option the caller sent.
+    ///
+    /// Permanent, like `panics`, and for the same reason. `lib.rs` says
+    /// every answer passes `check_distribution`; this road never called
+    /// it, so a degenerate readout could reach the wire and a record
+    /// could be drawn from it with nothing to show. Non-zero means some
+    /// request got a refusal it should never have been able to earn.
+    envelope_refusals: AtomicU64,
 }
 
 /// A request's options, as the model reads them.
@@ -229,6 +239,141 @@ fn refuse(code: u16, kind: &str, message: &str) -> tiny_http::Response<std::io::
     json_response(code, json!({"error": {"type": kind, "message": message}}))
 }
 
+/// Turns one decided batch into the wire's `answers`, or refuses.
+///
+/// Pure, so the refusal can be tested without a checkpoint or a device.
+/// Nothing here indexes on faith: a model that returned a ragged or
+/// degenerate readout refuses the whole request by name rather than
+/// answering from whatever happened to be in the vector. `lib.rs`
+/// promises every answer passes [`check_distribution`]; this is the road
+/// that keeps the promise.
+///
+/// The whole request is refused, not the one question: a body asks its
+/// questions together and a caller cannot act on half an answer set.
+fn compose_answers(
+    req: &crate::classify::Request,
+    decided: &combs_runtime::Decided,
+    counters: &Counters,
+) -> std::result::Result<Vec<Value>, (u16, Value)> {
+    let refuse = |what: String| -> (u16, Value) {
+        counters.envelope_refusals.fetch_add(1, Ordering::Relaxed);
+        counters.errors.fetch_add(1, Ordering::Relaxed);
+        (500, json!({"error": {"type": "envelope", "message": what}}))
+    };
+    let answered = decided.answers.as_slice();
+    if answered.len() != req.questions.len() {
+        return Err(refuse(format!(
+            "the seat answered {} of {} questions: a request is answered whole or not at all",
+            answered.len(),
+            req.questions.len()
+        )));
+    }
+    for (q, a) in req.questions.iter().zip(answered) {
+        if a.distribution.len() != q.options.len() {
+            return Err(refuse(format!(
+                "question {:?}: {} probabilities for {} options — the answer is not over the \
+                 options that were asked about",
+                q.name,
+                a.distribution.len(),
+                q.options.len()
+            )));
+        }
+        if a.logits.len() != a.distribution.len() {
+            return Err(refuse(format!(
+                "question {:?}: {} logits against {} probabilities — the two are keyed by the \
+                 same option ids and cannot differ",
+                q.name,
+                a.logits.len(),
+                a.distribution.len()
+            )));
+        }
+        if let Err(why) = combs_classify::check_distribution(&a.distribution) {
+            return Err(refuse(format!("question {:?}: {why}", q.name)));
+        }
+    }
+
+    // A question's probability of its FIRST option, which for a noul is
+    // the proposition — exactly what `classify.rs` feeds an implication.
+    let p_true: std::collections::HashMap<&str, f32> = req
+        .questions
+        .iter()
+        .zip(answered)
+        .map(|(q, a)| {
+            (
+                q.name.as_str(),
+                a.distribution.first().copied().unwrap_or(0.0),
+            )
+        })
+        .collect();
+
+    let mut out = Vec::with_capacity(answered.len());
+    for (q, a) in req.questions.iter().zip(answered) {
+        let p = &a.distribution;
+        let (top_i, top_p) =
+            p.iter().enumerate().fold(
+                (0usize, f32::MIN),
+                |b, (i, &v)| if v > b.1 { (i, v) } else { b },
+            );
+        // Checked above: `p` is as long as `q.options`, so `top_i` is a
+        // real option and the two indexings below cannot panic.
+        let top = &q.options[top_i];
+        // laya's own rule: the whole distribution for a choice or a
+        // score, and the distance from a coin flip for a noul.
+        let conf = combs_classify::system_one::decision_confidence(q.kind, p);
+        let mut sorted = p.clone();
+        sorted.sort_by(|x, y| y.partial_cmp(x).unwrap_or(std::cmp::Ordering::Equal));
+        let margin = sorted.first().copied().unwrap_or(0.0) - sorted.get(1).copied().unwrap_or(0.0);
+
+        let implications: Vec<Implication> = top
+            .tether
+            .requires
+            .iter()
+            .map(|r| Implication {
+                requires: r.clone(),
+                p: p_true.get(r.as_str()).copied().unwrap_or(0.0),
+                tau: req.thresholds.tau,
+            })
+            .collect();
+        let decision = decide(conf, req.thresholds.confidence, &implications);
+
+        let by_id = |vals: &[f32]| -> serde_json::Map<String, Value> {
+            q.options
+                .iter()
+                .zip(vals)
+                .map(|(o, &v)| (o.id.clone(), json!(v)))
+                .collect()
+        };
+        let mut ans = json!({
+            "name": q.name,
+            "type": match q.kind { Kind::Choice => "choice", Kind::Score => "score", Kind::Noul => "noul" },
+            "top": top.id,
+            "p_top": top_p,
+            "distribution": Value::Object(by_id(p)),
+            // The head's logit per option — the same key the cosine road
+            // fills with a cosine, named for what it is either way.
+            "similarities": Value::Object(by_id(&a.logits)),
+            "confidence": conf,
+            "margin": margin,
+            // Unlike the cosine road, this one IS calibrated, and says
+            // by what.
+            "calibrated": true,
+            "calibration": {"source": "checkpoint", "temperature": a.temperature, "bucket": a.bucket},
+            "temperature": a.temperature,
+            "p_act": a.p_act,
+            "decision": decision.word(),
+            "reason": match &decision { Decision::Act => Value::Null, d => json!(d.reason()) },
+            "implications": implications.iter().map(|i| json!({
+                "requires": i.requires, "p": i.p, "tau": i.tau, "holds": i.holds(), "gated": i.gated()
+            })).collect::<Vec<_>>(),
+        });
+        if q.kind == Kind::Score {
+            ans["expected_level"] = json!(expected_level(p));
+        }
+        out.push(ans);
+    }
+    Ok(out)
+}
+
 /// Answers one `/v1/classify` body from the decision seat.
 fn classify(engine: &DecisionEngine, counters: &Counters, body: &str, seat: Rendering) -> Value {
     let req = match crate::classify::parse_request(body) {
@@ -282,84 +427,10 @@ fn classify(engine: &DecisionEngine, counters: &Counters, body: &str, seat: Rend
     counters
         .questions
         .fetch_add(req.questions.len() as u64, Ordering::Relaxed);
-    let answered = decided.answers.as_slice();
-
-    // A question's probability of its FIRST option, which for a noul is
-    // the proposition — exactly what `classify.rs` feeds an implication.
-    let p_true: std::collections::HashMap<&str, f32> = req
-        .questions
-        .iter()
-        .zip(answered)
-        .map(|(q, a)| {
-            (
-                q.name.as_str(),
-                a.distribution.first().copied().unwrap_or(0.0),
-            )
-        })
-        .collect();
-
-    let mut out = Vec::with_capacity(answered.len());
-    for (q, a) in req.questions.iter().zip(answered) {
-        let p = &a.distribution;
-        let (top_i, top_p) =
-            p.iter().enumerate().fold(
-                (0usize, f32::MIN),
-                |b, (i, &v)| if v > b.1 { (i, v) } else { b },
-            );
-        // laya's own rule: the whole distribution for a choice or a
-        // score, and the distance from a coin flip for a noul.
-        let conf = combs_classify::system_one::decision_confidence(q.kind, p);
-        let mut sorted = p.clone();
-        sorted.sort_by(|x, y| y.partial_cmp(x).unwrap_or(std::cmp::Ordering::Equal));
-        let margin = sorted.first().copied().unwrap_or(0.0) - sorted.get(1).copied().unwrap_or(0.0);
-
-        let implications: Vec<Implication> = q.options[top_i]
-            .tether
-            .requires
-            .iter()
-            .map(|r| Implication {
-                requires: r.clone(),
-                p: p_true.get(r.as_str()).copied().unwrap_or(0.0),
-                tau: req.thresholds.tau,
-            })
-            .collect();
-        let decision = decide(conf, req.thresholds.confidence, &implications);
-
-        let by_id = |vals: &[f32]| -> serde_json::Map<String, Value> {
-            q.options
-                .iter()
-                .zip(vals)
-                .map(|(o, &v)| (o.id.clone(), json!(v)))
-                .collect()
-        };
-        let mut ans = json!({
-            "name": q.name,
-            "type": match q.kind { Kind::Choice => "choice", Kind::Score => "score", Kind::Noul => "noul" },
-            "top": q.options[top_i].id,
-            "p_top": top_p,
-            "distribution": Value::Object(by_id(p)),
-            // The head's logit per option — the same key the cosine road
-            // fills with a cosine, named for what it is either way.
-            "similarities": Value::Object(by_id(&a.logits)),
-            "confidence": conf,
-            "margin": margin,
-            // Unlike the cosine road, this one IS calibrated, and says
-            // by what.
-            "calibrated": true,
-            "calibration": {"source": "checkpoint", "temperature": a.temperature, "bucket": a.bucket},
-            "temperature": a.temperature,
-            "p_act": a.p_act,
-            "decision": decision.word(),
-            "reason": match &decision { Decision::Act => Value::Null, d => json!(d.reason()) },
-            "implications": implications.iter().map(|i| json!({
-                "requires": i.requires, "p": i.p, "tau": i.tau, "holds": i.holds(), "gated": i.gated()
-            })).collect::<Vec<_>>(),
-        });
-        if q.kind == Kind::Score {
-            ans["expected_level"] = json!(expected_level(p));
-        }
-        out.push(ans);
-    }
+    let out = match compose_answers(&req, &decided, counters) {
+        Ok(v) => v,
+        Err((code, body)) => return json!({"_status": code, "_body": body}),
+    };
 
     json!({"_status": 200, "_body": {
         "model": engine.model_id(),
@@ -483,6 +554,12 @@ pub fn serve(
                         // never the model inventing anything, which this
                         // seat cannot do.
                         "panics": engine.panics(),
+                        // Permanent, like `panics`: an answer that was
+                        // not a distribution never reached a caller, and
+                        // a record drawn from this seat says so.
+                        "envelope_refusals": counters
+                            .envelope_refusals
+                            .load(Ordering::Relaxed),
                     },
                     "warm_up": warm_json.clone(),
                 }),
@@ -517,6 +594,97 @@ pub fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a request and a matching `Decided` whose distributions the
+    /// caller chooses, so a degenerate readout can be put in front of the
+    /// composer without a checkpoint or a device.
+    fn decided_with(dists: &[Vec<f32>]) -> (crate::classify::Request, combs_runtime::Decided) {
+        let body = r#"{"state":"I want to cancel my subscription",
+            "questions":[
+              {"name":"intent","type":"choice","instructions":"which of these is the person asking for",
+               "options":[{"id":"unsubscribe","tether":{"means":"the person is asking us to end their subscription now"}},
+                          {"id":"none_of_these","tether":{"means":"something else entirely"}}]}
+            ]}"#;
+        let req = crate::classify::parse_request(body).expect("a well-formed request");
+        let answers: Vec<combs_runtime::DecisionAnswer> = req
+            .questions
+            .iter()
+            .zip(dists)
+            .map(|(q, d)| combs_runtime::DecisionAnswer {
+                name: q.name.clone(),
+                kind: q.kind,
+                distribution: d.clone(),
+                logits: vec![0.0; d.len()],
+                temperature: 1.0,
+                bucket: "choice:2".to_string(),
+                p_act: 1.0,
+                usage: combs_classify::QuestionUsage {
+                    tokens: 120,
+                    markers: q.options.len(),
+                    dropped_options: 0,
+                    instruction_tokens_cut: 0,
+                    option_tokens_cut: 0,
+                    state_tokens_cut: 0,
+                },
+            })
+            .collect();
+        let decided = combs_runtime::Decided {
+            answers,
+            batch: combs_runtime::BatchShape {
+                rows: 1,
+                len: 120,
+                markers: 2,
+            },
+        };
+        (req, decided)
+    }
+
+    /// `lib.rs` says every answer passes `check_distribution`; this road
+    /// never called it, so a readout that had gone degenerate could reach
+    /// a caller — and a measurement could be drawn from it with nothing
+    /// in the record to show. Now the request is refused whole, by name,
+    /// and the seat carries the count for the rest of its life.
+    #[test]
+    fn an_answer_that_is_not_a_distribution_is_refused_by_name_and_counted() {
+        let counters = Counters::default();
+
+        // Sums to 1.4.
+        let (req, decided) = decided_with(&[vec![0.7, 0.7]]);
+        let (code, body) =
+            compose_answers(&req, &decided, &counters).expect_err("not a distribution");
+        assert_eq!(code, 500);
+        assert_eq!(body["error"]["type"], "envelope");
+        let msg = body["error"]["message"].as_str().expect("a message");
+        assert!(msg.contains("intent"), "{msg}");
+        assert!(msg.contains("sums to"), "{msg}");
+
+        // A NaN, which is what a zero-sum softmax leaves behind.
+        let (req, decided) = decided_with(&[vec![f32::NAN, 0.5]]);
+        let (_, body) = compose_answers(&req, &decided, &counters).expect_err("a NaN");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("not a number")),
+            "{body}"
+        );
+
+        // Three probabilities for two options: the old code would have
+        // answered, keyed only the first two, and never said so.
+        let (req, decided) = decided_with(&[vec![0.2, 0.3, 0.5]]);
+        let (_, body) = compose_answers(&req, &decided, &counters).expect_err("ragged");
+        let msg = body["error"]["message"].as_str().expect("a message");
+        assert!(msg.contains("3 probabilities for 2 options"), "{msg}");
+
+        assert_eq!(counters.envelope_refusals.load(Ordering::Relaxed), 3);
+
+        // And a sound answer still composes, keyed by the caller's ids.
+        let (req, decided) = decided_with(&[vec![0.75, 0.25]]);
+        let out = compose_answers(&req, &decided, &counters).expect("a distribution");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["top"], "unsubscribe");
+        assert_eq!(out[0]["distribution"]["none_of_these"], 0.25);
+        assert_eq!(counters.envelope_refusals.load(Ordering::Relaxed), 3);
+    }
 
     /// The two roads are a SEAT's configuration, not a caller's habit.
     /// A record that cannot say which road produced it is the defect
