@@ -40,6 +40,7 @@ pub use decision::{DecisionLogits, LayaModel, TypedDecisionModel};
 pub use modernbert::{EncoderGeometry, ModernBert};
 pub use qwen35::Qwen35Model;
 pub use norm::rms_norm;
+pub use matmul::dense_matmul_summary;
 pub use staged::flush_device;
 pub use qlinear::{
     batched_matmul_summary, packed_device_bytes, quant_census, Linear, QuantLinearOp,

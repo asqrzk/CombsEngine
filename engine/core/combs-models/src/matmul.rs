@@ -54,6 +54,22 @@ pub(crate) fn safe_matmul<B: Backend, const D: usize>(
     Tensor::cat(slabs, D - 2)
 }
 
+/// One line describing the DENSE road — `linear` → [`safe_matmul`] →
+/// burn's own matmul — so a seat whose weights are plain tensors records
+/// the road it takes instead of the quantized one it never enters.
+///
+/// `batched_matmul_summary` (qlinear.rs) describes the quantized batched
+/// road and its operand door. A dense seat that printed that line said
+/// `f32 operands` under an f16 build — true of a road not taken. Here the
+/// operands are simply the tensors' own dtype, which the caller knows.
+pub fn dense_matmul_summary(dtype: &str, fusion: bool) -> String {
+    format!(
+        "dense matmul (burn autotune), {dtype} operands, {SAFE_M_SLAB}-row slabs past \
+         M>={BROKEN_MATMUL_BOUNDARY} & K>={BROKEN_MATMUL_BOUNDARY}, fusion {}",
+        if fusion { "on" } else { "off" }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +107,26 @@ mod tests {
         let single: Vec<f32> = lhs.clone().matmul(rhs.clone()).into_data().to_vec().unwrap();
         let wrapped: Vec<f32> = safe_matmul(lhs, rhs).into_data().to_vec().unwrap();
         assert_eq!(single, wrapped);
+    }
+
+    /// The dense line must describe the dense road and nothing about the
+    /// quantized batched one (whose line once stood in for it).
+    #[test]
+    fn the_dense_summary_names_the_road_and_not_the_quantized_one() {
+        let line = dense_matmul_summary("f16", false);
+        assert!(line.starts_with("dense matmul"), "{line}");
+        assert!(line.contains("f16 operands"), "{line}");
+        assert!(
+            line.contains("256-row slabs past M>=512 & K>=512"),
+            "{line}"
+        );
+        assert!(line.ends_with("fusion off"), "{line}");
+        for word in ["batched", "tuned kernel", " rows,"] {
+            assert!(
+                !line.contains(word),
+                "the dense line must not describe the quantized road: {line}"
+            );
+        }
+        assert!(dense_matmul_summary("f32", true).ends_with("fusion on"));
     }
 }

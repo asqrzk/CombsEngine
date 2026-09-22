@@ -57,6 +57,66 @@ pub fn is_decision_seat(dir: &Path) -> bool {
 /// What this seat calls its scorer, everywhere it says so.
 pub const BACKEND: &str = "system-one";
 
+/// The config line's fields, composed without a device so a test can read
+/// what a seat would say of itself. `extra` is what the caller learned
+/// with a device in hand (the WGSL doors) or from its own flags.
+pub(crate) fn config_fields(
+    model_id: &str,
+    dtype: &str,
+    fusion: bool,
+    extra: &[(&'static str, String)],
+) -> Vec<(&'static str, String)> {
+    let mut fields = vec![
+        ("model", model_id.to_string()),
+        ("dtype", dtype.to_string()),
+        // The DENSE road: this seat's linears are plain tensors through
+        // `llama::linear` and burn's matmul. The quantized batched road
+        // and its operand door are never entered here, and the line that
+        // describes them said `f32 operands` under an f16 build — true of
+        // a road not taken. What is printed is the road that ran.
+        ("matmul", combs_models::dense_matmul_summary(dtype, fusion)),
+        ("classify_backend", BACKEND.to_string()),
+        // The one WGSL door on this seat's path: `RotaryEmbedding::apply_qk`
+        // asks `wgsl::try_rope_qk` (rope.rs). The norms are LayerNorm,
+        // which has no WGSL path, and attention is burn's — so whatever
+        // `wgsl_doors` reports open, this is the door that is walked.
+        ("doors_walked", "rope".to_string()),
+        // Said out loud because it is the whole difference: this seat
+        // holds no KV arena at all.
+        ("kv_arena", "none (this seat decodes nothing)".to_string()),
+    ];
+    fields.extend(extra.iter().cloned());
+    fields
+}
+
+/// Every WGSL door as the kernels read it, on one line — the fact the
+/// kit prints and no seat did. The f16 storage door is composed the way
+/// the kit composes it: a door open is not a road taken, and only the
+/// build's dtype says whether f16 tensors ever reach those kernels.
+#[cfg(not(feature = "cpu"))]
+fn wgsl_doors_line() -> String {
+    let device = combs_core::init_device();
+    let client = <combs_core::wgpu::WgpuRuntime as cubecl::prelude::Runtime>::client(&device);
+    combs_models::active_doors(&client)
+        .into_iter()
+        .map(|(k, v)| {
+            let v = if k == "f16_storage_door" {
+                match (v == "true", combs_core::BACKEND.dtype == "f16") {
+                    (true, true) => "open · taken (f16 tensors reach the kernels)".to_string(),
+                    (true, false) => {
+                        "open · never taken (this build has no f16 tensors)".to_string()
+                    }
+                    (false, _) => "shut".to_string(),
+                }
+            } else {
+                v
+            };
+            format!("{k}={v}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[derive(Default)]
 struct Counters {
     requests: AtomicU64,
@@ -235,18 +295,17 @@ pub fn serve(engine: DecisionEngine, addr: &str) -> Result<()> {
     let started = Instant::now();
     let model_id = engine.model_id().to_string();
 
+    let mut extra: Vec<(&'static str, String)> = vec![("backend", combs_core::backend_line())];
+    #[cfg(not(feature = "cpu"))]
+    extra.push(("wgsl_doors", wgsl_doors_line()));
     combs_core::provenance::startup(
         "system-one",
-        &[
-            ("model", model_id.clone()),
-            ("dtype", combs_core::BACKEND.dtype.to_string()),
-            ("backend", combs_core::backend_line()),
-            ("matmul", combs_models::batched_matmul_summary()),
-            ("classify_backend", BACKEND.to_string()),
-            // Said out loud because it is the whole difference: this seat
-            // holds no KV arena at all.
-            ("kv_arena", "none (this seat decodes nothing)".to_string()),
-        ],
+        &config_fields(
+            &model_id,
+            combs_core::BACKEND.dtype,
+            combs_core::BACKEND.fusion,
+            &extra,
+        ),
     );
     eprintln!("combs serve: listening on http://{addr} (system-one seat: {model_id})");
 
@@ -320,4 +379,44 @@ pub fn serve(engine: DecisionEngine, addr: &str) -> Result<()> {
         let _ = request.respond(response);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The seat's own line must describe the dense road it runs — never
+    /// the quantized batched road, whose line once stood in for it and
+    /// said `f32 operands` under an f16 build.
+    #[test]
+    fn the_config_line_never_names_the_batched_road() {
+        let fields = config_fields(
+            "laya-typed-decisions",
+            "f16",
+            false,
+            &[("backend", "f16 · fusion off".to_string())],
+        );
+        let get = |k: &str| {
+            fields
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or_else(|| panic!("the config line has no field {k}"))
+        };
+        let matmul = get("matmul");
+        assert!(matmul.starts_with("dense matmul"), "{matmul}");
+        assert!(matmul.contains("f16 operands"), "{matmul}");
+        assert!(matmul.ends_with("fusion off"), "{matmul}");
+        for word in ["batched", "tuned kernel", " rows,"] {
+            assert!(
+                !matmul.contains(word),
+                "the quantized road's words on a dense seat: {matmul}"
+            );
+        }
+        assert_eq!(get("doors_walked"), "rope");
+        assert_eq!(get("classify_backend"), "system-one");
+        assert_eq!(get("dtype"), "f16");
+        assert!(get("kv_arena").starts_with("none"), "{}", get("kv_arena"));
+        assert_eq!(get("backend"), "f16 · fusion off");
+    }
 }

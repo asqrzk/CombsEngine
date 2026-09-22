@@ -322,6 +322,12 @@ fn pad_rows_target(m: usize) -> Option<usize> {
 
 /// One line describing what the batched path will actually do, so a run
 /// records its configuration instead of leaving it to be assumed.
+///
+/// This is the QUANTIZED batched road's line and describes only it. A
+/// seat whose linears are dense tensors (`llama::linear` → `safe_matmul`)
+/// never takes this road and prints `dense_matmul_summary` instead —
+/// printed under an f16 dense seat, this line once said `f32 operands`
+/// of a road that seat never entered.
 pub fn batched_matmul_summary() -> String {
     let threshold = batched_threshold();
     let strategy = if matches!(matmul_strategy(), MatmulStrategy::Cube) {
