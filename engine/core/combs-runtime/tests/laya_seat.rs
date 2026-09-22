@@ -184,10 +184,23 @@ fn the_seat_answers_the_real_checkpoint() {
             }
         }
     }
-    // laya rounds every figure it publishes to four decimals, so 5e-5 is
-    // the floor this comparison can show and the bound sits just above it.
-    println!("\n  worst gap against laya's own answers: {worst:.2e} at {at}");
-    assert!(worst <= 1e-4, "real-checkpoint parity: {worst:.2e} at {at}");
+    // Two bounds, because the two builds hold the weights differently.
+    // The checkpoint is F16 on disk: the f32 build WIDENS it and should
+    // reproduce laya's own f32 run to the floor this comparison can show
+    // — laya rounds every published figure to four decimals, so 5e-5 is
+    // that floor. The f16 build keeps the weights at half precision and
+    // pays for it; 3e-3 is the same allowance qwen35_parity makes, and
+    // the measured gap is printed either way so the bound can tighten.
+    let tol = if combs_core::BACKEND.dtype == "f16" {
+        3e-3
+    } else {
+        1e-4
+    };
+    println!(
+        "\n  worst gap against laya's own answers: {worst:.2e} at {at}  (bound {tol:.0e} on the {} build)",
+        combs_core::BACKEND.dtype
+    );
+    assert!(worst <= tol, "real-checkpoint parity: {worst:.2e} at {at}");
 
     if let Ok(path) = std::env::var("COMBS_LAYA_DUMP") {
         std::fs::write(&path, serde_json::to_string_pretty(&dump).expect("json"))

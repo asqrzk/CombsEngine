@@ -30,7 +30,7 @@ use combs_formats::{EncoderConfig, ModelSource};
 use crate::llama::{linear, load_tensor};
 use crate::matmul::safe_matmul;
 use crate::norm::layer_norm_opt;
-use crate::precision::to_f32;
+use crate::precision::{to_f32, to_float};
 use crate::rope::RotaryEmbedding;
 use crate::{ModelError, Result};
 
@@ -223,8 +223,18 @@ impl<B: Backend> ModernBert<B> {
             let v = split(2);
 
             let scores = safe_matmul(q, k.swap_dims(2, 3)) / (self.head_dim as f64).sqrt();
+            // The scores and the mask are f32 for stability, so what
+            // comes out is f32 — and `wo` below is the build's dtype.
+            // Handing an f32 activation to an f16 weight is a width
+            // mismatch the backend refuses at dispatch, which is what
+            // took the f16 seat down; whisper.rs:249 records that the
+            // same mismatch elsewhere is NOT refused and simply answers
+            // wrongly, which is the worse half of the lesson.
             let attended = safe_matmul(softmax(to_f32(scores) + mask.clone(), 3), to_f32(v));
-            let attended = attended.swap_dims(1, 2).reshape([batch, seq, self.hidden]);
+            let attended =
+                to_float(attended, h.dtype())
+                    .swap_dims(1, 2)
+                    .reshape([batch, seq, self.hidden]);
             h = h + linear(attended, &layer.wo, None);
 
             // GeGLU, around the next residual. `Wi` is twice the
@@ -263,7 +273,16 @@ impl<B: Backend> ModernBert<B> {
                 }
             }
         }
-        Tensor::<B, 1>::from_floats(m.as_slice(), device).reshape([1, 1, seq, seq])
+        // Born F32 on EVERY build. `from_floats` otherwise takes the
+        // device's dtype, and on the f16 build `f32::MIN / 2` is past
+        // ±65,504 and becomes infinity — and then an f32 score plus an
+        // f16 mask is a width mismatch this backend refuses at dispatch
+        // (it took the whole f16 seat down) or, worse, does not refuse
+        // and answers wrongly. The same lesson whisper.rs:239 records.
+        Tensor::from_data(
+            burn::tensor::TensorData::new(m, [1, 1, seq, seq]),
+            (device, burn::tensor::DType::F32),
+        )
     }
 }
 

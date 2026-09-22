@@ -31,7 +31,7 @@ use crate::llama::{linear, load_tensor};
 use crate::matmul::safe_matmul;
 use crate::modernbert::{EncoderGeometry, ModernBert};
 use crate::norm::layer_norm_opt;
-use crate::precision::to_f32;
+use crate::precision::{to_f32, to_float};
 use crate::{ModelError, Result};
 
 /// What a marker that does not exist scores. laya's own value: low
@@ -122,9 +122,15 @@ impl<B: Backend> TorchEncoderLayer<B> {
         // No rotary here: torch's MultiheadAttention has no positional
         // term of its own, and the encoder below already placed one.
         let scores = safe_matmul(part(0), part(1).swap_dims(2, 3)) / (head_dim as f64).sqrt();
-        let attended = safe_matmul(softmax(to_f32(scores) + pad.clone(), 3), to_f32(part(2)))
-            .swap_dims(1, 2)
-            .reshape([batch, seq, hidden]);
+        // Back to the build's width before `out_proj`: see the note in
+        // modernbert.rs. An f32 activation into an f16 weight is a
+        // dispatch the backend refuses.
+        let attended = to_float(
+            safe_matmul(softmax(to_f32(scores) + pad.clone(), 3), to_f32(part(2))),
+            x.dtype(),
+        )
+        .swap_dims(1, 2)
+        .reshape([batch, seq, hidden]);
         let x = x + linear(attended, &self.out_proj.w, Some(&self.out_proj.b));
 
         let n = layer_norm_opt(
@@ -375,16 +381,22 @@ impl<B: Backend> TypedDecisionModel for LayaModel<B> {
 
         // The pooled vector is position zero AFTER the head.
         let pooled = h.narrow(1, 0, 1).reshape([rows, self.hidden]);
+        // Born F32, like every other host-built tensor here: `from_data`
+        // without a dtype takes the DEVICE's, so on the f16 build this
+        // was an f16 tensor concatenated onto an f32 one — a width
+        // mismatch the backend refuses, and the refusal surfaces only at
+        // the next read, several operations from its cause.
         let feat_t = Tensor::<B, 1>::from_data(
             burn::tensor::TensorData::new(feats, [rows * ACT_FEATURES]),
-            &device,
+            (&device, burn::tensor::DType::F32),
         )
         .reshape([rows, ACT_FEATURES]);
-        let joined = Tensor::cat(vec![to_f32(pooled), feat_t], 1).reshape([
-            rows,
-            1,
-            self.hidden + ACT_FEATURES,
-        ]);
+        // And back to the weights' own width before the act head.
+        let joined = to_float(
+            Tensor::cat(vec![to_f32(pooled), feat_t], 1),
+            self.act_head.hidden.w.dtype(),
+        )
+        .reshape([rows, 1, self.hidden + ACT_FEATURES]);
         let a = burn::tensor::activation::gelu(linear(
             joined,
             &self.act_head.hidden.w,
