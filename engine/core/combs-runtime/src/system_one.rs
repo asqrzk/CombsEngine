@@ -13,6 +13,7 @@
 //! what the tiny parity fixture is and what the seat's own tests run on.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -25,7 +26,7 @@ use combs_classify::system_one::{
 use combs_classify::Kind;
 use combs_core::CombsBackend;
 use combs_formats::{ModelMetadata, SafetensorsSource};
-use combs_models::{LayaModel, TypedDecisionModel};
+use combs_models::{DecisionLogits, LayaModel, TypedDecisionModel};
 use tokenizers::Tokenizer;
 
 use crate::EngineError;
@@ -169,10 +170,59 @@ pub fn default_warm_shapes(limits: Limits) -> Vec<(usize, usize)> {
     out
 }
 
+/// Runs one batch through the model, surviving a fault and recording it.
+///
+/// Two things that used to be one. **The lock is recovered**: `decide`
+/// takes `&self` and mutates nothing, so a Mutex poisoned by an earlier
+/// panic guards a model still exactly as it was loaded — the Mutex is
+/// here to serialise the GPU, not to guard mutation, and dying of
+/// poison threw away a sound seat. **The panic is contained and
+/// counted**: one malformed batch that trips an index refuses ITSELF
+/// rather than ending a process that answers everything else.
+///
+/// Recovering silently would be the wrong half of the fix. A seat that
+/// has ever faulted says so for the rest of its life, so a measurement
+/// can never be drawn from a broken process without the record showing
+/// it. A panic here is OUR code faulting before the model answers — it
+/// is not the model inventing anything, and this seat cannot invent
+/// anything: it scores one marker per provided option and decodes
+/// nothing.
+fn guarded_decide(
+    model: &Mutex<Box<dyn TypedDecisionModel>>,
+    panics: &AtomicU64,
+    batch: &DecisionBatch,
+) -> Result<DecisionLogits> {
+    let model = model.lock().unwrap_or_else(|e| e.into_inner());
+    // `AssertUnwindSafe` is honest precisely because `decide` takes
+    // `&self`: there is no half-written state for an unwind to expose.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model.decide(batch))) {
+        Ok(r) => r.map_err(EngineError::Model),
+        Err(_) => {
+            panics.fetch_add(1, AtomicOrdering::Relaxed);
+            Err(EngineError::Model(combs_models::ModelError::Unsupported(
+                "the model panicked answering this batch: the request is refused and the seat \
+                 stays up, but this process has now faulted and says so in \
+                 `/v1/stats.classify.panics` for the rest of its life"
+                    .to_string(),
+            )))
+        }
+    }
+}
+
 /// A seated typed-decision model.
 pub struct DecisionEngine {
     // One at a time: the model holds device buffers sized for one batch.
     model: Mutex<Box<dyn TypedDecisionModel>>,
+    /// How many requests this seat has panicked on, for the life of the
+    /// process. Never reset.
+    ///
+    /// A panic here is OUR bug faulting before the model answers — it is
+    /// not the model inventing anything, and this seat cannot invent
+    /// anything (it scores one marker per provided option and decodes
+    /// nothing). But a seat that has ever faulted must SAY so, or a
+    /// measurement can be drawn from a process that broke and no reader
+    /// can tell. Recovery without a record is the wrong half of the fix.
+    panics: AtomicU64,
     tokenizer: Tok,
     calibration: Calibration,
     limits: Limits,
@@ -275,6 +325,7 @@ impl DecisionEngine {
 
         Ok(Self {
             model: Mutex::new(Box::new(model)),
+            panics: AtomicU64::new(0),
             tokenizer: Tok(tokenizer),
             calibration: agent.calibration,
             limits: Limits {
@@ -317,10 +368,12 @@ impl DecisionEngine {
     /// rather than in a caller's answer.
     pub fn warm(&self, shapes: &[(usize, usize)]) -> Result<WarmReport> {
         let bad = |what: String| EngineError::Model(combs_models::ModelError::Unsupported(what));
-        let model = self
-            .model
-            .lock()
-            .map_err(|_| bad("the seat is poisoned".to_string()))?;
+        // A previous panic must not end the seat. `decide` takes `&self`
+        // and mutates nothing, so a lock poisoned by an earlier fault
+        // guards a model that is still exactly as it was loaded; the
+        // Mutex is here to serialise the GPU, not to guard mutation.
+        // `panics` is what carries the fault forward, not a dead lock.
+        let model = self.model.lock().unwrap_or_else(|e| e.into_inner());
         let t0 = Instant::now();
         let mut passes = Vec::with_capacity(shapes.len());
         for &(rows, len) in shapes {
@@ -359,6 +412,14 @@ impl DecisionEngine {
     /// [`Self::decide`], plus the shape of the batch it ran — what a
     /// record needs to price a request in tokens rather than in
     /// questions.
+    /// How many requests this seat has panicked on since it was loaded.
+    ///
+    /// Non-zero is permanent and deliberate: any record taken from this
+    /// process afterwards carries the fact that it faulted.
+    pub fn panics(&self) -> u64 {
+        self.panics.load(AtomicOrdering::Relaxed)
+    }
+
     pub fn decide_with_shape(
         &self,
         state: &str,
@@ -415,13 +476,7 @@ impl DecisionEngine {
             len: batch.len,
             markers: batch.markers,
         };
-        let out = {
-            let model = self
-                .model
-                .lock()
-                .map_err(|_| bad("the seat is poisoned".to_string()))?;
-            model.decide(&batch).map_err(EngineError::Model)?
-        };
+        let out = guarded_decide(&self.model, &self.panics, &batch)?;
 
         let mut answers = Vec::with_capacity(questions.len());
         for (i, q) in questions.iter().enumerate() {
@@ -453,6 +508,74 @@ impl DecisionEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A model that faults on its first batch and answers every one
+    /// after. Its `metadata` is never reached by `guarded_decide`, so it
+    /// is left unimplemented rather than fabricated.
+    struct PanicsOnce {
+        calls: AtomicU64,
+    }
+
+    impl TypedDecisionModel for PanicsOnce {
+        fn metadata(&self) -> &ModelMetadata {
+            unimplemented!("guarded_decide never asks a model for its metadata")
+        }
+
+        fn decide(
+            &self,
+            _batch: &DecisionBatch,
+        ) -> std::result::Result<DecisionLogits, combs_models::ModelError> {
+            if self.calls.fetch_add(1, AtomicOrdering::Relaxed) == 0 {
+                panic!("an index this batch tripped");
+            }
+            Ok(DecisionLogits {
+                logits: vec![vec![0.5]],
+                act: vec![vec![1.0]],
+            })
+        }
+    }
+
+    fn empty_batch() -> DecisionBatch {
+        DecisionBatch {
+            rows: 1,
+            len: 1,
+            markers: 1,
+            input_ids: vec![0],
+            attention: vec![1],
+            marker_pos: vec![0],
+            marker_mask: vec![true],
+            qtype: vec![0],
+        }
+    }
+
+    /// The seat survives its own fault, keeps answering, and CARRIES THE
+    /// FACT. Recovering silently would be the wrong half: a record must
+    /// never be drawn from a process that faulted without showing it.
+    #[test]
+    fn a_panic_refuses_its_own_request_and_is_carried_for_the_seats_life() {
+        let model: Mutex<Box<dyn TypedDecisionModel>> = Mutex::new(Box::new(PanicsOnce {
+            calls: AtomicU64::new(0),
+        }));
+        let panics = AtomicU64::new(0);
+
+        // The faulting request refuses ITSELF...
+        let first = guarded_decide(&model, &panics, &empty_batch());
+        let why = first.expect_err("the batch panicked").to_string();
+        assert!(why.contains("panicked"), "{why}");
+        // ...and the refusal says where the fact now lives, so whoever
+        // reads it knows the seat is marked and not merely annoyed.
+        assert!(why.contains("panics"), "{why}");
+        assert_eq!(panics.load(AtomicOrdering::Relaxed), 1);
+
+        // The lock was poisoned by that unwind. The seat answers anyway:
+        // `decide` takes `&self`, so the model behind a poisoned lock is
+        // exactly the model that was loaded.
+        let second = guarded_decide(&model, &panics, &empty_batch());
+        assert!(second.is_ok(), "a poisoned lock ended a sound seat");
+
+        // And the count does not reset when the seat recovers.
+        assert_eq!(panics.load(AtomicOrdering::Relaxed), 1);
+    }
 
     fn specials() -> Specials {
         Specials {

@@ -473,6 +473,16 @@ pub fn serve(
                         "last_ms": counters.last_ms.load(Ordering::Relaxed),
                         "render": rendering.as_str(),
                         "road": rendering.road().as_str(),
+                        // Non-zero is PERMANENT and deliberate. A seat
+                        // that ever faulted carries the fact here for
+                        // the life of the process, because a sitting
+                        // copies this file into its record: a
+                        // measurement must never be drawn from a broken
+                        // process without the record showing it. A panic
+                        // is OUR bug faulting before the model answers —
+                        // never the model inventing anything, which this
+                        // seat cannot do.
+                        "panics": engine.panics(),
                     },
                     "warm_up": warm_json.clone(),
                 }),
