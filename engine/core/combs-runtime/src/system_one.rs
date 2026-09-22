@@ -14,6 +14,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use combs_classify::sequence::{
     build_sequence, collate, DecisionBatch, Encode, Limits, QuestionUsage, Sequence, Specials,
@@ -93,6 +94,79 @@ pub struct BatchShape {
 pub struct Decided {
     pub answers: Vec<DecisionAnswer>,
     pub batch: BatchShape,
+}
+
+/// One warm-up pass and what it cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WarmPass {
+    pub rows: usize,
+    pub len: usize,
+    pub ms: u64,
+}
+
+/// What warming the seat cost — so a record can say the first real
+/// request paid no autotune, and how long the seat took to be ready.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WarmReport {
+    pub passes: Vec<WarmPass>,
+    pub total_ms: u64,
+}
+
+/// A legal rectangle of `rows` questions, `len` tokens each, `markers`
+/// options apiece — `[CLS] [MASK]…[MASK] [SEP] [SEP]…` to the full
+/// length, so the kernels see every shape a request could take before
+/// one arrives. `None` when the shape cannot hold its own markers.
+pub fn warm_batch(
+    rows: usize,
+    len: usize,
+    markers: usize,
+    specials: &Specials,
+) -> Option<DecisionBatch> {
+    if rows == 0 || markers == 0 || len < markers + 2 {
+        return None;
+    }
+    let seqs: Vec<Sequence> = (0..rows)
+        .map(|_| {
+            let mut ids = Vec::with_capacity(len);
+            ids.push(specials.cls);
+            let mut marks = Vec::with_capacity(markers);
+            for _ in 0..markers {
+                marks.push(ids.len());
+                ids.push(specials.mask);
+            }
+            ids.push(specials.sep);
+            // Real tokens to the row's full length: what matters is the
+            // shape the matmuls see, and a padded row costs the same.
+            while ids.len() < len {
+                ids.push(specials.sep);
+            }
+            Sequence {
+                ids,
+                markers: marks,
+                options: markers,
+                kind: Kind::Choice,
+                instruction_tokens_cut: 0,
+                option_tokens_cut: 0,
+                state_tokens_cut: 0,
+            }
+        })
+        .collect();
+    collate(&seqs, specials.pad)
+}
+
+/// The shapes a seat warms by default: one and two questions at the
+/// lengths the seed suites take (a two-question request is two rows of
+/// ~150–200 tokens), then the larger rectangles a longer state or more
+/// questions would make — each clamped to the checkpoint's `max_len`.
+pub fn default_warm_shapes(limits: Limits) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for (rows, len) in [(1, 256), (2, 256), (2, 512), (4, 1024)] {
+        let len = len.min(limits.max_len);
+        if !out.contains(&(rows, len)) {
+            out.push((rows, len));
+        }
+    }
+    out
 }
 
 /// A seated typed-decision model.
@@ -230,6 +304,45 @@ impl DecisionEngine {
         &self.model_id
     }
 
+    /// The two length budgets this seat answers within.
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+
+    /// Runs the model over `shapes` before any request arrives, so the
+    /// first real one pays neither autotune nor a first-launch compile.
+    /// The seat's first request measured 1,058 ms cold (s138); a router
+    /// with a 1,500 ms budget should never be the one to pay it. Every
+    /// pass syncs on its readback, so a launch error surfaces HERE
+    /// rather than in a caller's answer.
+    pub fn warm(&self, shapes: &[(usize, usize)]) -> Result<WarmReport> {
+        let bad = |what: String| EngineError::Model(combs_models::ModelError::Unsupported(what));
+        let model = self
+            .model
+            .lock()
+            .map_err(|_| bad("the seat is poisoned".to_string()))?;
+        let t0 = Instant::now();
+        let mut passes = Vec::with_capacity(shapes.len());
+        for &(rows, len) in shapes {
+            let batch = warm_batch(rows, len, 2, &self.specials).ok_or_else(|| {
+                bad(format!(
+                    "a warm-up shape of {rows}x{len} cannot hold its own markers"
+                ))
+            })?;
+            let t = Instant::now();
+            model.decide(&batch).map_err(EngineError::Model)?;
+            passes.push(WarmPass {
+                rows,
+                len,
+                ms: t.elapsed().as_millis() as u64,
+            });
+        }
+        Ok(WarmReport {
+            passes,
+            total_ms: t0.elapsed().as_millis() as u64,
+        })
+    }
+
     /// Every question over one state, in ONE forward pass.
     ///
     /// That is the shape this seat exists for: a batch of questions
@@ -334,5 +447,58 @@ impl DecisionEngine {
             answers,
             batch: shape,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn specials() -> Specials {
+        Specials {
+            cls: 1,
+            sep: 2,
+            mask: 3,
+            pad: 0,
+            mask_text: "[MASK]".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_warm_batch_is_a_legal_rectangle() {
+        let b = warm_batch(2, 8, 2, &specials()).expect("it fits");
+        assert_eq!((b.rows, b.len, b.markers), (2, 8, 2));
+        assert_eq!(b.input_ids.len(), 16);
+        assert!(
+            b.attention.iter().all(|&a| a == 1),
+            "no padding in a warm row"
+        );
+        assert!(b.marker_mask.iter().all(|&m| m), "every marker is real");
+        for r in 0..2 {
+            assert_eq!(b.input_ids[r * 8], 1, "a row starts with [CLS]");
+            for j in 0..2 {
+                let pos = b.marker_pos[r * 2 + j] as usize;
+                assert!(pos < 8);
+                assert_eq!(b.input_ids[r * 8 + pos], 3, "a marker sits on a [MASK]");
+            }
+        }
+        assert_eq!(b.qtype, vec![0, 0]);
+        assert!(
+            warm_batch(1, 3, 2, &specials()).is_none(),
+            "three tokens cannot hold two markers"
+        );
+        assert!(warm_batch(0, 8, 2, &specials()).is_none());
+    }
+
+    #[test]
+    fn default_warm_shapes_never_exceed_max_len_and_never_repeat() {
+        let shapes = default_warm_shapes(Limits {
+            max_len: 300,
+            head_max_len: 192,
+        });
+        assert!(shapes.iter().all(|&(_, len)| len <= 300), "{shapes:?}");
+        let mut seen = std::collections::HashSet::new();
+        assert!(shapes.iter().all(|s| seen.insert(*s)), "{shapes:?}");
+        assert_eq!(shapes[0], (1, 256));
     }
 }

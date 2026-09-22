@@ -240,3 +240,33 @@ fn a_question_whose_options_cannot_fit_is_refused_by_name() {
         "the refusal does not say why: {why}"
     );
 }
+
+#[test]
+#[ignore = "needs the laya checkpoint (COMBS_TEST_LAYA)"]
+fn warming_makes_the_first_request_cost_what_the_second_does() {
+    let Some(engine) = seat() else { return };
+    let report = engine
+        .warm(&combs_runtime::default_warm_shapes(engine.limits()))
+        .expect("the seat warms");
+    for p in &report.passes {
+        println!("  warm {}x{}: {} ms", p.rows, p.len, p.ms);
+    }
+    println!(
+        "  warm-up total: {} ms over {} passes",
+        report.total_ms,
+        report.passes.len()
+    );
+    let (states, questions) = suite();
+    let time = |s: &str| {
+        let t = std::time::Instant::now();
+        engine.decide(s, &questions).expect("it answers");
+        t.elapsed().as_millis() as u64
+    };
+    let first = time(states[0]);
+    let second = time(states[0]);
+    println!("  first request after warm-up: {first} ms; second: {second} ms");
+    assert!(
+        first <= 2 * second.max(1),
+        "the first request after warm-up still paid for something: {first} ms against {second} ms"
+    );
+}

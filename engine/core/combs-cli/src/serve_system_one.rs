@@ -28,7 +28,7 @@ use std::time::Instant;
 use anyhow::Result;
 use combs_classify::system_one::Criteria;
 use combs_classify::{decide, expected_level, Decision, Implication, Kind};
-use combs_runtime::{DecisionEngine, DecisionQuestion};
+use combs_runtime::{DecisionEngine, DecisionQuestion, WarmReport};
 use serde_json::{json, Value};
 
 /// Does this directory hold a decision model rather than a decoder?
@@ -331,17 +331,33 @@ fn classify(engine: &DecisionEngine, counters: &Counters, body: &str) -> Value {
     }})
 }
 
-/// Serves a decision model on `addr` forever.
-pub fn serve(engine: DecisionEngine, addr: &str) -> Result<()> {
+/// Serves a decision model on `addr` forever. `warm` is what the seat
+/// already ran before listening, said on the config line and in
+/// `/v1/stats` so a record can tell a warmed seat from a cold one.
+pub fn serve(engine: DecisionEngine, warm: WarmReport, addr: &str) -> Result<()> {
     let server = tiny_http::Server::http(addr).map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
     let engine = Arc::new(engine);
     let counters = Arc::new(Counters::default());
     let started = Instant::now();
     let model_id = engine.model_id().to_string();
 
-    let mut extra: Vec<(&'static str, String)> = vec![("backend", combs_core::backend_line())];
+    let mut extra: Vec<(&'static str, String)> = vec![
+        ("backend", combs_core::backend_line()),
+        (
+            "warm_up",
+            format!("{} passes, {} ms", warm.passes.len(), warm.total_ms),
+        ),
+    ];
     #[cfg(not(feature = "cpu"))]
     extra.push(("wgsl_doors", wgsl_doors_line()));
+    let warm_json = json!({
+        "passes": warm
+            .passes
+            .iter()
+            .map(|p| json!({"rows": p.rows, "len": p.len, "ms": p.ms}))
+            .collect::<Vec<_>>(),
+        "total_ms": warm.total_ms,
+    });
     combs_core::provenance::startup(
         "system-one",
         &config_fields(
@@ -396,6 +412,7 @@ pub fn serve(engine: DecisionEngine, addr: &str) -> Result<()> {
                         "errors": counters.errors.load(Ordering::Relaxed),
                         "last_ms": counters.last_ms.load(Ordering::Relaxed),
                     },
+                    "warm_up": warm_json.clone(),
                 }),
             ),
             ("POST", "/v1/classify") => {

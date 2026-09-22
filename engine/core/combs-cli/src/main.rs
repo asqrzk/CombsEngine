@@ -547,7 +547,11 @@ fn cmd_serve(
             );
         }
         let engine = combs_runtime::DecisionEngine::load(&model)?;
-        return serve_system_one::serve(engine, &format!("127.0.0.1:{port}"));
+        // Warm before listening: the first request on a cold seat paid
+        // 1,058 ms (s138) — autotune for every shape the encoder makes —
+        // and a router with a 1,500 ms budget should never pay it.
+        let warm = engine.warm(&combs_runtime::default_warm_shapes(engine.limits()))?;
+        return serve_system_one::serve(engine, warm, &format!("127.0.0.1:{port}"));
     }
     let t_load = std::time::Instant::now();
     let source = open_model_source(&model)?;
