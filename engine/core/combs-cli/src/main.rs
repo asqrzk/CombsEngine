@@ -30,6 +30,7 @@ mod serve;
 mod serve_audio;
 #[cfg(not(feature = "cpu"))]
 mod serve_images;
+mod serve_system_one;
 
 #[derive(Parser)]
 #[command(name = "combs", version, about = "Combs Engine — cross-platform edge AI inference")]
@@ -533,6 +534,21 @@ fn cmd_serve(
     anonymous_sessions: serve::AnonymousSessions,
 ) -> Result<()> {
     let model = resolve_model_arg(&model)?;
+    // Before the arena maths, and before the source is even opened: a
+    // decision model reads a whole sequence at once, so the KV fit that
+    // follows would size a room it never enters. s126 measured that
+    // refusal happening for real — 2,272 MB of weights plus a
+    // generation-sized 7,168 MB arena against 9,694 MB free — and the
+    // preflight was right; the arena was simply never for this seat.
+    if serve_system_one::is_decision_seat(&model) {
+        if context_size.is_some() {
+            eprintln!(
+                "combs serve: --context-size is ignored by a System 1 seat: it holds no KV arena"
+            );
+        }
+        let engine = combs_runtime::DecisionEngine::load(&model)?;
+        return serve_system_one::serve(engine, &format!("127.0.0.1:{port}"));
+    }
     let t_load = std::time::Instant::now();
     let source = open_model_source(&model)?;
     let open_ms = t_load.elapsed().as_millis() as u64;

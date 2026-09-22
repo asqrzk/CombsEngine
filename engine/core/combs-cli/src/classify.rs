@@ -49,20 +49,20 @@ const MAX_OPTIONS: usize = combs_classify::bars::MAX_OPTIONS;
 const MAX_TEXTS: usize = 64;
 
 /// One question as the wire declares it.
-struct Question {
-    name: String,
-    kind: Kind,
-    instructions: String,
+pub(crate) struct Question {
+    pub(crate) name: String,
+    pub(crate) kind: Kind,
+    pub(crate) instructions: String,
     /// `choice` and `score` carry options; a `noul` is folded into a
     /// two-option choice whose first option is the proposition.
-    options: Vec<Opt>,
+    pub(crate) options: Vec<Opt>,
 }
 
-struct Request {
-    state: String,
-    questions: Vec<Question>,
-    temperature: f32,
-    thresholds: Thresholds,
+pub(crate) struct Request {
+    pub(crate) state: String,
+    pub(crate) questions: Vec<Question>,
+    pub(crate) temperature: f32,
+    pub(crate) thresholds: Thresholds,
 }
 
 /// Which scorer answers `/v1/classify` on this build. One constant, so
@@ -176,7 +176,7 @@ fn key_of(kind: Kind, instructions: &str, texts: &[String]) -> u64 {
     h
 }
 
-fn bad(msg: &str) -> (u16, Value) {
+pub(crate) fn bad(msg: &str) -> (u16, Value) {
     (400, error_json("invalid_request", msg))
 }
 
@@ -198,7 +198,7 @@ fn parse_opt(v: &Value, question: &str, i: usize) -> Result<Opt, (u16, Value)> {
 }
 
 /// Read a request, refusing by name before anything is embedded.
-fn parse_request(body: &str) -> Result<Request, (u16, Value)> {
+pub(crate) fn parse_request(body: &str) -> Result<Request, (u16, Value)> {
     let v: Value = serde_json::from_str(body).map_err(|e| bad(&format!("bad JSON: {e}")))?;
 
     let state = match v.get("state") {
