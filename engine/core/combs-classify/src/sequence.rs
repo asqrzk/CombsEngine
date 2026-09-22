@@ -41,6 +41,8 @@
 //!   of a long state survives and the end is dropped.
 
 use crate::system_one::{qtype, qtype_name};
+use serde::{Deserialize, Serialize};
+
 use crate::Kind;
 
 /// Tokens one option may spend on itself. The marker is not counted
@@ -116,6 +118,28 @@ pub struct Sequence {
     /// would be if none had been pushed off the end.
     pub options: usize,
     pub kind: Kind,
+    /// Instruction tokens the head budget cut away.
+    pub instruction_tokens_cut: usize,
+    /// Option tokens cut, by the per-option cap and by the shared head
+    /// budget together — the model read that much less of what the
+    /// options meant.
+    pub option_tokens_cut: usize,
+    /// State tokens cut from the RIGHT to fit `max_len`, the final
+    /// truncation included.
+    pub state_tokens_cut: usize,
+}
+
+/// What one question cost and what it lost, on the wire beside its
+/// answer — so a record can tell a silently truncated option from a
+/// genuinely low-scoring one, which §138's could not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionUsage {
+    pub tokens: usize,
+    pub markers: usize,
+    pub dropped_options: usize,
+    pub instruction_tokens_cut: usize,
+    pub option_tokens_cut: usize,
+    pub state_tokens_cut: usize,
 }
 
 impl Sequence {
@@ -124,6 +148,18 @@ impl Sequence {
     /// answered and the caller must refuse it by name.
     pub fn dropped(&self) -> usize {
         self.options.saturating_sub(self.markers.len())
+    }
+
+    /// The counts a caller records beside the answer.
+    pub fn usage(&self) -> QuestionUsage {
+        QuestionUsage {
+            tokens: self.ids.len(),
+            markers: self.markers.len(),
+            dropped_options: self.dropped(),
+            instruction_tokens_cut: self.instruction_tokens_cut,
+            option_tokens_cut: self.option_tokens_cut,
+            state_tokens_cut: self.state_tokens_cut,
+        }
     }
 }
 
@@ -169,10 +205,12 @@ pub fn build_sequence(
         strip(instructions)
     ));
 
+    let mut option_tokens_cut = 0usize;
     let mut opt_ids: Vec<Vec<u32>> = options
         .iter()
         .map(|o| {
             let mut body = enc.ids(&format!(" {}", strip(o)));
+            option_tokens_cut += body.len().saturating_sub(OPTION_TOKEN_CAP);
             body.truncate(OPTION_TOKEN_CAP);
             let mut v = Vec::with_capacity(body.len() + 1);
             v.push(specials.mask);
@@ -191,11 +229,14 @@ pub fn build_sequence(
         let per = MIN_OPTION_TOKENS
             .max(limits.head_max_len.saturating_sub(MIN_OPTION_BUDGET) / opt_ids.len().max(1));
         for o in &mut opt_ids {
+            option_tokens_cut += o.len().saturating_sub(per);
             o.truncate(per);
         }
         budget = head_max - spent(&opt_ids);
     }
+    let head_before = head_ids.len();
     head_ids.truncate(budget.max(MIN_HEAD_TOKENS as isize) as usize);
+    let instruction_tokens_cut = head_before - head_ids.len();
 
     let mut ids = Vec::with_capacity(limits.max_len);
     ids.push(specials.cls);
@@ -212,11 +253,18 @@ pub fn build_sequence(
     let room = limits.max_len.saturating_sub(ids.len() + 1);
     let mut st = enc.ids(&strip(state));
     // From the RIGHT: the beginning of a long state survives.
+    let state_before = st.len();
     st.truncate(room);
+    let mut state_tokens_cut = state_before - st.len();
     ids.extend_from_slice(&st);
     ids.push(specials.sep);
 
+    // The final cut, which only bites when the head and the options
+    // alone overflow `max_len`: what it removes is the state's tail
+    // (the state is last), so it is counted with the state.
+    let before_final = ids.len();
     ids.truncate(limits.max_len);
+    state_tokens_cut += before_final - ids.len();
     let markers = markers
         .into_iter()
         .filter(|&m| m < limits.max_len)
@@ -226,6 +274,9 @@ pub fn build_sequence(
         markers,
         options: options.len(),
         kind,
+        instruction_tokens_cut,
+        option_tokens_cut,
+        state_tokens_cut,
     }
 }
 
@@ -478,6 +529,81 @@ mod tests {
         for w in t.markers.windows(2) {
             assert_eq!(w[1] - w[0], MIN_OPTION_TOKENS);
         }
+    }
+
+    #[test]
+    fn what_was_cut_is_counted_per_budget() {
+        let enc = Words::default();
+        let roomy = Limits {
+            max_len: 512,
+            head_max_len: 192,
+        };
+        // Nothing cut: every counter is zero and the usage is the shape.
+        let s = build(&enc, "q", &opts(&["one two", "three"]), "a state", roomy);
+        let u = s.usage();
+        assert_eq!(
+            (
+                u.instruction_tokens_cut,
+                u.option_tokens_cut,
+                u.state_tokens_cut,
+                u.dropped_options
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(u.tokens, s.ids.len());
+        assert_eq!(u.markers, 2);
+
+        // An option past its own cap: the surplus is what the model
+        // never read.
+        let long = (0..100)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let s = build(&enc, "q", &opts(&[&long, "b"]), "s", roomy);
+        assert_eq!(s.usage().option_tokens_cut, 100 - OPTION_TOKEN_CAP);
+        assert_eq!(s.usage().instruction_tokens_cut, 0);
+
+        // The squeeze from the test above: a 60-word head under a
+        // 16-token head budget keeps its floor of 8, and the options
+        // are cut to theirs.
+        let head = (0..60).map(|i| format!("w{i} ")).collect::<String>();
+        let squeeze = Limits {
+            max_len: 512,
+            head_max_len: 16,
+        };
+        let t = build(
+            &enc,
+            &head,
+            &opts(&["one two three four five", "six seven eight", "nine ten"]),
+            "s",
+            squeeze,
+        );
+        let u = t.usage();
+        // The head the model reads is the instructions PLUS the type
+        // prefix this file splices in ("choice question:"), so 60 words
+        // of instruction are 62 tokens before the budget cuts them.
+        assert_eq!(u.instruction_tokens_cut, 62 - MIN_HEAD_TOKENS);
+        // Each option is cut to the 4-token floor, marker included, so
+        // three words survive: the five-word option loses two, and the
+        // three- and two-word options lose nothing.
+        assert_eq!(u.option_tokens_cut, 2);
+        assert_eq!(u.state_tokens_cut, 0);
+
+        // A state longer than the room: cut from the right, and counted.
+        let state = (0..50)
+            .map(|i| format!("s{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let tight = Limits {
+            max_len: 24,
+            head_max_len: 192,
+        };
+        let s = build(&enc, "q", &opts(&["a", "b"]), &state, tight);
+        assert_eq!(s.dropped(), 0);
+        // [CLS] + 3 head words + [SEP] + 2×([MASK] + 1) + [SEP] = 10,
+        // leaving 24 - 10 - 1 = 13 for the state.
+        assert_eq!(s.usage().state_tokens_cut, 50 - 13);
+        assert_eq!(s.ids.len(), 24);
     }
 
     #[test]

@@ -59,7 +59,7 @@ pub use sampler::{
     sampler_from_params,
 };
 pub use stop::{StopDetector, StopStringMatcher};
-pub use system_one::{DecisionAnswer, DecisionEngine, DecisionQuestion};
+pub use system_one::{BatchShape, Decided, DecisionAnswer, DecisionEngine, DecisionQuestion};
 pub use template::ChatTemplate;
 pub use toolcall::{
     ChatMessage, ToolCall, ToolCallParser, ToolCallStyle, ToolEvent, ToolFunction,

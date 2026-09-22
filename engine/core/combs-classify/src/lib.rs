@@ -28,6 +28,7 @@
 pub mod bars;
 pub mod suite;
 pub mod sequence;
+pub use sequence::QuestionUsage;
 pub mod sweep;
 pub mod system_one;
 pub mod tether;

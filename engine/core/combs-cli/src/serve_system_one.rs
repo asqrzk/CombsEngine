@@ -153,6 +153,44 @@ fn criteria_of(q: &crate::classify::Question) -> Criteria {
     }
 }
 
+/// What one request cost and what its budgets cut away.
+///
+/// `tokens` is the padded rectangle the model actually ran — rows times
+/// len, not the sum of the questions' own lengths — because that is what
+/// the matmuls are priced in. The per-question block says what each one
+/// lost: an option cut past the 48-token cap or the shared head budget,
+/// instructions cut to their floor, the state's tail dropped to fit.
+fn usage_json(req: &crate::classify::Request, decided: &combs_runtime::Decided) -> Value {
+    let per: Vec<Value> = req
+        .questions
+        .iter()
+        .zip(&decided.answers)
+        .map(|(q, a)| {
+            let u = &a.usage;
+            json!({
+                "name": q.name,
+                "tokens": u.tokens,
+                "markers": u.markers,
+                "dropped_options": u.dropped_options,
+                "instruction_tokens_cut": u.instruction_tokens_cut,
+                "option_tokens_cut": u.option_tokens_cut,
+                "state_tokens_cut": u.state_tokens_cut,
+            })
+        })
+        .collect();
+    json!({
+        "questions": req.questions.len(),
+        "forward_passes": 1,
+        "tokens": decided.batch.rows * decided.batch.len,
+        "batch": {
+            "rows": decided.batch.rows,
+            "len": decided.batch.len,
+            "markers": decided.batch.markers,
+        },
+        "per_question": per,
+    })
+}
+
 fn json_response(code: u16, body: Value) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     let text = serde_json::to_string(&body).unwrap_or_else(|_| "{}".into());
     tiny_http::Response::from_string(text)
@@ -187,7 +225,7 @@ fn classify(engine: &DecisionEngine, counters: &Counters, body: &str) -> Value {
         .collect();
 
     let t0 = Instant::now();
-    let answered = match engine.decide(&req.state, &questions) {
+    let decided = match engine.decide_with_shape(&req.state, &questions) {
         Ok(a) => a,
         Err(e) => {
             counters.errors.fetch_add(1, Ordering::Relaxed);
@@ -201,13 +239,14 @@ fn classify(engine: &DecisionEngine, counters: &Counters, body: &str) -> Value {
     counters
         .questions
         .fetch_add(req.questions.len() as u64, Ordering::Relaxed);
+    let answered = decided.answers.as_slice();
 
     // A question's probability of its FIRST option, which for a noul is
     // the proposition — exactly what `classify.rs` feeds an implication.
     let p_true: std::collections::HashMap<&str, f32> = req
         .questions
         .iter()
-        .zip(&answered)
+        .zip(answered)
         .map(|(q, a)| {
             (
                 q.name.as_str(),
@@ -217,7 +256,7 @@ fn classify(engine: &DecisionEngine, counters: &Counters, body: &str) -> Value {
         .collect();
 
     let mut out = Vec::with_capacity(answered.len());
-    for (q, a) in req.questions.iter().zip(&answered) {
+    for (q, a) in req.questions.iter().zip(answered) {
         let p = &a.distribution;
         let (top_i, top_p) =
             p.iter().enumerate().fold(
@@ -283,7 +322,12 @@ fn classify(engine: &DecisionEngine, counters: &Counters, body: &str) -> Value {
         "model": engine.model_id(),
         "backend": BACKEND,
         "answers": out,
-        "usage": {"questions": req.questions.len(), "forward_passes": 1},
+        // What the request COST and what it LOST. §138's record could not
+        // tell a silently truncated option from a genuinely low-scoring
+        // one, because the only usage on the wire was a question count:
+        // the seat's cost is padded tokens (rows x len), and its budgets
+        // cut instructions, options and the state's tail without a word.
+        "usage": usage_json(&req, &decided),
     }})
 }
 
@@ -418,5 +462,76 @@ mod tests {
         assert_eq!(get("dtype"), "f16");
         assert!(get("kv_arena").starts_with("none"), "{}", get("kv_arena"));
         assert_eq!(get("backend"), "f16 · fusion off");
+    }
+
+    /// Every question says what it cost and what it lost, and the
+    /// request's token count is the padded rectangle the model ran —
+    /// not the sum of the questions' own lengths.
+    #[test]
+    fn usage_names_every_question_and_carries_the_five_counts() {
+        let body = r#"{"state":"I want to cancel my subscription",
+            "questions":[
+              {"name":"is_request","type":"noul","instructions":"is the person asking us to do something",
+               "tether":{"means":"the person is asking us to do something for them now",
+                         "not":["the person is quoting, translating or describing"]}},
+              {"name":"intent","type":"choice","instructions":"which of these is the person asking for",
+               "options":[{"id":"unsubscribe","tether":{"means":"the person is asking us to end their subscription now"}},
+                          {"id":"none_of_these","tether":{"means":"something else entirely"}}]}
+            ]}"#;
+        let req = crate::classify::parse_request(body).expect("a well-formed request");
+        let answers: Vec<combs_runtime::DecisionAnswer> = req
+            .questions
+            .iter()
+            .map(|q| combs_runtime::DecisionAnswer {
+                name: q.name.clone(),
+                kind: q.kind,
+                distribution: vec![0.5, 0.5],
+                logits: vec![0.0, 0.0],
+                temperature: 1.0,
+                bucket: "choice:2".to_string(),
+                p_act: 1.0,
+                usage: combs_classify::QuestionUsage {
+                    tokens: 120,
+                    markers: q.options.len(),
+                    dropped_options: 0,
+                    instruction_tokens_cut: 3,
+                    option_tokens_cut: 7,
+                    state_tokens_cut: 0,
+                },
+            })
+            .collect();
+        let decided = combs_runtime::Decided {
+            answers,
+            batch: combs_runtime::BatchShape {
+                rows: 2,
+                len: 155,
+                markers: 7,
+            },
+        };
+        let u = usage_json(&req, &decided);
+        assert_eq!(u["questions"], 2);
+        assert_eq!(u["forward_passes"], 1);
+        // The padded rectangle, which is what was multiplied — two rows
+        // of 155 even though one question is shorter than the other.
+        assert_eq!(u["tokens"], 310);
+        assert_eq!(u["batch"]["rows"], 2);
+        assert_eq!(u["batch"]["len"], 155);
+        let per = u["per_question"]
+            .as_array()
+            .expect("one entry per question");
+        assert_eq!(per.len(), 2);
+        assert_eq!(per[0]["name"], req.questions[0].name.as_str());
+        for k in [
+            "tokens",
+            "markers",
+            "dropped_options",
+            "instruction_tokens_cut",
+            "option_tokens_cut",
+            "state_tokens_cut",
+        ] {
+            assert!(per[0].get(k).is_some(), "usage has no {k}: {per:?}");
+        }
+        assert_eq!(per[0]["option_tokens_cut"], 7);
+        assert_eq!(per[1]["tokens"], 120);
     }
 }

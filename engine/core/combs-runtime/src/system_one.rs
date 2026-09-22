@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use combs_classify::sequence::{
-    build_sequence, collate, DecisionBatch, Encode, Limits, Sequence, Specials,
+    build_sequence, collate, DecisionBatch, Encode, Limits, QuestionUsage, Sequence, Specials,
 };
 use combs_classify::system_one::{
     engine_order, readout, render_options, AgentConfig, Calibration, Criteria,
@@ -75,6 +75,24 @@ pub struct DecisionAnswer {
     /// What the act head made of the decision: the probability of
     /// answering rather than escalating.
     pub p_act: f32,
+    /// What this question cost and what it lost.
+    pub usage: QuestionUsage,
+}
+
+/// The padded rectangle one request became: every question a row,
+/// every row the longest question's length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchShape {
+    pub rows: usize,
+    pub len: usize,
+    pub markers: usize,
+}
+
+/// Every answer, and the shape of the batch that produced them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Decided {
+    pub answers: Vec<DecisionAnswer>,
+    pub batch: BatchShape,
 }
 
 /// A seated typed-decision model.
@@ -222,8 +240,26 @@ impl DecisionEngine {
         state: &str,
         questions: &[DecisionQuestion],
     ) -> Result<Vec<DecisionAnswer>> {
+        Ok(self.decide_with_shape(state, questions)?.answers)
+    }
+
+    /// [`Self::decide`], plus the shape of the batch it ran — what a
+    /// record needs to price a request in tokens rather than in
+    /// questions.
+    pub fn decide_with_shape(
+        &self,
+        state: &str,
+        questions: &[DecisionQuestion],
+    ) -> Result<Decided> {
         if questions.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Decided {
+                answers: Vec::new(),
+                batch: BatchShape {
+                    rows: 0,
+                    len: 0,
+                    markers: 0,
+                },
+            });
         }
         let bad = |what: String| EngineError::Model(combs_models::ModelError::Unsupported(what));
 
@@ -261,6 +297,11 @@ impl DecisionEngine {
 
         let batch: DecisionBatch = collate(&sequences, self.specials.pad)
             .ok_or_else(|| bad("nothing to ask".to_string()))?;
+        let shape = BatchShape {
+            rows: batch.rows,
+            len: batch.len,
+            markers: batch.markers,
+        };
         let out = {
             let model = self
                 .model
@@ -286,8 +327,12 @@ impl DecisionEngine {
                 // Index zero is answering; the rest are the acts the
                 // config prices.
                 p_act: out.act[i].first().copied().unwrap_or(0.0),
+                usage: sequences[i].usage(),
             });
         }
-        Ok(answers)
+        Ok(Decided {
+            answers,
+            batch: shape,
+        })
     }
 }
