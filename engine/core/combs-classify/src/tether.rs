@@ -40,6 +40,13 @@ pub struct Tether {
     /// this, as opposed to quoting or describing it?").
     #[serde(default)]
     pub requires: Vec<String>,
+    /// A short word a scorer MAY read in a label slot, for the road that
+    /// has one: laya's sequence renders `label: criterion`, and its own
+    /// presets put a meaning there (`billing`, `refund`), never an
+    /// identifier. Absent, that road uses an ordinal instead — an
+    /// identifier is never a label, which is the whole rule.
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 /// An option: an opaque identifier the caller routes on, and the tether
@@ -111,6 +118,22 @@ pub fn validate(opts: &[Opt], declared: &[String], max_options: usize) -> Result
         }
         if let Some(prev) = opts[..i].iter().find(|p| p.id == o.id) {
             return Err(format!("option \"{}\" appears twice", prev.id));
+        }
+        if let Some(label) = o.tether.label.as_deref() {
+            let label = label.trim();
+            if label.is_empty() {
+                return Err(format!(
+                    "option \"{}\" carries an empty label: leave it out rather than score nothing",
+                    o.id
+                ));
+            }
+            if label == o.id {
+                return Err(format!(
+                    "option \"{}\" labels itself with its own identifier: an identifier is a topic, \
+                     not a meaning, and a scorer that reads it matches by word overlap",
+                    o.id
+                ));
+            }
         }
         if let Some(prev) = opts[..i]
             .iter()

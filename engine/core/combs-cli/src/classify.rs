@@ -288,6 +288,10 @@ pub(crate) fn parse_request(body: &str) -> Result<Request, (u16, Value)> {
                             means: t.means.clone(),
                             not: Vec::new(),
                             requires: Vec::new(),
+                            // laya renders a noul's sides as `true:`/
+                            // `false:` itself; a label here would be a
+                            // third word for the same slot.
+                            label: None,
                         },
                     },
                     Opt {
@@ -296,6 +300,7 @@ pub(crate) fn parse_request(body: &str) -> Result<Request, (u16, Value)> {
                             means: contrary,
                             not: Vec::new(),
                             requires: Vec::new(),
+                            label: None,
                         },
                     },
                 ]

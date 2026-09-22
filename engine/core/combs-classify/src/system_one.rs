@@ -170,6 +170,109 @@ fn described(v: &Value) -> Option<&Value> {
     }
 }
 
+/// How an option's text reaches the scorer on the marker road.
+///
+/// laya's sequence renders `label: criterion` per option. What goes in
+/// those two slots is ours to choose, and the choice is measurable — so
+/// it is a door with a default that changes nothing, not a rewrite.
+///
+/// The hazard the tether exists to close (`tether.rs`) is an identifier
+/// in front of a scorer: `escalate_user_planning_unsubscription` carries
+/// the TOPIC, so "translate the phrase 'I'm considering unsubscription'"
+/// matches it by word overlap. The cosine road never had this problem —
+/// it embeds `scored_text()`, and two tests pin that the id is absent.
+/// The marker road arrived with the id in the label slot and the `not`
+/// anchors nowhere, so the two roads have never scored the same text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Rendering {
+    /// `id: means` — what this seat shipped, kept as the default so a
+    /// record taken against it stays comparable.
+    #[default]
+    IdMeans,
+    /// `<label or ordinal>: means` — the identifier gone, the anchors
+    /// still absent. Isolates what the identifier alone was worth.
+    LabelMeans,
+    /// `<label or ordinal>: means. Not this when the state is instead: …`
+    /// — the text the cosine road scores, on the marker road at last.
+    LabelAnchors,
+}
+
+impl Rendering {
+    /// The wire's own word for this rendering, and back.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Rendering::IdMeans => "id-means",
+            Rendering::LabelMeans => "label-means",
+            Rendering::LabelAnchors => "label-anchors",
+        }
+    }
+
+    /// Refused by name rather than defaulted: a caller who asks for a
+    /// rendering that does not exist gets told, not silently measured
+    /// against another one.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "id-means" => Ok(Rendering::IdMeans),
+            "label-means" => Ok(Rendering::LabelMeans),
+            "label-anchors" => Ok(Rendering::LabelAnchors),
+            other => Err(format!(
+                "unknown render {other:?}: one of id-means, label-means, label-anchors"
+            )),
+        }
+    }
+}
+
+/// What the scorer reads in an option's label slot.
+///
+/// Never the identifier unless the caller asked for `id-means`. A
+/// tether that names a label gets that word; one that does not gets an
+/// ordinal, which carries no topic at all.
+fn label_of(opt: &crate::Opt, i: usize, rendering: Rendering) -> String {
+    match rendering {
+        Rendering::IdMeans => opt.id.clone(),
+        _ => opt
+            .tether
+            .label
+            .as_deref()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("option {}", i + 1)),
+    }
+}
+
+/// One question's criteria as the model will read them.
+///
+/// The seat and any measurement of it call THIS, so a rendering cannot
+/// be one thing in the server and another in the harness that grades it.
+pub fn criteria_for(kind: Kind, options: &[crate::Opt], rendering: Rendering) -> Criteria {
+    let text = |o: &crate::Opt| match rendering {
+        Rendering::LabelAnchors => o.scored_text(),
+        _ => o.tether.means.clone(),
+    };
+    match kind {
+        Kind::Choice => Criteria::Choice(
+            options
+                .iter()
+                .enumerate()
+                .map(|(i, o)| (label_of(o, i, rendering), Value::String(text(o))))
+                .collect(),
+        ),
+        Kind::Score => Criteria::Score(options.iter().map(|o| Value::String(text(o))).collect()),
+        // A noul's two sides are already the proposition and its
+        // contraries; `parse_request` folded them, and a label slot
+        // there is laya's own `false:`/`true:`, not ours to fill.
+        Kind::Noul => Criteria::Noul {
+            when_true: options
+                .first()
+                .map(|o| Value::String(o.tether.means.clone())),
+            when_false: options
+                .get(1)
+                .map(|o| Value::String(o.tether.means.clone())),
+        },
+    }
+}
+
 /// The option texts, in marker order — one string per marker the
 /// sequence will carry.
 pub fn render_options(criteria: &Criteria) -> Vec<String> {
@@ -411,6 +514,96 @@ pub fn decision_confidence(kind: Kind, p: &[f32]) -> f32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// THE rule, on the road that broke it. `tether.rs` says an
+    /// identifier is never scored, and the cosine road has two tests
+    /// pinning it — but the marker road renders `label: criterion` and
+    /// arrived with the id in the label slot, so the two roads have
+    /// never scored the same text. Every rendering but the default must
+    /// keep the identifier out; the default carries it and is named
+    /// here so nobody mistakes it for safe.
+    #[test]
+    fn no_rendering_but_the_default_puts_the_identifier_in_front_of_the_scorer() {
+        let opts = vec![
+            crate::Opt {
+                id: "escalate_user_planning_unsubscription".to_string(),
+                tether: crate::Tether {
+                    means: "the person is asking us to end their subscription now".to_string(),
+                    not: vec!["quoting or translating a sentence about unsubscribing".to_string()],
+                    requires: vec!["is_request".to_string()],
+                    label: None,
+                },
+            },
+            crate::Opt {
+                id: "request_refund".to_string(),
+                tether: crate::Tether {
+                    means: "the person is asking us to return money".to_string(),
+                    not: Vec::new(),
+                    requires: Vec::new(),
+                    label: Some("refund".to_string()),
+                },
+            },
+        ];
+        let texts = |r| render_options(&criteria_for(Kind::Choice, &opts, r));
+
+        // The default: the identifier IS in front of the scorer, which
+        // is what every number taken against this seat so far was.
+        let shipped = texts(Rendering::IdMeans);
+        assert!(
+            shipped[0].starts_with("escalate_user_planning_unsubscription:"),
+            "{shipped:?}"
+        );
+
+        for rendering in [Rendering::LabelMeans, Rendering::LabelAnchors] {
+            let rendered = texts(rendering);
+            for (o, text) in opts.iter().zip(&rendered) {
+                assert!(
+                    !text.contains(&o.id),
+                    "{} put an identifier in front of the scorer: {text}",
+                    rendering.as_str()
+                );
+            }
+            // A tether with no label gets an ordinal, which carries no
+            // topic; one that names a label gets that word.
+            assert!(rendered[0].starts_with("option 1:"), "{rendered:?}");
+            assert!(rendered[1].starts_with("refund:"), "{rendered:?}");
+        }
+
+        // Only `label-anchors` carries what the option is NOT — the
+        // clause the cosine road has always scored.
+        assert!(!texts(Rendering::LabelMeans)[0].contains("Not this when"));
+        let anchored = texts(Rendering::LabelAnchors);
+        assert!(
+            anchored[0].contains("Not this when the state is instead: quoting or translating"),
+            "{anchored:?}"
+        );
+        // `requires` is a question name, which has an identifier's
+        // shape, and stays out of every rendering.
+        for r in [
+            Rendering::IdMeans,
+            Rendering::LabelMeans,
+            Rendering::LabelAnchors,
+        ] {
+            assert!(!texts(r)[0].contains("is_request"), "{r:?}");
+        }
+    }
+
+    /// A rendering nobody implemented is refused by name rather than
+    /// quietly measured as the default.
+    #[test]
+    fn an_unknown_rendering_is_refused_by_name() {
+        assert_eq!(
+            Rendering::parse("label-anchors"),
+            Ok(Rendering::LabelAnchors)
+        );
+        let why = Rendering::parse("anchors").expect_err("not a rendering");
+        assert!(
+            why.contains("anchors") && why.contains("label-anchors"),
+            "{why}"
+        );
+        assert_eq!(Rendering::default(), Rendering::IdMeans);
+    }
+
     use super::*;
     use serde_json::json;
 

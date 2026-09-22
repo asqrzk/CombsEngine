@@ -17,7 +17,12 @@ fn near(a: f32, b: f32, tol: f32) -> bool {
 fn means(id: &str, text: &str) -> Opt {
     Opt {
         id: id.to_string(),
-        tether: Tether { means: text.to_string(), not: Vec::new(), requires: Vec::new() },
+        tether: Tether {
+            means: text.to_string(),
+            not: Vec::new(),
+            requires: Vec::new(),
+            label: None,
+        },
     }
 }
 
@@ -167,6 +172,7 @@ fn a_scorer_never_reads_an_option_identifier() {
     let opt = Opt {
         id: "escalate_user_planning_unsubscription".to_string(),
         tether: Tether {
+            label: None,
             means: "the person is asking us to end their subscription now".to_string(),
             not: vec!["quoting or translating a sentence about unsubscribing".to_string()],
             requires: vec!["is_request".to_string()],
@@ -220,6 +226,7 @@ fn an_implication_naming_an_undeclared_question_is_refused_by_name() {
     let opts = vec![Opt {
         id: "escalate".to_string(),
         tether: Tether {
+            label: None,
             means: "the person is asking us to act".to_string(),
             not: Vec::new(),
             requires: vec!["is_request".to_string()],

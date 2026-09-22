@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
-use combs_classify::system_one::Criteria;
+use combs_classify::system_one::{criteria_for, Criteria, Rendering};
 use combs_classify::{decide, expected_level, Decision, Implication, Kind};
 use combs_runtime::{DecisionEngine, DecisionQuestion, WarmReport};
 use serde_json::{json, Value};
@@ -131,26 +131,12 @@ struct Counters {
 /// whose FIRST option is the proposition; laya renders `[false, true]`,
 /// so this is where the two conventions meet on the way in, as
 /// `engine_order` is where they meet on the way out.
-fn criteria_of(q: &crate::classify::Question) -> Criteria {
-    let means = |i: usize| json!(q.options[i].tether.means.clone());
-    match q.kind {
-        Kind::Choice => Criteria::Choice(
-            q.options
-                .iter()
-                .map(|o| (o.id.clone(), json!(o.tether.means.clone())))
-                .collect(),
-        ),
-        Kind::Score => Criteria::Score(
-            q.options
-                .iter()
-                .map(|o| json!(o.tether.means.clone()))
-                .collect(),
-        ),
-        Kind::Noul => Criteria::Noul {
-            when_true: Some(means(0)),
-            when_false: q.options.get(1).map(|_| means(1)),
-        },
-    }
+///
+/// WHAT the model reads is `combs_classify::system_one::criteria_for`,
+/// shared with anything that measures this seat so a rendering cannot be
+/// one thing here and another in the harness that grades it.
+fn criteria_of(q: &crate::classify::Question, rendering: Rendering) -> Criteria {
+    criteria_for(q.kind, &q.options, rendering)
 }
 
 /// What one request cost and what its budgets cut away.
@@ -214,13 +200,30 @@ fn classify(engine: &DecisionEngine, counters: &Counters, body: &str) -> Value {
             return json!({"_status": code, "_body": v});
         }
     };
+    // Which text the options reach the scorer as. Default `id-means`,
+    // which is what this seat has always done, so a record taken against
+    // it stays comparable; an unknown value is refused by name.
+    let rendering = match serde_json::from_str::<Value>(body)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("render"))
+        .and_then(Value::as_str)
+        .map(Rendering::parse)
+    {
+        None => Rendering::default(),
+        Some(Ok(r)) => r,
+        Some(Err(why)) => {
+            counters.errors.fetch_add(1, Ordering::Relaxed);
+            return json!({"_status": 400, "_body": {"error": {"type": "invalid_request", "message": why}}});
+        }
+    };
     let questions: Vec<DecisionQuestion> = req
         .questions
         .iter()
         .map(|q| DecisionQuestion {
             name: q.name.clone(),
             instructions: q.instructions.clone(),
-            criteria: criteria_of(q),
+            criteria: criteria_of(q, rendering),
         })
         .collect();
 
@@ -327,6 +330,7 @@ fn classify(engine: &DecisionEngine, counters: &Counters, body: &str) -> Value {
         // one, because the only usage on the wire was a question count:
         // the seat's cost is padded tokens (rows x len), and its budgets
         // cut instructions, options and the state's tail without a word.
+        "render": rendering.as_str(),
         "usage": usage_json(&req, &decided),
     }})
 }
