@@ -557,12 +557,16 @@ fn cmd_serve(
                 "combs serve: --context-size is ignored by a System 1 seat: it holds no KV arena"
             );
         }
+        // Which road this seat serves, read BEFORE the weights: a seat
+        // started on a door nobody spelled right should refuse in
+        // milliseconds, not after 842 MB and a warm-up.
+        let rendering = serve_system_one::seat_rendering().map_err(|why| anyhow::anyhow!(why))?;
         let engine = combs_runtime::DecisionEngine::load(&model)?;
         // Warm before listening: the first request on a cold seat paid
         // 1,058 ms (s138) — autotune for every shape the encoder makes —
         // and a router with a 1,500 ms budget should never pay it.
         let warm = engine.warm(&combs_runtime::default_warm_shapes(engine.limits()))?;
-        return serve_system_one::serve(engine, warm, &format!("127.0.0.1:{port}"));
+        return serve_system_one::serve(engine, warm, rendering, &format!("127.0.0.1:{port}"));
     }
     let t_load = std::time::Instant::now();
     let source = open_model_source(&model)?;

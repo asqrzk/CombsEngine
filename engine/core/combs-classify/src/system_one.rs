@@ -197,6 +197,34 @@ pub enum Rendering {
     LabelAnchors,
 }
 
+/// The two roads an option can reach a scorer by, kept apart on purpose.
+///
+/// The driver's words. The **normal** road LABELS the option — laya's
+/// own convention, a word in the label slot and the criterion after it —
+/// so whatever that word carries, topic included, is scored. The
+/// **semantic** road scores the tether instead: what the option means
+/// and what it is NOT, with the option never named at all.
+///
+/// They are not two settings of one thing. They disagree about whether
+/// an option has a name the model may read, so a record must say which
+/// road it ran and a seat must be startable on either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Road {
+    /// The option is named; the name is scored.
+    Normal,
+    /// The option is described; the name is never scored.
+    Semantic,
+}
+
+impl Road {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Road::Normal => "normal",
+            Road::Semantic => "semantic",
+        }
+    }
+}
+
 impl Rendering {
     /// The wire's own word for this rendering, and back.
     pub fn as_str(self) -> &'static str {
@@ -207,16 +235,36 @@ impl Rendering {
         }
     }
 
+    /// Which of the two roads this rendering walks.
+    ///
+    /// `id-means` is on the NORMAL road: it labels the option, with the
+    /// worst available label. That it is the accident this seat shipped
+    /// does not make it a third road — it makes it the normal road with
+    /// the routing key in the name slot.
+    pub fn road(self) -> Road {
+        match self {
+            Rendering::IdMeans | Rendering::LabelMeans => Road::Normal,
+            Rendering::LabelAnchors => Road::Semantic,
+        }
+    }
+
     /// Refused by name rather than defaulted: a caller who asks for a
     /// rendering that does not exist gets told, not silently measured
     /// against another one.
+    ///
+    /// `normal` and `semantic` name the two ROADS and are the words a
+    /// configuration should use; the hyphenated names pick an exact
+    /// rendering, which is what a measurement arm wants. `normal`
+    /// resolves to `label-means` and never to `id-means`: the identifier
+    /// is a legacy default a caller must now ask for by its own name.
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
             "id-means" => Ok(Rendering::IdMeans),
-            "label-means" => Ok(Rendering::LabelMeans),
-            "label-anchors" => Ok(Rendering::LabelAnchors),
+            "label-means" | "normal" => Ok(Rendering::LabelMeans),
+            "label-anchors" | "semantic" => Ok(Rendering::LabelAnchors),
             other => Err(format!(
-                "unknown render {other:?}: one of id-means, label-means, label-anchors"
+                "unknown render {other:?}: a road (normal, semantic) or a \
+                 rendering (id-means, label-means, label-anchors)"
             )),
         }
     }
@@ -602,6 +650,45 @@ mod tests {
             "{why}"
         );
         assert_eq!(Rendering::default(), Rendering::IdMeans);
+    }
+
+    /// The two roads are the configuration's vocabulary, and `normal`
+    /// must never resolve to the identifier: that is a legacy default a
+    /// caller now asks for by its own name or not at all.
+    #[test]
+    fn the_two_roads_are_nameable_and_normal_is_not_the_identifier() {
+        assert_eq!(Rendering::parse("normal"), Ok(Rendering::LabelMeans));
+        assert_eq!(Rendering::parse("semantic"), Ok(Rendering::LabelAnchors));
+        assert_ne!(Rendering::parse("normal"), Ok(Rendering::IdMeans));
+
+        assert_eq!(Rendering::IdMeans.road(), Road::Normal);
+        assert_eq!(Rendering::LabelMeans.road(), Road::Normal);
+        assert_eq!(Rendering::LabelAnchors.road(), Road::Semantic);
+
+        // Exactly one rendering scores the tether, and it is the one the
+        // cosine road has always scored.
+        let semantic: Vec<_> = [
+            Rendering::IdMeans,
+            Rendering::LabelMeans,
+            Rendering::LabelAnchors,
+        ]
+        .into_iter()
+        .filter(|r| r.road() == Road::Semantic)
+        .collect();
+        assert_eq!(semantic, vec![Rendering::LabelAnchors]);
+
+        // The refusal names both roads and every rendering, so a bad
+        // configuration says what it could have been.
+        let why = Rendering::parse("anchors").expect_err("not a rendering");
+        for word in [
+            "normal",
+            "semantic",
+            "id-means",
+            "label-means",
+            "label-anchors",
+        ] {
+            assert!(why.contains(word), "{why} omits {word}");
+        }
     }
 
     use super::*;

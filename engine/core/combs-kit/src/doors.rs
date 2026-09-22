@@ -106,6 +106,14 @@ pub const DOORS: &[Door] = &[
     },
     Door {
         kind: Kind::Knob,
+        name: "COMBS_CLASSIFY_RENDER",
+        default: "id-means",
+        does: "which road a System 1 seat serves: `semantic` scores the tether (means + not anchors, the option never named), `normal` labels the option as laya does; `id-means` is the legacy default that puts the routing key in the label slot",
+        read_at: "combs-cli/src/serve_system_one.rs",
+        measured: Some("the ledger §138 addendum — the renderings probe"),
+    },
+    Door {
+        kind: Kind::Knob,
         name: "COMBS_TOOL_DIALECT",
         default: "unset",
         does: "names the tool-call dialect this seat speaks, outranking both the card beside the weights and the chat template's own evidence. Set it when a model's template lies about its phrasing, or to shut tool parsing off entirely with `none`. An unknown name is refused at load, naming every name that would have worked",

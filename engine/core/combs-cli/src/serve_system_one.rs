@@ -57,6 +57,36 @@ pub fn is_decision_seat(dir: &Path) -> bool {
 /// What this seat calls its scorer, everywhere it says so.
 pub const BACKEND: &str = "system-one";
 
+/// The door that starts the seat on one road or the other.
+///
+/// The two roads are kept apart deliberately (`Road`), so which one a
+/// seat serves is a property of the SEAT, not of whoever happens to call
+/// it: a supervisor spawning this process sets the door, the config line
+/// says what it resolved to, and a record can read it back. A request
+/// may still name `render` for itself — that is how an arm of a sitting
+/// measures the other road without restarting anything — but the seat's
+/// own answer is the door's.
+pub const RENDER_DOOR: &str = "COMBS_CLASSIFY_RENDER";
+
+/// Resolves the door's value, refused by name rather than defaulted.
+///
+/// Pure so the refusal can be tested without an environment. `None` is
+/// the door unset, which keeps `id-means`: the rendering this seat has
+/// always served, so a seat started with no door answers exactly as the
+/// sealed record did.
+pub(crate) fn rendering_door(value: Option<&str>) -> Result<Rendering, String> {
+    match value {
+        None => Ok(Rendering::default()),
+        Some(v) if v.trim().is_empty() => Ok(Rendering::default()),
+        Some(v) => Rendering::parse(v.trim()).map_err(|why| format!("{RENDER_DOOR}: {why}")),
+    }
+}
+
+/// The door as the environment holds it.
+pub fn seat_rendering() -> Result<Rendering, String> {
+    rendering_door(std::env::var(RENDER_DOOR).ok().as_deref())
+}
+
 /// The config line's fields, composed without a device so a test can read
 /// what a seat would say of itself. `extra` is what the caller learned
 /// with a device in hand (the WGSL doors) or from its own flags.
@@ -64,6 +94,7 @@ pub(crate) fn config_fields(
     model_id: &str,
     dtype: &str,
     fusion: bool,
+    rendering: Rendering,
     extra: &[(&'static str, String)],
 ) -> Vec<(&'static str, String)> {
     let mut fields = vec![
@@ -84,6 +115,13 @@ pub(crate) fn config_fields(
         // Said out loud because it is the whole difference: this seat
         // holds no KV arena at all.
         ("kv_arena", "none (this seat decodes nothing)".to_string()),
+        // WHICH ROAD THE OPTIONS REACH THE SCORER BY. Said on the line
+        // because §137 and §138 compared arms that differed in exactly
+        // this and no record could tell: one scored the option's name,
+        // the other the tether. A seat that does not say it cannot be
+        // compared to one that does.
+        ("render", rendering.as_str().to_string()),
+        ("road", rendering.road().as_str().to_string()),
     ];
     fields.extend(extra.iter().cloned());
     fields
@@ -192,7 +230,7 @@ fn refuse(code: u16, kind: &str, message: &str) -> tiny_http::Response<std::io::
 }
 
 /// Answers one `/v1/classify` body from the decision seat.
-fn classify(engine: &DecisionEngine, counters: &Counters, body: &str) -> Value {
+fn classify(engine: &DecisionEngine, counters: &Counters, body: &str, seat: Rendering) -> Value {
     let req = match crate::classify::parse_request(body) {
         Ok(r) => r,
         Err((code, v)) => {
@@ -200,9 +238,11 @@ fn classify(engine: &DecisionEngine, counters: &Counters, body: &str) -> Value {
             return json!({"_status": code, "_body": v});
         }
     };
-    // Which text the options reach the scorer as. Default `id-means`,
-    // which is what this seat has always done, so a record taken against
-    // it stays comparable; an unknown value is refused by name.
+    // Which text the options reach the scorer as. The SEAT's road unless
+    // this request names another — that override is how one arm of a
+    // sitting measures the other road without restarting the process, and
+    // it is echoed back so a record never has to infer which ran. An
+    // unknown value is refused by name.
     let rendering = match serde_json::from_str::<Value>(body)
         .ok()
         .as_ref()
@@ -210,7 +250,7 @@ fn classify(engine: &DecisionEngine, counters: &Counters, body: &str) -> Value {
         .and_then(Value::as_str)
         .map(Rendering::parse)
     {
-        None => Rendering::default(),
+        None => seat,
         Some(Ok(r)) => r,
         Some(Err(why)) => {
             counters.errors.fetch_add(1, Ordering::Relaxed);
@@ -331,6 +371,11 @@ fn classify(engine: &DecisionEngine, counters: &Counters, body: &str) -> Value {
         // the seat's cost is padded tokens (rows x len), and its budgets
         // cut instructions, options and the state's tail without a word.
         "render": rendering.as_str(),
+        "road": rendering.road().as_str(),
+        // True when this request asked for something other than the
+        // seat's own road, so a record can separate an arm's override
+        // from the seat's configuration without reading both.
+        "render_overridden": rendering != seat,
         "usage": usage_json(&req, &decided),
     }})
 }
@@ -338,7 +383,12 @@ fn classify(engine: &DecisionEngine, counters: &Counters, body: &str) -> Value {
 /// Serves a decision model on `addr` forever. `warm` is what the seat
 /// already ran before listening, said on the config line and in
 /// `/v1/stats` so a record can tell a warmed seat from a cold one.
-pub fn serve(engine: DecisionEngine, warm: WarmReport, addr: &str) -> Result<()> {
+pub fn serve(
+    engine: DecisionEngine,
+    warm: WarmReport,
+    rendering: Rendering,
+    addr: &str,
+) -> Result<()> {
     let server = tiny_http::Server::http(addr).map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
     let engine = Arc::new(engine);
     let counters = Arc::new(Counters::default());
@@ -368,10 +418,16 @@ pub fn serve(engine: DecisionEngine, warm: WarmReport, addr: &str) -> Result<()>
             &model_id,
             combs_core::BACKEND.dtype,
             combs_core::BACKEND.fusion,
+            rendering,
             &extra,
         ),
     );
-    eprintln!("combs serve: listening on http://{addr} (system-one seat: {model_id})");
+    eprintln!(
+        "combs serve: listening on http://{addr} (system-one seat: {model_id}, \
+         {} road, render {})",
+        rendering.road().as_str(),
+        rendering.as_str()
+    );
 
     let card = |id: &str, meta: &combs_formats::ModelMetadata| {
         json!({
@@ -415,6 +471,8 @@ pub fn serve(engine: DecisionEngine, warm: WarmReport, addr: &str) -> Result<()>
                         "questions": counters.questions.load(Ordering::Relaxed),
                         "errors": counters.errors.load(Ordering::Relaxed),
                         "last_ms": counters.last_ms.load(Ordering::Relaxed),
+                        "render": rendering.as_str(),
+                        "road": rendering.road().as_str(),
                     },
                     "warm_up": warm_json.clone(),
                 }),
@@ -424,7 +482,7 @@ pub fn serve(engine: DecisionEngine, warm: WarmReport, addr: &str) -> Result<()>
                 if let Err(e) = request.as_reader().read_to_string(&mut body) {
                     refuse(400, "invalid_request", &format!("unreadable body: {e}"))
                 } else {
-                    let v = classify(&engine, &counters, &body);
+                    let v = classify(&engine, &counters, &body, rendering);
                     json_response(
                         v["_status"].as_u64().unwrap_or(500) as u16,
                         v["_body"].clone(),
@@ -450,6 +508,52 @@ pub fn serve(engine: DecisionEngine, warm: WarmReport, addr: &str) -> Result<()>
 mod tests {
     use super::*;
 
+    /// The two roads are a SEAT's configuration, not a caller's habit.
+    /// A record that cannot say which road produced it is the defect
+    /// §137 and §138 fell into, so the door resolves, the line says it,
+    /// and a value nobody spelled right is refused rather than defaulted
+    /// into the other road's numbers.
+    #[test]
+    fn the_seat_is_startable_on_either_road_and_says_which() {
+        assert_eq!(rendering_door(None), Ok(Rendering::IdMeans));
+        assert_eq!(rendering_door(Some("")), Ok(Rendering::IdMeans));
+        assert_eq!(
+            rendering_door(Some("  semantic ")),
+            Ok(Rendering::LabelAnchors)
+        );
+        assert_eq!(rendering_door(Some("normal")), Ok(Rendering::LabelMeans));
+        assert_eq!(
+            rendering_door(Some("label-anchors")),
+            Ok(Rendering::LabelAnchors)
+        );
+
+        // Refused BY NAME, and the refusal names the door so an operator
+        // knows which environment variable to fix.
+        let why = rendering_door(Some("tether")).expect_err("not a road");
+        assert!(why.contains(RENDER_DOOR), "{why}");
+        assert!(why.contains("semantic") && why.contains("normal"), "{why}");
+
+        // Both roads reach the config line, and the line carries the
+        // road beside the exact rendering: `normal` and `id-means` are
+        // the same road and different text, and a record needs both.
+        for (r, road) in [
+            (Rendering::IdMeans, "normal"),
+            (Rendering::LabelMeans, "normal"),
+            (Rendering::LabelAnchors, "semantic"),
+        ] {
+            let fields = config_fields("m", "f16", false, r, &[]);
+            let get = |k: &str| {
+                fields
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or_else(|| panic!("no field {k}"))
+            };
+            assert_eq!(get("render"), r.as_str());
+            assert_eq!(get("road"), road);
+        }
+    }
+
     /// The seat's own line must describe the dense road it runs — never
     /// the quantized batched road, whose line once stood in for it and
     /// said `f32 operands` under an f16 build.
@@ -459,6 +563,7 @@ mod tests {
             "laya-typed-decisions",
             "f16",
             false,
+            Rendering::default(),
             &[("backend", "f16 · fusion off".to_string())],
         );
         let get = |k: &str| {
