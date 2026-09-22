@@ -239,6 +239,27 @@ fn refuse(code: u16, kind: &str, message: &str) -> tiny_http::Response<std::io::
     json_response(code, json!({"error": {"type": kind, "message": message}}))
 }
 
+/// Refuses a body that tries to choose its own rendering.
+///
+/// Pure, and it names the door rather than the field: a caller who wants
+/// the other road needs a seat serving it, and the message says how.
+fn refuse_render_key(body: &str) -> std::result::Result<(), String> {
+    let Ok(v) = serde_json::from_str::<Value>(body) else {
+        // Malformed JSON is `parse_request`'s refusal to make, not this
+        // one's; it has already run by the time we are called.
+        return Ok(());
+    };
+    if v.get("render").is_some() {
+        return Err(format!(
+            "a request cannot choose its own rendering: the road is the seat's, set by \
+             {RENDER_DOOR} (normal | semantic | id-means | label-means | label-anchors) before \
+             the weights load, and reported on the config line, in /v1/stats and in every \
+             answer. Start a seat on the other road."
+        ));
+    }
+    Ok(())
+}
+
 /// Turns one decided batch into the wire's `answers`, or refuses.
 ///
 /// Pure, so the refusal can be tested without a checkpoint or a device.
@@ -383,25 +404,22 @@ fn classify(engine: &DecisionEngine, counters: &Counters, body: &str, seat: Rend
             return json!({"_status": code, "_body": v});
         }
     };
-    // Which text the options reach the scorer as. The SEAT's road unless
-    // this request names another — that override is how one arm of a
-    // sitting measures the other road without restarting the process, and
-    // it is echoed back so a record never has to infer which ran. An
-    // unknown value is refused by name.
-    let rendering = match serde_json::from_str::<Value>(body)
-        .ok()
-        .as_ref()
-        .and_then(|v| v.get("render"))
-        .and_then(Value::as_str)
-        .map(Rendering::parse)
-    {
-        None => seat,
-        Some(Ok(r)) => r,
-        Some(Err(why)) => {
-            counters.errors.fetch_add(1, Ordering::Relaxed);
-            return json!({"_status": 400, "_body": {"error": {"type": "invalid_request", "message": why}}});
-        }
-    };
+    // The road is the SEAT's, and only the seat's.
+    //
+    // A request naming `render` is refused rather than obeyed. This was
+    // a per-request override for one commit, on the argument that an arm
+    // of a sitting could measure the other road without restarting —
+    // which is exactly the hole: the config line, `/v1/stats` and every
+    // record would say one road while a body quietly scored another. A
+    // seat's line is the whole truth only if nothing else can move it,
+    // and §137 against §138 is already one comparison of arms whose
+    // option text differed with nothing in either record able to say so.
+    // A sitting that wants both roads starts two seats, or restarts one.
+    if let Err(why) = refuse_render_key(body) {
+        counters.errors.fetch_add(1, Ordering::Relaxed);
+        return json!({"_status": 400, "_body": {"error": {"type": "invalid_request", "message": why}}});
+    }
+    let rendering = seat;
     let questions: Vec<DecisionQuestion> = req
         .questions
         .iter()
@@ -443,10 +461,6 @@ fn classify(engine: &DecisionEngine, counters: &Counters, body: &str, seat: Rend
         // cut instructions, options and the state's tail without a word.
         "render": rendering.as_str(),
         "road": rendering.road().as_str(),
-        // True when this request asked for something other than the
-        // seat's own road, so a record can separate an arm's override
-        // from the seat's configuration without reading both.
-        "render_overridden": rendering != seat,
         "usage": usage_json(&req, &decided),
     }})
 }
@@ -594,6 +608,30 @@ pub fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The road a seat serves is a property of the SEAT. For one commit
+    /// a body could name `render` and flip it for that request, which
+    /// made the config line, `/v1/stats` and the record say one road
+    /// while another was scored — the §137-against-§138 defect, rebuilt
+    /// on the road meant to close it. A body that asks is now told where
+    /// the road actually lives.
+    #[test]
+    fn a_request_cannot_change_the_seats_road() {
+        let with = r#"{"state":"x","render":"semantic","questions":[]}"#;
+        let why = refuse_render_key(with).expect_err("a body naming render");
+        assert!(why.contains(RENDER_DOOR), "{why}");
+        assert!(why.contains("semantic") && why.contains("normal"), "{why}");
+        assert!(why.contains("Start a seat"), "{why}");
+
+        // Even the road the seat is already on is refused: the answer is
+        // "not here", not "only if it agrees".
+        assert!(refuse_render_key(r#"{"render":"id-means"}"#).is_err());
+
+        // A body that does not ask passes, and malformed JSON is
+        // `parse_request`'s refusal, not this one's.
+        assert!(refuse_render_key(r#"{"state":"x","questions":[]}"#).is_ok());
+        assert!(refuse_render_key("{not json").is_ok());
+    }
 
     /// Builds a request and a matching `Decided` whose distributions the
     /// caller chooses, so a degenerate readout can be put in front of the
