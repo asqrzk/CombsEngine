@@ -387,6 +387,43 @@ fn cmd_gates(ctx: &Ctx, quick: bool, strict: bool) -> Result<()> {
     // xtask's own tests hold the byte-equality drift guards for the build
     // stamp files copied into combs-cli and combs-kit; nothing else runs them.
     tier("xtask", &["test", "-p", "xtask"]);
+    // The seat's crates ride every gate too, on their PURE tests: the
+    // modules that need a device (and take minutes) stay below in the
+    // full gate. Cheap, because `cli` above already compiled both crates
+    // as dependencies — measured 27 s cold for the runtime harness and
+    // 0.12 s to run. Before this, a combs-runtime test failed at HEAD
+    // for weeks and the browser build was broken, and every `--quick`
+    // said all gates passed: a gate proves only what it is configured
+    // to run, and a skipped crate is where defects go to live.
+    let rt = pure_tier_args("combs-runtime", RUNTIME_DEVICE_MODULES);
+    tier(
+        "runtime-pure",
+        &rt.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    // combs-models' pure tests: 27 of them, 0.05 s to run. The harness
+    // is 4m47s cold because the crate is ten times combs-runtime's size
+    // in test mode; 0.27 s when nothing in the crate changed, and a
+    // change to the crate pays the harness again on the order of the
+    // lib compile `cli` already pays for the same change.
+    let md = pure_tier_args("combs-models", MODELS_DEVICE_MODULES);
+    tier(
+        "models-pure",
+        &md.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    // The browser build, as a tier and not a command a person remembers
+    // to run: `cargo xtask web` was broken at HEAD for long enough that
+    // nobody could say when. A `check`, 0.99 s incremental; it shares no
+    // artifacts with the release tiers, so its cold cost is its own.
+    tier(
+        "web-check",
+        &[
+            "check",
+            "-p",
+            "combs-wasm",
+            "--target",
+            "wasm32-unknown-unknown",
+        ],
+    );
     if !quick {
         // These need a GPU adapter and take minutes; a machine without
         // one skips their GPU cases rather than failing them.
@@ -828,12 +865,93 @@ fn main() -> Result<()> {
     }
 }
 
+/// The modules of the two seat crates whose tests open a device. The
+/// quick gate skips exactly these and runs everything else, so a module
+/// named here must exist: a `--skip` that names nothing skips nothing,
+/// and the device tests would leak into every commit's gate without a
+/// word. The test below holds the list to the tree.
+const RUNTIME_DEVICE_MODULES: &[&str] = &["engine", "step", "transcribe"];
+const MODELS_DEVICE_MODULES: &[&str] = &["qlinear", "qmatmul", "qkernel", "wgsl", "kv", "whisper"];
+
+/// `cargo test` arguments for a crate's pure tests: its `--lib`, with
+/// each device module skipped by its test-path prefix.
+fn pure_tier_args(krate: &str, device_modules: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = ["test", "--release", "-p", krate, "--lib", "--"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for m in device_modules {
+        args.push("--skip".into());
+        args.push(format!("{m}::"));
+    }
+    args
+}
+
 #[cfg(test)]
 mod build_support {
+    use super::{pure_tier_args, MODELS_DEVICE_MODULES, RUNTIME_DEVICE_MODULES};
+
     /// combs-cli's build script stamps times with a committed copy of
     /// combs-core's formatter (a packaged tarball cannot include across
     /// crates). One implementation stays the law: this fails the
     /// workspace tests the moment the copy drifts by a byte.
+    /// A `--skip` that names a module which no longer exists skips
+    /// nothing, and the device tests it was meant to hold back leak into
+    /// every commit's gate — slowly on a machine with a GPU, silently on
+    /// one without. So every skipped module must be a real file in its
+    /// crate. A device-usage scan was considered and rejected: `budget`
+    /// and `system_one` mention the device and run fine, `engine` and
+    /// `step` open it and never say so, so a scan partitions nothing.
+    #[test]
+    fn every_skipped_device_module_still_exists() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask sits in the engine workspace");
+        for (krate, modules) in [
+            ("combs-runtime", RUNTIME_DEVICE_MODULES),
+            ("combs-models", MODELS_DEVICE_MODULES),
+        ] {
+            for m in modules {
+                let file = root.join(krate).join("src").join(format!("{m}.rs"));
+                let dir = root.join(krate).join("src").join(m).join("mod.rs");
+                assert!(
+                    file.exists() || dir.exists(),
+                    "{krate}: `--skip {m}::` names no module ({} / {}) — the device tests \
+                     it held back now run on every gate",
+                    file.display(),
+                    dir.display()
+                );
+            }
+            // And the skip list is not the whole crate: there must be
+            // something left to run, or the tier is theatre.
+            let src = root.join(krate).join("src");
+            let modules_in_tree = std::fs::read_dir(&src)
+                .expect("src")
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
+                .count();
+            assert!(
+                modules_in_tree > modules.len(),
+                "{krate}: everything is skipped"
+            );
+        }
+        // The args come out in the shape cargo reads.
+        let args = pure_tier_args("combs-runtime", &["engine"]);
+        assert_eq!(
+            args,
+            [
+                "test",
+                "--release",
+                "-p",
+                "combs-runtime",
+                "--lib",
+                "--",
+                "--skip",
+                "engine::"
+            ]
+        );
+    }
+
     #[test]
     fn the_cli_build_stamp_formatter_matches_combs_core() {
         let original = include_str!("../../combs-core/src/timefmt.rs");
