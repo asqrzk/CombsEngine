@@ -142,6 +142,7 @@ pub(crate) fn config_fields(
     dtype: &str,
     fusion: bool,
     rendering: Rendering,
+    context_size_given: bool,
     extra: &[(&'static str, String)],
 ) -> Vec<(&'static str, String)> {
     let mut fields = vec![
@@ -162,6 +163,11 @@ pub(crate) fn config_fields(
         // Said out loud because it is the whole difference: this seat
         // holds no KV arena at all.
         ("kv_arena", "none (this seat decodes nothing)".to_string()),
+        // A caller who passed --context-size is told once, HERE, on the
+        // line a record copies — not shouted to stderr on every start
+        // where a log reader must decide whether a warning matters. The
+        // field is absent when nothing was passed, so a line that
+        // carries it says a real flag was ignored.
         // WHICH ROAD THE OPTIONS REACH THE SCORER BY. Said on the line
         // because §137 and §138 compared arms that differed in exactly
         // this and no record could tell: one scored the option's name,
@@ -170,6 +176,12 @@ pub(crate) fn config_fields(
         ("render", rendering.as_str().to_string()),
         ("road", rendering.road().as_str().to_string()),
     ];
+    if context_size_given {
+        fields.push((
+            "context_size",
+            "ignored (this seat holds no KV arena)".to_string(),
+        ));
+    }
     fields.extend(extra.iter().cloned());
     fields
 }
@@ -701,6 +713,7 @@ pub fn serve(
     engine: DecisionEngine,
     warm: WarmReport,
     rendering: Rendering,
+    context_size_given: bool,
     addr: &str,
 ) -> Result<()> {
     let server = tiny_http::Server::http(addr).map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
@@ -728,6 +741,7 @@ pub fn serve(
             combs_core::BACKEND.dtype,
             combs_core::BACKEND.fusion,
             rendering,
+            context_size_given,
             &extra,
         ),
     );
@@ -825,6 +839,29 @@ mod tests {
 
     use std::io::Read;
     use std::time::Duration;
+
+    /// `--context-size` is a generative flag; a decision seat holds no
+    /// KV arena and ignores it. It used to be shouted to stderr on every
+    /// start that passed it — a warning a log reader has to weigh, and
+    /// one the supervisor passes unconditionally, so it fired on every
+    /// gateway-spawned seat. It belongs on the line a record copies,
+    /// once, beside the `kv_arena` field that says why: one fact, not an
+    /// alarm. A line that carries it says a real flag was ignored; a
+    /// line without it says none was passed.
+    #[test]
+    fn a_context_size_handed_to_a_decision_seat_is_said_on_the_line_not_shouted() {
+        let field = |given: bool| {
+            config_fields("m", "f16", false, Rendering::default(), given, &[])
+                .into_iter()
+                .find(|(k, _)| *k == "context_size")
+                .map(|(_, v)| v)
+        };
+        assert_eq!(
+            field(true).as_deref(),
+            Some("ignored (this seat holds no KV arena)")
+        );
+        assert_eq!(field(false), None, "a flag nobody passed is not a field");
+    }
 
     /// A warm-up pass is a rectangle AND a marker width; a record that
     /// says only the rectangle cannot tell whether the first real
@@ -1302,7 +1339,7 @@ mod tests {
             (Rendering::LabelMeans, "normal"),
             (Rendering::LabelAnchors, "semantic"),
         ] {
-            let fields = config_fields("m", "f16", false, r, &[]);
+            let fields = config_fields("m", "f16", false, r, false, &[]);
             let get = |k: &str| {
                 fields
                     .iter()
@@ -1325,6 +1362,7 @@ mod tests {
             "f16",
             false,
             Rendering::default(),
+            false,
             &[("backend", "f16 · fusion off".to_string())],
         );
         let get = |k: &str| {
