@@ -65,7 +65,15 @@ pub(crate) struct Question {
 pub(crate) struct Request {
     pub(crate) state: String,
     pub(crate) questions: Vec<Question>,
-    pub(crate) temperature: f32,
+    /// The caller's own temperature, when they sent one.
+    ///
+    /// `None` is "the caller said nothing", which the cosine road reads
+    /// as [`DEFAULT_TEMPERATURE`] and the marker road refuses to guess
+    /// at: that seat's temperature is the checkpoint's fitted
+    /// calibration, so a caller's number could not be applied without
+    /// making `calibrated: {source: "checkpoint"}` a false claim. The
+    /// two roads cannot share a default they disagree about.
+    pub(crate) temperature: Option<f32>,
     pub(crate) thresholds: Thresholds,
 }
 
@@ -335,14 +343,19 @@ pub(crate) fn parse_request(body: &str) -> Result<Request, (u16, Value)> {
         });
     }
 
-    let temperature = v
-        .get("temperature")
-        .and_then(Value::as_f64)
-        .map(|t| t as f32)
-        .unwrap_or(DEFAULT_TEMPERATURE);
-    if !(temperature.is_finite() && temperature > 0.0) {
-        return Err(bad("`temperature` must be a positive number"));
-    }
+    let temperature = match v.get("temperature") {
+        None | Some(Value::Null) => None,
+        Some(t) => {
+            let t = t
+                .as_f64()
+                .map(|t| t as f32)
+                .ok_or_else(|| bad("`temperature` must be a positive number"))?;
+            if !(t.is_finite() && t > 0.0) {
+                return Err(bad("`temperature` must be a positive number"));
+            }
+            Some(t)
+        }
+    };
 
     let mut thresholds = Thresholds::default();
     if let Some(t) = v.get("thresholds") {
@@ -416,7 +429,10 @@ pub fn handle_classify(
             ("questions", req.questions.len().to_string()),
             ("state_len", req.state.len().to_string()),
             ("state_fnv", format!("{:016x}", fnv1a(req.state.as_bytes()))),
-            ("temperature", format!("{:.4}", req.temperature)),
+            (
+                "temperature",
+                format!("{:.4}", req.temperature.unwrap_or(DEFAULT_TEMPERATURE)),
+            ),
         ],
     );
 
@@ -505,7 +521,7 @@ pub fn handle_classify(
         };
         let state_vec = &out.vectors[state_at[qi]];
         let sims: Vec<f32> = vectors.iter().map(|v| cosine(state_vec, v)).collect();
-        let p = softmax_scaled(&sims, req.temperature);
+        let p = softmax_scaled(&sims, req.temperature.unwrap_or(DEFAULT_TEMPERATURE));
         if let Err(e) = check_distribution(&p) {
             let why = format!("question {:?}: {e}", q.name);
             turn.failed(&why);
@@ -576,7 +592,7 @@ pub fn handle_classify(
             "confidence": conf,
             "margin": margin,
             "calibrated": false,
-            "temperature": req.temperature,
+            "temperature": req.temperature.unwrap_or(DEFAULT_TEMPERATURE),
             "decision": decision.word(),
             "reason": match &decision { Decision::Act => Value::Null, d => json!(d.reason()) },
             "implications": implications.iter().map(|i| json!({
@@ -648,6 +664,41 @@ mod tests {
     /// The seventeenth question is refused before any is scored, by
     /// name and with the number: a System 1 seat would have run all
     /// seventeen as one batch with nothing to stop it.
+    /// A caller's temperature and the cosine road's default are not the
+    /// same fact. Collapsing them at parse time cost the marker seat the
+    /// ability to tell them apart — so it dropped the caller's value and
+    /// echoed the checkpoint's under the same key.
+    #[test]
+    fn a_temperature_is_absent_when_the_caller_sent_none() {
+        let with = r#"{"state":"x","temperature":2.0,"questions":[
+            {"name":"q","type":"choice","options":[
+              {"id":"a","tether":{"means":"the first thing"}},
+              {"id":"b","tether":{"means":"the second thing"}}]}]}"#;
+        assert_eq!(parse_request(with).expect("valid").temperature, Some(2.0));
+
+        let without = r#"{"state":"x","questions":[
+            {"name":"q","type":"choice","options":[
+              {"id":"a","tether":{"means":"the first thing"}},
+              {"id":"b","tether":{"means":"the second thing"}}]}]}"#;
+        assert_eq!(parse_request(without).expect("valid").temperature, None);
+
+        // An explicit null is "said nothing", not "said zero".
+        let null = without.replace(r#""state":"x""#, r#""state":"x","temperature":null"#);
+        assert_eq!(parse_request(&null).expect("valid").temperature, None);
+
+        // And a nonsense value is still refused by name, as before.
+        let bad = without.replace(r#""state":"x""#, r#""state":"x","temperature":0"#);
+        let Err((_, v)) = parse_request(&bad) else {
+            panic!("zero is not a temperature")
+        };
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("temperature")),
+            "{v}"
+        );
+    }
+
     #[test]
     fn seventeen_questions_are_refused_before_any_is_scored() {
         // Each question is WELL FORMED, so the cap is what refuses the

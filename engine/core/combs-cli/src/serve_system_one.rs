@@ -271,6 +271,32 @@ fn answer_guarded(counters: &Counters, compose: impl FnOnce() -> Value) -> Value
     }
 }
 
+/// Refuses a temperature this seat will not apply.
+///
+/// It used to be parsed, validated, dropped, and then the CHECKPOINT's
+/// value echoed back under the same key — so a caller who sent 2.0 was
+/// told 1.0000159 with no way to know their number had gone nowhere.
+/// This seat's answer claims `calibrated: true` with
+/// `source: "checkpoint"`; applying a caller's scale would make that
+/// claim false, and ignoring one quietly makes the echo a lie. Any
+/// temperature is re-derivable offline from the `similarities` the
+/// answer already carries, which is what a sweep does.
+fn refuse_unappliable_temperature(
+    req: &crate::classify::Request,
+    counters: &Counters,
+) -> std::result::Result<(), Value> {
+    if req.temperature.is_none() {
+        return Ok(());
+    }
+    counters.errors.fetch_add(1, Ordering::Relaxed);
+    Err(
+        json!({"_status": 400, "_body": {"error": {"type": "invalid_request", "message":
+        "this seat will not take a temperature: its scale is the checkpoint's fitted \
+         calibration, reported per answer under `calibration`. Sweep offline from the \
+         `similarities` in the answer instead."}}}),
+    )
+}
+
 /// Refuses a body that tries to choose its own rendering.
 ///
 /// Pure, and it names the door rather than the field: a caller who wants
@@ -450,6 +476,9 @@ fn classify(engine: &DecisionEngine, counters: &Counters, body: &str, seat: Rend
     if let Err(why) = refuse_render_key(body) {
         counters.errors.fetch_add(1, Ordering::Relaxed);
         return json!({"_status": 400, "_body": {"error": {"type": "invalid_request", "message": why}}});
+    }
+    if let Err(v) = refuse_unappliable_temperature(&req, counters) {
+        return v;
     }
     let rendering = seat;
     let questions: Vec<DecisionQuestion> = req
@@ -651,6 +680,36 @@ pub fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The seat parsed a temperature, validated it, threw it away, and
+    /// echoed the checkpoint's under the same key — so a caller who sent
+    /// 2.0 was told 1.0000159 and could not tell their number had gone
+    /// nowhere. Refusing says so; ignoring made the echo a lie.
+    #[test]
+    fn a_temperature_the_seat_will_not_apply_is_refused_not_echoed() {
+        let body = r#"{"state":"x","temperature":2.0,"questions":[
+            {"name":"q","type":"choice","options":[
+              {"id":"a","tether":{"means":"the first thing"}},
+              {"id":"b","tether":{"means":"the second thing"}}]}]}"#;
+        let req = crate::classify::parse_request(body).expect("a well-formed request");
+        assert_eq!(req.temperature, Some(2.0), "the parser keeps what was sent");
+
+        // The refusal names the road out: the answer already carries the
+        // logits a sweep would re-derive a temperature from.
+        let counters = Counters::default();
+        let v = refuse_unappliable_temperature(&req, &counters).expect_err("a temperature");
+        assert_eq!(v["_status"], 400);
+        let msg = v["_body"]["error"]["message"].as_str().expect("a message");
+        assert!(msg.contains("checkpoint"), "{msg}");
+        assert!(msg.contains("similarities"), "{msg}");
+        assert_eq!(counters.errors.load(Ordering::Relaxed), 1);
+
+        // Without one, nothing is refused.
+        let plain = body.replace(r#""temperature":2.0,"#, "");
+        let req = crate::classify::parse_request(&plain).expect("a well-formed request");
+        assert!(refuse_unappliable_temperature(&req, &counters).is_ok());
+        assert_eq!(counters.errors.load(Ordering::Relaxed), 1);
+    }
 
     /// The runtime's guard covers the forward pass; this one covers
     /// everything the seat does with the result. Before it, a bug in our
