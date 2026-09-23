@@ -439,8 +439,11 @@ pub struct AgentConfig {
     /// How much of it the instructions and the option markers may take
     /// before the state gets what is left.
     pub head_max_len: usize,
-    /// Layers in the transformer head over the markers.
-    pub head_layers: usize,
+    /// Layers in the transformer head over the markers, when the config
+    /// states them. Absent is NOT two: the weights carry the count
+    /// (`head.layers.{j}.*`), the model reads it off them, and a config
+    /// that states a different number is refused at load.
+    pub head_layers: Option<usize>,
     /// Acts the head chooses between: one per priced act, plus the one
     /// that costs nothing — answering.
     pub num_acts: usize,
@@ -497,7 +500,19 @@ impl AgentConfig {
         Ok(Self {
             max_len: usize_at("max_len", 512),
             head_max_len: usize_at("head_max_len", 192),
-            head_layers: usize_at("head_layers", 2),
+            head_layers: match v.get("head_layers") {
+                None => None,
+                Some(raw) => Some(
+                    raw.as_u64()
+                        .filter(|&n| n >= 1)
+                        .map(|n| n as usize)
+                        .ok_or_else(|| {
+                            format!(
+                                "rl_agent_config.json: `head_layers` must be a positive integer, got {raw}"
+                            )
+                        })?,
+                ),
+            },
             // One act per price, plus answering, which is priced at
             // nothing and is not in the table.
             num_acts: v
@@ -827,7 +842,7 @@ mod tests {
         let cfg = shipped();
         assert_eq!(cfg.max_len, 1024);
         assert_eq!(cfg.head_max_len, 256);
-        assert_eq!(cfg.head_layers, 2);
+        assert_eq!(cfg.head_layers, Some(2));
         // `act_costs` prices one act; answering is the other.
         assert_eq!(cfg.num_acts, 2);
 
@@ -869,12 +884,39 @@ mod tests {
         assert!((clamp_temperature(1.7601518630981445) as f64 - 1.7601518630981445).abs() < 1e-7);
     }
 
+    /// `head_layers` used to default to 2 in silence: a three-layer
+    /// checkpoint without the key loaded two layers and answered wrongly
+    /// without a word. Absent is now absent — the weights say how deep
+    /// the head is — and a value that is there but unusable is refused
+    /// by name, as every other key on this wire is.
+    #[test]
+    fn a_config_without_head_layers_names_none_not_two() {
+        assert_eq!(AgentConfig::parse("{}").expect("parses").head_layers, None);
+        assert_eq!(
+            AgentConfig::parse(r#"{"head_layers": 3}"#)
+                .expect("parses")
+                .head_layers,
+            Some(3)
+        );
+        for bad in [
+            r#"{"head_layers": "two"}"#,
+            r#"{"head_layers": 0}"#,
+            r#"{"head_layers": -1}"#,
+        ] {
+            let why = AgentConfig::parse(bad).expect_err("an unusable head_layers is refused");
+            assert!(
+                why.contains("head_layers"),
+                "the refusal names the key: {why}"
+            );
+        }
+    }
+
     #[test]
     fn a_config_without_a_calibration_is_neutral_rather_than_refused() {
         let cfg = AgentConfig::parse("{}").expect("an empty config still names its defaults");
         assert_eq!(cfg.max_len, 512);
         assert_eq!(cfg.head_max_len, 192);
-        assert_eq!(cfg.head_layers, 2);
+        assert_eq!(cfg.head_layers, None, "absent is absent, not two");
         assert_eq!(cfg.num_acts, 1);
         assert_eq!(cfg.calibration.temperature(Kind::Choice, 4), NEUTRAL);
         assert!(cfg.calibration.clamped().is_empty());

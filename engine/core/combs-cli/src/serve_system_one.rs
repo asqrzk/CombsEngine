@@ -33,17 +33,32 @@ use serde_json::{json, Value};
 
 /// Does this directory hold a decision model rather than a decoder?
 ///
+/// What a model directory is, by its CONFIG, before anything is opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeatKind {
+    /// A laya typed-decision checkpoint: the encoder's config under
+    /// `encoder/`, or a flat ModernBERT with `rl_agent_config.json`
+    /// beside it.
+    Decision,
+    /// Anything else — the generative road opens it, or refuses it.
+    Generative,
+}
+
 /// By the CONFIG, before anything is opened: a laya checkpoint's config
 /// lives under `encoder/`, which a generative reader would not find at
-/// all, and a flat one names `modernbert` as its architecture.
-pub fn is_decision_seat(dir: &Path) -> bool {
+/// all, and a flat one names `modernbert` as its architecture. A flat
+/// ModernBERT WITHOUT laya's `rl_agent_config.json` is an encoder with
+/// no head — it can embed, it cannot decide — and this seat has no road
+/// for it: it is refused here by name, before a weight is read, rather
+/// than at load after 842 MB with no road left.
+pub fn seat_kind(dir: &Path) -> Result<SeatKind, String> {
     if !dir.is_dir() {
-        return false;
+        return Ok(SeatKind::Generative);
     }
     if dir.join("encoder/config.json").exists() {
-        return true;
+        return Ok(SeatKind::Decision);
     }
-    std::fs::read_to_string(dir.join("config.json"))
+    let flat_modernbert = std::fs::read_to_string(dir.join("config.json"))
         .ok()
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
         .and_then(|v| {
@@ -51,7 +66,18 @@ pub fn is_decision_seat(dir: &Path) -> bool {
                 .and_then(|m| m.as_str())
                 .map(str::to_string)
         })
-        .is_some_and(|m| m == "modernbert")
+        .is_some_and(|m| m == "modernbert");
+    if !flat_modernbert {
+        return Ok(SeatKind::Generative);
+    }
+    if dir.join("rl_agent_config.json").exists() {
+        return Ok(SeatKind::Decision);
+    }
+    Err(format!(
+        "{}: a ModernBERT encoder without laya's head (no rl_agent_config.json beside \
+         config.json) — it can embed but not decide, and this seat has no embedding road for it",
+        dir.display()
+    ))
 }
 
 /// What this seat calls its scorer, everywhere it says so.
@@ -680,6 +706,55 @@ pub fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A flat ModernBERT without laya's head used to be routed to this
+    /// seat by its `model_type` alone and die at load, after the read,
+    /// with no road left. It is an encoder — it can embed, not decide —
+    /// and it is refused here by name before a weight is opened.
+    #[test]
+    fn an_encoder_without_a_head_is_refused_before_load() {
+        let root = std::env::temp_dir().join(format!("combs-seat-kind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let flat = root.join("flat");
+        std::fs::create_dir_all(&flat).expect("a scratch dir");
+        std::fs::write(flat.join("config.json"), r#"{"model_type":"modernbert"}"#).expect("config");
+        let why = seat_kind(&flat).expect_err("an encoder without a head is refused");
+        assert!(
+            why.contains("rl_agent_config.json") && why.contains("embed"),
+            "the refusal names what is missing and what the model can do: {why}"
+        );
+        std::fs::write(flat.join("rl_agent_config.json"), "{}").expect("agent config");
+        assert_eq!(
+            seat_kind(&flat),
+            Ok(SeatKind::Decision),
+            "with laya's head beside it, a seat"
+        );
+
+        let laya = root.join("laya");
+        std::fs::create_dir_all(laya.join("encoder")).expect("a scratch dir");
+        std::fs::write(
+            laya.join("encoder/config.json"),
+            r#"{"model_type":"modernbert"}"#,
+        )
+        .expect("config");
+        assert_eq!(
+            seat_kind(&laya),
+            Ok(SeatKind::Decision),
+            "laya's own layout is a seat"
+        );
+
+        let generative = root.join("gen");
+        std::fs::create_dir_all(&generative).expect("a scratch dir");
+        std::fs::write(generative.join("config.json"), r#"{"model_type":"qwen3"}"#)
+            .expect("config");
+        assert_eq!(seat_kind(&generative), Ok(SeatKind::Generative));
+        assert_eq!(
+            seat_kind(&root.join("missing")),
+            Ok(SeatKind::Generative),
+            "not a dir: the generative road decides"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// The seat parsed a temperature, validated it, threw it away, and
     /// echoed the checkpoint's under the same key — so a caller who sent

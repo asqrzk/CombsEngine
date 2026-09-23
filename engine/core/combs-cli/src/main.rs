@@ -574,7 +574,8 @@ fn cmd_serve(
     // refusal happening for real — 2,272 MB of weights plus a
     // generation-sized 7,168 MB arena against 9,694 MB free — and the
     // preflight was right; the arena was simply never for this seat.
-    if serve_system_one::is_decision_seat(&model) {
+    let seat = serve_system_one::seat_kind(&model).map_err(|why| anyhow::anyhow!(why))?;
+    if seat == serve_system_one::SeatKind::Decision {
         if context_size.is_some() {
             eprintln!(
                 "combs serve: --context-size is ignored by a System 1 seat: it holds no KV arena"

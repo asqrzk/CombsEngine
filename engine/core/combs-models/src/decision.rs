@@ -158,9 +158,24 @@ pub struct LayaModel<B: Backend> {
     head_heads: usize,
 }
 
+/// How deep the head in these weights is: the number of `j` for which
+/// `head.layers.{j}.norm1.weight` exists, counted contiguously from 0.
+/// A gap ends the count (a checkpoint with layers 0 and 2 has one).
+pub fn head_depth(names: &[String]) -> usize {
+    (0..)
+        .take_while(|j| {
+            names
+                .iter()
+                .any(|n| n == &format!("head.layers.{j}.norm1.weight"))
+        })
+        .count()
+}
+
 impl<B: Backend> LayaModel<B> {
-    /// Loads the whole checkpoint. `head_layers` comes from
-    /// `rl_agent_config.json`, which this crate does not parse.
+    /// Loads the whole checkpoint. The head's depth is read off the
+    /// weights (`head.layers.{j}.*`); `head_layers` is what
+    /// `rl_agent_config.json` states, if it states it, and a stated depth
+    /// that disagrees with the weights is refused naming both.
     ///
     /// `metadata` is handed over rather than read off the source: a laya
     /// checkpoint keeps its encoder config under `encoder/` while its
@@ -170,7 +185,7 @@ impl<B: Backend> LayaModel<B> {
         source: &dyn ModelSource,
         device: &Device<B>,
         metadata: ModelMetadata,
-        head_layers: usize,
+        head_layers: Option<usize>,
     ) -> Result<Self> {
         let cfg = metadata.encoder.clone().ok_or_else(|| {
             ModelError::Unsupported(format!(
@@ -199,6 +214,27 @@ impl<B: Backend> LayaModel<B> {
             })
         };
 
+        // The head's depth is a fact of the weights: `head.layers.{j}.*`
+        // exists for exactly the layers there are. A config may state it;
+        // one that states it wrongly is refused rather than trusted,
+        // because a two-layer head loaded over three layers of weights
+        // answers — wrongly, and without a word.
+        let counted = head_depth(&source.tensor_names());
+        if counted == 0 {
+            return Err(ModelError::Unsupported(
+                "no `head.layers.*` in the weights: an encoder without laya's head cannot decide"
+                    .into(),
+            ));
+        }
+        let head_layers = match head_layers {
+            Some(stated) if stated != counted => {
+                return Err(ModelError::Unsupported(format!(
+                    "rl_agent_config.json states head_layers = {stated} but the weights carry \
+                     {counted} (head.layers.0..{counted}): the config disagrees with the checkpoint"
+                )));
+            }
+            _ => counted,
+        };
         let mut head = Vec::with_capacity(head_layers);
         for j in 0..head_layers {
             let l = format!("head.layers.{j}");
@@ -234,6 +270,11 @@ impl<B: Backend> LayaModel<B> {
             // least one.
             head_heads: (hidden / 64).max(1),
         })
+    }
+
+    /// The head's depth as loaded — read off the weights.
+    pub fn head_layers(&self) -> usize {
+        self.head.len()
     }
 
     /// The hidden state the scorer reads, and the pooled vector the act
@@ -419,5 +460,34 @@ impl<B: Backend> TypedDecisionModel for LayaModel<B> {
                 .map(|r| act_flat[r * n_act..(r + 1) * n_act].to_vec())
                 .collect(),
         })
+    }
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::head_depth;
+
+    #[test]
+    fn the_depth_is_the_contiguous_count_of_head_layers_in_the_weights() {
+        let names = |js: &[usize]| -> Vec<String> {
+            js.iter()
+                .flat_map(|j| {
+                    [
+                        format!("head.layers.{j}.norm1.weight"),
+                        format!("head.layers.{j}.in_proj.weight"),
+                    ]
+                })
+                .chain(["scorer.0.weight".to_string()])
+                .collect()
+        };
+        assert_eq!(head_depth(&names(&[])), 0);
+        assert_eq!(head_depth(&names(&[0])), 1);
+        assert_eq!(head_depth(&names(&[0, 1, 2])), 3);
+        assert_eq!(head_depth(&names(&[0, 2])), 1, "a gap ends the count");
+        assert_eq!(
+            head_depth(&names(&[1])),
+            0,
+            "layer 1 without layer 0 is no head"
+        );
     }
 }

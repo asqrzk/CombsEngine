@@ -224,7 +224,8 @@ fn the_heads_reproduce_layas_logits_and_its_act_decision() {
     let device = Default::default();
     let head_layers = fx["geometry"]["head_layers"].as_u64().expect("head_layers") as usize;
     let meta = combs_formats::ModelSource::metadata(&source).clone();
-    let model = LayaModel::<B>::load(&source, &device, meta, head_layers).expect("the model loads");
+    let model =
+        LayaModel::<B>::load(&source, &device, meta, Some(head_layers)).expect("the model loads");
 
     let rows: Vec<Vec<i64>> = serde_json::from_value(fx["input_ids"].clone()).expect("ids");
     let att: Vec<Vec<u8>> = serde_json::from_value(fx["attention_mask"].clone()).expect("mask");
@@ -299,4 +300,43 @@ fn the_heads_reproduce_layas_logits_and_its_act_decision() {
         "the fixture's act head is saturated, so this bound proves little: {want_act:?}"
     );
     assert!(gap <= 1e-3, "act: worst {gap:.3e} at {at}");
+}
+
+/// `head_layers` came from the config alone and defaulted to 2 in
+/// silence. The depth is a fact of the weights — `head.layers.{j}.*`
+/// exists for exactly the layers there are — so the model reads it off
+/// them, a config that agrees is fine, and one that disagrees is refused
+/// naming both numbers. The tiny fixture has one head layer.
+#[test]
+fn the_heads_depth_comes_from_the_weights_and_a_wrong_config_is_refused() {
+    let fx = fixture();
+    let dir = staged();
+    let source = SafetensorsSource::load(&dir).expect("the staged checkpoint opens");
+    let device = Default::default();
+    let meta = combs_formats::ModelSource::metadata(&source).clone();
+    let stated = fx["geometry"]["head_layers"].as_u64().expect("head_layers") as usize;
+
+    let model = LayaModel::<B>::load(&source, &device, meta.clone(), None)
+        .expect("loads with no stated depth: the weights say");
+    assert_eq!(
+        model.head_layers(),
+        stated,
+        "the depth read off the weights is the fixture's"
+    );
+
+    LayaModel::<B>::load(&source, &device, meta.clone(), Some(stated))
+        .expect("a config that agrees with the weights loads");
+
+    let why = match LayaModel::<B>::load(&source, &device, meta, Some(stated + 1)) {
+        Ok(_) => panic!(
+            "a config stating {} head layers over {stated} loaded",
+            stated + 1
+        ),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        why.contains(&format!("head_layers = {}", stated + 1))
+            && why.contains(&format!("carry {stated}")),
+        "the refusal names both numbers: {why}"
+    );
 }
