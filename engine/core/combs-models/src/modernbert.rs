@@ -222,7 +222,12 @@ impl<B: Backend> ModernBert<B> {
             let (q, k) = rotary.apply_qk(split(0), split(1), 0);
             let v = split(2);
 
-            let scores = safe_matmul(q, k.swap_dims(2, 3)) / (self.head_dim as f64).sqrt();
+            // Widened BEFORE the product, not after: see
+            // `precision::attention_scores`. This used to read
+            // `safe_matmul(q, kᵀ)` at the build's dtype with a `to_f32`
+            // on the result, which is the cast arriving after the
+            // arithmetic it protects.
+            let scores = crate::precision::attention_scores(q, k.swap_dims(2, 3), self.head_dim);
             // The scores and the mask are f32 for stability, so what
             // comes out is f32 — and `wo` below is the build's dtype.
             // Handing an f32 activation to an f16 weight is a width
@@ -230,7 +235,7 @@ impl<B: Backend> ModernBert<B> {
             // took the f16 seat down; whisper.rs:249 records that the
             // same mismatch elsewhere is NOT refused and simply answers
             // wrongly, which is the worse half of the lesson.
-            let attended = safe_matmul(softmax(to_f32(scores) + mask.clone(), 3), to_f32(v));
+            let attended = safe_matmul(softmax(scores + mask.clone(), 3), to_f32(v));
             let attended =
                 to_float(attended, h.dtype())
                     .swap_dims(1, 2)

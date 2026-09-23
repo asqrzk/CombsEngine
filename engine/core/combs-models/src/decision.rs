@@ -121,12 +121,13 @@ impl<B: Backend> TorchEncoderLayer<B> {
         };
         // No rotary here: torch's MultiheadAttention has no positional
         // term of its own, and the encoder below already placed one.
-        let scores = safe_matmul(part(0), part(1).swap_dims(2, 3)) / (head_dim as f64).sqrt();
+        // Widened before the product, as in modernbert.rs.
+        let scores = crate::precision::attention_scores(part(0), part(1).swap_dims(2, 3), head_dim);
         // Back to the build's width before `out_proj`: see the note in
         // modernbert.rs. An f32 activation into an f16 weight is a
         // dispatch the backend refuses.
         let attended = to_float(
-            safe_matmul(softmax(to_f32(scores) + pad.clone(), 3), to_f32(part(2))),
+            safe_matmul(softmax(scores + pad.clone(), 3), to_f32(part(2))),
             x.dtype(),
         )
         .swap_dims(1, 2)
