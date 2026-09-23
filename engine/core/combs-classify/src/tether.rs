@@ -89,6 +89,60 @@ fn same_meaning(text: &str) -> String {
         .to_string()
 }
 
+/// An identifier and a label reduced to the same shape, so one wearing
+/// the other's clothes is caught.
+///
+/// `request_refund`, `Request-Refund` and `request refund` are one key:
+/// the separator an identifier happens to use is not a meaning, and a
+/// scorer reads the words either way.
+fn label_key(text: &str) -> String {
+    text.to_lowercase()
+        .split(|c: char| c == '_' || c == '-' || c.is_whitespace())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether a label is a meaning-bearing word rather than a routing key.
+///
+/// The shape of an identifier is what is refused: `_`, a digit, and the
+/// `:` / `[` / `]` the sequence itself uses — a `:` in a label forges a
+/// second `label: criterion` slot in the text the model reads. What is
+/// allowed is what laya's own presets use: one to three ordinary words,
+/// hyphens inside a word, short enough to be a name.
+fn looks_like_an_identifier(label: &str) -> Option<String> {
+    const MAX: usize = 24;
+    if label.chars().count() > MAX {
+        return Some(format!(
+            "it is {} characters, past the {MAX} a name fits in",
+            label.chars().count()
+        ));
+    }
+    if let Some(c) = label.chars().find(|c| matches!(c, '_' | ':' | '[' | ']')) {
+        return Some(match c {
+            '_' => "it is spelled with underscores, which is how identifiers are spelled".to_string(),
+            _ => format!("it carries a {c:?}, which the option text uses to separate a label from its criterion"),
+        });
+    }
+    if label.chars().any(|c| c.is_ascii_digit()) {
+        return Some("it carries a digit, and a version or an index is not a meaning".to_string());
+    }
+    let words: Vec<&str> = label.split_whitespace().filter(|w| !w.is_empty()).collect();
+    if words.len() > 3 {
+        return Some(format!(
+            "it is {} words: a label names the option, the criterion explains it",
+            words.len()
+        ));
+    }
+    if !label
+        .chars()
+        .all(|c| c.is_alphabetic() || c == '-' || c.is_whitespace())
+    {
+        return Some("it is not made of words".to_string());
+    }
+    None
+}
+
 /// Refuse a question's options by name, before anything is scored.
 ///
 /// `declared` is every question name in the same request, so an
@@ -127,11 +181,38 @@ pub fn validate(opts: &[Opt], declared: &[String], max_options: usize) -> Result
                     o.id
                 ));
             }
-            if label == o.id {
+            // The whole point of the label slot is that a scorer MAY
+            // read it. So it has to be a meaning, and the rule cannot be
+            // `label == id`: `escalate_unsubscription` on
+            // `escalate_user_planning_unsubscription` is the same topic
+            // in a shorter coat, and word overlap is word overlap.
+            if let Some(why) = looks_like_an_identifier(label) {
                 return Err(format!(
-                    "option \"{}\" labels itself with its own identifier: an identifier is a topic, \
-                     not a meaning, and a scorer that reads it matches by word overlap",
+                    "option \"{}\" carries the label {label:?}, which reads as an identifier: \
+                     {why}. A label is a short meaning-bearing word a scorer may read — laya's \
+                     own presets use `refund`, `billing` — and an identifier is a topic that \
+                     matches by word overlap.",
                     o.id
+                ));
+            }
+            let key = label_key(label);
+            if let Some(twin) = opts.iter().find(|p| label_key(&p.id) == key) {
+                return Err(format!(
+                    "option \"{}\" labels itself {label:?}, which is option \"{}\"'s identifier \
+                     in another spelling: an identifier is a topic, not a meaning, and a scorer \
+                     that reads it matches by word overlap",
+                    o.id, twin.id
+                ));
+            }
+            if let Some(prev) = opts[..i]
+                .iter()
+                .filter_map(|p| p.tether.label.as_deref().map(|l| (p, l)))
+                .find(|(_, l)| label_key(l) == key)
+            {
+                return Err(format!(
+                    "options \"{}\" and \"{}\" both label themselves {label:?}: two options a \
+                     scorer cannot tell apart are one option",
+                    prev.0.id, o.id
                 ));
             }
         }

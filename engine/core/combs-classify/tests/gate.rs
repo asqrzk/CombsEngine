@@ -251,6 +251,70 @@ fn seventy_seven_options_refuse_by_name() {
 }
 
 #[test]
+/// The label slot exists so a scorer MAY read it, which is exactly why
+/// it cannot hold a routing key. `label == id` caught only the laziest
+/// spelling: `escalate_unsubscription` on
+/// `escalate_user_planning_unsubscription` is the same topic in a
+/// shorter coat, and word overlap does not care about the difference.
+fn a_label_cannot_be_an_identifier_in_disguise() {
+    let opt = |id: &str, label: Option<&str>| Opt {
+        id: id.to_string(),
+        tether: Tether {
+            means: format!("what {id} means, at some length"),
+            not: Vec::new(),
+            requires: Vec::new(),
+            label: label.map(str::to_string),
+        },
+    };
+    let refused = |opts: &[Opt]| -> String {
+        combs_classify::tether::validate(opts, &[], 64).expect_err("refused")
+    };
+
+    // The shape of an identifier, however it is spelled.
+    for bad in [
+        "request_refund",
+        "refund_v2",
+        "refund2",
+        "yes: refund",
+        "a much longer label than any name",
+        "cancel the subscription entirely now",
+    ] {
+        let why = refused(&[opt("some_option", Some(bad))]);
+        assert!(why.contains("some_option"), "{bad}: {why}");
+        assert!(why.contains(&format!("{bad:?}")), "{bad}: {why}");
+    }
+
+    // A sibling's identifier, in a separator that passes the shape rule
+    // — these reach the sibling check and must name the option they are
+    // wearing. (`REQUEST_REFUND` never gets that far: the underscore
+    // rule above refuses it first, which is why it is not in this list.)
+    for disguise in ["request refund", "Request-Refund"] {
+        let opts = [opt("request_refund", None), opt("other", Some(disguise))];
+        let why = combs_classify::tether::validate(&opts, &[], 64).expect_err("a sibling's id");
+        assert!(why.contains("request_refund"), "{disguise}: {why}");
+    }
+    // Refused either way, whichever rule gets there first.
+    let shouty = [
+        opt("request_refund", None),
+        opt("other", Some("REQUEST_REFUND")),
+    ];
+    assert!(combs_classify::tether::validate(&shouty, &[], 64).is_err());
+
+    // Two options a scorer could not tell apart are one option.
+    let twins = [opt("a", Some("refund")), opt("b", Some("Refund"))];
+    assert!(combs_classify::tether::validate(&twins, &[], 64).is_err());
+
+    // What laya's own presets look like still passes — including the
+    // crate's own example, a `refund` label on a `request_refund` id,
+    // which a token-of-the-id rule would have refused.
+    for good in ["refund", "billing", "money back", "not-billing"] {
+        let opts = [opt("request_refund", Some(good)), opt("other_thing", None)];
+        combs_classify::tether::validate(&opts, &[], 64)
+            .unwrap_or_else(|e| panic!("{good} is a meaning, not an identifier: {e}"));
+    }
+}
+
+#[test]
 fn the_ev_sweep_finds_the_threshold_that_minimises_it() {
     // A table where the cheap system is right exactly when its
     // confidence is at least 0.6, and the dear one is always right.
