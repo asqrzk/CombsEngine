@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
+use combs_classify::sequence::Cut;
 use combs_classify::system_one::{criteria_for, Criteria, Rendering};
 use combs_classify::{decide, expected_level, Decision, Implication, Kind};
 use combs_runtime::{DecisionEngine, DecisionQuestion, WarmReport};
@@ -111,6 +112,26 @@ pub(crate) fn rendering_door(value: Option<&str>) -> Result<Rendering, String> {
 /// The door as the environment holds it.
 pub fn seat_rendering() -> Result<Rendering, String> {
     rendering_door(std::env::var(RENDER_DOOR).ok().as_deref())
+}
+
+/// Which end of a state longer than its room the seat keeps. Read before
+/// the weights and refused by name; unset keeps the beginning, which is
+/// how every sealed record was taken.
+pub const STATE_CUT_DOOR: &str = "COMBS_CLASSIFY_STATE_CUT";
+
+/// Resolves the state-cut door's value, pure so the refusal can be tested
+/// without an environment.
+pub(crate) fn state_cut_door(value: Option<&str>) -> Result<Cut, String> {
+    match value {
+        None => Ok(Cut::Right),
+        Some(v) if v.trim().is_empty() => Ok(Cut::Right),
+        Some(v) => Cut::parse(v.trim()).map_err(|why| format!("{STATE_CUT_DOOR}: {why}")),
+    }
+}
+
+/// The door as the environment holds it.
+pub fn seat_state_cut() -> Result<Cut, String> {
+    state_cut_door(std::env::var(STATE_CUT_DOOR).ok().as_deref())
 }
 
 /// The config line's fields, composed without a device so a test can read
@@ -563,6 +584,7 @@ fn stats_json(
     counters: &Counters,
     model_panics: u64,
     rendering: Rendering,
+    state_cut: Cut,
     warm_up: &Value,
 ) -> Value {
     json!({
@@ -588,6 +610,7 @@ fn stats_json(
             "last_ms": counters.last_ms.load(Ordering::Relaxed),
             "render": rendering.as_str(),
             "road": rendering.road().as_str(),
+            "state_cut": state_cut.as_str(),
             // Non-zero is PERMANENT and deliberate. A seat
             // that ever faulted carries the fact here for
             // the life of the process, because a sitting
@@ -671,6 +694,8 @@ pub fn serve(
 
     let mut extra: Vec<(&'static str, String)> = vec![
         ("backend", combs_core::backend_line()),
+        // Which end of a long state this seat keeps — the door's word.
+        ("state_cut", engine.limits().cut.as_str().to_string()),
         (
             "warm_up",
             format!("{} passes, {} ms", warm.passes.len(), warm.total_ms),
@@ -738,6 +763,7 @@ pub fn serve(
                     &counters,
                     engine.panics(),
                     rendering,
+                    engine.limits().cut,
                     &warm_json,
                 ),
             ),
@@ -790,6 +816,21 @@ mod tests {
     use std::io::Read;
     use std::time::Duration;
 
+    /// The state-cut door: two words; unset keeps the beginning every
+    /// sealed record was taken with; anything else is refused naming the
+    /// door.
+    #[test]
+    fn the_state_cut_door_takes_two_words_and_names_itself_otherwise() {
+        assert_eq!(state_cut_door(None), Ok(Cut::Right));
+        assert_eq!(state_cut_door(Some("")), Ok(Cut::Right));
+        assert_eq!(state_cut_door(Some(" left ")), Ok(Cut::Left));
+        let why = state_cut_door(Some("middle")).expect_err("refused");
+        assert!(
+            why.contains("COMBS_CLASSIFY_STATE_CUT") && why.contains("middle"),
+            "{why}"
+        );
+    }
+
     /// A sitting copies `/v1/stats` into its record, and `build-info
     /// --refuse-dirty` can only be graded from a record that names the
     /// build. The generative seat has carried `build_manifest` and
@@ -801,7 +842,7 @@ mod tests {
         let counters = Counters::default();
         counters.requests.fetch_add(3, Ordering::Relaxed);
         let warm = json!({"total_ms": 1});
-        let stats = stats_json(7, &counters, 0, Rendering::LabelAnchors, &warm);
+        let stats = stats_json(7, &counters, 0, Rendering::LabelAnchors, Cut::Left, &warm);
         let manifest = &stats["build_manifest"];
         assert!(
             manifest["git"]["short"].is_string(),
@@ -837,6 +878,7 @@ mod tests {
         }
         assert_eq!(classify["requests"], 3);
         assert_eq!(classify["road"], "semantic");
+        assert_eq!(classify["state_cut"], "left");
         assert_eq!(stats["uptime_s"], 7);
         assert_eq!(stats["warm_up"]["total_ms"], 1);
     }

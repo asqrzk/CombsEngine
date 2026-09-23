@@ -114,6 +114,14 @@ pub const DOORS: &[Door] = &[
     },
     Door {
         kind: Kind::Knob,
+        name: "COMBS_CLASSIFY_STATE_CUT",
+        default: "right",
+        does: "which end of a state longer than its room a System 1 seat keeps: `right` keeps the beginning (laya's agent, every sealed record), `left` keeps the end (laya's own `truncate_left`, where a pasted conversation's ask usually is); what is cut is counted either way",
+        read_at: "combs-cli/src/serve_system_one.rs",
+        measured: None,
+    },
+    Door {
+        kind: Kind::Knob,
         name: "COMBS_TOOL_DIALECT",
         default: "unset",
         does: "names the tool-call dialect this seat speaks, outranking both the card beside the weights and the chat template's own evidence. Set it when a model's template lies about its phrasing, or to shut tool parsing off entirely with `none`. An unknown name is refused at load, naming every name that would have worked",

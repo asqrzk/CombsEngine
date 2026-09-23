@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use combs_classify::sequence::{
-    build_sequence, collate, DecisionBatch, Encode, Limits, QuestionUsage, Sequence, Specials,
+    build_sequence, collate, Cut, DecisionBatch, Encode, Limits, QuestionUsage, Sequence, Specials,
 };
 use combs_classify::system_one::{
     engine_order, readout, render_options, AgentConfig, Calibration, Criteria,
@@ -402,6 +402,7 @@ impl DecisionEngine {
             limits: Limits {
                 max_len: agent.max_len,
                 head_max_len: agent.head_max_len,
+                cut: Cut::Right,
             },
             specials: Specials {
                 cls: encoder.cls_id,
@@ -429,6 +430,13 @@ impl DecisionEngine {
     /// The two length budgets this seat answers within.
     pub fn limits(&self) -> Limits {
         self.limits
+    }
+
+    /// Which end of a long state this seat keeps — the door's, read by
+    /// the seat before the weights and handed here after them.
+    pub fn with_state_cut(mut self, cut: Cut) -> Self {
+        self.limits.cut = cut;
+        self
     }
 
     /// Runs the model over `shapes` before any request arrives, so the
@@ -746,6 +754,7 @@ mod tests {
         let shapes = default_warm_shapes(Limits {
             max_len: 300,
             head_max_len: 192,
+            cut: Cut::Right,
         });
         assert!(shapes.iter().all(|&(_, len)| len <= 300), "{shapes:?}");
         let mut seen = std::collections::HashSet::new();

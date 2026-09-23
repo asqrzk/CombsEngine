@@ -180,6 +180,7 @@ fn every_truncation_road_lands_where_laya_lands() {
             Limits {
                 max_len: c.max_len,
                 head_max_len: c.head_max_len,
+                cut: Cut::Right,
             },
         );
         let want_ids = numbers(&fixture, name, "ids");

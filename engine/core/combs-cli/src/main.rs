@@ -585,7 +585,8 @@ fn cmd_serve(
         // started on a door nobody spelled right should refuse in
         // milliseconds, not after 842 MB and a warm-up.
         let rendering = serve_system_one::seat_rendering().map_err(|why| anyhow::anyhow!(why))?;
-        let engine = combs_runtime::DecisionEngine::load(&model)?;
+        let state_cut = serve_system_one::seat_state_cut().map_err(|why| anyhow::anyhow!(why))?;
+        let engine = combs_runtime::DecisionEngine::load(&model)?.with_state_cut(state_cut);
         // Warm before listening: the first request on a cold seat paid
         // 1,058 ms (s138) — autotune for every shape the encoder makes —
         // and a router with a 1,500 ms budget should never pay it.

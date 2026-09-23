@@ -36,7 +36,9 @@
 //! * An option is tokenized with a LEADING SPACE. The tokenizer is
 //!   byte-level: `"refund"` and `" refund"` are different tokens, and
 //!   the model was fitted on the spaced one.
-//! * The state is cut from the RIGHT. `truncate_left` exists in laya and
+//! * The state is cut from the RIGHT by default (`Cut::Right`); the seat's
+//!   `COMBS_CLASSIFY_STATE_CUT=left` keeps the end instead, laya's own
+//!   `truncate_left`. That function exists in laya and
 //!   defaults false, and its caller never passes it — so the beginning
 //!   of a long state survives and the end is dropped.
 
@@ -87,7 +89,47 @@ pub struct Specials {
     pub mask_text: String,
 }
 
-/// The two length budgets, from `rl_agent_config.json`.
+/// Which end of a state longer than its room survives.
+///
+/// The asymmetry with options is principled and stays: a cut option
+/// changes the answer SPACE and is refused by name; a cut state changes
+/// the EVIDENCE and is counted (`state_tokens_cut`). This only chooses
+/// which half of the evidence the seat reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Cut {
+    /// The beginning survives — laya's `agent.py` behaviour, and this
+    /// seat's since it was seated: every sealed record was taken so.
+    #[default]
+    Right,
+    /// The end survives — laya's own `truncate_left`, which its agent
+    /// never passes. A pasted conversation's ask is usually at the end.
+    Left,
+}
+
+impl Cut {
+    /// The word a door or a config line uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Cut::Right => "right",
+            Cut::Left => "left",
+        }
+    }
+
+    /// The two words and nothing else, refused by name.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "right" => Ok(Cut::Right),
+            "left" => Ok(Cut::Left),
+            other => Err(format!(
+                "unknown state cut {other:?}: `right` keeps the beginning of a long state, \
+                 `left` keeps its end"
+            )),
+        }
+    }
+}
+
+/// The two length budgets, from `rl_agent_config.json`, and which end of
+/// a long state they leave standing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// The whole sequence.
@@ -95,6 +137,8 @@ pub struct Limits {
     /// The instructions and the markers, before the state gets what is
     /// left.
     pub head_max_len: usize,
+    /// Which end of a state longer than its room survives.
+    pub cut: Cut,
 }
 
 impl Default for Limits {
@@ -104,6 +148,7 @@ impl Default for Limits {
         Self {
             max_len: 512,
             head_max_len: 192,
+            cut: Cut::Right,
         }
     }
 }
@@ -252,9 +297,15 @@ pub fn build_sequence(
     // What is left for the state, keeping one place for the final [SEP].
     let room = limits.max_len.saturating_sub(ids.len() + 1);
     let mut st = enc.ids(&strip(state));
-    // From the RIGHT: the beginning of a long state survives.
+    // Which end survives is the door's; the count is the same either way.
     let state_before = st.len();
-    st.truncate(room);
+    match limits.cut {
+        Cut::Right => st.truncate(room),
+        Cut::Left => {
+            let gone = st.len().saturating_sub(room);
+            st.drain(..gone);
+        }
+    }
     let mut state_tokens_cut = state_before - st.len();
     ids.extend_from_slice(&st);
     ids.push(specials.sep);
@@ -480,6 +531,7 @@ mod tests {
         let tight = Limits {
             max_len: 12,
             head_max_len: 192,
+            cut: Cut::Right,
         };
         let s = build(&enc, "q", &opts(&["one"]), state, tight);
         assert_eq!(s.ids.len(), tight.max_len);
@@ -502,6 +554,7 @@ mod tests {
         let room = Limits {
             max_len: 512,
             head_max_len: 192,
+            cut: Cut::Right,
         };
         let s = build(&enc, &head, &opts(&["a", "b"]), "s", room);
         assert_eq!(s.markers.len(), 2);
@@ -512,6 +565,7 @@ mod tests {
         let squeeze = Limits {
             max_len: 512,
             head_max_len: 16,
+            cut: Cut::Right,
         };
         let t = build_sequence(
             &enc,
@@ -537,6 +591,7 @@ mod tests {
         let roomy = Limits {
             max_len: 512,
             head_max_len: 192,
+            cut: Cut::Right,
         };
         // Nothing cut: every counter is zero and the usage is the shape.
         let s = build(&enc, "q", &opts(&["one two", "three"]), "a state", roomy);
@@ -570,6 +625,7 @@ mod tests {
         let squeeze = Limits {
             max_len: 512,
             head_max_len: 16,
+            cut: Cut::Right,
         };
         let t = build(
             &enc,
@@ -597,6 +653,7 @@ mod tests {
         let tight = Limits {
             max_len: 24,
             head_max_len: 192,
+            cut: Cut::Right,
         };
         let s = build(&enc, "q", &opts(&["a", "b"]), &state, tight);
         assert_eq!(s.dropped(), 0);
@@ -606,6 +663,52 @@ mod tests {
         assert_eq!(s.ids.len(), 24);
     }
 
+    /// The same state, the same room, the OTHER end: a pasted
+    /// conversation's ask is usually at its end, and `Cut::Left` keeps it
+    /// — laya's own `truncate_left`, never passed by its agent. What is
+    /// cut is counted identically; only which half survives changes.
+    /// `Words` maps a word to 1000 + its length, so `s0`..`s9` are 1002
+    /// and `s10`..`s49` are 1003: the right cut keeps ten 1002s, the left
+    /// cut keeps none.
+    #[test]
+    fn the_state_is_cut_from_the_left_when_the_door_says_so() {
+        let enc = Words::default();
+        let state = (0..50)
+            .map(|i| format!("s{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let left = Limits {
+            max_len: 24,
+            head_max_len: 192,
+            cut: Cut::Left,
+        };
+        let s = build(&enc, "q", &opts(&["a", "b"]), &state, left);
+        assert_eq!(s.dropped(), 0);
+        assert_eq!(
+            s.usage().state_tokens_cut,
+            50 - 13,
+            "the count is the cut's, not the end's"
+        );
+        assert_eq!(s.ids.len(), 24);
+        // The 13 state tokens sit between the second [SEP] and the last.
+        let state_ids = &s.ids[10..23];
+        assert!(
+            state_ids.iter().all(|&id| id == 1003),
+            "the END of the state survives a left cut (s37..s49, all length 3): {state_ids:?}"
+        );
+        let right = Limits {
+            cut: Cut::Right,
+            ..left
+        };
+        let s = build(&enc, "q", &opts(&["a", "b"]), &state, right);
+        assert_eq!(
+            &s.ids[10..20],
+            &[1002; 10],
+            "the right cut keeps s0..s9: {:?}",
+            &s.ids[10..23]
+        );
+    }
+
     #[test]
     fn a_marker_pushed_past_the_end_is_counted_not_hidden() {
         let enc = Words::default();
@@ -613,6 +716,7 @@ mod tests {
         let tiny = Limits {
             max_len: 8,
             head_max_len: 192,
+            cut: Cut::Right,
         };
         let s = build(
             &enc,
