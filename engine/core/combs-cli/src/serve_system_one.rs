@@ -555,6 +555,45 @@ fn classify(engine: &DecisionEngine, counters: &Counters, body: &str, seat: Rend
 /// Serves a decision model on `addr` forever. `warm` is what the seat
 /// already ran before listening, said on the config line and in
 /// `/v1/stats` so a record can tell a warmed seat from a cold one.
+/// The response type every route builds.
+type Resp = tiny_http::Response<std::io::Cursor<Vec<u8>>>;
+
+/// One thread per request, so a GET never waits behind a forward pass.
+/// This does NOT make the seat concurrent: the engine's model lock is
+/// its only serialisation and stays, so two classifies still run one
+/// after the other and throughput is 1/latency. What moves is the
+/// WAITING — `/health`, `/v1/stats`, parsing and refusals answer during
+/// a 208 ms classify, where the supervisor polls health every 250 ms.
+///
+/// The handler runs inside a guard: a panic anywhere in routing answers
+/// `panicked`'s response instead of dropping the request (tiny_http
+/// answers a dropped request with an empty 500, and nobody counts it).
+/// Kept apart from `serve` so a test can drive the loop with a handler
+/// of its own.
+fn serve_on<H, P>(server: Arc<tiny_http::Server>, handle: H, panicked: P)
+where
+    H: Fn(&str, &str, &mut dyn std::io::Read) -> Resp + Send + Sync + 'static,
+    P: Fn(&str, &str) -> Resp + Send + Sync + 'static,
+{
+    let handle = Arc::new(handle);
+    let panicked = Arc::new(panicked);
+    for mut request in server.incoming_requests() {
+        let handle = handle.clone();
+        let panicked = panicked.clone();
+        std::thread::spawn(move || {
+            let path = request.url().split('?').next().unwrap_or("").to_string();
+            let method = request.method().as_str().to_string();
+            let response = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle(&method, &path, request.as_reader())
+            })) {
+                Ok(response) => response,
+                Err(_) => panicked(&method, &path),
+            };
+            let _ = request.respond(response);
+        });
+    }
+}
+
 pub fn serve(
     engine: DecisionEngine,
     warm: WarmReport,
@@ -618,11 +657,11 @@ pub fn serve(
         })
     };
 
-    for mut request in server.incoming_requests() {
-        let path = request.url().split('?').next().unwrap_or("").to_string();
-        let method = request.method().as_str().to_string();
+    let server = Arc::new(server);
+    let faults = counters.clone();
+    let handle = move |method: &str, path: &str, reader: &mut dyn std::io::Read| -> Resp {
         let meta = engine.metadata();
-        let response = match (method.as_str(), path.as_str()) {
+        match (method, path) {
             ("GET", "/health") => json_response(200, json!({"status": "ok"})),
             ("GET", "/v1/models") => json_response(
                 200,
@@ -676,7 +715,7 @@ pub fn serve(
             ),
             ("POST", "/v1/classify") => {
                 let mut body = String::new();
-                if let Err(e) = request.as_reader().read_to_string(&mut body) {
+                if let Err(e) = reader.read_to_string(&mut body) {
                     refuse(400, "invalid_request", &format!("unreadable body: {e}"))
                 } else {
                     let v = answer_guarded(&counters, || {
@@ -697,15 +736,155 @@ pub fn serve(
                 ),
             ),
             _ => refuse(404, "not_found", &format!("no route {method} {path}")),
-        };
-        let _ = request.respond(response);
-    }
+        }
+    };
+    serve_on(server, handle, move |method, path| {
+        // Counted under the same key as a fault inside the answer, and
+        // permanent for the same reason: a record drawn from this seat
+        // must show it.
+        faults.seat_panics.fetch_add(1, Ordering::Relaxed);
+        refuse(
+            500,
+            "panic",
+            &format!(
+                "the seat faulted while answering {method} {path}; the fault is counted for the \
+                 life of the process in /v1/stats.classify.faults.seat"
+            ),
+        )
+    });
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::io::Read;
+    use std::time::Duration;
+
+    fn http_get(port: u16, path: &str) -> Option<(u16, Vec<u8>)> {
+        use std::io::Write;
+        let raw = format!("GET {path} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .ok()?;
+        stream.write_all(raw.as_bytes()).ok()?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).ok()?;
+        let header_end = response.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+        let head = String::from_utf8_lossy(&response[..header_end]);
+        let status: u16 = head.split_whitespace().nth(1)?.parse().ok()?;
+        Some((status, response[header_end..].to_vec()))
+    }
+
+    fn http_post(port: u16, path: &str, body: &str) -> Option<(u16, Vec<u8>)> {
+        use std::io::Write;
+        let raw = format!(
+            "POST {path} HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .ok()?;
+        stream.write_all(raw.as_bytes()).ok()?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).ok()?;
+        let header_end = response.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+        let head = String::from_utf8_lossy(&response[..header_end]);
+        let status: u16 = head.split_whitespace().nth(1)?.parse().ok()?;
+        Some((status, response[header_end..].to_vec()))
+    }
+
+    /// The seat was serial at the ACCEPT loop: `/health` and `/v1/stats`
+    /// queued behind a 208 ms classify, and the supervisor polls health
+    /// every 250 ms. One thread per request moves the waiting, not the
+    /// work: a GET 50 ms into a 600 ms POST comes back in well under the
+    /// POST's time. Throughput is unchanged — the model lock still
+    /// serialises the forward passes — and this test claims nothing else.
+    #[test]
+    fn health_answers_while_a_classify_holds_the_seat() {
+        let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("a free port"));
+        let port = server.server_addr().to_ip().expect("an ip listener").port();
+        let listener = server.clone();
+        let served = std::thread::spawn(move || {
+            serve_on(
+                listener,
+                |method, path, _reader| {
+                    if method == "POST" {
+                        std::thread::sleep(Duration::from_millis(600));
+                    }
+                    json_response(200, json!({"path": path}))
+                },
+                |_, _| refuse(500, "panic", "unreachable here"),
+            );
+        });
+        let post = std::thread::spawn(move || {
+            let t = Instant::now();
+            let status = http_post(port, "/v1/classify", "{}").map(|(s, _)| s);
+            (t.elapsed().as_millis(), status)
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let t = Instant::now();
+        let get = http_get(port, "/health").map(|(s, _)| s);
+        let get_ms = t.elapsed().as_millis();
+        assert_eq!(get, Some(200));
+        assert!(
+            get_ms < 200,
+            "GET /health took {get_ms} ms behind a 600 ms POST: the seat is still serial at the \
+             accept loop"
+        );
+        let (post_ms, post_status) = post.join().expect("the POST thread");
+        assert_eq!(post_status, Some(200));
+        assert!(
+            post_ms >= 600,
+            "the POST answered in {post_ms} ms, before its handler could have"
+        );
+        server.unblock();
+        served
+            .join()
+            .expect("the loop ends when the listener is unblocked");
+    }
+
+    /// A panic anywhere in routing used to drop the request, which
+    /// tiny_http answers with an empty 500 that nobody counts. Inside the
+    /// thread the guard answers first, and the loop goes on.
+    #[test]
+    fn a_panic_outside_the_answer_guard_is_answered_and_counted() {
+        let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("a free port"));
+        let port = server.server_addr().to_ip().expect("an ip listener").port();
+        let listener = server.clone();
+        let counted = Arc::new(AtomicU64::new(0));
+        let seen = counted.clone();
+        let served = std::thread::spawn(move || {
+            serve_on(
+                listener,
+                |_method, path, _reader| {
+                    if path == "/boom" {
+                        panic!("a bug in routing");
+                    }
+                    json_response(200, json!({}))
+                },
+                move |method, path| {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                    refuse(500, "panic", &format!("faulted on {method} {path}"))
+                },
+            );
+        });
+        let (status, body) = http_get(port, "/boom").expect("an answer, not a dropped request");
+        assert_eq!(status, 500);
+        assert!(
+            String::from_utf8_lossy(&body).contains("faulted on GET /boom"),
+            "{body:?}"
+        );
+        assert_eq!(counted.load(Ordering::Relaxed), 1);
+        let (status, _) = http_get(port, "/health").expect("the next request answers");
+        assert_eq!(status, 200, "one fault does not take the loop down");
+        server.unblock();
+        served.join().expect("the loop ends");
+    }
 
     /// A flat ModernBERT without laya's head used to be routed to this
     /// seat by its `model_type` alone and die at load, after the read,
