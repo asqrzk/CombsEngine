@@ -444,8 +444,10 @@ fn cmd_gates(ctx: &Ctx, quick: bool, strict: bool) -> Result<()> {
         // The app and the fleet ship the f16 build; every tier above is the
         // f32 build. These compile the f16 backend itself (CombsBackend is
         // f16 here) in its own target dir so the two never invalidate each
-        // other. combs-runtime's own `f16` does not reach combs-core, so the
-        // feature is named on combs-core explicitly.
+        // other. The feature is spelled on the crate under test and nowhere
+        // else: each crate's `f16` forwards to its dependencies', and each
+        // crate's `flavour_tests` refuses a build whose own flag and backend
+        // disagree — the half-spelling `combs-core/f16` included.
         let mut tier_f16 = |name: &str, args: &[&str]| {
             eprintln!("== {name} ==");
             let mut cmd = Command::new(cargo());
@@ -458,11 +460,11 @@ fn cmd_gates(ctx: &Ctx, quick: bool, strict: bool) -> Result<()> {
         };
         tier_f16(
             "models-f16",
-            &["test", "--release", "-p", "combs-models", "--lib", "--features", "combs-core/f16"],
+            &["test", "--release", "-p", "combs-models", "--lib", "--features", "f16"],
         );
         tier_f16(
             "runtime-f16",
-            &["test", "--release", "-p", "combs-runtime", "--features", "f16,combs-core/f16"],
+            &["test", "--release", "-p", "combs-runtime", "--features", "f16"],
         );
     }
 

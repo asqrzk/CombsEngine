@@ -402,6 +402,29 @@ fn main() -> Result<()> {
 }
 
 #[cfg(test)]
+mod flavour_tests {
+    /// This crate reads its own `f16` flag and the tensors read the
+    /// backend; the two must be one fact. Before this pin, `--features
+    /// f16` on this crate alone switched the flag and left the backend
+    /// f32 — an arena sized for two-byte elements over four-byte storage
+    /// — and the tiers spelled `combs-core/f16` around it, which is the
+    /// same mismatch the other way round. Either half-spelling fails
+    /// here by name, in both flavours.
+    #[test]
+    fn the_crates_flavour_flag_and_the_backend_agree() {
+        let flag = cfg!(feature = "f16");
+        let backend = combs_core::BACKEND.dtype;
+        assert_eq!(
+            flag,
+            backend == "f16",
+            "this crate's `f16` feature is {flag} but combs-core serves {backend}: \
+             spell the feature on the crate under test and let it forward — never \
+             on a dependency alone, never on this crate without the forwarding"
+        );
+    }
+}
+
+#[cfg(test)]
 mod kv_auto_tests {
     /// The formula, checked at one worked example: qwen2.5-7B-class
     /// geometry (4 kv heads x 128 dim, all-global 28 layers... kept

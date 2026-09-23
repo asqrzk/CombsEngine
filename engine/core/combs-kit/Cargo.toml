@@ -14,8 +14,8 @@ path = "src/main.rs"
 # which build produced it, and comparing f16 against f32 is two records,
 # not two code paths.
 cpu = ["combs-core/cpu", "combs-runtime/cpu", "combs-models/cpu"]
-f16 = ["combs-core/f16", "combs-runtime/f16"]
-f16-fusion = ["f16", "combs-core/f16-fusion", "combs-runtime/f16-fusion"]
+f16 = ["combs-core/f16", "combs-models/f16", "combs-runtime/f16"]
+f16-fusion = ["f16", "combs-core/f16-fusion", "combs-models/f16-fusion", "combs-runtime/f16-fusion"]
 
 [dependencies]
 combs-core.workspace = true

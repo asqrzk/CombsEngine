@@ -7,6 +7,10 @@ description = "Combs Engine model architecture registry (Llama family)"
 
 [features]
 cpu = ["combs-core/cpu"]
+# The half-precision backend, forwarded: a crate under test spells
+# `--features f16` on itself and the flag reaches combs-core through here.
+f16 = ["combs-core/f16"]
+f16-fusion = ["f16", "combs-core/f16-fusion"]
 
 [dependencies]
 burn.workspace = true
