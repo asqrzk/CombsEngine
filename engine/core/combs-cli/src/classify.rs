@@ -406,12 +406,23 @@ pub(crate) fn parse_request(body: &str) -> Result<Request, (u16, Value)> {
 
     let mut thresholds = Thresholds::default();
     if let Some(t) = v.get("thresholds") {
-        if let Some(c) = t.get("confidence").and_then(Value::as_f64) {
-            thresholds.confidence = c as f32;
-        }
-        if let Some(tau) = t.get("tau").and_then(Value::as_f64) {
-            thresholds.tau = tau as f32;
-        }
+        // A value that is there and unusable is refused by name, as an
+        // unknown key is: `as_f64` used to default a string, a bool or a
+        // list to 0.0 — no gate at all — in silence. Absent and null are
+        // the default, the way `temperature` reads them.
+        let floor = |key: &str, default: f32| -> Result<f32, (u16, Value)> {
+            match t.get(key) {
+                None | Some(Value::Null) => Ok(default),
+                Some(raw) => match raw.as_f64().map(|f| f as f32) {
+                    Some(f) if f.is_finite() && (0.0..=1.0).contains(&f) => Ok(f),
+                    _ => Err(bad(&format!(
+                        "`thresholds.{key}` must be a number in [0, 1], got {raw}"
+                    ))),
+                },
+            }
+        };
+        thresholds.confidence = floor("confidence", thresholds.confidence)?;
+        thresholds.tau = floor("tau", thresholds.tau)?;
     }
 
     Ok(Request {
@@ -815,6 +826,48 @@ mod tests {
                 .is_some_and(|m| m.contains("temperature")),
             "{v}"
         );
+    }
+
+    /// A threshold that was not a number fell to 0.0 — no gate — in
+    /// silence: `"confidence": "0.5"` acted on every answer and said
+    /// nothing. The hazard F5 closed for a misspelt key was open for a
+    /// mistyped value. Now it is refused by name, and so is a value
+    /// outside [0, 1]; absent and null stay the default.
+    #[test]
+    fn a_threshold_that_is_not_a_number_is_refused_by_name_not_defaulted() {
+        let body = |thresholds: &str| {
+            format!(
+                r#"{{"state":"x","thresholds":{thresholds},"questions":[
+                    {{"name":"q","type":"choice","options":[
+                      {{"id":"a","tether":{{"means":"the first thing"}}}},
+                      {{"id":"b","tether":{{"means":"the second thing"}}}}]}}]}}"#
+            )
+        };
+        for (unusable, key) in [
+            (r#"{"confidence":"0.5"}"#, "confidence"),
+            (r#"{"tau":true}"#, "tau"),
+            (r#"{"tau":[0.5]}"#, "tau"),
+            (r#"{"confidence":1.5}"#, "confidence"),
+            (r#"{"tau":-0.1}"#, "tau"),
+        ] {
+            let Err((status, v)) = parse_request(&body(unusable)) else {
+                panic!(
+                    "{unusable} parsed: a threshold that is not a number in [0, 1] was defaulted"
+                )
+            };
+            assert_eq!(status, 400);
+            assert!(
+                v["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains(&format!("thresholds.{key}"))),
+                "{v}"
+            );
+        }
+        let ok = parse_request(&body(r#"{"confidence":0.5,"tau":0.7}"#)).expect("valid");
+        assert_eq!(ok.thresholds.confidence, 0.5);
+        assert_eq!(ok.thresholds.tau, 0.7);
+        let null = parse_request(&body(r#"{"tau":null}"#)).expect("valid");
+        assert_eq!(null.thresholds.tau, Thresholds::default().tau);
     }
 
     #[test]
