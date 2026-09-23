@@ -555,6 +555,69 @@ fn classify(engine: &DecisionEngine, counters: &Counters, body: &str, seat: Rend
 /// Serves a decision model on `addr` forever. `warm` is what the seat
 /// already ran before listening, said on the config line and in
 /// `/v1/stats` so a record can tell a warmed seat from a cold one.
+/// The seat's `/v1/stats`, composed without a device so a test can read
+/// what a record would carry. `model_panics` is the engine's count; the
+/// seat's own is in `counters`.
+fn stats_json(
+    uptime_s: u64,
+    counters: &Counters,
+    model_panics: u64,
+    rendering: Rendering,
+    warm_up: &Value,
+) -> Value {
+    json!({
+        "uptime_s": uptime_s,
+        // The generative seat's two keys, in its shapes: a sitting copies
+        // this file into its record, and `build-info --refuse-dirty` can
+        // only be graded from a record that names the build.
+        "build_manifest": crate::build_info::manifest(),
+        "build": {
+            "dtype": combs_core::BACKEND.dtype,
+            "fusion": combs_core::BACKEND.fusion,
+            "cpu_backend": combs_core::BACKEND.cpu,
+        },
+        // `totals` stays zero and is present on purpose: a
+        // reader comparing this seat to a generative one must
+        // see that nothing was generated, not infer it.
+        "totals": {"requests": 0, "tokens": 0},
+        "classify": {
+            "backend": BACKEND,
+            "requests": counters.requests.load(Ordering::Relaxed),
+            "questions": counters.questions.load(Ordering::Relaxed),
+            "errors": counters.errors.load(Ordering::Relaxed),
+            "last_ms": counters.last_ms.load(Ordering::Relaxed),
+            "render": rendering.as_str(),
+            "road": rendering.road().as_str(),
+            // Non-zero is PERMANENT and deliberate. A seat
+            // that ever faulted carries the fact here for
+            // the life of the process, because a sitting
+            // copies this file into its record: a
+            // measurement must never be drawn from a broken
+            // process without the record showing it. A panic
+            // is OUR bug faulting before the model answers —
+            // never the model inventing anything, which this
+            // seat cannot do.
+            // The sum a reader should look at, and the
+            // two halves so a fault can be placed: the
+            // model's forward pass, or the seat's own
+            // reading of it.
+            "panics": model_panics
+                + counters.seat_panics.load(Ordering::Relaxed),
+            "faults": {
+                "model": model_panics,
+                "seat": counters.seat_panics.load(Ordering::Relaxed),
+            },
+            // Permanent, like `panics`: an answer that was
+            // not a distribution never reached a caller, and
+            // a record drawn from this seat says so.
+            "envelope_refusals": counters
+                .envelope_refusals
+                .load(Ordering::Relaxed),
+        },
+        "warm_up": warm_up.clone(),
+    })
+}
+
 /// The response type every route builds.
 type Resp = tiny_http::Response<std::io::Cursor<Vec<u8>>>;
 
@@ -670,48 +733,13 @@ pub fn serve(
             ("GET", "/v1/model/info") => json_response(200, card(&model_id, meta)),
             ("GET", "/v1/stats") => json_response(
                 200,
-                json!({
-                    "uptime_s": started.elapsed().as_secs(),
-                    // `totals` stays zero and is present on purpose: a
-                    // reader comparing this seat to a generative one must
-                    // see that nothing was generated, not infer it.
-                    "totals": {"requests": 0, "tokens": 0},
-                    "classify": {
-                        "backend": BACKEND,
-                        "requests": counters.requests.load(Ordering::Relaxed),
-                        "questions": counters.questions.load(Ordering::Relaxed),
-                        "errors": counters.errors.load(Ordering::Relaxed),
-                        "last_ms": counters.last_ms.load(Ordering::Relaxed),
-                        "render": rendering.as_str(),
-                        "road": rendering.road().as_str(),
-                        // Non-zero is PERMANENT and deliberate. A seat
-                        // that ever faulted carries the fact here for
-                        // the life of the process, because a sitting
-                        // copies this file into its record: a
-                        // measurement must never be drawn from a broken
-                        // process without the record showing it. A panic
-                        // is OUR bug faulting before the model answers —
-                        // never the model inventing anything, which this
-                        // seat cannot do.
-                        // The sum a reader should look at, and the
-                        // two halves so a fault can be placed: the
-                        // model's forward pass, or the seat's own
-                        // reading of it.
-                        "panics": engine.panics()
-                            + counters.seat_panics.load(Ordering::Relaxed),
-                        "faults": {
-                            "model": engine.panics(),
-                            "seat": counters.seat_panics.load(Ordering::Relaxed),
-                        },
-                        // Permanent, like `panics`: an answer that was
-                        // not a distribution never reached a caller, and
-                        // a record drawn from this seat says so.
-                        "envelope_refusals": counters
-                            .envelope_refusals
-                            .load(Ordering::Relaxed),
-                    },
-                    "warm_up": warm_json.clone(),
-                }),
+                stats_json(
+                    started.elapsed().as_secs(),
+                    &counters,
+                    engine.panics(),
+                    rendering,
+                    &warm_json,
+                ),
             ),
             ("POST", "/v1/classify") => {
                 let mut body = String::new();
@@ -761,6 +789,57 @@ mod tests {
 
     use std::io::Read;
     use std::time::Duration;
+
+    /// A sitting copies `/v1/stats` into its record, and `build-info
+    /// --refuse-dirty` can only be graded from a record that names the
+    /// build. The generative seat has carried `build_manifest` and
+    /// `build.dtype` for as long as the platform has read them; this seat
+    /// carried neither, and s138 could not be graded. Same keys, same
+    /// shapes, so `serve_stats`' assertions read either seat.
+    #[test]
+    fn the_seats_stats_carry_the_manifest_under_the_generative_seats_keys() {
+        let counters = Counters::default();
+        counters.requests.fetch_add(3, Ordering::Relaxed);
+        let warm = json!({"total_ms": 1});
+        let stats = stats_json(7, &counters, 0, Rendering::LabelAnchors, &warm);
+        let manifest = &stats["build_manifest"];
+        assert!(
+            manifest["git"]["short"].is_string(),
+            "the git identity: {manifest}"
+        );
+        assert!(manifest["built_at"].is_string(), "built_at: {manifest}");
+        assert_eq!(manifest["serving_dtype"], combs_core::BACKEND.dtype);
+        let dtype = stats["build"]["dtype"].as_str().unwrap_or_default();
+        assert!(
+            dtype == "f16" || dtype == "f32",
+            "the platform reads .build.dtype: {}",
+            stats["build"]
+        );
+        assert_eq!(
+            stats["build"]["dtype"], stats["build_manifest"]["serving_dtype"],
+            "one build, said twice the same"
+        );
+        // The keys the sealed records already carry, unchanged.
+        let classify = &stats["classify"];
+        for key in [
+            "backend",
+            "requests",
+            "questions",
+            "errors",
+            "last_ms",
+            "render",
+            "road",
+            "panics",
+            "faults",
+            "envelope_refusals",
+        ] {
+            assert!(!classify[key].is_null(), "classify.{key} left the wire");
+        }
+        assert_eq!(classify["requests"], 3);
+        assert_eq!(classify["road"], "semantic");
+        assert_eq!(stats["uptime_s"], 7);
+        assert_eq!(stats["warm_up"]["total_ms"], 1);
+    }
 
     fn http_get(port: u16, path: &str) -> Option<(u16, Vec<u8>)> {
         use std::io::Write;
