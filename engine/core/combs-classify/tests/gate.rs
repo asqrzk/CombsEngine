@@ -344,3 +344,55 @@ fn the_ev_sweep_finds_the_threshold_that_minimises_it() {
     let (t_free, _) = sweep_thresholds(&rows, &free);
     assert!(near(t_free, 0.0, 1e-6), "with errors free the cheap system always answers: got {t_free}");
 }
+
+/// `bars.rs` says the gateway keeps the same question cap "by hand, in
+/// two trees: a test pins each so a drift is a failure". Neither test
+/// existed: the gateway's own tests pass 2 by environment and assert a
+/// literal 16, and nothing on either side ever read the other's number.
+/// This is our half. The gateway is built from its own image, so it
+/// cannot read this tree; its half is a cited literal.
+///
+/// When the gateway tree is not beside us the test SAYS SO and passes —
+/// a silent pass is how the first version of this rule was lost.
+#[test]
+fn the_gateways_question_cap_matches_this_crates_when_the_gateway_tree_is_beside_us() {
+    let conf = match std::env::var("COMBS_INFERENCE_DIR") {
+        Ok(dir) => std::path::PathBuf::from(dir).join("config/serve.conf"),
+        Err(_) => std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../combs-inference/config/serve.conf"),
+    };
+    let Ok(text) = std::fs::read_to_string(&conf) else {
+        eprintln!(
+            "cross-tree pin unread: no gateway config at {} (set COMBS_INFERENCE_DIR to pin it)",
+            conf.display()
+        );
+        return;
+    };
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("MAX_QUESTIONS="))
+        .unwrap_or_else(|| {
+            panic!(
+                "{} carries no MAX_QUESTIONS line: the gateway stopped capping what this crate caps",
+                conf.display()
+            )
+        });
+    let theirs: usize = line["MAX_QUESTIONS=".len()..]
+        .split('#')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("{} is not a number in {}: {e}", line, conf.display()));
+    assert_eq!(
+        theirs,
+        combs_classify::bars::MAX_QUESTIONS,
+        "the gateway caps questions at {theirs} and this crate at {} ({}): a request \
+         the gateway forwards would be refused by the seat, or one the seat would answer is \
+         refused before it arrives",
+        combs_classify::bars::MAX_QUESTIONS,
+        conf.display()
+    );
+    eprintln!("cross-tree pin read: {} says {theirs}", conf.display());
+}
