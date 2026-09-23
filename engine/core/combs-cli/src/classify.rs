@@ -210,8 +210,54 @@ fn parse_opt(v: &Value, question: &str, i: usize) -> Result<Opt, (u16, Value)> {
 }
 
 /// Read a request, refusing by name before anything is embedded.
+/// Every key this road reads, at each level of a body.
+///
+/// A key nobody reads used to be dropped in silence. That is the wrong
+/// default for a wire that calls itself typed: a misspelt `lable` falls
+/// back to the ordinal and an arm of a sitting measures a rendering
+/// nobody chose; a `"taps"` a caller believed in changes nothing and
+/// says nothing. Both read, from the outside, exactly like a seat that
+/// obeyed. The parser is a hand walk over `Value` rather than a derive,
+/// so the lists live here and the refusal names what it did not know.
+const REQUEST_KEYS: &[&str] = &["state", "questions", "temperature", "thresholds"];
+const QUESTION_KEYS: &[&str] = &[
+    "name",
+    "type",
+    "instructions",
+    "options",
+    "levels",
+    "tether",
+];
+const THRESHOLD_KEYS: &[&str] = &["confidence", "tau"];
+
+/// Refuses a key this road would not have read, naming it and the set.
+fn only_known_keys(v: &Value, known: &[&str], whose: &str) -> Result<(), (u16, Value)> {
+    let Some(o) = v.as_object() else {
+        return Ok(());
+    };
+    for k in o.keys() {
+        if !known.contains(&k.as_str()) {
+            return Err(bad(&format!(
+                "{whose} carries `{k}`, which this road does not read. It takes {}. A key \
+                 nobody reads is refused rather than dropped: a misspelling that falls back to \
+                 a default looks exactly like a seat that obeyed.",
+                known
+                    .iter()
+                    .map(|k| format!("`{k}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn parse_request(body: &str) -> Result<Request, (u16, Value)> {
     let v: Value = serde_json::from_str(body).map_err(|e| bad(&format!("bad JSON: {e}")))?;
+    only_known_keys(&v, REQUEST_KEYS, "this request")?;
+    if let Some(t) = v.get("thresholds") {
+        only_known_keys(t, THRESHOLD_KEYS, "`thresholds`")?;
+    }
 
     let state = match v.get("state") {
         Some(Value::String(s)) if !s.trim().is_empty() => s.clone(),
@@ -249,6 +295,7 @@ pub(crate) fn parse_request(body: &str) -> Result<Request, (u16, Value)> {
 
     let mut questions = Vec::with_capacity(qs.len());
     for q in qs {
+        only_known_keys(q, QUESTION_KEYS, "a question")?;
         let name = q
             .get("name")
             .and_then(Value::as_str)
@@ -668,6 +715,77 @@ mod tests {
     /// same fact. Collapsing them at parse time cost the marker seat the
     /// ability to tell them apart — so it dropped the caller's value and
     /// echoed the checkpoint's under the same key.
+    /// A key nobody reads was dropped in silence, which for a typed wire
+    /// is the wrong default. The hazard is not the exotic key a caller
+    /// invented — it is `lable`, which falls back to the ordinal so an
+    /// arm of a sitting measures a rendering nobody chose, and looks
+    /// from the outside exactly like a seat that obeyed.
+    #[test]
+    fn an_unknown_key_is_refused_by_name_not_dropped() {
+        let ok = r#"{"state":"x","questions":[
+            {"name":"q","type":"choice","options":[
+              {"id":"a","tether":{"means":"the first thing"}},
+              {"id":"b","tether":{"means":"the second thing"}}]}]}"#;
+        parse_request(ok).expect("a well-formed request still parses");
+
+        let why = |body: &str, what: &str| -> String {
+            let Err((code, v)) = parse_request(body) else {
+                panic!("{what} was accepted")
+            };
+            assert_eq!(code, 400, "{what}");
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        // Top level: the key a caller believed in and that changed nothing.
+        let m = why(
+            &ok.replace(r#""state":"x""#, r#""state":"x","taps":[3]"#),
+            "taps",
+        );
+        assert!(m.contains("`taps`"), "{m}");
+        assert!(
+            m.contains("`questions`"),
+            "the refusal names what it does take: {m}"
+        );
+
+        // On a question.
+        let m = why(
+            &ok.replace(r#""name":"q""#, r#""name":"q","tapss":[3]"#),
+            "tapss",
+        );
+        assert!(m.contains("`tapss`"), "{m}");
+
+        // On an option — the misspelling that silently costs a rendering.
+        let m = why(
+            &ok.replace(r#""id":"a""#, r#""id":"a","lable":"refund""#),
+            "lable",
+        );
+        assert!(m.contains("lable"), "{m}");
+
+        // Inside a tether.
+        let m = why(
+            &ok.replace(
+                r#"{"means":"the first thing"}"#,
+                r#"{"means":"the first thing","nott":[]}"#,
+            ),
+            "nott",
+        );
+        assert!(m.contains("nott"), "{m}");
+
+        // And in thresholds, where a typo would read as "no gate at all".
+        let m = why(
+            &ok.replace(
+                r#""state":"x""#,
+                r#""state":"x","thresholds":{"confidance":0.5}"#,
+            ),
+            "confidance",
+        );
+        assert!(m.contains("confidance"), "{m}");
+        assert!(m.contains("`tau`"), "{m}");
+    }
+
     #[test]
     fn a_temperature_is_absent_when_the_caller_sent_none() {
         let with = r#"{"state":"x","temperature":2.0,"questions":[

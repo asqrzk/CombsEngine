@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 
 /// What one option means, and what it is not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Tether {
     /// One sentence in the caller's own words: what is true of the state
     /// when this option is the right answer. Required, and refused empty
@@ -52,6 +53,7 @@ pub struct Tether {
 /// An option: an opaque identifier the caller routes on, and the tether
 /// that is the only thing a scorer ever sees.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Opt {
     pub id: String,
     pub tether: Tether,
