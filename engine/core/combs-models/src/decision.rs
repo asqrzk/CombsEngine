@@ -158,6 +158,22 @@ pub struct LayaModel<B: Backend> {
     head_heads: usize,
 }
 
+/// A float tensor built on the host, born F32 on EVERY build. `from_data`
+/// without a width takes the DEVICE's — f16 on the f16 build — and a
+/// host-built f16 beside an f32 is a width mismatch this backend refuses
+/// at dispatch or, worse, does not. Every host-built float tensor in this
+/// file goes through here; `width_tests` holds it to that.
+fn host_f32<B: Backend, const D: usize>(
+    values: Vec<f32>,
+    shape: [usize; D],
+    device: &Device<B>,
+) -> Tensor<B, D> {
+    Tensor::from_data(
+        burn::tensor::TensorData::new(values, shape),
+        (device, burn::tensor::DType::F32),
+    )
+}
+
 /// How deep the head in these weights is: the number of `j` for which
 /// `head.layers.{j}.norm1.weight` exists, counted contiguously from 0.
 /// A gap ends the count (a checkpoint with layers 0 and 2 has one).
@@ -294,15 +310,14 @@ impl<B: Backend> LayaModel<B> {
             device,
         )
         .reshape([rows, len]);
-        let attention = Tensor::<B, 1>::from_data(
-            burn::tensor::TensorData::new(
-                batch
-                    .attention
-                    .iter()
-                    .map(|&a| a as f32)
-                    .collect::<Vec<_>>(),
-                [rows * len],
-            ),
+        // The padding mask, born F32 like every host-built tensor here.
+        // It used to take the device's width — f16 on the f16 build —
+        // where its siblings named theirs: harmless while `to_f32`
+        // widened it downstream, and exactly the class that took the f16
+        // seat down once (`feat_t`, below).
+        let attention = host_f32::<B, 1>(
+            batch.attention.iter().map(|&a| a as f32).collect(),
+            [rows * len],
             device,
         )
         .reshape([rows, len]);
@@ -428,11 +443,8 @@ impl<B: Backend> TypedDecisionModel for LayaModel<B> {
         // was an f16 tensor concatenated onto an f32 one — a width
         // mismatch the backend refuses, and the refusal surfaces only at
         // the next read, several operations from its cause.
-        let feat_t = Tensor::<B, 1>::from_data(
-            burn::tensor::TensorData::new(feats, [rows * ACT_FEATURES]),
-            (&device, burn::tensor::DType::F32),
-        )
-        .reshape([rows, ACT_FEATURES]);
+        let feat_t =
+            host_f32::<B, 1>(feats, [rows * ACT_FEATURES], &device).reshape([rows, ACT_FEATURES]);
         // And back to the weights' own width before the act head.
         let joined = to_float(
             Tensor::cat(vec![to_f32(pooled), feat_t], 1),
@@ -488,6 +500,45 @@ mod depth_tests {
             head_depth(&names(&[1])),
             0,
             "layer 1 without layer 0 is no head"
+        );
+    }
+}
+
+#[cfg(test)]
+mod width_tests {
+    /// Every float tensor this file builds on the host names its width,
+    /// by going through `host_f32`. A bare `from_data` takes the
+    /// device's — f16 on the f16 build — and the seat's own lib tests
+    /// cannot see that: they pin the test device to f32 before any
+    /// tensor exists, so a tensor taking the device's width is f32 there
+    /// too. The source is read instead: outside `host_f32`, only integer
+    /// tensors may call `from_data` bare.
+    #[test]
+    fn every_host_built_float_tensor_names_its_width() {
+        let src = include_str!("decision.rs");
+        let call = concat!("from_", "data(");
+        let mut bare = Vec::new();
+        let mut in_helper = false;
+        for (i, line) in src.lines().enumerate() {
+            if line.starts_with("fn host_f32") {
+                in_helper = true;
+            }
+            if in_helper {
+                if line == "}" {
+                    in_helper = false;
+                }
+                continue;
+            }
+            // An integer tensor names `Int` on the line of its call.
+            if !line.contains(call) || line.contains("Int>") {
+                continue;
+            }
+            bare.push(format!("{}: {}", i + 1, line.trim()));
+        }
+        assert!(
+            bare.is_empty(),
+            "host-built float tensors that do not go through host_f32:\n{}",
+            bare.join("\n")
         );
     }
 }
