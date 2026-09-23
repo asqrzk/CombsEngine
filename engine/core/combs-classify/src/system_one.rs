@@ -88,10 +88,18 @@ pub fn render_criterion(v: &Value) -> String {
     if let Value::String(s) = v {
         return s.clone();
     }
+    // Neither failure is reachable — a `Value` always serialises and
+    // serde_json always writes utf-8 — but this runs once per option per
+    // request, and a request path with an `expect` on it is a request
+    // path that can end the process. `to_string()` is the same text
+    // without the house spacing, which is worse than the rubric and far
+    // better than a panic.
     let mut buf = Vec::new();
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, Spaced);
-    v.serialize(&mut ser).expect("a Value serialises");
-    String::from_utf8(buf).expect("serde_json writes utf-8")
+    if v.serialize(&mut ser).is_err() {
+        return v.to_string();
+    }
+    String::from_utf8(buf).unwrap_or_else(|_| v.to_string())
 }
 
 /// JSON with a space after every separator — python's `json.dumps`

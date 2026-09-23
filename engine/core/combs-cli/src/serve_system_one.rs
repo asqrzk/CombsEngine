@@ -161,6 +161,11 @@ struct Counters {
     questions: AtomicU64,
     errors: AtomicU64,
     last_ms: AtomicU64,
+    /// Panics caught in the SEAT — the composing, the routing, the
+    /// reading of a body — as distinct from the runtime's `panics`,
+    /// which counts faults inside the forward pass. Permanent, and
+    /// reported beside the model's so a record can tell the two apart.
+    seat_panics: AtomicU64,
     /// Answers refused because they were not answers: a distribution
     /// that does not sum, carries a NaN, or does not have one
     /// probability per option the caller sent.
@@ -237,6 +242,33 @@ fn json_response(code: u16, body: Value) -> tiny_http::Response<std::io::Cursor<
 
 fn refuse(code: u16, kind: &str, message: &str) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     json_response(code, json!({"error": {"type": kind, "message": message}}))
+}
+
+/// Runs one request's whole answer under a caught unwind.
+///
+/// `guarded_decide` in the runtime catches the FORWARD PASS. Everything
+/// after it — reading the logits, composing the wire body, looking an
+/// option up by the index of the largest probability — ran unguarded in
+/// the seat, so a bug in our own reading killed the process and took the
+/// permanent fault count with it. The count exists precisely so a record
+/// drawn from a seat that faulted says so; a counter that dies with the
+/// process cannot do that.
+///
+/// The two guards are disjoint. A model panic is caught in the runtime,
+/// returns `Err`, and never reaches here; this one catches what the seat
+/// itself does wrong. They are counted apart for the same reason.
+fn answer_guarded(counters: &Counters, compose: impl FnOnce() -> Value) -> Value {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(compose)) {
+        Ok(v) => v,
+        Err(_) => {
+            counters.seat_panics.fetch_add(1, Ordering::Relaxed);
+            counters.errors.fetch_add(1, Ordering::Relaxed);
+            json!({"_status": 500, "_body": {"error": {"type": "panic", "message":
+                "the seat panicked composing this answer: the request is refused and the seat \
+                 stays up, but this process has now faulted and says so in \
+                 `/v1/stats.classify.panics` for the rest of its life"}}})
+        }
+    }
 }
 
 /// Refuses a body that tries to choose its own rendering.
@@ -567,7 +599,16 @@ pub fn serve(
                         // is OUR bug faulting before the model answers —
                         // never the model inventing anything, which this
                         // seat cannot do.
-                        "panics": engine.panics(),
+                        // The sum a reader should look at, and the
+                        // two halves so a fault can be placed: the
+                        // model's forward pass, or the seat's own
+                        // reading of it.
+                        "panics": engine.panics()
+                            + counters.seat_panics.load(Ordering::Relaxed),
+                        "faults": {
+                            "model": engine.panics(),
+                            "seat": counters.seat_panics.load(Ordering::Relaxed),
+                        },
                         // Permanent, like `panics`: an answer that was
                         // not a distribution never reached a caller, and
                         // a record drawn from this seat says so.
@@ -583,7 +624,9 @@ pub fn serve(
                 if let Err(e) = request.as_reader().read_to_string(&mut body) {
                     refuse(400, "invalid_request", &format!("unreadable body: {e}"))
                 } else {
-                    let v = classify(&engine, &counters, &body, rendering);
+                    let v = answer_guarded(&counters, || {
+                        classify(&engine, &counters, &body, rendering)
+                    });
                     json_response(
                         v["_status"].as_u64().unwrap_or(500) as u16,
                         v["_body"].clone(),
@@ -608,6 +651,33 @@ pub fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The runtime's guard covers the forward pass; this one covers
+    /// everything the seat does with the result. Before it, a bug in our
+    /// own reading killed the process — and with it the permanent count
+    /// that exists so a record can say the seat ever faulted.
+    #[test]
+    fn a_panic_in_the_seat_answers_a_refusal_and_is_carried() {
+        let counters = Counters::default();
+
+        let v = answer_guarded(&counters, || panic!("an index the composer tripped"));
+        assert_eq!(v["_status"], 500);
+        assert_eq!(v["_body"]["error"]["type"], "panic");
+        assert!(
+            v["_body"]["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("panics")),
+            "the refusal must say where the fact now lives: {v}"
+        );
+        assert_eq!(counters.seat_panics.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.errors.load(Ordering::Relaxed), 1);
+
+        // The seat keeps answering, and recovering does not reset the
+        // count — a process that faulted once says so for its life.
+        let v = answer_guarded(&counters, || json!({"_status": 200}));
+        assert_eq!(v["_status"], 200);
+        assert_eq!(counters.seat_panics.load(Ordering::Relaxed), 1);
+    }
 
     /// The road a seat serves is a property of the SEAT. For one commit
     /// a body could name `render` and flip it for that request, which

@@ -171,6 +171,76 @@ pub fn default_warm_shapes(limits: Limits) -> Vec<(usize, usize)> {
     out
 }
 
+/// Turns the head's raw output into answers, refusing a shape it cannot
+/// read rather than indexing into it.
+///
+/// Every index here used to be taken on faith: `out.logits[i]` assumed a
+/// row per question, `[..k]` assumed that row was at least as long as
+/// the question's options, and `out.act[i]` assumed the same of the act
+/// head. A model that returned fewer rows than it was asked about — a
+/// loader that quietly built the wrong head, a kernel that dropped a
+/// launch — panicked inside the seat, OUTSIDE `guarded_decide`, which
+/// catches only the forward pass. The seat then died on a bug in its own
+/// reading, and the permanent `panics` count that was supposed to carry
+/// a fault forward never got the chance to record it.
+///
+/// Pure: no device, no lock, no tokenizer. A refusal names the question
+/// and both numbers, because "the model returned the wrong shape" is
+/// useless to whoever has to find out why.
+fn read_answers(
+    questions: &[DecisionQuestion],
+    rendered: &[Vec<String>],
+    sequences: &[Sequence],
+    out: &DecisionLogits,
+    calibration: &Calibration,
+) -> Result<Vec<DecisionAnswer>> {
+    let bad = |what: String| EngineError::Model(combs_models::ModelError::Unsupported(what));
+    if out.logits.len() != questions.len() {
+        return Err(bad(format!(
+            "the head returned {} rows for {} questions",
+            out.logits.len(),
+            questions.len()
+        )));
+    }
+    if out.act.len() != questions.len() {
+        return Err(bad(format!(
+            "the act head returned {} rows for {} questions",
+            out.act.len(),
+            questions.len()
+        )));
+    }
+    let mut answers = Vec::with_capacity(questions.len());
+    for (i, q) in questions.iter().enumerate() {
+        let kind = q.criteria.kind();
+        let k = rendered[i].len();
+        if out.logits[i].len() < k {
+            return Err(bad(format!(
+                "question {:?}: the head returned {} logits for {} markers — an answer over \
+                 fewer options is an answer to a different question",
+                q.name,
+                out.logits[i].len(),
+                k
+            )));
+        }
+        let logits = &out.logits[i][..k];
+        let t = calibration.temperature(kind, k);
+        let p = readout(logits, t);
+        answers.push(DecisionAnswer {
+            name: q.name.clone(),
+            kind,
+            distribution: engine_order(kind, &p),
+            logits: engine_order(kind, logits),
+            temperature: t,
+            bucket: calibration.bucket(kind, k),
+            // Index zero is answering; the rest are the acts the
+            // config prices.
+            p_act: out.act[i].first().copied().unwrap_or(0.0),
+            usage: sequences[i].usage(),
+        });
+    }
+    Ok(answers)
+}
+
 /// Runs one batch through the model, surviving a fault and recording it.
 ///
 /// Two things that used to be one. **The lock is recovered**: `decide`
@@ -478,27 +548,7 @@ impl DecisionEngine {
             markers: batch.markers,
         };
         let out = guarded_decide(&self.model, &self.panics, &batch)?;
-
-        let mut answers = Vec::with_capacity(questions.len());
-        for (i, q) in questions.iter().enumerate() {
-            let kind = q.criteria.kind();
-            let k = rendered[i].len();
-            let logits = &out.logits[i][..k];
-            let t = self.calibration.temperature(kind, k);
-            let p = readout(logits, t);
-            answers.push(DecisionAnswer {
-                name: q.name.clone(),
-                kind,
-                distribution: engine_order(kind, &p),
-                logits: engine_order(kind, logits),
-                temperature: t,
-                bucket: self.calibration.bucket(kind, k),
-                // Index zero is answering; the rest are the acts the
-                // config prices.
-                p_act: out.act[i].first().copied().unwrap_or(0.0),
-                usage: sequences[i].usage(),
-            });
-        }
+        let answers = read_answers(questions, &rendered, &sequences, &out, &self.calibration)?;
         Ok(Decided {
             answers,
             batch: shape,
@@ -547,6 +597,83 @@ mod tests {
             marker_mask: vec![true],
             qtype: vec![0],
         }
+    }
+
+    /// A head that returns the wrong shape must refuse BY NAME, not
+    /// panic inside the seat. `guarded_decide` catches the forward pass
+    /// only, so a bug in our own reading of the output used to kill the
+    /// process — and the permanent fault count that exists to carry a
+    /// fault forward never recorded it, because the recorder died too.
+    #[test]
+    fn a_ragged_answer_is_refused_by_name_and_never_indexed() {
+        let q = DecisionQuestion {
+            name: "intent".to_string(),
+            instructions: String::new(),
+            criteria: Criteria::Choice(vec![
+                ("a".to_string(), serde_json::json!("the first")),
+                ("b".to_string(), serde_json::json!("the second")),
+            ]),
+        };
+        let rendered = vec![vec![
+            "a: the first".to_string(),
+            "b: the second".to_string(),
+        ]];
+        // Built by hand rather than tokenized: `read_answers` reads a
+        // sequence only for its `usage()`, and this test is about the
+        // shape the HEAD returned.
+        let sequences = vec![Sequence {
+            ids: vec![1, 3, 4, 3, 5, 2],
+            markers: vec![1, 3],
+            options: 2,
+            kind: Kind::Choice,
+            instruction_tokens_cut: 0,
+            option_tokens_cut: 0,
+            state_tokens_cut: 0,
+        }];
+        let cal = Calibration::neutral();
+        let qs = vec![q];
+
+        // One logit for two markers: the old code sliced `[..2]` and
+        // panicked where nobody was catching.
+        let ragged = DecisionLogits {
+            logits: vec![vec![0.5]],
+            act: vec![vec![1.0]],
+        };
+        let why = read_answers(&qs, &rendered, &sequences, &ragged, &cal)
+            .expect_err("one logit for two markers")
+            .to_string();
+        assert!(why.contains("intent"), "{why}");
+        assert!(why.contains("1 logits for 2 markers"), "{why}");
+
+        // No row at all for the question that was asked.
+        let empty = DecisionLogits {
+            logits: vec![],
+            act: vec![],
+        };
+        let why = read_answers(&qs, &rendered, &sequences, &empty, &cal)
+            .expect_err("no rows")
+            .to_string();
+        assert!(why.contains("0 rows for 1 questions"), "{why}");
+
+        // The act head short while the scorer is sound — still refused,
+        // rather than answered with a p_act nobody computed.
+        let no_act = DecisionLogits {
+            logits: vec![vec![0.5, 0.5]],
+            act: vec![],
+        };
+        let why = read_answers(&qs, &rendered, &sequences, &no_act, &cal)
+            .expect_err("no act rows")
+            .to_string();
+        assert!(why.contains("act head"), "{why}");
+
+        // And a sound shape still reads.
+        let good = DecisionLogits {
+            logits: vec![vec![1.0, 0.0]],
+            act: vec![vec![1.0]],
+        };
+        let answers = read_answers(&qs, &rendered, &sequences, &good, &cal).expect("a sound head");
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].distribution.len(), 2);
     }
 
     /// The seat survives its own fault, keeps answering, and CARRIES THE
