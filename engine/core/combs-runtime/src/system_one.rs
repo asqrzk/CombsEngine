@@ -18,6 +18,7 @@ use std::sync::Mutex;
 // clock: native — `mod system_one` is cfg'd off wasm in lib.rs.
 use std::time::Instant;
 
+use combs_classify::bars;
 use combs_classify::sequence::{
     build_sequence, collate, Cut, DecisionBatch, Encode, Limits, QuestionUsage, Sequence, Specials,
 };
@@ -103,6 +104,10 @@ pub struct Decided {
 pub struct WarmPass {
     pub rows: usize,
     pub len: usize,
+    /// The marker width this pass tuned. A rectangle is not one shape:
+    /// the head's matmuls are sized by the markers, so two passes of the
+    /// same rows and length at different widths are different kernels.
+    pub markers: usize,
     pub ms: u64,
 }
 
@@ -156,16 +161,39 @@ pub fn warm_batch(
     collate(&seqs, specials.pad)
 }
 
-/// The shapes a seat warms by default: one and two questions at the
-/// lengths the seed suites take (a two-question request is two rows of
-/// ~150–200 tokens), then the larger rectangles a longer state or more
-/// questions would make — each clamped to the checkpoint's `max_len`.
-pub fn default_warm_shapes(limits: Limits) -> Vec<(usize, usize)> {
+/// The shapes a seat warms by default, as `(rows, len, markers)`.
+///
+/// A rectangle alone was not the shape: every pass here used to warm two
+/// markers, so the head's own matmuls were tuned at width two and
+/// nothing else. Measured on the ae86e63 smoke, an untuned shape costs
+/// **≈ 5 s on its first call** — and every seed question (7 and 9
+/// options), every small one-question body, and any request past four
+/// questions met one. Three gaps are closed here: the smallest row a
+/// request can make, a real marker width beside the suites' rectangle,
+/// and the widest head the wire admits (`MAX_QUESTIONS` rows of
+/// `MAX_OPTIONS` markers) at a length that keeps that pass on the same
+/// 4,096-token rectangle as the deepest one, rather than adding a
+/// 16,384-token pass to every start.
+///
+/// Each length is clamped to the checkpoint's `max_len`, and a shape
+/// that could not hold its own markers is dropped rather than refused —
+/// a tiny checkpoint should still warm what it can.
+pub fn default_warm_shapes(limits: Limits) -> Vec<(usize, usize, usize)> {
     let mut out = Vec::new();
-    for (rows, len) in [(1, 256), (2, 256), (2, 512), (4, 1024)] {
+    for (rows, len, markers) in [
+        (1, 64, 2),
+        (1, 256, 2),
+        (2, 256, 9),
+        (2, 512, 2),
+        (4, 1024, 2),
+        (bars::MAX_QUESTIONS, 256, bars::MAX_OPTIONS),
+    ] {
         let len = len.min(limits.max_len);
-        if !out.contains(&(rows, len)) {
-            out.push((rows, len));
+        if len < markers + 2 {
+            continue;
+        }
+        if !out.contains(&(rows, len, markers)) {
+            out.push((rows, len, markers));
         }
     }
     out
@@ -445,7 +473,7 @@ impl DecisionEngine {
     /// with a 1,500 ms budget should never be the one to pay it. Every
     /// pass syncs on its readback, so a launch error surfaces HERE
     /// rather than in a caller's answer.
-    pub fn warm(&self, shapes: &[(usize, usize)]) -> Result<WarmReport> {
+    pub fn warm(&self, shapes: &[(usize, usize, usize)]) -> Result<WarmReport> {
         let bad = |what: String| EngineError::Model(combs_models::ModelError::Unsupported(what));
         // A previous panic must not end the seat. `decide` takes `&self`
         // and mutates nothing, so a lock poisoned by an earlier fault
@@ -455,10 +483,10 @@ impl DecisionEngine {
         let model = self.model.lock().unwrap_or_else(|e| e.into_inner());
         let t0 = Instant::now();
         let mut passes = Vec::with_capacity(shapes.len());
-        for &(rows, len) in shapes {
-            let batch = warm_batch(rows, len, 2, &self.specials).ok_or_else(|| {
+        for &(rows, len, markers) in shapes {
+            let batch = warm_batch(rows, len, markers, &self.specials).ok_or_else(|| {
                 bad(format!(
-                    "a warm-up shape of {rows}x{len} cannot hold its own markers"
+                    "a warm-up shape of {rows}x{len} cannot hold its own {markers} markers"
                 ))
             })?;
             let t = Instant::now();
@@ -466,6 +494,7 @@ impl DecisionEngine {
             passes.push(WarmPass {
                 rows,
                 len,
+                markers,
                 ms: t.elapsed().as_millis() as u64,
             });
         }
@@ -756,9 +785,60 @@ mod tests {
             head_max_len: 192,
             cut: Cut::Right,
         });
-        assert!(shapes.iter().all(|&(_, len)| len <= 300), "{shapes:?}");
+        assert!(shapes.iter().all(|&(_, len, _)| len <= 300), "{shapes:?}");
         let mut seen = std::collections::HashSet::new();
         assert!(shapes.iter().all(|s| seen.insert(*s)), "{shapes:?}");
-        assert_eq!(shapes[0], (1, 256));
+        assert_eq!(shapes[0], (1, 64, 2));
+    }
+
+    /// The warm set used to be four rectangles at two markers. The head
+    /// is sized by the MARKERS, so a seven-option question met an
+    /// untuned kernel and paid ~5 s for it (the ae86e63 smoke), and so
+    /// did a one-question body below the smallest rectangle. The set now
+    /// covers the smallest row a request can make, a real marker width,
+    /// and the widest head the wire admits — and every shape in it can
+    /// hold its own markers, or `warm` would refuse at start-up.
+    #[test]
+    fn default_warm_shapes_cover_the_widest_head_and_the_smallest_row() {
+        let limits = Limits {
+            max_len: 1024,
+            head_max_len: 256,
+            cut: Cut::Right,
+        };
+        let shapes = default_warm_shapes(limits);
+        assert!(shapes.contains(&(1, 64, 2)), "the smallest row: {shapes:?}");
+        assert!(
+            shapes
+                .iter()
+                .any(|&(rows, _, markers)| rows == bars::MAX_QUESTIONS
+                    && markers == bars::MAX_OPTIONS),
+            "the widest head the wire admits: {shapes:?}"
+        );
+        assert!(
+            shapes.iter().any(|&(_, _, markers)| markers > 2),
+            "a real marker width beside the suites' rectangle: {shapes:?}"
+        );
+        let specials = specials();
+        for &(rows, len, markers) in &shapes {
+            assert!(len <= limits.max_len, "{rows}x{len} past max_len");
+            assert!(
+                warm_batch(rows, len, markers, &specials).is_some(),
+                "{rows}x{len} at {markers} markers cannot hold them: warm would refuse at start-up"
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        assert!(shapes.iter().all(|s| seen.insert(*s)), "{shapes:?}");
+        // The widest head rides the deepest pass's own rectangle rather
+        // than adding a 16,384-token pass to every start.
+        let widest = shapes
+            .iter()
+            .find(|&&(rows, _, _)| rows == bars::MAX_QUESTIONS)
+            .copied()
+            .expect("the widest head");
+        assert!(
+            widest.0 * widest.1 <= 4 * 1024,
+            "the widest pass costs {} tokens: every seat start pays it",
+            widest.0 * widest.1
+        );
     }
 }

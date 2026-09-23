@@ -641,6 +641,23 @@ fn stats_json(
     })
 }
 
+/// What the warm-up cost, for the config line and `/v1/stats`.
+///
+/// `markers` is part of the shape, not decoration: the head's matmuls
+/// are sized by the marker width, so a record that says only the
+/// rectangle cannot tell whether the seat's first real request paid
+/// autotune. Pure, so a test reads what a record would carry.
+fn warm_json(warm: &WarmReport) -> Value {
+    json!({
+        "passes": warm
+            .passes
+            .iter()
+            .map(|p| json!({"rows": p.rows, "len": p.len, "markers": p.markers, "ms": p.ms}))
+            .collect::<Vec<_>>(),
+        "total_ms": warm.total_ms,
+    })
+}
+
 /// The response type every route builds.
 type Resp = tiny_http::Response<std::io::Cursor<Vec<u8>>>;
 
@@ -703,14 +720,7 @@ pub fn serve(
     ];
     #[cfg(not(feature = "cpu"))]
     extra.push(("wgsl_doors", wgsl_doors_line()));
-    let warm_json = json!({
-        "passes": warm
-            .passes
-            .iter()
-            .map(|p| json!({"rows": p.rows, "len": p.len, "ms": p.ms}))
-            .collect::<Vec<_>>(),
-        "total_ms": warm.total_ms,
-    });
+    let warm_json = warm_json(&warm);
     combs_core::provenance::startup(
         "system-one",
         &config_fields(
@@ -815,6 +825,37 @@ mod tests {
 
     use std::io::Read;
     use std::time::Duration;
+
+    /// A warm-up pass is a rectangle AND a marker width; a record that
+    /// says only the rectangle cannot tell whether the first real
+    /// request paid autotune, which is ~5 s at an untuned shape.
+    #[test]
+    fn warm_up_says_how_many_markers_each_pass_had() {
+        let report = WarmReport {
+            passes: vec![
+                combs_runtime::WarmPass {
+                    rows: 1,
+                    len: 64,
+                    markers: 2,
+                    ms: 7,
+                },
+                combs_runtime::WarmPass {
+                    rows: 16,
+                    len: 256,
+                    markers: 64,
+                    ms: 11,
+                },
+            ],
+            total_ms: 18,
+        };
+        let json = warm_json(&report);
+        assert_eq!(json["total_ms"], 18);
+        assert_eq!(json["passes"][0]["markers"], 2);
+        assert_eq!(json["passes"][1]["markers"], 64);
+        assert_eq!(json["passes"][1]["rows"], 16);
+        assert_eq!(json["passes"][1]["len"], 256);
+        assert_eq!(json["passes"][1]["ms"], 11);
+    }
 
     /// The state-cut door: two words; unset keeps the beginning every
     /// sealed record was taken with; anything else is refused naming the
