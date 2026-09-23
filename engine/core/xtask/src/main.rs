@@ -395,7 +395,7 @@ fn cmd_gates(ctx: &Ctx, quick: bool, strict: bool) -> Result<()> {
     // for weeks and the browser build was broken, and every `--quick`
     // said all gates passed: a gate proves only what it is configured
     // to run, and a skipped crate is where defects go to live.
-    let rt = pure_tier_args("combs-runtime", RUNTIME_DEVICE_MODULES);
+    let rt = pure_tier_args("combs-runtime", RUNTIME_DEVICE_MODULES, &[]);
     tier(
         "runtime-pure",
         &rt.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -405,7 +405,7 @@ fn cmd_gates(ctx: &Ctx, quick: bool, strict: bool) -> Result<()> {
     // in test mode; 0.27 s when nothing in the crate changed, and a
     // change to the crate pays the harness again on the order of the
     // lib compile `cli` already pays for the same change.
-    let md = pure_tier_args("combs-models", MODELS_DEVICE_MODULES);
+    let md = pure_tier_args("combs-models", MODELS_DEVICE_MODULES, MODELS_PURE_TESTS);
     tier(
         "models-pure",
         &md.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -428,10 +428,14 @@ fn cmd_gates(ctx: &Ctx, quick: bool, strict: bool) -> Result<()> {
         // These need a GPU adapter and take minutes; a machine without
         // one skips their GPU cases rather than failing them.
         tier("formats", &["test", "--release", "-p", "combs-formats"]);
-        tier(
-            "models",
-            &["test", "--release", "-p", "combs-models", "--lib"],
-        );
+        // `--lib` plus the device-free integration tests the quick tier
+        // does not carry: before this they ran in no tier at all.
+        let mut models = vec!["test", "--release", "-p", "combs-models", "--lib"];
+        for t in MODELS_FULL_TESTS {
+            models.push("--test");
+            models.push(t);
+        }
+        tier("models", &models);
         tier("runtime", &["test", "--release", "-p", "combs-runtime"]);
         tier(
             "diffusion",
@@ -871,15 +875,42 @@ fn main() -> Result<()> {
 /// and the device tests would leak into every commit's gate without a
 /// word. The test below holds the list to the tree.
 const RUNTIME_DEVICE_MODULES: &[&str] = &["engine", "step", "transcribe"];
+
+/// combs-models integration tests that need no device, by cost.
+///
+/// Both models tiers passed `--lib`, so every one of these ran in NO
+/// tier — including `laya_parity`, which is the only coverage there is
+/// of `decision.rs` and `modernbert.rs`, the System 1 seat's own model
+/// code. Measured on this Mac, cold link then run:
+///
+///   laya_parity     176 s   0.02 s   3 tests   the seat's encoder and heads
+///   kv_cache         96 s   0.00 s   5 tests
+///   phi_fused       104 s   0.01 s   1 test
+///   qwen_bias       104 s   0.00 s   2 tests
+///   streamed_mount  208 s  45.95 s   2 tests   — runs for 46 SECONDS
+///
+/// Only `laya_parity` rides every commit: it guards the seat, and three
+/// minutes of link once per clean checkout buys that. The rest join the
+/// full gate, which is a promotion from nowhere. `streamed_mount` would
+/// never belong in a quick tier at any link cost — 46 s of RUNNING is
+/// the disqualifier, and a tier nobody can bear to run is a tier that
+/// gets skipped.
+const MODELS_PURE_TESTS: &[&str] = &["laya_parity"];
+const MODELS_FULL_TESTS: &[&str] = &["kv_cache", "phi_fused", "qwen_bias", "streamed_mount"];
 const MODELS_DEVICE_MODULES: &[&str] = &["qlinear", "qmatmul", "qkernel", "wgsl", "kv", "whisper"];
 
 /// `cargo test` arguments for a crate's pure tests: its `--lib`, with
 /// each device module skipped by its test-path prefix.
-fn pure_tier_args(krate: &str, device_modules: &[&str]) -> Vec<String> {
-    let mut args: Vec<String> = ["test", "--release", "-p", krate, "--lib", "--"]
+fn pure_tier_args(krate: &str, device_modules: &[&str], tests: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = ["test", "--release", "-p", krate, "--lib"]
         .iter()
         .map(|s| s.to_string())
         .collect();
+    for t in tests {
+        args.push("--test".into());
+        args.push((*t).to_string());
+    }
+    args.push("--".into());
     for m in device_modules {
         args.push("--skip".into());
         args.push(format!("{m}::"));
@@ -889,7 +920,10 @@ fn pure_tier_args(krate: &str, device_modules: &[&str]) -> Vec<String> {
 
 #[cfg(test)]
 mod build_support {
-    use super::{pure_tier_args, MODELS_DEVICE_MODULES, RUNTIME_DEVICE_MODULES};
+    use super::{
+        pure_tier_args, MODELS_DEVICE_MODULES, MODELS_FULL_TESTS, MODELS_PURE_TESTS,
+        RUNTIME_DEVICE_MODULES,
+    };
 
     /// combs-cli's build script stamps times with a committed copy of
     /// combs-core's formatter (a packaged tarball cannot include across
@@ -935,8 +969,23 @@ mod build_support {
                 "{krate}: everything is skipped"
             );
         }
+        // Every named integration test is a real file, or the `--test`
+        // names nothing and cargo fails the tier by name.
+        let tests = root.join("combs-models").join("tests");
+        for t in MODELS_PURE_TESTS.iter().chain(MODELS_FULL_TESTS) {
+            assert!(
+                tests.join(format!("{t}.rs")).exists(),
+                "combs-models/tests/{t}.rs does not exist, but a tier names it"
+            );
+        }
+        // And the two lists are disjoint: a test in both would link twice
+        // per gate for nothing.
+        for t in MODELS_PURE_TESTS {
+            assert!(!MODELS_FULL_TESTS.contains(t), "{t} is in both lists");
+        }
+
         // The args come out in the shape cargo reads.
-        let args = pure_tier_args("combs-runtime", &["engine"]);
+        let args = pure_tier_args("combs-runtime", &["engine"], &[]);
         assert_eq!(
             args,
             [
@@ -948,6 +997,22 @@ mod build_support {
                 "--",
                 "--skip",
                 "engine::"
+            ]
+        );
+        let args = pure_tier_args("combs-models", &["kv"], &["laya_parity"]);
+        assert_eq!(
+            args,
+            [
+                "test",
+                "--release",
+                "-p",
+                "combs-models",
+                "--lib",
+                "--test",
+                "laya_parity",
+                "--",
+                "--skip",
+                "kv::"
             ]
         );
     }
