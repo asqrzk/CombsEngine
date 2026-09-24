@@ -1,7 +1,7 @@
 //! The invariant suite: what a rung must survive before anything is
 //! wired to it.
 //!
-//! Five checks, and each one exists because a classifier can pass the
+//! Six checks, and each one exists because a classifier can pass the
 //! obvious test and still be useless:
 //!
 //! - SCHEMA — the answer is shaped like an answer at all: it names an
@@ -14,11 +14,17 @@
 //! - IMPLICATIONS — an action that fired had its speech act hold.
 //! - CALIBRATION — the confidence means something, scored by ECE *and*
 //!   Brier.
+//! - NOUL — the speech act reads as the fixture says it should. The gate
+//!   the whole design rests on had no gold of its own until this check:
+//!   every item said which option it expected and nothing about whether
+//!   it was a request at all.
 //!
 //! A check is only worth its name if it can be shown to CATCH
 //! something, so every check here has a test that feeds it a canned
 //! failure and requires it to refuse, and a positive control requiring
 //! it not to refuse everything.
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +56,18 @@ pub struct Header {
     pub suite: String,
     pub delta: f32,
     pub questions: Vec<QuestionSpec>,
+    /// Why this fixture's noul is allowed a false side past the option
+    /// cap. v1 and the v2 control copy joined four contraries into a
+    /// 46-word false side that the 48-token cap cuts mid-clause; they are
+    /// kept verbatim for continuity with the records taken on them, and
+    /// they say so here. A current fixture carries no such note and is
+    /// held to the bound.
+    #[serde(default)]
+    pub legacy_noul: Option<String>,
+    /// Anything the fixture's author wants a reader to know first — a
+    /// probe's provenance, a pending second hand.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// What an item expects: which question, which option, and whether that
@@ -145,6 +163,13 @@ pub struct Item {
     /// with the run that measured the original.
     #[serde(default)]
     pub from_v1: Option<u64>,
+    /// What each noul question should read for this state: `true` when
+    /// the proposition holds. Keyed by question name, so a fixture with
+    /// two nouls says both. `expect` names an OPTION and says nothing
+    /// about the speech act; until this field every measurement of the
+    /// gate was a measurement against nothing.
+    #[serde(default)]
+    pub noul: BTreeMap<String, bool>,
 }
 
 impl Item {
@@ -240,6 +265,19 @@ pub fn parse(jsonl: &str) -> Result<(Header, Vec<Item>), String> {
         return Err("the fixture has no items".to_string());
     }
     for (n, item) in items.iter().enumerate() {
+        for q in item.noul.keys() {
+            let is_noul = header
+                .questions
+                .iter()
+                .any(|hq| hq.name == *q && hq.kind == Kind::Noul);
+            if !is_noul {
+                return Err(format!(
+                    "item {}: names a noul answer for {q:?}, which the header does not declare \
+                     as a noul",
+                    item.id
+                ));
+            }
+        }
         let declared = header
             .questions
             .iter()
@@ -546,6 +584,54 @@ pub fn check_calibration(_h: &Header, items: &[Item], observed: &[Observed]) -> 
     }
 }
 
+/// The speech act reads as the fixture says: a noul's `top` is `true`
+/// exactly where the item's gold says the proposition holds.
+///
+/// Only items that carry a gold for an observed noul are judged, and an
+/// item whose gold names a question this run never asked is counted as
+/// unanswered rather than skipped — a run that forgot the gate says so.
+pub fn check_noul(_h: &Header, items: &[Item], observed: &[Observed]) -> Verdict {
+    let mut wrong: Vec<String> = Vec::new();
+    let mut unanswered: Vec<String> = Vec::new();
+    let mut n = 0usize;
+    for item in items {
+        for (q, gold) in &item.noul {
+            n += 1;
+            let Some(a) = find(observed, &item.id).and_then(|o| answer_for(o, q)) else {
+                unanswered.push(format!("{}.{q}", item.id));
+                continue;
+            };
+            let read = a.top == "true";
+            if read != *gold {
+                wrong.push(format!(
+                    "{}.{q} read {} (p {:.2}) where the fixture says {}",
+                    item.id, a.top, a.p_top, gold
+                ));
+            }
+        }
+    }
+    let holds = wrong.is_empty() && unanswered.is_empty();
+    Verdict {
+        claim: "the speech act reads as the fixture says".to_string(),
+        holds,
+        evidence: if n == 0 {
+            "no item carries a noul answer: the gate was never graded".to_string()
+        } else if holds {
+            format!("{n} noul readings, every one as the fixture says")
+        } else {
+            let mut s = format!(
+                "{} of {n} noul readings wrong: {}",
+                wrong.len(),
+                wrong.join("; ")
+            );
+            if !unanswered.is_empty() {
+                s.push_str(&format!("; unanswered: {}", unanswered.join(", ")));
+            }
+            s
+        },
+    }
+}
+
 /// Every check, in the order a reader wants them.
 pub fn run_all(h: &Header, items: &[Item], observed: &[Observed]) -> Vec<Verdict> {
     vec![
@@ -554,5 +640,6 @@ pub fn run_all(h: &Header, items: &[Item], observed: &[Observed]) -> Vec<Verdict
         check_monotonicity(h, items, observed),
         check_implications(h, items, observed),
         check_calibration(h, items, observed),
+        check_noul(h, items, observed),
     ]
 }

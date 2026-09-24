@@ -3,8 +3,8 @@
 //! check that refuses everything cannot pass for a strict one.
 
 use combs_classify::suite::{
-    check_calibration, check_contrast, check_monotonicity, check_schema, parse, Answer, Header,
-    Item, Observed,
+    check_calibration, check_contrast, check_monotonicity, check_noul, check_schema, parse, Answer,
+    Header, Item, Observed,
 };
 use combs_classify::tether::validate;
 
@@ -553,4 +553,209 @@ fn deliberation_is_a_near_miss_mode_beside_the_four() {
     assert_eq!(item.near_miss_mode(), Some("deliberation"));
     assert_eq!(item.of(), Some("call-b1"));
     assert!(!item.is_paraphrase());
+}
+
+// --- the noul's own expected answer (E7) -------------------------------------
+
+const SEED_V2_OLDNOUL: &str = include_str!("data/classify-seed-v2-oldnoul.jsonl");
+
+/// The rule the golds were written to, and which the fixtures now pin:
+/// a base, a paraphrase, a translation request, a definition request and
+/// a deliberation are all requests — for an action or for an answer — so
+/// the proposition holds; a description of the past and a refusal are
+/// not. v1's untyped contrasts are the same six texts as v2's, so they
+/// carry the same six answers by id.
+fn gold_by_rule(item: &Item) -> bool {
+    match item.near_miss_mode() {
+        None => true,
+        Some("translation") | Some("definition") | Some("deliberation") => true,
+        Some("past") | Some("negation") => false,
+        Some("contrast") => matches!(item.id.as_str(), "unsub-c1" | "refund-c1" | "call-c1"),
+        Some(other) => panic!("no rule for {other}"),
+    }
+}
+
+/// Every shipped item says what its noul should read, and says it by the
+/// pre-registered rule. Until this, `expect` named an option and nothing
+/// said whether the state was a request at all — the gate was measured
+/// against nothing.
+#[test]
+fn every_shipped_item_says_what_its_noul_should_read() {
+    for (name, text) in [
+        ("v1", SEED),
+        ("v2", SEED_V2),
+        ("v2-oldnoul", SEED_V2_OLDNOUL),
+    ] {
+        let (h, items) = parse(text).expect("parses");
+        assert!(
+            h.questions.iter().any(|q| q.name == "is_request"),
+            "{name} asks is_request"
+        );
+        for item in &items {
+            let gold = item
+                .noul
+                .get("is_request")
+                .unwrap_or_else(|| panic!("{name}: {} carries no noul answer", item.id));
+            assert_eq!(
+                *gold,
+                gold_by_rule(item),
+                "{name}: {} ({}) is not labelled by the rule",
+                item.id,
+                item.kind
+            );
+        }
+    }
+}
+
+#[test]
+fn a_noul_answer_naming_a_question_the_header_does_not_declare_as_a_noul_is_refused() {
+    let base = one_item(
+        r#"{"question":"intent","option":"schedule_call","fires":true}"#,
+        "",
+        "base",
+    );
+    for (extra, why) in [
+        (r#","noul":{"intent":true}"#, "does not declare as a noul"),
+        (r#","noul":{"nope":false}"#, "does not declare as a noul"),
+    ] {
+        let fixture = base.replacen("\"expect\":", &format!("{}, \"expect\":", &extra[1..]), 1);
+        let err = parse(&fixture).expect_err("a noul answer for a non-noul is refused");
+        assert!(err.contains(why) && err.contains("call-d1"), "{err}");
+    }
+}
+
+/// The check reads `true` against the gold, names what it got wrong with
+/// the probability it read it at, and names an item whose gate was never
+/// asked instead of skipping it.
+#[test]
+fn the_noul_check_reads_true_against_the_gold_and_names_what_it_got_wrong() {
+    let fixture = concat!(
+        r#"{"kind":"header","suite":"t","delta":0.15,"questions":["#,
+        r#"{"name":"is_request","kind":"noul","tether":{"means":"the person is asking","not":["the person is telling"]}},"#,
+        r#"{"name":"intent","kind":"choice","options":[{"id":"a","tether":{"means":"a"}},{"id":"none_of_these","tether":{"means":"none"}}]}]}"#,
+        "\n",
+        r#"{"id":"ask","kind":"base","state":"do a","expect":{"question":"intent","option":"a","fires":true},"noul":{"is_request":true}}"#,
+        "\n",
+        r#"{"id":"tell","kind":"past-of:ask","state":"a was done","expect":{"question":"intent","option":"none_of_these","fires":true},"never":{"question":"intent","option":"a"},"noul":{"is_request":false}}"#,
+    );
+    let (h, items) = parse(fixture).expect("parses");
+    let obs = |ask_top: &str, tell_top: &str| {
+        vec![
+            Observed {
+                item: "ask".into(),
+                answers: vec![
+                    ans("is_request", ask_top, 0.9, 0.9, "act"),
+                    ans("intent", "a", 0.8, 0.8, "act"),
+                ],
+            },
+            Observed {
+                item: "tell".into(),
+                answers: vec![
+                    ans("is_request", tell_top, 0.7, 0.7, "act"),
+                    ans("intent", "none_of_these", 0.8, 0.8, "act"),
+                ],
+            },
+        ]
+    };
+    let v = check_noul(&h, &items, &obs("true", "false"));
+    assert!(v.holds, "{}", v.evidence);
+    assert!(v.evidence.contains("2 noul readings"), "{}", v.evidence);
+
+    let v = check_noul(&h, &items, &obs("false", "false"));
+    assert!(!v.holds);
+    assert!(
+        v.evidence
+            .contains("ask.is_request read false (p 0.90) where the fixture says true"),
+        "{}",
+        v.evidence
+    );
+
+    let v = check_noul(&h, &items, &obs("true", "true"));
+    assert!(!v.holds);
+    assert!(
+        v.evidence.contains("tell.is_request read true"),
+        "{}",
+        v.evidence
+    );
+
+    // The gate never asked: named, not skipped.
+    let without = vec![Observed {
+        item: "ask".into(),
+        answers: vec![ans("intent", "a", 0.8, 0.8, "act")],
+    }];
+    let v = check_noul(&h, &items, &without);
+    assert!(!v.holds);
+    assert!(
+        v.evidence
+            .contains("unanswered: ask.is_request, tell.is_request"),
+        "{}",
+        v.evidence
+    );
+
+    // A positive control against a fixture with no gold at all.
+    let (h0, items0) = read();
+    let stripped: Vec<Item> = items0
+        .into_iter()
+        .map(|mut i| {
+            i.noul.clear();
+            i
+        })
+        .collect();
+    let v = check_noul(&h0, &stripped, &answers_that_work(&stripped));
+    assert!(v.evidence.contains("never graded"), "{}", v.evidence);
+}
+
+/// The option cap is 48 tokens and the v2 false side was 46 WORDS — cut
+/// mid-clause on every sealed record, invisibly. A current fixture keeps
+/// each noul side under thirty words (≈ 40 tokens); a legacy one says
+/// why it does not, in its header, and must actually be over the bound
+/// to be allowed the note.
+#[test]
+fn every_current_fixture_keeps_each_noul_side_under_thirty_words() {
+    const BOUND: usize = 30;
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let mut seen = 0usize;
+    for entry in std::fs::read_dir(&dir).expect("tests/data") {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (h, _) = parse(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        for q in h
+            .questions
+            .iter()
+            .filter(|q| q.kind == combs_classify::Kind::Noul)
+        {
+            let t = q.tether.as_ref().expect("a noul has a tether");
+            let sides = [
+                ("true", t.means.split_whitespace().count()),
+                ("false", t.not.join("; ").split_whitespace().count()),
+            ];
+            seen += 1;
+            match &h.legacy_noul {
+                Some(why) => {
+                    assert!(
+                        sides.iter().any(|(_, w)| *w > BOUND),
+                        "{}: carries a legacy note ({why}) but every side is within the bound",
+                        path.display()
+                    );
+                }
+                None => {
+                    for (side, words) in sides {
+                        assert!(
+                            words <= BOUND,
+                            "{}: the {side} side of {} is {words} words (bound {BOUND})",
+                            path.display(),
+                            q.name
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        seen >= 3,
+        "only {seen} nouls seen: the test lost its subject"
+    );
 }
