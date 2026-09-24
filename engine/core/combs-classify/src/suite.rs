@@ -60,6 +60,34 @@ pub struct Expect {
     pub question: String,
     pub option: String,
     pub fires: bool,
+    /// Options that are ALSO right for this item.
+    ///
+    /// Every item in v1 and v2 has exactly one right answer, which is
+    /// what a seed suite should have. A genuinely ambiguous state does
+    /// not: "shall I walk to the carwash" is a person asking for a view,
+    /// and both "advise" and "none of these" are defensible readings of
+    /// a catalogue that has no verb for it. Scoring such an item against
+    /// one string measures the writer's taste, not the scorer.
+    ///
+    /// `option` stays the named answer — what a table prints and what
+    /// the base-lookup reads — and this is what else would be accepted.
+    /// Only meaningful where the option must fire; `parse` refuses it
+    /// anywhere else, and refuses one that names the option again or an
+    /// option the item forbids.
+    #[serde(default)]
+    pub any_of: Vec<String>,
+}
+
+impl Expect {
+    /// Is `top` one of the answers this item accepts?
+    pub fn accepts(&self, top: &str) -> bool {
+        top == self.option || self.any_of.iter().any(|o| o == top)
+    }
+
+    /// Every option this item accepts, the named one first.
+    pub fn accepted(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.option.as_str()).chain(self.any_of.iter().map(String::as_str))
+    }
 }
 
 /// An option that must NEVER be the answer for this item, whatever the
@@ -87,6 +115,14 @@ pub const NEAR_MISS_KINDS: &[&str] = &[
     "definition-of:",
     "past-of:",
     "negation-of:",
+    // The fifth mode, and the one the others cannot cover: a person
+    // asking what THEY should do. Translation, definition, past and
+    // negation are all "not a request", so the `is_request` gate can
+    // shut them; a deliberation IS a request — for a view — so only the
+    // option's own tether can hold it. An item of this kind scored as a
+    // plain positive before it was named here, which is a suite
+    // measuring less than it says.
+    "deliberation-of:",
 ];
 
 /// One labelled state.
@@ -195,13 +231,74 @@ pub fn parse(jsonl: &str) -> Result<(Header, Vec<Item>), String> {
             header = Some(serde_json::from_value(v).map_err(|e| format!("line {}: {e}", n + 1))?);
             continue;
         }
-        items.push(serde_json::from_value(v).map_err(|e| format!("line {}: {e}", n + 1))?);
+        let item: Item = serde_json::from_value(v).map_err(|e| format!("line {}: {e}", n + 1))?;
+        check_any_of(&item, n + 1)?;
+        items.push(item);
     }
     let header = header.ok_or_else(|| "the fixture has no header line".to_string())?;
     if items.is_empty() {
         return Err("the fixture has no items".to_string());
     }
+    for (n, item) in items.iter().enumerate() {
+        let declared = header
+            .questions
+            .iter()
+            .find(|q| q.name == item.expect.question);
+        if let Some(q) = declared {
+            if !q.options.is_empty() {
+                for want in item.expect.accepted() {
+                    if !q.options.iter().any(|o| o.id == want) {
+                        return Err(format!(
+                            "item {}: expects {want:?} on question {:?}, which declares no such \
+                             option",
+                            item.id, item.expect.question
+                        ));
+                    }
+                }
+            }
+        } else {
+            return Err(format!(
+                "item {}: expects question {:?}, which the header does not declare",
+                item.id, item.expect.question
+            ));
+        }
+        let _ = n;
+    }
     Ok((header, items))
+}
+
+/// An alternative answer is only an alternative where an answer is due.
+fn check_any_of(item: &Item, line: usize) -> Result<(), String> {
+    if item.expect.any_of.is_empty() {
+        return Ok(());
+    }
+    if !item.expect.fires {
+        return Err(format!(
+            "line {line}: item {} lists any_of but expects its option NOT to fire: an alternative \
+             answer is only an alternative where an answer is due",
+            item.id
+        ));
+    }
+    if let Some(dup) = item
+        .expect
+        .any_of
+        .iter()
+        .find(|o| **o == item.expect.option)
+    {
+        return Err(format!(
+            "line {line}: item {} lists {dup:?} in any_of and as its option",
+            item.id
+        ));
+    }
+    if let Some(n) = &item.never {
+        if let Some(clash) = item.expect.any_of.iter().find(|o| **o == n.option) {
+            return Err(format!(
+                "line {line}: item {} accepts {clash:?} in any_of and forbids it in never",
+                item.id
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Did this option take this question, and act on it?
@@ -422,7 +519,7 @@ pub fn check_calibration(_h: &Header, items: &[Item], observed: &[Observed]) -> 
             continue;
         };
         let hit = if item.expect.fires {
-            a.top == item.expect.option
+            item.expect.accepts(&a.top)
         } else {
             a.top != item.expect.option
         };

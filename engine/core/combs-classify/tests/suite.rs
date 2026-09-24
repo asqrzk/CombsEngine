@@ -431,3 +431,126 @@ fn the_contrast_check_reads_v2s_never_and_catches_a_scorer_that_takes_it() {
     assert!(!v.holds, "the check did not catch a mention that fired");
     assert!(v.evidence.contains("unsub-c1"), "{}", v.evidence);
 }
+
+/// One fixture built by hand, so the rules below are shown to catch
+/// their own failures without touching a shipped suite.
+fn one_item(expect: &str, never: &str, kind: &str) -> String {
+    format!(
+        concat!(
+            r#"{{"kind":"header","suite":"t","delta":0.15,"questions":[{{"name":"intent","kind":"choice","options":["#,
+            r#"{{"id":"advise_or_decide","tether":{{"means":"the person is asking us what they should do, not to do it"}}}},"#,
+            r#"{{"id":"schedule_call","tether":{{"means":"the person is asking us to book a call"}}}},"#,
+            r#"{{"id":"none_of_these","tether":{{"means":"something else entirely"}}}}]}}]}}"#,
+            "\n",
+            r#"{{"id":"call-d1","kind":"{kind}","state":"shall i book that call or just email them","expect":{expect}{never}}}"#,
+        ),
+        kind = kind,
+        expect = expect,
+        never = never,
+    )
+}
+
+/// A seed suite should have one right answer per item, and both shipped
+/// ones do. A genuinely ambiguous state does not: a person asking what
+/// THEY should do, against a catalogue with no verb for it, is read
+/// defensibly as advice or as none-of-these, and scoring that against
+/// one string measures the writer's taste. `any_of` names the
+/// alternatives; `option` stays the named answer a table prints.
+#[test]
+fn an_item_with_two_acceptable_answers_is_hit_by_either_and_never_by_its_never() {
+    let fixture = one_item(
+        r#"{"question":"intent","option":"advise_or_decide","fires":true,"any_of":["none_of_these"]}"#,
+        r#","never":{"question":"intent","option":"schedule_call"}"#,
+        "deliberation-of:call-b1",
+    );
+    let (h, items) = parse(&fixture).expect("the fixture parses");
+    let item = &items[0];
+    assert!(item.expect.accepts("advise_or_decide"), "the named answer");
+    assert!(item.expect.accepts("none_of_these"), "the alternative");
+    assert!(!item.expect.accepts("schedule_call"), "what it forbids");
+    assert_eq!(
+        item.expect.accepted().collect::<Vec<_>>(),
+        ["advise_or_decide", "none_of_these"],
+        "the named answer first"
+    );
+    assert_eq!(item.forbidden(), Some(("intent", "schedule_call")));
+
+    // Either accepted answer scores as a hit; the forbidden one does not.
+    for top in ["advise_or_decide", "none_of_these"] {
+        let obs = vec![Observed {
+            item: item.id.clone(),
+            answers: vec![ans("intent", top, 0.8, 0.8, "act")],
+        }];
+        let v = check_calibration(&h, &items, &obs);
+        assert!(
+            v.evidence.contains("accuracy 1.00"),
+            "{top} should be a hit: {}",
+            v.evidence
+        );
+    }
+    let obs = vec![Observed {
+        item: item.id.clone(),
+        answers: vec![ans("intent", "schedule_call", 0.8, 0.8, "act")],
+    }];
+    let v = check_calibration(&h, &items, &obs);
+    assert!(
+        v.evidence.contains("accuracy 0.00"),
+        "the forbidden option is not a hit: {}",
+        v.evidence
+    );
+}
+
+/// An alternative that names an option nobody declared, an option the
+/// item already names, or an option it forbids, is a fixture that
+/// measures something other than what it says.
+#[test]
+fn any_of_naming_an_undeclared_or_contradictory_option_is_refused() {
+    let cases = [
+        (
+            r#"{"question":"intent","option":"advise_or_decide","fires":true,"any_of":["ask_pricing"]}"#,
+            "",
+            "declares no such option",
+        ),
+        (
+            r#"{"question":"intent","option":"advise_or_decide","fires":true,"any_of":["advise_or_decide"]}"#,
+            "",
+            "as its option",
+        ),
+        (
+            r#"{"question":"intent","option":"advise_or_decide","fires":true,"any_of":["schedule_call"]}"#,
+            r#","never":{"question":"intent","option":"schedule_call"}"#,
+            "forbids it in never",
+        ),
+        (
+            r#"{"question":"intent","option":"schedule_call","fires":false,"any_of":["none_of_these"]}"#,
+            "",
+            "an alternative answer is only an alternative where an answer is due",
+        ),
+    ];
+    for (expect, never, why) in cases {
+        let fixture = one_item(expect, never, "deliberation-of:call-b1");
+        let err = parse(&fixture).expect_err("this fixture must be refused");
+        assert!(err.contains(why), "expected {why:?}, got {err}");
+    }
+}
+
+/// Translation, definition, past and negation are all "not a request",
+/// so the `is_request` gate can shut them. A deliberation IS a request —
+/// for a view — and only the option's own tether can hold it. Before it
+/// was named, an item of this kind scored as a plain positive: the
+/// suite would have reported a clean pass on the very bar it exists to
+/// apply, which is the near miss of the near-miss scorer.
+#[test]
+fn deliberation_is_a_near_miss_mode_beside_the_four() {
+    let fixture = one_item(
+        r#"{"question":"intent","option":"advise_or_decide","fires":true}"#,
+        r#","never":{"question":"intent","option":"schedule_call"}"#,
+        "deliberation-of:call-b1",
+    );
+    let (_, items) = parse(&fixture).expect("the fixture parses");
+    let item = &items[0];
+    assert!(item.is_contrast(), "a deliberation is a near miss");
+    assert_eq!(item.near_miss_mode(), Some("deliberation"));
+    assert_eq!(item.of(), Some("call-b1"));
+    assert!(!item.is_paraphrase());
+}
