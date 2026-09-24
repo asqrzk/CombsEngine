@@ -12,6 +12,7 @@
 //! resolves each of those and accepts a flat directory too, which is
 //! what the tiny parity fixture is and what the seat's own tests run on.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
@@ -39,16 +40,57 @@ type Result<T> = std::result::Result<T, EngineError>;
 /// links none.
 struct Tok(Tokenizer);
 
-impl Encode for Tok {
+impl Tok {
+    /// One request's view of the tokenizer: the same ids, plus a record
+    /// of the first text it could not read, kept on THIS call's stack so
+    /// two requests on two threads can never read each other's failure.
+    fn view(&self) -> TokView<'_> {
+        TokView {
+            tok: &self.0,
+            failed: Cell::new(None),
+        }
+    }
+}
+
+/// [`Encode`] for one request. The seam returns ids and nothing else, so
+/// a text the tokenizer cannot read used to become an EMPTY text — the
+/// question kept its markers and was answered on nothing, and the record
+/// could not tell that from a short state (`state_tokens_cut` reads 0
+/// either way). The failure is recorded here and the request is refused
+/// by name once every text has been read.
+struct TokView<'a> {
+    tok: &'a Tokenizer,
+    failed: Cell<Option<String>>,
+}
+
+impl TokView<'_> {
+    /// The first text this request could not read, if any.
+    fn failure(&self) -> Option<String> {
+        self.failed.take()
+    }
+}
+
+impl Encode for TokView<'_> {
     fn ids(&self, text: &str) -> Vec<u32> {
         // `false`: this file splices every special by NUMBER, so the
         // tokenizer must not add any of its own.
-        match self.0.encode(text, false) {
+        match self.tok.encode(text, false) {
             Ok(enc) => enc.get_ids().to_vec(),
-            // A text the tokenizer cannot read is empty rather than
-            // fatal: the question still has its markers, and an answer
-            // on less text is what every other budget here produces too.
-            Err(_) => Vec::new(),
+            Err(e) => {
+                // `Cell::take` is destructive, so an earlier failure is
+                // taken out and put back rather than peeked at — asking
+                // `take().is_none()` would throw away the very thing it
+                // was checking for. The FIRST unreadable text is the one
+                // the refusal names.
+                match self.failed.take() {
+                    Some(first) => self.failed.set(Some(first)),
+                    None => {
+                        let shown: String = text.chars().take(80).collect();
+                        self.failed.set(Some(format!("{shown:?}: {e}")));
+                    }
+                }
+                Vec::new()
+            }
         }
     }
 }
@@ -447,6 +489,34 @@ impl DecisionEngine {
         })
     }
 
+    /// A seat over any model and tokenizer, for the seat's own tests: the
+    /// calibration neutral, laya's default limits, the parity fixture's
+    /// specials, and the tiny encoder's geometry as its metadata.
+    #[cfg(test)]
+    fn for_tests(model: Box<dyn TypedDecisionModel>, tokenizer: Tokenizer) -> Self {
+        let config: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../combs-models/tests/fixtures/laya_tiny_config.json"
+        )))
+        .expect("the tiny config is json");
+        Self {
+            model: Mutex::new(model),
+            panics: AtomicU64::new(0),
+            tokenizer: Tok(tokenizer),
+            calibration: Calibration::neutral(),
+            limits: Limits::default(),
+            specials: Specials {
+                cls: 1,
+                sep: 2,
+                mask: 3,
+                pad: 0,
+                mask_text: "[MASK]".to_string(),
+            },
+            metadata: ModelMetadata::from_hf_config(&config, None).expect("the tiny config reads"),
+            model_id: "test".to_string(),
+        }
+    }
+
     pub fn metadata(&self) -> &ModelMetadata {
         &self.metadata
     }
@@ -547,10 +617,11 @@ impl DecisionEngine {
 
         let mut sequences: Vec<Sequence> = Vec::with_capacity(questions.len());
         let mut rendered: Vec<Vec<String>> = Vec::with_capacity(questions.len());
+        let tok = self.tokenizer.view();
         for q in questions {
             let options = render_options(&q.criteria);
             let seq = build_sequence(
-                &self.tokenizer,
+                &tok,
                 &self.specials,
                 q.criteria.kind(),
                 &q.instructions,
@@ -575,6 +646,15 @@ impl DecisionEngine {
             }
             sequences.push(seq);
             rendered.push(options);
+        }
+        // A text the tokenizer could not read was tokenised as nothing.
+        // An answer over the markers alone would be an answer to a
+        // different question, so the request is refused, naming the text.
+        if let Some(why) = tok.failure() {
+            return Err(bad(format!(
+                "a text in this request could not be tokenised, and an answer on nothing would \
+                 be an answer to a different question: {why}"
+            )));
         }
 
         let batch: DecisionBatch = collate(&sequences, self.specials.pad)
@@ -750,6 +830,103 @@ mod tests {
             pad: 0,
             mask_text: "[MASK]".to_string(),
         }
+    }
+
+    /// A word-level tokenizer over exactly `words`, with NO unknown token:
+    /// any other word is an error, which is the case a byte-level
+    /// tokenizer never produces and this seat had never been asked about.
+    fn strict_tokenizer(words: &[&str]) -> Tokenizer {
+        use tokenizers::models::wordlevel::WordLevel;
+        use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
+        let vocab = words
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (w.to_string(), i as u32))
+            .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .build()
+            .expect("a word-level model");
+        let mut t = Tokenizer::new(model);
+        t.with_pre_tokenizer(Some(WhitespaceSplit));
+        t
+    }
+
+    /// A text the tokenizer cannot read used to come back as NO ids, and
+    /// the question was answered on the markers alone.
+    #[test]
+    fn an_unreadable_text_is_recorded_not_read_as_empty() {
+        let t = strict_tokenizer(&["hello", "there"]);
+        let tok = Tok(t);
+        let view = tok.view();
+        assert_eq!(view.ids("hello there"), vec![0, 1]);
+        assert_eq!(view.failure(), None, "a readable text records nothing");
+        assert_eq!(view.ids("goodbye"), Vec::<u32>::new());
+        let why = view.failure().expect("the failure is recorded");
+        assert!(why.contains("goodbye"), "it names the text: {why}");
+        assert_eq!(view.failure(), None, "and it is taken once");
+        // The first failure is the one kept.
+        view.ids("first");
+        view.ids("second");
+        assert!(view.failure().unwrap().contains("first"));
+    }
+
+    /// A model that answers every batch with a flat row per question.
+    struct Flat;
+
+    impl TypedDecisionModel for Flat {
+        fn metadata(&self) -> &ModelMetadata {
+            unimplemented!("the seat never asks a model for its metadata")
+        }
+
+        fn decide(
+            &self,
+            batch: &DecisionBatch,
+        ) -> std::result::Result<DecisionLogits, combs_models::ModelError> {
+            Ok(DecisionLogits {
+                logits: vec![vec![0.0; batch.markers]; batch.rows],
+                act: vec![vec![1.0]; batch.rows],
+            })
+        }
+    }
+
+    /// The seat refuses a request whose state the tokenizer cannot read,
+    /// naming the text, instead of answering on nothing; the same words
+    /// it CAN read still answer, and the refusal is not a fault.
+    #[test]
+    fn a_request_whose_state_cannot_be_read_is_refused_by_name() {
+        let words = [
+            "choice",
+            "question:",
+            "a:",
+            "the",
+            "first",
+            "b:",
+            "second",
+            "hello",
+        ];
+        let engine = DecisionEngine::for_tests(Box::new(Flat), strict_tokenizer(&words));
+        let q = DecisionQuestion {
+            name: "intent".to_string(),
+            instructions: String::new(),
+            criteria: Criteria::Choice(vec![
+                ("a".to_string(), serde_json::json!("the first")),
+                ("b".to_string(), serde_json::json!("the second")),
+            ]),
+        };
+        let ok = engine
+            .decide("hello", &[q.clone()])
+            .expect("a readable state answers");
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].distribution.len(), 2);
+
+        let why = engine
+            .decide("goodbye", &[q])
+            .expect_err("an unreadable state is refused")
+            .to_string();
+        assert!(why.contains("could not be tokenised"), "{why}");
+        assert!(why.contains("goodbye"), "it names the text: {why}");
+        assert_eq!(engine.panics(), 0, "a refusal is not a fault");
     }
 
     #[test]
