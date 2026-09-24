@@ -131,11 +131,25 @@ fn the_encoder_reproduces_laya_layer_by_layer() {
         Tensor::<B, 1>::from_data(TensorData::new(att_rows.concat(), [batch * seq]), &device)
             .reshape([batch, seq]);
 
-    let (encoded, taps) = model.forward_taps(ids, &attention, &[0, 1]);
+    // A tap is the number of layers APPLIED: 0 is the stream the first
+    // layer reads (the fixture's `embedded`, which is HF's
+    // `ModernBertEmbeddings` output, embedding norm included), 1 is
+    // after layer 0, and 2 — this fixture's whole stack — is the stream
+    // the final norm has not yet touched. `encoded` is that norm's
+    // output, which is why tap 2 and `encoded` are different tensors.
+    let (encoded, taps) = model
+        .forward_taps(ids.clone(), &attention, &[0, 1, 2])
+        .expect("three taps over a two-layer stack");
+    assert_eq!(
+        taps.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        [0, 1, 2],
+        "taps come back in the caller's order"
+    );
 
     for (name, got) in [
-        ("layer0", taps[0].1.clone()),
-        ("layer1", taps[1].1.clone()),
+        ("embedded", taps[0].1.clone()),
+        ("layer0", taps[1].1.clone()),
+        ("layer1", taps[2].1.clone()),
         ("encoded", encoded),
     ] {
         let want = floats(&fx[name]);
@@ -338,5 +352,87 @@ fn the_heads_depth_comes_from_the_weights_and_a_wrong_config_is_refused() {
         why.contains(&format!("head_layers = {}", stated + 1))
             && why.contains(&format!("carry {stated}")),
         "the refusal names both numbers: {why}"
+    );
+}
+
+/// The tap contract, on the tiny fixture: a tap index is the number of
+/// layers applied, taps come back in the caller's order, a multi-tap
+/// call is bitwise the same as the single-tap calls it stands for, the
+/// deepest tap is NOT the normed output, and a tap past the stack is
+/// refused by name rather than quietly absent — which is what the old
+/// coordinate did with `taps=[2]` on this two-layer model.
+#[test]
+fn the_taps_coordinate_is_layers_applied_and_out_of_range_is_refused() {
+    let dir = staged();
+    let source = SafetensorsSource::load(&dir).expect("the staged checkpoint opens");
+    let device = Default::default();
+    let meta = combs_formats::ModelSource::metadata(&source).clone();
+    let geom = EncoderGeometry::from_metadata(&meta);
+    let cfg = meta.encoder.clone().expect("an encoder config");
+    let encoder = ModernBert::<B>::load(&source, &device, combs_models::ENCODER_PREFIX, cfg, geom)
+        .expect("the encoder loads");
+
+    let fx = fixture();
+    let ids_rows: Vec<Vec<i64>> = serde_json::from_value(fx["input_ids"].clone()).expect("ids");
+    let att_rows: Vec<Vec<f32>> =
+        serde_json::from_value(fx["attention_mask"].clone()).expect("mask");
+    let (batch, seq) = (ids_rows.len(), ids_rows[0].len());
+    let ids = Tensor::<B, 1, burn::tensor::Int>::from_data(
+        TensorData::new(ids_rows.concat(), [batch * seq]),
+        &device,
+    )
+    .reshape([batch, seq]);
+    let attention =
+        Tensor::<B, 1>::from_data(TensorData::new(att_rows.concat(), [batch * seq]), &device)
+            .reshape([batch, seq]);
+    let raw = |t: Tensor<B, 3>| -> Vec<f32> { t.into_data().to_vec().expect("f32") };
+
+    // The caller's order, not ascending depth.
+    let (_, out_of_order) = encoder
+        .forward_taps(ids.clone(), &attention, &[2, 0])
+        .expect("two taps in range");
+    assert_eq!(
+        out_of_order.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        [2, 0],
+        "taps come back in the caller's order"
+    );
+
+    // A multi-tap call is bitwise the single-tap calls it stands for.
+    for &t in &[0usize, 1, 2] {
+        let (_, one) = encoder
+            .forward_taps(ids.clone(), &attention, &[t])
+            .expect("one tap in range");
+        let want = raw(one[0].1.clone());
+        let mine = out_of_order
+            .iter()
+            .find(|(i, _)| *i == t)
+            .map(|(_, h)| raw(h.clone()));
+        if let Some(mine) = mine {
+            assert_eq!(
+                mine, want,
+                "tap {t} differs between a single and a multi call"
+            );
+        }
+        let (final_out, all) = encoder
+            .forward_taps(ids.clone(), &attention, &[0, 1, 2])
+            .expect("three taps in range");
+        assert_eq!(raw(all[t].1.clone()), want, "tap {t} in the full call");
+        if t == 2 {
+            assert_ne!(
+                raw(all[2].1.clone()),
+                raw(final_out),
+                "the deepest tap is the stream BEFORE the final norm"
+            );
+        }
+    }
+
+    // One past the stack is refused by name, where it used to be absent.
+    let why = encoder
+        .forward_taps(ids, &attention, &[3])
+        .expect_err("a tap past a two-layer stack is refused");
+    let why = why.to_string();
+    assert!(
+        why.contains("tap 3") && why.contains("2-layer"),
+        "the refusal names both: {why}"
     );
 }

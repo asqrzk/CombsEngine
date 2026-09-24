@@ -167,18 +167,46 @@ impl<B: Backend> ModernBert<B> {
     ///
     /// `attention` is 1 where a token is real and 0 where it is padding.
     pub fn forward(&self, ids: Tensor<B, 2, Int>, attention: &Tensor<B, 2>) -> Tensor<B, 3> {
-        self.forward_taps(ids, attention, &[]).0
+        self.forward_taps(ids, attention, &[])
+            .expect("an empty tap list can name no layer out of range")
+            .0
     }
 
-    /// The same, plus a copy of the hidden state after each layer named
+    /// The same, plus a copy of the residual stream at each depth named
     /// in `taps` — the depth knob a later arm scores offline, measured
     /// before it is ever a default.
+    ///
+    /// **A tap index is the number of layers APPLIED**, which is the
+    /// coordinate `GenerativeModel::prefill_taps` states, the one
+    /// `llama.rs` keeps, and the one a `transformers` `hidden_states`
+    /// stack uses — so a published tap index carries over verbatim. Tap
+    /// `0` is the stream the first layer reads (here the token embedding
+    /// AFTER this architecture's embedding norm, which is what HF's
+    /// `ModernBertEmbeddings` returns), and tap `num_layers` is the
+    /// stream the final norm has not yet touched. **No norm is applied
+    /// to any tap**; the returned `.0` is the normed output as always.
+    ///
+    /// This used to key on the 0-based index of the layer that produced
+    /// the stream, so `taps=[0]` meant ONE layer applied and the
+    /// embedding stream had no index at all — an off-by-one against
+    /// every other tap in the estate, and silent, because a tap past the
+    /// stack was simply absent from the result rather than refused.
+    ///
+    /// Taps come back in the CALLER's order, one entry per index given,
+    /// so a caller who asks `[28, 7]` gets them that way round.
     pub fn forward_taps(
         &self,
         ids: Tensor<B, 2, Int>,
         attention: &Tensor<B, 2>,
         taps: &[usize],
-    ) -> (Tensor<B, 3>, Vec<(usize, Tensor<B, 3>)>) {
+    ) -> Result<(Tensor<B, 3>, Vec<(usize, Tensor<B, 3>)>)> {
+        let layers = self.layers.len();
+        if let Some(&bad) = taps.iter().find(|&&t| t > layers) {
+            return Err(ModelError::Unsupported(format!(
+                "tap {bad} exceeds the {layers}-layer stack: a tap is the number of layers \
+                 applied, so {layers} is the deepest and 0 is the embedding stream"
+            )));
+        }
         let [batch, seq] = ids.dims();
         let device = ids.device();
 
@@ -197,7 +225,13 @@ impl<B: Backend> ModernBert<B> {
                 .reshape([batch, seq, self.hidden]);
         let mut h = layer_norm_opt(embedded, self.embed_norm.clone(), None, self.cfg.norm_eps);
 
-        let mut caught = Vec::new();
+        // One slot per index the caller asked for, filled in their order.
+        let mut caught: Vec<Option<Tensor<B, 3>>> = vec![None; taps.len()];
+        for (slot, &t) in taps.iter().enumerate() {
+            if t == 0 {
+                caught[slot] = Some(h.clone());
+            }
+        }
         for (i, layer) in self.layers.iter().enumerate() {
             let global = self.cfg.is_global_layer(i);
             let mask = if global { &global_mask } else { &sliding_mask };
@@ -251,15 +285,21 @@ impl<B: Backend> ModernBert<B> {
             let activated = burn::tensor::activation::gelu(value) * gate;
             h = h + linear(activated, &layer.wo_mlp, None);
 
-            if taps.contains(&i) {
-                caught.push((i, h.clone()));
+            let applied = i + 1;
+            for (slot, &t) in taps.iter().enumerate() {
+                if t == applied {
+                    caught[slot] = Some(h.clone());
+                }
             }
         }
 
-        (
+        Ok((
             layer_norm_opt(h, self.final_norm.clone(), None, self.cfg.norm_eps),
-            caught,
-        )
+            taps.iter()
+                .zip(caught)
+                .map(|(&t, h)| (t, h.expect("every tap in range is caught")))
+                .collect(),
+        ))
     }
 
     /// `[1, 1, seq, seq]`, zero inside the band and `MASKED` outside it.
