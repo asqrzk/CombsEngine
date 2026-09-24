@@ -398,6 +398,10 @@ pub struct Calibration {
     per_type: [f32; 3],
     by_bucket: BTreeMap<String, f32>,
     clamped: Vec<String>,
+    /// The shipped number behind each clamped entry, by the same name,
+    /// when it was a number at all — what a served temperature was
+    /// clamped FROM, so an answer can say so.
+    clamped_from: BTreeMap<String, f32>,
 }
 
 impl Calibration {
@@ -407,6 +411,7 @@ impl Calibration {
             per_type: [NEUTRAL; 3],
             by_bucket: BTreeMap::new(),
             clamped: Vec::new(),
+            clamped_from: BTreeMap::new(),
         }
     }
 
@@ -429,6 +434,28 @@ impl Calibration {
     /// when the checkpoint's calibration was usable as written.
     pub fn clamped(&self) -> &[String] {
         &self.clamped
+    }
+
+    /// The value a question's served temperature was clamped FROM, when
+    /// it was: the bucket's shipped number if the bucket exists and was
+    /// clamped, else the type's if the question fell back to it and
+    /// that was clamped. `None` means the served temperature is what
+    /// the checkpoint wrote.
+    ///
+    /// Why an answer needs it: `calibration.temperature` reads 0.5 on
+    /// every 16-option question of this checkpoint, and 0.5 is not what
+    /// laya fitted — `choice:11+` shipped at 0.1006, the fitter's own
+    /// floor, and the loader clamped it. A record that only saw the
+    /// served number could not tell a fitted 0.5 from a clamped one
+    /// (§139a measured the clamp as the better of the two; the point is
+    /// that the answer says which it is).
+    pub fn clamped_from(&self, kind: Kind, k: usize) -> Option<f32> {
+        let q = qtype(kind);
+        let bucket = temp_bucket(q, k);
+        if self.by_bucket.contains_key(&bucket) {
+            return self.clamped_from.get(&bucket).copied();
+        }
+        self.clamped_from.get(&format!("temperature[{q}]")).copied()
     }
 }
 
@@ -469,6 +496,7 @@ impl AgentConfig {
         // simply defaulted; only a value that is THERE and unusable is
         // worth naming.
         let mut clamped = Vec::new();
+        let mut clamped_from = BTreeMap::new();
         let mut take = |name: String, raw: Option<&Value>| -> f32 {
             let Some(r) = raw else {
                 return NEUTRAL;
@@ -479,6 +507,9 @@ impl AgentConfig {
                 }
                 usable => {
                     clamped.push(format!("{name}={r}"));
+                    if let Some(x) = usable.filter(|x| x.is_finite()) {
+                        clamped_from.insert(name, x as f32);
+                    }
                     usable.map(clamp_temperature).unwrap_or(NEUTRAL)
                 }
             }
@@ -528,6 +559,7 @@ impl AgentConfig {
                 per_type,
                 by_bucket,
                 clamped,
+                clamped_from,
             },
         })
     }
@@ -1040,6 +1072,38 @@ mod tests {
         assert_eq!(clamp_temperature(f64::NAN), NEUTRAL);
         assert_eq!(clamp_temperature(f64::INFINITY), NEUTRAL);
         assert!((clamp_temperature(1.7601518630981445) as f64 - 1.7601518630981445).abs() < 1e-7);
+    }
+
+    /// A served temperature that the loader clamped names the number it
+    /// was clamped from; one the checkpoint wrote as served names
+    /// nothing. The bucket's own value first, the type's when the
+    /// question fell back to it, and a value that was not a number has
+    /// no number to name.
+    #[test]
+    fn a_clamped_bucket_names_the_value_it_was_clamped_from() {
+        let cfg = shipped();
+        let from = cfg
+            .calibration
+            .clamped_from(Kind::Choice, 16)
+            .expect("choice:11+ was clamped");
+        assert!((from as f64 - 0.10058280825614929).abs() < 1e-7, "{from}");
+        assert_eq!(cfg.calibration.clamped_from(Kind::Choice, 4), None);
+        assert_eq!(cfg.calibration.clamped_from(Kind::Noul, 2), None);
+        assert_eq!(cfg.calibration.clamped_from(Kind::Score, 4), None);
+
+        // No bucket at all: the type's value is what was served, and
+        // what was clamped.
+        let typed = AgentConfig::parse(r#"{"temperature": [12.0, 1.0, 1.0]}"#).expect("parses");
+        assert_eq!(typed.calibration.temperature(Kind::Choice, 4), TEMP_MAX);
+        assert_eq!(typed.calibration.clamped_from(Kind::Choice, 4), Some(12.0));
+        assert_eq!(typed.calibration.clamped_from(Kind::Score, 4), None);
+
+        // Not a number: refused by name, and nothing to be clamped from.
+        let odd =
+            AgentConfig::parse(r#"{"temperature_by_options": {"choice:2": "x"}}"#).expect("parses");
+        assert_eq!(odd.calibration.clamped().len(), 1);
+        assert_eq!(odd.calibration.clamped_from(Kind::Choice, 2), None);
+        assert_eq!(odd.calibration.temperature(Kind::Choice, 2), NEUTRAL);
     }
 
     /// `head_layers` used to default to 2 in silence: a three-layer

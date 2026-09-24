@@ -118,6 +118,10 @@ pub struct DecisionAnswer {
     /// The temperature applied, and the bucket it came from.
     pub temperature: f32,
     pub bucket: String,
+    /// The shipped value that temperature was clamped from, when the
+    /// loader refused the checkpoint's own number — `None` when what was
+    /// applied is what was written.
+    pub clamped_from: Option<f32>,
     /// What the act head made of the decision: the probability of
     /// answering rather than escalating.
     pub p_act: f32,
@@ -302,6 +306,7 @@ fn read_answers(
             logits: engine_order(kind, logits),
             temperature: t,
             bucket: calibration.bucket(kind, k),
+            clamped_from: calibration.clamped_from(kind, k),
             // Index zero is answering; the rest are the acts the
             // config prices.
             p_act: out.act[i].first().copied().unwrap_or(0.0),

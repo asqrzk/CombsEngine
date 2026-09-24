@@ -507,6 +507,12 @@ fn compose_answers(
         if q.kind == Kind::Score {
             ans["expected_level"] = json!(expected_level(p));
         }
+        // Only when the loader refused the checkpoint's own number: a
+        // served 0.5 that was fitted at 0.5 says nothing, a served 0.5
+        // that was written as 0.1006 says what it was clamped from.
+        if let Some(from) = a.clamped_from {
+            ans["calibration"]["clamped_from"] = json!(from);
+        }
         out.push(ans);
     }
     Ok(out)
@@ -1237,6 +1243,7 @@ mod tests {
                 logits: vec![0.0; d.len()],
                 temperature: 1.0,
                 bucket: "choice:2".to_string(),
+                clamped_from: None,
                 p_act: 1.0,
                 usage: combs_classify::QuestionUsage {
                     tokens: 120,
@@ -1257,6 +1264,30 @@ mod tests {
             },
         };
         (req, decided)
+    }
+
+    /// `calibration.temperature` on a 16-option question of this
+    /// checkpoint reads 0.5, and 0.5 is not what laya fitted: `choice:11+`
+    /// shipped at 0.1006 and the loader clamped it. An answer says so
+    /// ONLY when it happened, so a served temperature that is the
+    /// checkpoint's own carries no extra key.
+    #[test]
+    fn a_clamped_bucket_says_what_it_was_clamped_from_in_the_answer() {
+        let counters = Counters::default();
+        let (req, mut decided) = decided_with(&[vec![0.75, 0.25]]);
+        let out = compose_answers(&req, &decided, &counters).expect("a distribution");
+        assert!(
+            out[0]["calibration"].get("clamped_from").is_none(),
+            "nothing was clamped, so nothing is said: {}",
+            out[0]["calibration"]
+        );
+        decided.answers[0].clamped_from = Some(0.1006);
+        let out = compose_answers(&req, &decided, &counters).expect("a distribution");
+        let from = out[0]["calibration"]["clamped_from"]
+            .as_f64()
+            .expect("the shipped value");
+        assert!((from - 0.1006).abs() < 1e-6, "{from}");
+        assert_eq!(out[0]["calibration"]["source"], "checkpoint");
     }
 
     /// `lib.rs` says every answer passes `check_distribution`; this road
@@ -1414,6 +1445,7 @@ mod tests {
                 logits: vec![0.0, 0.0],
                 temperature: 1.0,
                 bucket: "choice:2".to_string(),
+                clamped_from: None,
                 p_act: 1.0,
                 usage: combs_classify::QuestionUsage {
                     tokens: 120,
