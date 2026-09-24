@@ -66,16 +66,33 @@ impl Opt {
     /// `requires` names — both carry an identifier's shape, and an
     /// identifier is a topic, not a meaning. The test beside this
     /// function is what keeps that true.
+    ///
+    /// And nothing of ours is in it unless the anchors are: an option
+    /// with no contrary reaches the scorer as the caller wrote it, byte
+    /// for byte, on every road. The rule is "no punctuation of ours where
+    /// there are no words of ours", and it is measured, not aesthetic:
+    /// until 2026-09-24 this function closed every meaning with a full
+    /// stop the means road did not add, and on a 16-option catalogue
+    /// with no contraries that one byte moved 70 of 173 answers — every
+    /// anchors-vs-means contrast taken before then was a punctuation
+    /// contrast wearing the anchors' name (§139a). A normaliser would
+    /// hide that sensitivity, not remove it: the caller's text is the
+    /// caller's, stop or no stop.
+    ///
+    /// With anchors there ARE words of ours, and they carry our
+    /// punctuation: one stop closes the meaning before the clause (the
+    /// caller's own trailing stops fold into it rather than doubling),
+    /// and one closes the clause.
     pub fn scored_text(&self) -> String {
-        let mut s = self.tether.means.trim().trim_end_matches('.').to_string();
-        s.push('.');
         let anchors: Vec<&str> =
             self.tether.not.iter().map(|n| n.trim()).filter(|n| !n.is_empty()).collect();
-        if !anchors.is_empty() {
-            s.push_str(" Not this when the state is instead: ");
-            s.push_str(&anchors.join("; "));
-            s.push('.');
+        if anchors.is_empty() {
+            return self.tether.means.clone();
         }
+        let mut s = self.tether.means.trim().trim_end_matches('.').to_string();
+        s.push_str(". Not this when the state is instead: ");
+        s.push_str(&anchors.join("; "));
+        s.push('.');
         s
     }
 }

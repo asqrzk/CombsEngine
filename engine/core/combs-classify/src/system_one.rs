@@ -202,6 +202,9 @@ pub enum Rendering {
     LabelMeans,
     /// `<label or ordinal>: means. Not this when the state is instead: …`
     /// — the text the cosine road scores, on the marker road at last.
+    /// For an option with no contrary it is byte-identical to
+    /// `label-means`: a rendering adds no punctuation where it adds no
+    /// words (`Opt::scored_text`).
     LabelAnchors,
 }
 
@@ -657,6 +660,161 @@ mod tests {
         ] {
             assert!(!texts(r)[0].contains("is_request"), "{r:?}");
         }
+    }
+
+    fn bare(id: &str, means: &str) -> crate::Opt {
+        crate::Opt {
+            id: id.to_string(),
+            tether: crate::Tether {
+                means: means.to_string(),
+                not: Vec::new(),
+                requires: Vec::new(),
+                label: None,
+            },
+        }
+    }
+
+    /// With no contraries there are no words of ours to add, so there is
+    /// no punctuation of ours either: the two label roads render an
+    /// option byte for byte the same. Measured 2026-09-24 on CLINC
+    /// banking (§139a): the one trailing full stop this road used to add
+    /// moved 70 of 173 tops, so every anchors-vs-means contrast before
+    /// this test was a punctuation contrast.
+    #[test]
+    fn label_means_and_label_anchors_render_byte_identically_when_no_option_has_a_contrary() {
+        let opts = vec![
+            bare(
+                "freeze_account",
+                "the person is asking about freeze account",
+            ),
+            bare("halt", "Halt the agent now."),
+            bare("none_of_these", "something  else,  spaced oddly "),
+        ];
+        for kind in [Kind::Choice, Kind::Score] {
+            let means = render_options(&criteria_for(kind, &opts, Rendering::LabelMeans));
+            let anchors = render_options(&criteria_for(kind, &opts, Rendering::LabelAnchors));
+            assert_eq!(
+                means, anchors,
+                "{kind:?}: the two label roads differ on options with no contrary"
+            );
+        }
+    }
+
+    /// A rendering never adds or removes a character of the caller's
+    /// meaning: a full stop, a missing one, a doubled space are the
+    /// caller's and reach the scorer as written, on every road. A
+    /// normaliser would hide a sensitivity the model has rather than
+    /// remove it; the author of the text owns the text.
+    #[test]
+    fn a_rendering_keeps_the_callers_meaning_byte_for_byte_when_it_adds_no_words() {
+        for t in [
+            "x",
+            "x.",
+            "x..",
+            " x ",
+            "x\n",
+            "a  b",
+            "Halt the agent now.",
+        ] {
+            let opt = bare("o", t);
+            assert_eq!(opt.scored_text(), t, "scored_text altered {t:?}");
+            for r in [
+                Rendering::IdMeans,
+                Rendering::LabelMeans,
+                Rendering::LabelAnchors,
+            ] {
+                let rendered =
+                    render_options(&criteria_for(Kind::Choice, std::slice::from_ref(&opt), r));
+                let rest = rendered[0]
+                    .split_once(": ")
+                    .map(|(_, rest)| rest)
+                    .unwrap_or(&rendered[0]);
+                assert_eq!(rest, t, "{}: the meaning {t:?} was altered", r.as_str());
+            }
+        }
+    }
+
+    /// With contraries there ARE words of ours, and they carry our
+    /// punctuation: one stop closes the caller's meaning before the
+    /// clause (their own trailing stops fold into it, never doubled),
+    /// one closes the clause; an anchor that is only whitespace is no
+    /// anchor at all.
+    #[test]
+    fn an_anchored_text_joins_our_words_with_our_punctuation_and_keeps_the_callers() {
+        let with = |means: &str, not: &[&str]| crate::Opt {
+            id: "o".to_string(),
+            tether: crate::Tether {
+                means: means.to_string(),
+                not: not.iter().map(|n| n.to_string()).collect(),
+                requires: Vec::new(),
+                label: None,
+            },
+        };
+        let want = "the person wants money back. Not this when the state is instead: quoting it; asking what it is.";
+        assert_eq!(
+            with(
+                "the person wants money back",
+                &["quoting it", " asking what it is "]
+            )
+            .scored_text(),
+            want
+        );
+        assert_eq!(
+            with(
+                "the person wants money back.",
+                &["quoting it", "asking what it is"]
+            )
+            .scored_text(),
+            want
+        );
+        assert_eq!(with("x", &["  "]).scored_text(), "x");
+    }
+
+    /// Every fixture this crate ships renders the same on both label
+    /// roads wherever an option has no contrary — the property the
+    /// 2026-09-24 records lacked. Walks `tests/data/*.jsonl` headers.
+    #[test]
+    fn every_shipped_fixture_renders_the_same_on_both_label_roads_where_it_has_no_contrary() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+        let mut seen = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("tests/data") {
+            let path = entry.expect("an entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("a fixture");
+            let header: Value =
+                serde_json::from_str(text.lines().next().expect("a header line")).expect("json");
+            for q in header["questions"].as_array().expect("questions") {
+                let kind = match q["kind"].as_str() {
+                    Some("choice") => Kind::Choice,
+                    Some("score") => Kind::Score,
+                    _ => continue,
+                };
+                let opts: Vec<crate::Opt> = q["options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|o| serde_json::from_value(o.clone()).expect("an option"))
+                    .filter(|o: &crate::Opt| o.tether.not.iter().all(|n| n.trim().is_empty()))
+                    .collect();
+                if opts.is_empty() {
+                    continue;
+                }
+                seen += opts.len();
+                assert_eq!(
+                    render_options(&criteria_for(kind, &opts, Rendering::LabelMeans)),
+                    render_options(&criteria_for(kind, &opts, Rendering::LabelAnchors)),
+                    "{}: question {}",
+                    path.display(),
+                    q["name"]
+                );
+            }
+        }
+        assert!(
+            seen > 0,
+            "no shipped fixture option without a contrary was walked"
+        );
     }
 
     /// A rendering nobody implemented is refused by name rather than
