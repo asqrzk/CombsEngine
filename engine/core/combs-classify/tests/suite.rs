@@ -3,8 +3,8 @@
 //! check that refuses everything cannot pass for a strict one.
 
 use combs_classify::suite::{
-    check_calibration, check_contrast, check_monotonicity, check_noul, check_schema, parse, Answer,
-    Header, Item, Observed,
+    check_calibration, check_contrast, check_levels, check_monotonicity, check_noul, check_schema,
+    parse, Answer, Header, Item, Observed,
 };
 use combs_classify::tether::validate;
 
@@ -757,5 +757,114 @@ fn every_current_fixture_keeps_each_noul_side_under_thirty_words() {
     assert!(
         seen >= 3,
         "only {seen} nouls seen: the test lost its subject"
+    );
+}
+
+// --- a fixture may ask a score (E8) -------------------------------------------
+
+const SCORE_V1: &str = include_str!("data/classify-score-v1-probe.jsonl");
+
+/// The third kind has never been measured against a label on either
+/// system. This fixture asks one score question over five levels whose
+/// texts are concrete situations; its `expect.option` names a level, and
+/// the level's place in the header is the scale.
+#[test]
+fn the_score_probe_parses_and_names_a_level_on_every_item() {
+    let (h, items) = parse(SCORE_V1).expect("the score probe parses");
+    assert_eq!(h.suite, "score-v1-probe");
+    assert!(
+        h.note.as_deref().unwrap_or("").contains("PROBE"),
+        "a probe says so in its header"
+    );
+    let q = &h.questions[0];
+    assert_eq!(q.kind, combs_classify::Kind::Score);
+    assert_eq!(q.options.len(), 5, "five levels");
+    assert_eq!(items.len(), 6);
+    for item in &items {
+        assert!(
+            q.options.iter().any(|o| o.id == item.expect.option),
+            "{} names {}, which is not a level",
+            item.id,
+            item.expect.option
+        );
+    }
+    assert!(
+        items.iter().any(|i| i.is_paraphrase()),
+        "one paraphrase, so drift is measured too"
+    );
+}
+
+/// A score item hits on its level; one level off is within the check's
+/// bar and counted as not exact; two off is named with both levels; a
+/// level nobody declared is refused by the schema check AND named here.
+#[test]
+fn a_score_item_hits_on_its_level_and_a_level_past_the_scale_is_refused() {
+    let (h, items) = parse(SCORE_V1).expect("parses");
+    let obs = |top: &str| {
+        vec![Observed {
+            item: "sev-b2".into(),
+            answers: vec![ans("severity", top, 0.6, 0.5, "act")],
+        }]
+    };
+    let only = |id: &str| {
+        items
+            .iter()
+            .filter(|i| i.id == id)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let one = only("sev-b2");
+
+    let v = check_levels(&h, &one, &obs("degraded"));
+    assert!(v.holds, "{}", v.evidence);
+    assert!(v.evidence.contains("1 scores, 1 exact"), "{}", v.evidence);
+    let v = check_calibration(&h, &one, &obs("degraded"));
+    assert!(v.evidence.contains("accuracy 1.00"), "{}", v.evidence);
+
+    let v = check_levels(&h, &one, &obs("minor"));
+    assert!(v.holds, "one level off is within the bar: {}", v.evidence);
+    assert!(v.evidence.contains("0 exact"), "{}", v.evidence);
+    let v = check_calibration(&h, &one, &obs("minor"));
+    assert!(
+        v.evidence.contains("accuracy 0.00"),
+        "one off is still not a hit: {}",
+        v.evidence
+    );
+
+    let v = check_levels(&h, &one, &obs("critical"));
+    assert!(!v.holds);
+    assert!(
+        v.evidence
+            .contains("sev-b2 read level 4 (critical) where the fixture says 2 (degraded)"),
+        "{}",
+        v.evidence
+    );
+
+    let v = check_levels(&h, &one, &obs("severe"));
+    assert!(!v.holds);
+    assert!(
+        v.evidence.contains("named a level nobody declared: severe"),
+        "{}",
+        v.evidence
+    );
+    let v = check_schema(&h, &one, &obs("severe"));
+    assert!(!v.holds, "the schema check reads a score's levels too");
+    assert!(v.evidence.contains("severe"), "{}", v.evidence);
+
+    // A fixture that asks no score says so, rather than passing quietly.
+    let (h0, items0) = read();
+    let v = check_levels(&h0, &items0, &answers_that_work(&items0));
+    assert!(
+        v.evidence.contains("no item asks a score question"),
+        "{}",
+        v.evidence
+    );
+
+    // A level past the scale in the FIXTURE is refused at parse.
+    let bad = SCORE_V1.replacen(r#""option": "cosmetic""#, r#""option": "fatal""#, 1);
+    let err = parse(&bad).expect_err("a level nobody declared");
+    assert!(
+        err.contains("fatal") && err.contains("declares no such"),
+        "{err}"
     );
 }

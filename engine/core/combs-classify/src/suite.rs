@@ -1,7 +1,7 @@
 //! The invariant suite: what a rung must survive before anything is
 //! wired to it.
 //!
-//! Six checks, and each one exists because a classifier can pass the
+//! Seven checks, and each one exists because a classifier can pass the
 //! obvious test and still be useless:
 //!
 //! - SCHEMA — the answer is shaped like an answer at all: it names an
@@ -14,6 +14,8 @@
 //! - IMPLICATIONS — an action that fired had its speech act hold.
 //! - CALIBRATION — the confidence means something, scored by ECE *and*
 //!   Brier.
+//! - LEVELS — a score lands within one level of the fixture's, on the
+//!   caller's own scale.
 //! - NOUL — the speech act reads as the fixture says it should. The gate
 //!   the whole design rests on had no gold of its own until this check:
 //!   every item said which option it expected and nothing about whether
@@ -374,7 +376,7 @@ pub fn check_schema(h: &Header, items: &[Item], observed: &[Observed]) -> Verdic
                 ));
                 continue;
             };
-            if q.kind == Kind::Choice && !q.options.iter().any(|o| o.id == a.top) {
+            if q.kind != Kind::Noul && !q.options.iter().any(|o| o.id == a.top) {
                 bad.push(format!(
                     "{}: named an option nobody declared: {}",
                     item.id, a.top
@@ -632,6 +634,66 @@ pub fn check_noul(_h: &Header, items: &[Item], observed: &[Observed]) -> Verdict
     }
 }
 
+/// A score answers within one level of the fixture's, and exactly on it
+/// is counted apart. A score question's `expect.option` names a level,
+/// and the level's position in the header is the scale — so "one level
+/// off" is one step along the caller's own order, never a number the
+/// scorer invented.
+pub fn check_levels(h: &Header, items: &[Item], observed: &[Observed]) -> Verdict {
+    let mut n = 0usize;
+    let mut exact = 0usize;
+    let mut far: Vec<String> = Vec::new();
+    let mut unread: Vec<String> = Vec::new();
+    for item in items {
+        let Some(q) = h
+            .questions
+            .iter()
+            .find(|q| q.name == item.expect.question && q.kind == Kind::Score)
+        else {
+            continue;
+        };
+        n += 1;
+        let Some(a) = find(observed, &item.id).and_then(|o| answer_for(o, &q.name)) else {
+            unread.push(item.id.clone());
+            continue;
+        };
+        let want = q.options.iter().position(|o| o.id == item.expect.option);
+        let got = q.options.iter().position(|o| o.id == a.top);
+        match (want, got) {
+            (Some(w), Some(g)) if w == g => exact += 1,
+            (Some(w), Some(g)) if w.abs_diff(g) <= 1 => {}
+            (Some(w), Some(g)) => far.push(format!(
+                "{} read level {g} ({}) where the fixture says {w} ({})",
+                item.id, a.top, item.expect.option
+            )),
+            _ => unread.push(format!(
+                "{} named a level nobody declared: {}",
+                item.id, a.top
+            )),
+        }
+    }
+    let holds = far.is_empty() && unread.is_empty();
+    Verdict {
+        claim: "a score lands within one level of the fixture's".to_string(),
+        holds,
+        evidence: if n == 0 {
+            "no item asks a score question".to_string()
+        } else {
+            let mut s = format!(
+                "{n} scores, {exact} exact, {} more than one level off",
+                far.len()
+            );
+            if !far.is_empty() {
+                s.push_str(&format!(": {}", far.join("; ")));
+            }
+            if !unread.is_empty() {
+                s.push_str(&format!("; unread: {}", unread.join(", ")));
+            }
+            s
+        },
+    }
+}
+
 /// Every check, in the order a reader wants them.
 pub fn run_all(h: &Header, items: &[Item], observed: &[Observed]) -> Vec<Verdict> {
     vec![
@@ -641,5 +703,6 @@ pub fn run_all(h: &Header, items: &[Item], observed: &[Observed]) -> Vec<Verdict
         check_implications(h, items, observed),
         check_calibration(h, items, observed),
         check_noul(h, items, observed),
+        check_levels(h, items, observed),
     ]
 }
