@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 
 use combs_classify::{
-    check_distribution, confidence, decide, expected_level, softmax_scaled, tether, Decision,
-    Implication, Kind, Opt, Thresholds,
+    abstain_top, check_distribution, confidence, decide, expected_level, softmax_scaled, tether,
+    AbstainRule, Decision, Implication, Kind, Opt, Thresholds,
 };
 use combs_runtime::{EmbedOptions, Engine};
 
@@ -60,6 +60,10 @@ pub(crate) struct Question {
     /// `choice` and `score` carry options; a `noul` is folded into a
     /// two-option choice whose first option is the proposition.
     pub(crate) options: Vec<Opt>,
+    /// The option this question abstains TO and the floor that sends
+    /// the top there, when the caller asked for one (`abstain`). Absent
+    /// is today's rule: the argmax, whatever it is.
+    pub(crate) abstain: Option<AbstainRule>,
 }
 
 pub(crate) struct Request {
@@ -227,8 +231,10 @@ const QUESTION_KEYS: &[&str] = &[
     "options",
     "levels",
     "tether",
+    "abstain",
 ];
 const THRESHOLD_KEYS: &[&str] = &["confidence", "tau"];
+const ABSTAIN_KEYS: &[&str] = &["option", "p_min", "gap_max"];
 
 /// Refuses a key this road would not have read, naming it and the set.
 fn only_known_keys(v: &Value, known: &[&str], whose: &str) -> Result<(), (u16, Value)> {
@@ -382,11 +388,80 @@ pub(crate) fn parse_request(body: &str) -> Result<Request, (u16, Value)> {
         tether::validate(&options, &declared, MAX_OPTIONS)
             .map_err(|e| bad(&format!("question {name:?}: {e}")))?;
 
+        // The abstain slot: which option this question abstains TO, and
+        // the floor that sends the top there. Resolved to an index here
+        // so decision time cannot fail; refused by name on the two kinds
+        // it has no meaning for; and a slot with no floor is refused
+        // rather than read as "always" or "never".
+        let abstain = match q.get("abstain") {
+            None | Some(Value::Null) => None,
+            Some(slot) => {
+                only_known_keys(slot, ABSTAIN_KEYS, &format!("question {name:?} `abstain`"))?;
+                match kind {
+                    Kind::Noul => {
+                        return Err(bad(&format!(
+                            "question {name:?}: a noul has two sides and no option to abstain \
+                             to; gate it with `thresholds.tau` instead"
+                        )));
+                    }
+                    Kind::Score => {
+                        return Err(bad(&format!(
+                            "question {name:?}: a score's levels are ordered, and none of them \
+                             means none; an abstain slot is for a choice"
+                        )));
+                    }
+                    Kind::Choice => {}
+                }
+                let option = slot.get("option").and_then(Value::as_str).ok_or_else(|| {
+                    bad(&format!(
+                        "question {name:?}: `abstain.option` must name one of its options"
+                    ))
+                })?;
+                let index = options.iter().position(|o| o.id == option).ok_or_else(|| {
+                    bad(&format!(
+                        "question {name:?}: `abstain.option` {option:?} is not one of its \
+                         options ({})",
+                        options
+                            .iter()
+                            .map(|o| format!("{:?}", o.id))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                })?;
+                let floor = |key: &str, lo: f32, hi: f32| -> Result<Option<f32>, (u16, Value)> {
+                    match slot.get(key) {
+                        None | Some(Value::Null) => Ok(None),
+                        Some(raw) => match raw.as_f64().map(|f| f as f32) {
+                            Some(f) if f.is_finite() && f >= lo && f <= hi => Ok(Some(f)),
+                            _ => Err(bad(&format!(
+                                "question {name:?}: `abstain.{key}` must be a number in [{lo}, {}, got {raw}",
+                                if hi == f32::MAX { "∞)".to_string() } else { format!("{hi}]") }
+                            ))),
+                        },
+                    }
+                };
+                let p_min = floor("p_min", 0.0, 1.0)?;
+                let gap_max = floor("gap_max", 0.0, f32::MAX)?;
+                if p_min.is_none() && gap_max.is_none() {
+                    return Err(bad(&format!(
+                        "question {name:?}: an abstain slot with no floor is not a rule; give \
+                         `p_min`, `gap_max` or both"
+                    )));
+                }
+                Some(AbstainRule {
+                    index,
+                    p_min,
+                    gap_max,
+                })
+            }
+        };
+
         questions.push(Question {
             name,
             kind,
             instructions,
             options,
+            abstain,
         });
     }
 
@@ -601,11 +676,16 @@ pub fn handle_classify(
     let mut answers = Vec::with_capacity(req.questions.len());
     for (qi, q) in req.questions.iter().enumerate() {
         let p = &dist[qi];
-        let (top_i, top_p) =
+        let (top_i, _) =
             p.iter().enumerate().fold(
                 (0usize, f32::MIN),
                 |b, (i, &v)| if v > b.1 { (i, v) } else { b },
             );
+        // The abstain slot, if the question carries one, before the
+        // implications and the floors judge the top.
+        let names: Vec<&str> = q.options.iter().map(|o| o.id.as_str()).collect();
+        let (top_i, moved) = abstain_top(p, &raw[qi], top_i, q.abstain.as_ref(), &names);
+        let top_p = p[top_i];
         let conf = confidence(p);
         let mut sorted: Vec<f32> = p.clone();
         sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
@@ -652,13 +732,25 @@ pub fn handle_classify(
             "calibrated": false,
             "temperature": req.temperature.unwrap_or(DEFAULT_TEMPERATURE),
             "decision": decision.word(),
-            "reason": match &decision { Decision::Act => Value::Null, d => json!(d.reason()) },
+            "reason": match &decision {
+                Decision::Act => moved.as_ref().map(|m| json!(m.reason)).unwrap_or(Value::Null),
+                d => json!(d.reason()),
+            },
             "implications": implications.iter().map(|i| json!({
                 "requires": i.requires, "p": i.p, "tau": i.tau, "holds": i.holds(), "gated": i.gated()
             })).collect::<Vec<_>>(),
         });
         if q.kind == Kind::Score {
             a["expected_level"] = json!(expected_level(p));
+        }
+        // Only when the slot was sent: absent, the answer keeps its keys.
+        if let Some(rule) = &q.abstain {
+            a["abstain"] = json!({
+                "option": q.options[rule.index].id,
+                "applied": moved.is_some(),
+                "from": moved.as_ref().map(|m| json!(q.options[m.from].id)).unwrap_or(Value::Null),
+                "reason": moved.as_ref().map(|m| json!(m.reason)).unwrap_or(Value::Null),
+            });
         }
         // At Debug, the numbers behind one answer — raw scores included,
         // so a suspect verdict can be re-derived from the log alone.
@@ -795,6 +887,125 @@ mod tests {
         );
         assert!(m.contains("confidance"), "{m}");
         assert!(m.contains("`tau`"), "{m}");
+
+        // And in an abstain slot, where a typo would read as "no floor".
+        let m = why(
+            &ok.replace(
+                r#""name":"q""#,
+                r#""name":"q","abstain":{"option":"a","p_mim":0.2}"#,
+            ),
+            "p_mim",
+        );
+        assert!(m.contains("p_mim"), "{m}");
+        assert!(m.contains("`p_min`"), "{m}");
+    }
+
+    fn with_slot(slot: &str) -> String {
+        q_choice().replace(
+            r#""name":"intent""#,
+            &format!(r#""name":"intent","abstain":{slot}"#),
+        )
+    }
+
+    fn refusal(body: &str) -> String {
+        let Err((code, v)) = parse_request(body) else {
+            panic!("accepted: {body}")
+        };
+        assert_eq!(code, 400);
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The option a question abstains TO must be one of its own, and is
+    /// resolved to an index at parse so the decision cannot fail later.
+    #[test]
+    fn an_abstain_slot_must_name_one_of_the_questions_options() {
+        let r = parse_request(&with_slot(r#"{"option":"none_of_these","p_min":0.2}"#))
+            .expect("a slot naming an option");
+        assert_eq!(
+            r.questions[0].abstain,
+            Some(AbstainRule {
+                index: 1,
+                p_min: Some(0.2),
+                gap_max: None
+            })
+        );
+        let m = refusal(&with_slot(r#"{"option":"zzz","p_min":0.2}"#));
+        assert!(m.contains("zzz"), "{m}");
+        assert!(
+            m.contains("none_of_these") && m.contains("escalate_user_planning_unsubscription"),
+            "the refusal lists the options: {m}"
+        );
+        let m = refusal(&with_slot(r#"{"p_min":0.2}"#));
+        assert!(m.contains("`abstain.option`"), "{m}");
+        // Absent and null are the same thing: no slot.
+        assert_eq!(
+            parse_request(&with_slot("null"))
+                .expect("null is absent")
+                .questions[0]
+                .abstain,
+            None
+        );
+    }
+
+    /// A noul has two sides and a score an ordered scale: neither has an
+    /// option that means "none of these", and a slot on either is
+    /// refused naming the kind and the gate that does apply.
+    #[test]
+    fn an_abstain_slot_is_refused_on_a_noul_and_on_a_score_by_name() {
+        let noul = r#"{"state":"x","questions":[{"name":"is_request","type":"noul",
+            "tether":{"means":"the person asks","not":["the person quotes"]},
+            "abstain":{"option":"true","p_min":0.5}}]}"#;
+        let m = refusal(noul);
+        assert!(m.contains("noul") && m.contains("thresholds.tau"), "{m}");
+        let score = r#"{"state":"x","questions":[{"name":"severity","type":"score",
+            "levels":[{"id":"low","tether":{"means":"nothing broke"}},{"id":"high","tether":{"means":"everything broke"}}],
+            "abstain":{"option":"low","p_min":0.5}}]}"#;
+        let m = refusal(score);
+        assert!(m.contains("score") && m.contains("choice"), "{m}");
+    }
+
+    /// A slot with no floor is not a rule: it is refused rather than
+    /// read as "always abstain" or "never".
+    #[test]
+    fn an_abstain_slot_with_no_floor_is_refused_as_no_rule() {
+        let m = refusal(&with_slot(r#"{"option":"none_of_these"}"#));
+        assert!(
+            m.contains("no floor") && m.contains("`p_min`") && m.contains("`gap_max`"),
+            "{m}"
+        );
+        let m = refusal(&with_slot(
+            r#"{"option":"none_of_these","p_min":null,"gap_max":null}"#,
+        ));
+        assert!(m.contains("no floor"), "{m}");
+    }
+
+    /// A floor that is not a number in its range is refused by name, as
+    /// a threshold is — never defaulted.
+    #[test]
+    fn an_abstain_floor_that_is_not_a_number_is_refused_by_name() {
+        for bad_p in [r#""0.5""#, "1.5", "-0.1", "true", "[0.5]"] {
+            let m = refusal(&with_slot(&format!(
+                r#"{{"option":"none_of_these","p_min":{bad_p}}}"#
+            )));
+            assert!(m.contains("`abstain.p_min`"), "{bad_p}: {m}");
+        }
+        let m = refusal(&with_slot(r#"{"option":"none_of_these","gap_max":-1}"#));
+        assert!(m.contains("`abstain.gap_max`"), "{m}");
+        let r = parse_request(&with_slot(
+            r#"{"option":"none_of_these","gap_max":2.5,"p_min":null}"#,
+        ))
+        .expect("a gap alone is a rule");
+        assert_eq!(
+            r.questions[0].abstain,
+            Some(AbstainRule {
+                index: 1,
+                p_min: None,
+                gap_max: Some(2.5)
+            })
+        );
     }
 
     #[test]

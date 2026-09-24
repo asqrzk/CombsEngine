@@ -5,8 +5,8 @@
 use combs_classify::sweep::{sweep_thresholds, Costs, Row};
 use combs_classify::tether::{validate, Opt, Tether};
 use combs_classify::{
-    brier, check_distribution, confidence, decide, ece, expected_level, fit_temperature,
-    softmax_scaled, Implication,
+    abstain_top, brier, check_distribution, confidence, decide, ece, expected_level,
+    fit_temperature, softmax_scaled, AbstainRule, Implication,
 };
 
 fn near(a: f32, b: f32, tol: f32) -> bool {
@@ -312,6 +312,91 @@ fn a_label_cannot_be_an_identifier_in_disguise() {
         combs_classify::tether::validate(&opts, &[], 64)
             .unwrap_or_else(|e| panic!("{good} is a meaning, not an identifier: {e}"));
     }
+}
+
+/// The abstain option takes the top when its probability clears the
+/// floor — equality included, as an implication's floor is — and the
+/// move says where the top came from.
+#[test]
+fn the_abstain_option_takes_the_top_when_it_clears_its_floor_and_says_from_where() {
+    let names = ["refund", "none"];
+    let p = [0.7, 0.3];
+    let z = [1.0, 0.2];
+    let rule = AbstainRule {
+        index: 1,
+        p_min: Some(0.3),
+        gap_max: None,
+    };
+    let (top, moved) = abstain_top(&p, &z, 0, Some(&rule), &names);
+    assert_eq!(
+        top, 1,
+        "a floor met EXACTLY must hold, as an implication's floor does"
+    );
+    let m = moved.expect("the top moved");
+    assert_eq!(m.from, 0);
+    assert!(
+        m.reason.contains("none") && m.reason.contains("p_min") && m.reason.contains("refund"),
+        "{}",
+        m.reason
+    );
+    let rule = AbstainRule {
+        index: 1,
+        p_min: Some(0.31),
+        gap_max: None,
+    };
+    assert_eq!(abstain_top(&p, &z, 0, Some(&rule), &names), (0, None));
+}
+
+/// The score gap is a second floor, temperature-free: the abstain
+/// option takes the top when the argmax's score is within `gap_max` of
+/// it. `p_min` is asked first.
+#[test]
+fn the_abstain_option_takes_the_top_when_it_sits_within_the_score_gap() {
+    let names = ["refund", "none"];
+    let p = [0.7, 0.3];
+    let z = [1.0, 0.6];
+    let rule = AbstainRule {
+        index: 1,
+        p_min: None,
+        gap_max: Some(0.4),
+    };
+    let (top, moved) = abstain_top(&p, &z, 0, Some(&rule), &names);
+    assert_eq!(top, 1);
+    assert!(moved.expect("moved").reason.contains("gap"));
+    let rule = AbstainRule {
+        index: 1,
+        p_min: None,
+        gap_max: Some(0.39),
+    };
+    assert_eq!(abstain_top(&p, &z, 0, Some(&rule), &names), (0, None));
+    let rule = AbstainRule {
+        index: 1,
+        p_min: Some(0.9),
+        gap_max: Some(0.4),
+    };
+    let (top, moved) = abstain_top(&p, &z, 0, Some(&rule), &names);
+    assert_eq!(top, 1);
+    assert!(moved.expect("moved by the gap").reason.contains("gap"));
+}
+
+/// No slot, or an argmax that already is the abstain option: the argmax
+/// stands and nothing is said.
+#[test]
+fn no_slot_or_an_abstain_option_already_on_top_moves_nothing_and_says_nothing() {
+    let names = ["refund", "none"];
+    assert_eq!(
+        abstain_top(&[0.7, 0.3], &[1.0, 0.2], 0, None, &names),
+        (0, None)
+    );
+    let rule = AbstainRule {
+        index: 1,
+        p_min: Some(0.0),
+        gap_max: Some(9.0),
+    };
+    assert_eq!(
+        abstain_top(&[0.2, 0.8], &[0.1, 2.0], 1, Some(&rule), &names),
+        (1, None)
+    );
 }
 
 #[test]

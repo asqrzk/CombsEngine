@@ -208,6 +208,91 @@ pub fn decide(confidence: f32, threshold: f32, implications: &[Implication]) -> 
     Decision::Act
 }
 
+/// The abstain slot a question may carry: the option it abstains TO and
+/// the floor, or floors, that send the top there when the argmax is
+/// something else.
+///
+/// Why a slot and not a threshold: `thresholds.confidence` reads the
+/// whole distribution's entropy, and on a 16-option catalogue that
+/// ranked out-of-scope states at AUROC 0.78 where the abstain option's
+/// OWN probability ranked them at 0.95 and the argmax still sent 28 of
+/// 98 to it (§139a, `label-means`). The signal was on the wire all
+/// along; `decide` could not see it. This rule can, and it runs before
+/// `decide`, so the implications and the floors then judge the moved
+/// top like any other.
+///
+/// Two floors because the probability one is bound by the served
+/// temperature's clamp — at T = 0.5 a floor on p reached 63% of the
+/// negatives at 5% false abstains where a floor on the score gap
+/// reached 78% — and the gap is temperature-free. `p_min` is asked
+/// first, then `gap_max`; equality at a floor holds, as an
+/// implication's does.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AbstainRule {
+    /// The abstain option's index in the question's own option order,
+    /// resolved at parse so nothing here can fail at decision time.
+    pub index: usize,
+    /// Move the top when p(abstain) >= this.
+    pub p_min: Option<f32>,
+    /// Move the top when score(argmax) − score(abstain) <= this, in the
+    /// road's own score units: a head logit on the marker road, a
+    /// cosine on the cosine road.
+    pub gap_max: Option<f32>,
+}
+
+/// Where a top moved from, and the one rule that moved it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Moved {
+    pub from: usize,
+    pub reason: String,
+}
+
+/// The abstain rule. No slot, an argmax that already IS the abstain
+/// option, or no floor met: the argmax, and nothing said.
+pub fn abstain_top(
+    p: &[f32],
+    scores: &[f32],
+    argmax: usize,
+    rule: Option<&AbstainRule>,
+    names: &[&str],
+) -> (usize, Option<Moved>) {
+    let Some(r) = rule else {
+        return (argmax, None);
+    };
+    if r.index == argmax || r.index >= p.len() || argmax >= p.len() {
+        return (argmax, None);
+    }
+    let name = |i: usize| names.get(i).copied().unwrap_or("?");
+    if let Some(floor) = r.p_min {
+        if p[r.index] >= floor {
+            let reason = format!(
+                "abstain option {}: p {:.2} >= p_min {:.2} (argmax was {} at {:.2})",
+                name(r.index),
+                p[r.index],
+                floor,
+                name(argmax),
+                p[argmax]
+            );
+            return (r.index, Some(Moved { from: argmax, reason }));
+        }
+    }
+    if let Some(gap_max) = r.gap_max {
+        if scores.len() == p.len() {
+            let gap = scores[argmax] - scores[r.index];
+            if gap <= gap_max {
+                let reason = format!(
+                    "abstain option {}: score gap {gap:.2} <= gap_max {gap_max:.2} (argmax was {} at {:.2})",
+                    name(r.index),
+                    name(argmax),
+                    scores[argmax]
+                );
+                return (r.index, Some(Moved { from: argmax, reason }));
+            }
+        }
+    }
+    (argmax, None)
+}
+
 /// `softmax(z / T)`. Lower T is sharper; T is fitted per cell, never
 /// guessed, and T = 1 is the unfitted identity.
 pub fn softmax_scaled(logits: &[f32], t: f32) -> Vec<f32> {

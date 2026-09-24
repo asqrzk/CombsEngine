@@ -28,7 +28,7 @@ use std::time::Instant;
 use anyhow::Result;
 use combs_classify::sequence::Cut;
 use combs_classify::system_one::{criteria_for, Criteria, Rendering};
-use combs_classify::{decide, expected_level, Decision, Implication, Kind};
+use combs_classify::{abstain_top, decide, expected_level, Decision, Implication, Kind};
 use combs_runtime::{DecisionEngine, DecisionQuestion, WarmReport};
 use serde_json::{json, Value};
 
@@ -447,13 +447,18 @@ fn compose_answers(
     let mut out = Vec::with_capacity(answered.len());
     for (q, a) in req.questions.iter().zip(answered) {
         let p = &a.distribution;
-        let (top_i, top_p) =
+        let (top_i, _) =
             p.iter().enumerate().fold(
                 (0usize, f32::MIN),
                 |b, (i, &v)| if v > b.1 { (i, v) } else { b },
             );
-        // Checked above: `p` is as long as `q.options`, so `top_i` is a
-        // real option and the two indexings below cannot panic.
+        // The abstain slot, if the question carries one, before the
+        // implications and the floors judge the top. Checked above: `p`
+        // is as long as `q.options` and `logits` as long as `p`, so
+        // every index below is a real option and cannot panic.
+        let names: Vec<&str> = q.options.iter().map(|o| o.id.as_str()).collect();
+        let (top_i, moved) = abstain_top(p, &a.logits, top_i, q.abstain.as_ref(), &names);
+        let top_p = p[top_i];
         let top = &q.options[top_i];
         // laya's own rule: the whole distribution for a choice or a
         // score, and the distance from a coin flip for a noul.
@@ -499,7 +504,10 @@ fn compose_answers(
             "temperature": a.temperature,
             "p_act": a.p_act,
             "decision": decision.word(),
-            "reason": match &decision { Decision::Act => Value::Null, d => json!(d.reason()) },
+            "reason": match &decision {
+                Decision::Act => moved.as_ref().map(|m| json!(m.reason)).unwrap_or(Value::Null),
+                d => json!(d.reason()),
+            },
             "implications": implications.iter().map(|i| json!({
                 "requires": i.requires, "p": i.p, "tau": i.tau, "holds": i.holds(), "gated": i.gated()
             })).collect::<Vec<_>>(),
@@ -512,6 +520,15 @@ fn compose_answers(
         // that was written as 0.1006 says what it was clamped from.
         if let Some(from) = a.clamped_from {
             ans["calibration"]["clamped_from"] = json!(from);
+        }
+        // Only when the slot was sent: absent, the answer keeps its keys.
+        if let Some(rule) = &q.abstain {
+            ans["abstain"] = json!({
+                "option": q.options[rule.index].id,
+                "applied": moved.is_some(),
+                "from": moved.as_ref().map(|m| json!(q.options[m.from].id)).unwrap_or(Value::Null),
+                "reason": moved.as_ref().map(|m| json!(m.reason)).unwrap_or(Value::Null),
+            });
         }
         out.push(ans);
     }
@@ -1264,6 +1281,131 @@ mod tests {
             },
         };
         (req, decided)
+    }
+
+    /// `decided_with`, for a body of the test's own and with the head's
+    /// logits given, so an abstain slot's score gap can be put in front
+    /// of the composer.
+    fn decided_for(
+        body: &str,
+        dists: &[Vec<f32>],
+        logits: &[Vec<f32>],
+    ) -> (crate::classify::Request, combs_runtime::Decided) {
+        let req = crate::classify::parse_request(body).expect("a well-formed request");
+        let answers = req
+            .questions
+            .iter()
+            .zip(dists.iter().zip(logits))
+            .map(|(q, (d, z))| combs_runtime::DecisionAnswer {
+                name: q.name.clone(),
+                kind: q.kind,
+                distribution: d.clone(),
+                logits: z.clone(),
+                temperature: 1.0,
+                bucket: "choice:2".to_string(),
+                clamped_from: None,
+                p_act: 1.0,
+                usage: combs_classify::QuestionUsage {
+                    tokens: 120,
+                    markers: q.options.len(),
+                    dropped_options: 0,
+                    instruction_tokens_cut: 0,
+                    option_tokens_cut: 0,
+                    state_tokens_cut: 0,
+                },
+            })
+            .collect();
+        let decided = combs_runtime::Decided {
+            answers,
+            batch: combs_runtime::BatchShape {
+                rows: 1,
+                len: 120,
+                markers: 2,
+            },
+        };
+        (req, decided)
+    }
+
+    /// A question may name the option it abstains TO and the floor that
+    /// sends the top there. Measured 2026-09-24 (§139a): without the
+    /// identifier in the label slot the seat ranked out-of-scope states
+    /// at AUROC 0.95 by p(none_of_these) and still sent 28 of 98 to it,
+    /// because the argmax was the only rule it had. Absent the slot the
+    /// answer keeps today's keys, byte for byte.
+    #[test]
+    fn an_abstain_slot_moves_the_top_in_the_answer_and_absent_the_answer_keeps_todays_keys() {
+        let counters = Counters::default();
+        let plain = r#"{"state":"x","questions":[{"name":"intent","type":"choice","options":[
+              {"id":"unsubscribe","tether":{"means":"the person is asking us to end their subscription now"}},
+              {"id":"none_of_these","tether":{"means":"something else entirely"}}]}]}"#;
+        let slot = plain.replace(
+            r#""name":"intent""#,
+            r#""name":"intent","abstain":{"option":"none_of_these","p_min":0.3,"gap_max":0.5}"#,
+        );
+
+        let (req, decided) = decided_for(plain, &[vec![0.65, 0.35]], &[vec![1.0, 0.3]]);
+        let out = compose_answers(&req, &decided, &counters).expect("answers");
+        let mut keys: Vec<&str> = out[0]
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        let mut want = vec![
+            "calibrated",
+            "calibration",
+            "confidence",
+            "decision",
+            "distribution",
+            "implications",
+            "margin",
+            "name",
+            "p_act",
+            "p_top",
+            "reason",
+            "similarities",
+            "temperature",
+            "top",
+            "type",
+        ];
+        want.sort_unstable();
+        assert_eq!(keys, want, "absent the slot, the answer keeps today's keys");
+        assert_eq!(out[0]["top"], "unsubscribe");
+
+        // p_min: 0.35 >= 0.3 moves the top, and the reason says from where.
+        let (req, decided) = decided_for(&slot, &[vec![0.65, 0.35]], &[vec![1.0, 0.3]]);
+        let out = compose_answers(&req, &decided, &counters).expect("answers");
+        assert_eq!(out[0]["top"], "none_of_these");
+        assert!((out[0]["p_top"].as_f64().expect("p_top") - 0.35).abs() < 1e-6);
+        assert_eq!(out[0]["abstain"]["option"], "none_of_these");
+        assert_eq!(out[0]["abstain"]["applied"], true);
+        assert_eq!(out[0]["abstain"]["from"], "unsubscribe");
+        let why = out[0]["abstain"]["reason"].as_str().expect("a reason");
+        assert!(
+            why.contains("p_min") && why.contains("unsubscribe"),
+            "{why}"
+        );
+        assert_eq!(out[0]["decision"], "act");
+        assert_eq!(out[0]["reason"], why);
+
+        // The gap alone: p 0.1 is under the floor, the logits are 0.4 apart.
+        let (req, decided) = decided_for(&slot, &[vec![0.9, 0.1]], &[vec![1.0, 0.6]]);
+        let out = compose_answers(&req, &decided, &counters).expect("answers");
+        assert_eq!(out[0]["top"], "none_of_these");
+        assert!(out[0]["abstain"]["reason"]
+            .as_str()
+            .expect("a reason")
+            .contains("gap"));
+
+        // Neither floor met: the slot is present, nothing moves, and it says so.
+        let (req, decided) = decided_for(&slot, &[vec![0.9, 0.1]], &[vec![3.0, 0.5]]);
+        let out = compose_answers(&req, &decided, &counters).expect("answers");
+        assert_eq!(out[0]["top"], "unsubscribe");
+        assert_eq!(out[0]["abstain"]["applied"], false);
+        assert!(out[0]["abstain"]["from"].is_null());
+        assert!(out[0]["reason"].is_null());
+        assert_eq!(counters.envelope_refusals.load(Ordering::Relaxed), 0);
     }
 
     /// `calibration.temperature` on a 16-option question of this
