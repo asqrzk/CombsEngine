@@ -1,0 +1,94 @@
+{
+  "sand": "0.1",
+  "file": "review-sweep.sand",
+  "hash": "<hash>",
+  "lines": 12,
+  "declarations": {
+    "kinds": [],
+    "scales": [
+      {
+        "name": "Sentiment",
+        "at": "1:7",
+        "levels": [
+          "hostile",
+          "cold",
+          "warm",
+          "glowing"
+        ]
+      }
+    ],
+    "shapes": []
+  },
+  "settle": {
+    "at": "2:1",
+    "passes": true
+  },
+  "sites": [
+    {
+      "id": "d1",
+      "at": "6:7",
+      "text": "the {{review}} is at most cold on Sentiment",
+      "how": "score:Sentiment",
+      "binding": "review",
+      "model": "default:decide",
+      "loops": [
+        "parallel"
+      ],
+      "batch": 1
+    },
+    {
+      "id": "d2",
+      "at": "6:54",
+      "text": "the {{review}} names a specific employee",
+      "how": "noul",
+      "binding": "review",
+      "model": "default:decide",
+      "loops": [
+        "parallel"
+      ],
+      "batch": 1
+    }
+  ],
+  "batches": [
+    {
+      "id": 1,
+      "at": "6:3",
+      "binding": "review",
+      "sites": [
+        "d1",
+        "d2"
+      ],
+      "speculative": [],
+      "speculated": false,
+      "questions": 2,
+      "loops": [
+        "parallel"
+      ],
+      "conditional": true,
+      "model": "default:decide"
+    }
+  ],
+  "calls": [],
+  "loops": [
+    {
+      "at": "5:59",
+      "kind": "parallel"
+    }
+  ],
+  "cost": {
+    "min": {
+      "passes": 0,
+      "completions": 0
+    },
+    "max": {
+      "passes": 0,
+      "completions": 0
+    },
+    "loops": [
+      "n × 1 pass"
+    ],
+    "unbounded": false,
+    "text": "min 0 passes · max 0 passes + n × 1 pass"
+  },
+  "warnings": []
+}

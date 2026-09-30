@@ -1,0 +1,17 @@
+[
+  { "id": "service-request", "name": "Service request", "level": 0, "file": "service-request.sand", "needs": ["decide"],
+    "blurb": "Four lines: a prose condition and an extraction. One pass on a seat.",
+    "input": "Hi, could you please reset my password today? I can't get into the app. Email me when it's done." },
+  { "id": "support-triage", "name": "Support triage", "level": 1, "file": "support-triage.sand", "needs": ["decide"],
+    "blurb": "A kind and a scale, a switch with case unsure, and one settle() that decides what counts as sure.",
+    "input": "I was charged twice last month and I want that money back now. This is the third time." },
+  { "id": "extract-shape", "name": "Status update", "level": 2, "file": "extract-shape.sand", "needs": ["decide", "ask"],
+    "blurb": "A shape with kinded and text slots: decisions fill the first, a chat model writes the second.",
+    "input": "Any news on the outage ticket I raised for the billing dashboard yesterday? Still can't see invoices." },
+  { "id": "review-sweep", "name": "Review sweep", "level": 4, "file": "review-sweep.sand", "needs": ["decide"],
+    "blurb": "parallel over a list under a pass budget; each review costs one pass.",
+    "input": "[\"The driver was rude and slammed the door.\", \"Lovely product, arrived early.\", \"Sam at the desk ignored us for ten minutes.\", \"Late, but the coffee machine itself is fine.\"]" },
+  { "id": "intent-router", "name": "Intent router", "level": 3, "file": "intent-router.sand", "needs": ["decide"],
+    "blurb": "The platform's regex router rewritten: the mention-versus-ask hazard becomes one prose predicate.",
+    "input": "translate 'my card was declined' into Spanish" }
+]

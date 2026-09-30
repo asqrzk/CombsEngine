@@ -1,0 +1,9 @@
+{
+  "name": "@combs/sand",
+  "version": "0.3.0",
+  "exports": {
+    ".": "./mod.ts",
+    "./cli": "./cli/main.ts"
+  },
+  "license": "MIT"
+}

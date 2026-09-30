@@ -1,0 +1,13 @@
+const Topic = kind("what is the ticket about", { billing: "a charge or invoice", outage: "something is down or broken", feature: "they want something new", other: "none of these" }, { fallback: "other" });
+const Ticket = shape({ topic: Topic, product: text("the product named, or 'unknown'"), summary: text("one sentence in the customer's words") });
+settle({ floor: 0.6, passes: 4, tokens: 4000 });
+
+if (the {{input}} asks for a status update unless they are reporting the problem for the first time) {
+  const t = extract({{input}}, Ticket);
+  const reply = ask("Write a two-sentence status acknowledgement for {{t.product}} in the customer's tone: {{input}}");
+  log(reply);
+} else {
+  log("filed", extract({{input}}, Ticket, { using: "ask" }));
+} unsure {
+  log("could not tell; filed for a human");
+}

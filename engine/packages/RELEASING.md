@@ -26,9 +26,17 @@ because the npm/PyPI wrappers download its assets at install time).
 | `Engine/Packages/npm/combs-mesh/package.json` | `version` |
 | `Engine/Packages/npm/combs-client/package.json` | `version` |
 | `Engine/Packages/npm/combs-zerotrust/package.json` | `version` |
+| `Engine/Packages/npm/combs-sand/package.json` | `version` |
 | `Engine/Packages/pypi/combs-engine/pyproject.toml` | `version` + `src/combs_engine/__init__.py` |
-| `engine/js/<pkg>/deno.json` (all ten, incl. `mesh` and `memory`) | `version` |
+| `engine/js/<pkg>/deno.json` (all eleven, incl. `mesh`, `memory` and `sand`) | `version` |
 
+> `combs-sand` is dual-published too: source of truth is `engine/js/sand/`
+> (`index.js`, `index.d.ts`, `compiler/`, `runtime/`, `README.md`) — copy them
+> byte-identical over `Engine/Packages/npm/combs-sand/` before publishing
+> (`cp -R engine/js/sand/{index.js,index.d.ts,compiler,runtime,README.md} engine/packages/npm/combs-sand/`);
+> `cli/` is Deno-only and stays out of the npm mirror. `deno publish` ships
+> `@combs/sand` to JSR from the same tree.
+>
 > `combs-zerotrust` is dual-published: source of truth is
 > `Engine/Js/zerotrust/mod.js` — before publishing, copy it over
 > `Engine/Packages/npm/combs-zerotrust/index.js` (keep them byte-identical)

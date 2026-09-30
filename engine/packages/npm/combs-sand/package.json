@@ -1,0 +1,36 @@
+{
+  "name": "@combs-edge/combs-sand",
+  "version": "0.3.0",
+  "description": "SAND — semantic abstraction of neurolinguistic determinism. TypeScript plus prose predicates decided by a model: the compiler and runtime. Zero deps; browser, Node, Deno, Cloudflare Workers.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
+  "homepage": "https://github.com/asqrzk/CombsEngine",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/asqrzk/CombsEngine.git",
+    "directory": "Engine/Packages/npm/combs-sand"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "compiler/",
+    "runtime/"
+  ],
+  "keywords": [
+    "combs",
+    "sand",
+    "typed-decisions",
+    "classification",
+    "openai-compatible",
+    "dsl",
+    "typescript"
+  ]
+}

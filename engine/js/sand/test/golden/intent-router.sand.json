@@ -1,0 +1,83 @@
+{
+  "sand": "0.1",
+  "file": "intent-router.sand",
+  "hash": "<hash>",
+  "lines": 36,
+  "declarations": {
+    "kinds": [
+      {
+        "name": "Mode",
+        "at": "1:7",
+        "options": [
+          "chat",
+          "tools",
+          "plan"
+        ],
+        "fallback": "tools"
+      }
+    ],
+    "scales": [],
+    "shapes": []
+  },
+  "settle": {
+    "at": "6:1",
+    "passes": true
+  },
+  "sites": [
+    {
+      "id": "d1",
+      "at": "23:9",
+      "text": "the {{input}} only mentions an action rather than asking for one",
+      "how": "noul",
+      "binding": "input",
+      "model": "default:decide",
+      "loops": [],
+      "batch": 1
+    }
+  ],
+  "batches": [
+    {
+      "id": 1,
+      "at": "23:3",
+      "binding": "input",
+      "sites": [
+        "d1"
+      ],
+      "speculative": [
+        "Mode"
+      ],
+      "speculated": false,
+      "questions": 1,
+      "loops": [],
+      "conditional": true,
+      "model": "default:decide"
+    }
+  ],
+  "calls": [
+    {
+      "at": "27:11",
+      "verb": "decide",
+      "binding": "input",
+      "spec": "Mode",
+      "using": null,
+      "loops": [],
+      "conditional": true,
+      "speculative": []
+    }
+  ],
+  "loops": [],
+  "cost": {
+    "min": {
+      "passes": 0,
+      "completions": 0
+    },
+    "max": {
+      "passes": 1,
+      "completions": 0
+    },
+    "loops": [],
+    "unbounded": false,
+    "text": "min 0 passes · max 1 pass"
+  },
+  "warnings": []
+}

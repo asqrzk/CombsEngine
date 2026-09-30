@@ -1,0 +1,11 @@
+const Sentiment = scale("how does the review sound", { hostile: "angry, demanding a remedy", cold: "disappointed", warm: "satisfied", glowing: "delighted and says so" });
+settle({ passes: 100, ms: 20_000 });
+
+const reviews: string[] = JSON.parse({{input}});
+const flagged = await parallel(reviews, async (review) => {
+  if (the {{review}} is at most cold on Sentiment && the {{review}} names a specific employee unless they name a product) {
+    return review;
+  }
+  return null;
+}, { limit: 8 });
+log(flagged.filter(Boolean).length, "reviews need a manager");

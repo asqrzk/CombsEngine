@@ -1,0 +1,110 @@
+{
+  "sand": "0.1",
+  "file": "extract-shape.sand",
+  "hash": "<hash>",
+  "lines": 14,
+  "declarations": {
+    "kinds": [
+      {
+        "name": "Topic",
+        "at": "1:7",
+        "options": [
+          "billing",
+          "outage",
+          "feature",
+          "other"
+        ],
+        "fallback": "other"
+      }
+    ],
+    "scales": [],
+    "shapes": [
+      {
+        "name": "Ticket",
+        "at": "2:7",
+        "slots": {
+          "topic": "Topic",
+          "product": "text",
+          "summary": "text"
+        }
+      }
+    ]
+  },
+  "settle": {
+    "at": "3:1",
+    "passes": true
+  },
+  "sites": [
+    {
+      "id": "d1",
+      "at": "5:5",
+      "text": "the {{input}} asks for a status update",
+      "how": "noul",
+      "binding": "input",
+      "model": "default:decide",
+      "loops": [],
+      "batch": 1
+    }
+  ],
+  "batches": [
+    {
+      "id": 1,
+      "at": "5:1",
+      "binding": "input",
+      "sites": [
+        "d1"
+      ],
+      "speculative": [
+        "Ticket"
+      ],
+      "speculated": false,
+      "questions": 1,
+      "loops": [],
+      "conditional": false,
+      "model": "default:decide"
+    }
+  ],
+  "calls": [
+    {
+      "at": "6:13",
+      "verb": "extract",
+      "binding": "input",
+      "spec": "Ticket",
+      "using": null,
+      "loops": [],
+      "conditional": true,
+      "speculative": []
+    },
+    {
+      "at": "10:16",
+      "verb": "extract",
+      "binding": "input",
+      "spec": "Ticket",
+      "using": "ask",
+      "loops": [],
+      "conditional": true,
+      "speculative": []
+    },
+    {
+      "at": "7:17",
+      "verb": "ask",
+      "loops": [],
+      "conditional": true
+    }
+  ],
+  "loops": [],
+  "cost": {
+    "min": {
+      "passes": 1,
+      "completions": 0
+    },
+    "max": {
+      "passes": 1,
+      "completions": 3
+    },
+    "loops": [],
+    "unbounded": false,
+    "text": "min 1 pass · max 1 pass, 3 completions"
+  },
+  "warnings": []
+}

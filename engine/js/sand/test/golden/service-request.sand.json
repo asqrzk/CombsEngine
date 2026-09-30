@@ -1,0 +1,115 @@
+{
+  "sand": "0.1",
+  "file": "service-request.sand",
+  "hash": "<hash>",
+  "lines": 9,
+  "declarations": {
+    "kinds": [
+      {
+        "name": "Urgency",
+        "at": "1:7",
+        "options": [
+          "now",
+          "soon",
+          "whenever"
+        ],
+        "fallback": null
+      },
+      {
+        "name": "Channel",
+        "at": "2:7",
+        "options": [
+          "email",
+          "phone",
+          "any"
+        ],
+        "fallback": null
+      }
+    ],
+    "scales": [],
+    "shapes": [
+      {
+        "name": "ServiceRequest",
+        "at": "3:7",
+        "slots": {
+          "urgency": "Urgency",
+          "channel": "Channel"
+        }
+      }
+    ]
+  },
+  "settle": null,
+  "sites": [
+    {
+      "id": "d1",
+      "at": "5:4",
+      "text": "the {{input}} is a service request",
+      "how": "noul",
+      "binding": "input",
+      "model": "default:decide",
+      "loops": [],
+      "batch": 1
+    }
+  ],
+  "batches": [
+    {
+      "id": 1,
+      "at": "5:1",
+      "binding": "input",
+      "sites": [
+        "d1"
+      ],
+      "speculative": [
+        "ServiceRequest"
+      ],
+      "speculated": false,
+      "questions": 1,
+      "loops": [],
+      "conditional": false,
+      "model": "default:decide"
+    }
+  ],
+  "calls": [
+    {
+      "at": "7:1",
+      "verb": "extract",
+      "binding": "input",
+      "spec": "ServiceRequest",
+      "using": null,
+      "loops": [],
+      "conditional": true,
+      "speculative": []
+    }
+  ],
+  "loops": [],
+  "cost": {
+    "min": {
+      "passes": 1,
+      "completions": 0
+    },
+    "max": {
+      "passes": 1,
+      "completions": 0
+    },
+    "loops": [],
+    "unbounded": false,
+    "text": "min 1 pass · max 1 pass"
+  },
+  "warnings": [
+    {
+      "code": "W-GENERIC-CONTRARY",
+      "at": "5:4",
+      "message": "no contrary given; the decision will be weak. Add `unless <what this can be mistaken for>`"
+    },
+    {
+      "code": "N-EXTRACT-SHAPE",
+      "at": "7:1",
+      "message": "`extract` names no shape; the one in scope, `ServiceRequest`, was used"
+    },
+    {
+      "code": "W-UNSETTLED",
+      "at": "1:1",
+      "message": "no settle(); nothing can abstain and every unsure branch is dead"
+    }
+  ]
+}
