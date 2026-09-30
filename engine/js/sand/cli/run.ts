@@ -106,7 +106,7 @@ export async function runCommand(file: string, flags: RunFlags): Promise<number>
   for (const s of statuses) if (!s.success) code = Math.max(code, s.code || 1);
   for (const o of outputs) {
     if (o == null) { totals.failures++; continue; }
-    try { const j = JSON.parse(o); if (j && typeof j === "object" && j.error) { totals.failures++; console.error(`${j.error.code} ${j.error.at ?? ""} · ${j.error.message}`); } } catch { /* raw */ }
+    try { const j = JSON.parse(o); if (j && typeof j === "object" && j.error) { totals.failures++; console.error(j.error.message); } } catch { /* raw */ }
     console.log(o ?? "null");
   }
   if (!flags.quiet) console.error(`run   ${inputs.length} input${inputs.length === 1 ? "" : "s"} · ${totals.requests} request${totals.requests === 1 ? "" : "s"} · ${totals.passes} pass${totals.passes === 1 ? "" : "es"} · ${totals.tokens} tokens · ${Date.now() - totals.ms} ms${flags.trace ? ` · trace ${flags.trace} (${totals.events} events)` : ""}${totals.failures ? ` · ${totals.failures} failed` : ""}`);
