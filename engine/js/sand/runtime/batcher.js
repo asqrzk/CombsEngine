@@ -84,6 +84,7 @@ export class Batcher {
       this.ctx.budget.record({ passes: res.passes ?? 0, tokens: res.tokens ?? 0, completions: res.completions ?? 0 });
       const id = ++this.requests;
       this.ctx.emit("sand.request", "event", { status: "ok", model: b.modelName, road: b.adapter.road ?? "", questions: chunk.length, passes: res.passes ?? 0, tokens: res.tokens ?? 0, balance: res.balance ?? undefined, ms: res.ms }, { spanId: res.requestId ?? undefined, input: { state: b.state, questions: chunk, thresholds: thresholdsOf(b.settle) }, output: res.raw ?? { answers: res.answers } });
+      if (res.estimated && !this.warned.has(`unmetered:${b.modelName}`)) { this.warned.add(`unmetered:${b.modelName}`); const line = `W-UNMETERED: ${b.modelName} reported no usage; tokens are estimated at one per four characters`; this.ctx.emit("sand.log", "log", { level: "warn", message: line }, { severity: "warn", output: line }); }
       if (res.passesCharged != null && res.passesCharged !== res.passes) this.ctx.emit("sand.log", "log", { level: "warn", message: `the gate charged ${res.passesCharged} passes and the answer says ${res.passes}` }, { severity: "warn", output: `the gate charged ${res.passesCharged} passes and the answer says ${res.passes}` });
       // shape check: one answer per question, in order, top among the ids sent
       if (!Array.isArray(res.answers) || res.answers.length !== chunk.length) {

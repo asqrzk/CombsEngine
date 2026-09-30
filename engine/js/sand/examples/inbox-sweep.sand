@@ -1,0 +1,32 @@
+// Inbox sweep. A list of messages, all at once, one pass each, under a budget.
+// Needs: the Combs model only.
+
+const Category = kind("what is this message", {
+  complaint: "something went wrong and they are unhappy about it",
+  question: "they want to know something",
+  praise: "they are pleased and say so",
+  noise: "an ad, a bounce, or nothing that needs a reply",
+}, { fallback: "noise" });
+const Heat = scale("how upset does the writer sound", ["calm", "annoyed", "furious"]);
+settle({ floor: 0.55, passes: 200, ms: 30_000 });
+
+const messages: string[] = JSON.parse({{input}});
+const sorted = parallel(messages, async (message) => {
+  if (the {{message}} is a complaint && the {{message}} is at least annoyed on Heat) {
+    return { message, action: "call back today" };
+  } else if (the {{message}} is a complaint || the {{message}} is a question) {
+    return { message, action: "reply this week" };
+  } else {
+    return { message, action: "file" };
+  } unsure {
+    return { message, action: "a person reads it" };
+  }
+}, { limit: 8, tolerate: true });
+
+const counts: Record<string, number> = {};
+for (const r of sorted) {
+  const action = r instanceof Error ? "not sorted: out of passes" : r.action;
+  counts[action] = (counts[action] ?? 0) + 1;
+}
+log(counts);
+return counts;

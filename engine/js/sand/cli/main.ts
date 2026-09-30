@@ -4,8 +4,9 @@
  *
  *   sand check <file.sand> [--strict]
  *   sand build <file.sand> [-o dir] [--js]
- *   sand run   <file.sand> (--input "…" | --stdin | --jsonl in.jsonl) [--workers N] [--trace out.ndjson]
- *                          [--model name] [--road seat] [--timeout ms] [--allow <deno flag>] [--quiet]
+ *   sand run   <file.sand> (--input "…" | --stdin | --jsonl in.jsonl) [--session id] [--workers N]
+ *                          [--yes | --no | --unsure] [--memory dir] [--trace out.ndjson]
+ *                          [--model name] [--road name] [--timeout ms] [--allow <deno flag>] [--quiet]
  *   sand log   <trace.ndjson>
  *
  * Install: deno install -g -A -n sand jsr:@combs/sand/cli
@@ -14,14 +15,15 @@
 import { build, importTarget } from "./build.ts";
 import { runCommand } from "./run.ts";
 import { logCommand } from "./log.ts";
-import { loadLayers, resolveConfig, PROLOGUE_LINES, ROADS } from "../mod.ts";
+import { loadLayers, needsOf, PROLOGUE_LINES, resolveConfig } from "../mod.ts";
 
 const USAGE = `sand — semantic abstraction of neurolinguistic determinism
 
   sand check <file.sand> [--strict]
   sand build <file.sand> [-o dir] [--js]
-  sand run   <file.sand> (--input "…" | --stdin | --jsonl in.jsonl) [--workers N] [--trace out.ndjson]
-                         [--model name] [--road seat] [--timeout ms] [--allow <deno flag>] [--quiet]
+  sand run   <file.sand> (--input "…" | --stdin | --jsonl in.jsonl) [--session id] [--workers N]
+                         [--yes | --no | --unsure] [--memory dir] [--trace out.ndjson]
+                         [--model name] [--road name] [--timeout ms] [--allow <deno flag>] [--quiet]
   sand log   <trace.ndjson>
 
 Config: the nearest sand.json upward, $SAND_CONFIG, ~/.config/combs/sand.json, or none at all —
@@ -36,8 +38,9 @@ function parse(argv: string[]) {
       const [k, v] = a.slice(2).split("=", 2);
       if (v !== undefined) { flags[k] = v; continue; }
       const next = argv[i + 1];
-      if (["strict", "js", "stdin", "quiet"].includes(k) || next === undefined || next.startsWith("--")) { flags[k] = true; continue; }
-      if (k === "allow") { (flags.allow as string[] | undefined) ? (flags.allow as string[]).push(next) : (flags.allow = [next]); i++; continue; }
+      // every deno permission flag starts with `--`, so `--allow` takes the next word whatever it looks like
+      if (k === "allow" && next !== undefined) { (flags.allow as string[] | undefined) ? (flags.allow as string[]).push(next) : (flags.allow = [next]); i++; continue; }
+      if (["strict", "js", "stdin", "quiet", "yes", "no", "unsure"].includes(k) || next === undefined || next.startsWith("--")) { flags[k] = true; continue; }
       flags[k] = next; i++; continue;
     }
     pos.push(a);
@@ -56,7 +59,10 @@ async function check(file: string, strict: boolean): Promise<number> {
   const name = file.replace(/^.*\//, "");
   console.log(`${name} · ${plan.declarations.kinds.length + plan.declarations.scales.length + plan.declarations.shapes.length} declarations · ${plan.sites.length} predicate${plan.sites.length === 1 ? "" : "s"} · ${plan.batches.length} batch${plan.batches.length === 1 ? "" : "es"}`);
   for (const s of plan.sites) console.log(`  ${s.at.padEnd(7)} ${s.text.padEnd(52).slice(0, 52)} ${s.how.padEnd(16)} ${s.batch ? `batch ${s.batch}` : ""}${s.loops.length ? ` (in ${s.loops.join("/")})` : ""}`);
-  for (const c of plan.calls) console.log(`  ${c.at.padEnd(7)} ${(c.verb + "(" + (c.binding ? "{{" + c.binding + "}}" : "") + (c.spec ? ", " + c.spec : "") + ")").padEnd(52).slice(0, 52)} ${c.speculative?.length ? "speculates " + c.speculative.join(", ") : c.verb}${c.loops.length ? ` (in ${c.loops.join("/")})` : ""}`);
+  for (const c of plan.calls) {
+    const head = `${c.on ? c.on + "." : ""}${c.verb}(${c.binding ? "{{" + c.binding + "}}" : ""}${c.spec ? ", " + c.spec : ""})`;
+    console.log(`  ${c.at.padEnd(7)} ${head.padEnd(52).slice(0, 52)} ${c.speculative?.length ? "speculates " + c.speculative.join(", ") : c.of ?? c.verb}${c.loops.length ? ` (in ${c.loops.join("/")})` : ""}`);
+  }
   // the road check needs the config
   let roadNote = "";
   try {
@@ -66,10 +72,11 @@ async function check(file: string, strict: boolean): Promise<number> {
     const d = cfg.default.decide ? cfg.models[cfg.default.decide] : null;
     const road = d?.road ?? "seat";
     roadNote = ` · decide: ${cfg.default.decide ?? "none"}${d ? ` (${d.kind}${d.kind === "decision" ? " · " + road : ""})` : ""} · ask: ${cfg.default.ask ?? "none"}`;
-    if (d && (road === "modernbert" || road === "deberta") && plan.sites.some((s) => s.how === "noul")) warnings.push({ code: "W-ROAD", at: plan.sites.find((s) => s.how === "noul")!.at, message: `the default decide model runs on ${road}, which cannot answer a prose predicate; use a seat road for this program` });
+    if (d && (road === "modernbert" || road === "deberta") && plan.sites.some((s) => s.how === "noul")) warnings.push({ code: "W-ROAD", at: plan.sites.find((s) => s.how === "noul")!.at, message: `the decide model's \`road\` is set to ${road}, which costs one pass per option and cannot answer a prose predicate; this program needs one that can` });
   } catch (e) { roadNote = ` · config: ${(e as Error).message}`; }
-  const zs = plan.sites.some((s) => s.how === "noul") ? "n/a (a noul is asked)" : `${plan.batches.reduce((n, b) => n + b.questions, 0)}+ per option`;
+  const zs = plan.sites.some((s) => s.how === "noul") ? "n/a (a yes/no question is asked)" : `${plan.batches.reduce((n, b) => n + b.questions, 0)}+ per option`;
   console.log(`plan    ${plan.batches.length} batch${plan.batches.length === 1 ? "" : "es"} · cost  ${plan.cost.text} · zero-shot: ${zs}${roadNote}`);
+  console.log(`needs   ${needsOf(plan).join(" · ") || "nothing: this program asks no model"}`);
   for (const w of warnings) console.log(`${w.code.padEnd(19)}${w.at} · ${w.message}`);
   // types
   const proc = new Deno.Command("deno", { args: ["check", "--config", `${built.dir}/deno.json`, built.ts], stdout: "piped", stderr: "piped" });
@@ -97,7 +104,16 @@ if (import.meta.main) {
       console.log(`imports @combs/sand from ${importTarget()}`);
       code = 0;
     }
-    else if (cmd === "run" && file) code = await runCommand(file, { input: flags.input as string | undefined, stdin: !!flags.stdin, jsonl: flags.jsonl as string | undefined, workers: flags.workers ? Number(flags.workers) : undefined, trace: flags.trace as string | undefined, model: flags.model as string | undefined, road: flags.road as string | undefined, timeout: flags.timeout ? Number(flags.timeout) : undefined, allow: flags.allow as string[] | undefined, quiet: !!flags.quiet });
+    else if (cmd === "run" && file) {
+      code = await runCommand(file, {
+        input: flags.input as string | undefined, stdin: !!flags.stdin, jsonl: flags.jsonl as string | undefined,
+        session: flags.session as string | undefined, memory: flags.memory as string | undefined,
+        yes: !!flags.yes, no: !!flags.no, unsure: !!flags.unsure,
+        workers: flags.workers ? Number(flags.workers) : undefined, trace: flags.trace as string | undefined,
+        model: flags.model as string | undefined, road: flags.road as string | undefined,
+        timeout: flags.timeout ? Number(flags.timeout) : undefined, allow: flags.allow as string[] | undefined, quiet: !!flags.quiet,
+      });
+    }
     else if (cmd === "log" && file) code = await logCommand(file);
     else { console.log(USAGE); code = cmd ? 2 : 0; }
   } catch (e) {

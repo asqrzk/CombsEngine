@@ -1,4 +1,4 @@
-import { kind, scale, shape, text, settle, configure, decide, decideAll, classify, ask, extract, unsure, and, or, not, parallel, race, timeout, retry, using, named, log, run, trace } from "@combs/sand";
+import { kind, scale, shape, text, settle, configure, decide, decideAll, classify, ask, extract, chat, assistant, tool, memory, confirm, emit, unsure, and, or, not, parallel, race, timeout, retry, using, named, log, run, trace } from "@combs/sand";
 export default async function main(input: string) {
 const Topic = kind("what is the ticket about", { billing: "a charge or invoice", outage: "something is down or broken", feature: "they want something new", other: "none of these" }, { name: "Topic", fallback: "other" });
 const Ticket = shape({ topic: Topic, product: text("the product named, or 'unknown'"), summary: text("one sentence in the customer's words") }, { name: "Ticket" });

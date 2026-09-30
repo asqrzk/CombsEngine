@@ -1,0 +1,24 @@
+// Moderator. One post. A yes/no question decides; when the model is unsure a
+// person is asked, and if nobody is there the post waits in a queue. The
+// counts live in a memory too. Needs: the Combs model and a memory.
+
+settle({ floor: 0.7, gap: 0.3, passes: 1, wait: 30_000 });
+const queue = memory("moderation-queue");
+const tally = memory("moderation-tally");
+
+if (the {{input}} attacks a person or a group unless it quotes, reports or condemns such an attack) {
+  emit("removed");
+  tally.remember({ action: "removed", post: {{input}} });
+} else {
+  emit("kept");
+  tally.remember({ action: "kept", post: {{input}} });
+} unsure {
+  const answer = confirm("The model was not sure about this post. Remove it?");
+  if (answer === true) { emit("removed by a person"); tally.remember({ action: "removed", by: "person", post: {{input}} }); }
+  else if (answer === false) { emit("kept by a person"); tally.remember({ action: "kept", by: "person", post: {{input}} }); }
+  else { queue.remember({ post: {{input}}, held: new Date().toISOString() }); emit("held for review"); }
+}
+
+const waiting = queue.recall("held posts", { limit: 100 });
+const removed = tally.recall("removed", { limit: 1000 });
+log(waiting.length, "waiting for a person ·", removed.length, "removed so far");

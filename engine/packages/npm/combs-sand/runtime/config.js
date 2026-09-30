@@ -4,8 +4,9 @@
  * Layered like @combs/core's config.ts: defaults → $SAND_CONFIG → the nearest
  * `sand.json` upward from the program → ~/.config/combs/sand.json → what the
  * program passes to configure() → what a call names. Zero config works: a
- * COMBS_API_KEY in the environment yields a decision model called `combs`, an
- * OPENAI_API_KEY a chat model called `openai`.
+ * COMBS_API_KEY in the environment yields the decision model `combs`, the chat
+ * model `combs-chat` and the memory store `combs-memory`; an OPENAI_API_KEY a
+ * chat model called `openai`, which keeps precedence for `ask`.
  *
  * This module never touches Deno.* or process.*: it takes `env` and `readFile`
  * ports, so the same code runs in the browser (with env: () => undefined).
@@ -13,8 +14,8 @@
 
 import { SandError } from "./errors.js";
 
-export const DEFAULT_LIMITS = { passes: 64, tokens: 20000, ms: 60000, concurrency: 4 };
-export const DEFAULTS = { models: {}, default: { decide: null, ask: null }, settle: {}, limits: { ...DEFAULT_LIMITS }, net: [] };
+export const DEFAULT_LIMITS = { passes: 64, tokens: 20000, ms: 60000, turns: 32, wait: null, concurrency: 4 };
+export const DEFAULTS = { models: {}, default: { decide: null, ask: null, memory: null }, settle: {}, limits: { ...DEFAULT_LIMITS }, net: [] };
 
 /** The registry of model kinds: name → (modelConfig, ports) => adapter. Filled by wires/*.js and registerKind(). */
 export const kindRegistry = new Map();
@@ -62,7 +63,12 @@ export function deriveNet(models, written) {
 /** Models implied by the environment alone. Missing keys mean "absent", never an error. */
 export function zeroConfig(env) {
   const models = {};
-  if (env("COMBS_API_KEY")) models.combs = { kind: "decision", url: env("COMBS_API_URL") || "https://api.combs.network", key: "$COMBS_API_KEY", road: "seat", implicit: true };
+  if (env("COMBS_API_KEY")) {
+    const url = String(env("COMBS_API_URL") || "https://api.combs.network").replace(/\/+$/, "");
+    models.combs = { kind: "decision", url, key: "$COMBS_API_KEY", road: "seat", implicit: true };
+    models["combs-chat"] = { kind: "chat", url: `${url}/v1`, key: "$COMBS_API_KEY", model: env("COMBS_CHAT_MODEL") || "default", implicit: true };
+    models["combs-memory"] = { kind: "memory", url, key: "$COMBS_API_KEY", implicit: true };
+  }
   if (env("OPENAI_API_KEY")) models.openai = { kind: "chat", url: env("OPENAI_BASE_URL") || "https://api.openai.com/v1", key: "$OPENAI_API_KEY", model: env("OPENAI_MODEL") || "gpt-4o-mini", implicit: true };
   return { models };
 }
@@ -92,9 +98,10 @@ export function resolveConfig({ env, layers = [], explicit = null, local = null 
   const byKind = (k) => Object.values(models).filter((m) => m.kind === k && !m.unavailable).map((m) => m.name);
   const decide = merged.default.decide ?? (models.combs && !models.combs.unavailable ? "combs" : byKind("decision")[0] ?? null);
   const ask = merged.default.ask ?? (models.openai && !models.openai.unavailable ? "openai" : byKind("chat")[0] ?? "none");
+  const memory = merged.default.memory ?? (models["combs-memory"] && !models["combs-memory"].unavailable ? "combs-memory" : byKind("memory")[0] ?? "none");
   return {
     models,
-    default: { decide, ask },
+    default: { decide, ask, memory },
     settle: merged.settle ?? {},
     limits: { ...DEFAULT_LIMITS, ...(merged.limits ?? {}) },
     net: deriveNet(models, merged.net?.length ? merged.net : null),

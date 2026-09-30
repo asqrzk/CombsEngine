@@ -1,8 +1,17 @@
 {
-  "sand": "0.1",
+  "sand": "0.2",
   "file": "review-sweep.sand",
   "hash": "<hash>",
   "lines": 12,
+  "uses": {
+    "decide": true,
+    "ask": false,
+    "chat": false,
+    "tools": false,
+    "memory": false,
+    "confirm": false,
+    "emit": false
+  },
   "declarations": {
     "kinds": [],
     "scales": [
@@ -19,9 +28,16 @@
     ],
     "shapes": []
   },
+  "chats": [],
+  "tools": [],
+  "memories": [],
+  "confirms": [],
+  "hosts": [],
   "settle": {
     "at": "2:1",
-    "passes": true
+    "passes": true,
+    "turns": false,
+    "wait": false
   },
   "sites": [
     {
@@ -78,17 +94,20 @@
   "cost": {
     "min": {
       "passes": 0,
-      "completions": 0
+      "turns": 0,
+      "memory": 0
     },
     "max": {
       "passes": 0,
-      "completions": 0
+      "turns": 0,
+      "memory": 0
     },
+    "waits": 0,
     "loops": [
       "n × 1 pass"
     ],
     "unbounded": false,
-    "text": "min 0 passes · max 0 passes + n × 1 pass"
+    "text": "min 0 passes · max 0 passes + n × 1 pass (capped at 100 by settle)"
   },
   "warnings": []
 }

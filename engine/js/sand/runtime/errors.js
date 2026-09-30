@@ -4,6 +4,17 @@
  * Every message reads `CODE line:col · text`. Compile-time codes come from the
  * transform; runtime codes from the verbs and adapters. `line`/`col` are the
  * program's own positions (the `.sand` file), never the emitted `.ts`.
+ *
+ * The runtime's codes, each raised in exactly one place and catalogued in the
+ * README: `E-MODEL` (no model, the wrong class, or an unset variable),
+ * `E-STATE`, `E-SHAPE`, `E-TOOL-SHAPE` (tool(…) was given something that is not
+ * a shape, or an assistant something that is not a tool), `E-WIRE`, `E-AUTH`,
+ * `E-PASSES`, `E-SUSPENDED`, `E-HOST`, `E-STREAM` (a stream carried an error
+ * frame or broke mid-answer), `E-MEMORY` (a store refused, answered the wrong
+ * shape, or is not reachable from this host), `E-FENCE` (the fence a run asked
+ * for could not be built, so the run did not happen), `E-ANSWER-SHAPE`,
+ * `E-BUDGET`, `E-TIMEOUT`, `E-RUNTIME`, `E-NO-MODEL`. Warnings are `sand.log`
+ * lines, never codes: `W-UNCALIBRATED`, `W-UNMETERED`, `W-NOBODY`.
  */
 
 export class SandError extends Error {

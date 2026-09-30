@@ -1,8 +1,17 @@
 {
-  "sand": "0.1",
+  "sand": "0.2",
   "file": "service-request.sand",
   "hash": "<hash>",
   "lines": 9,
+  "uses": {
+    "decide": true,
+    "ask": false,
+    "chat": false,
+    "tools": false,
+    "memory": false,
+    "confirm": false,
+    "emit": false
+  },
   "declarations": {
     "kinds": [
       {
@@ -38,6 +47,11 @@
       }
     ]
   },
+  "chats": [],
+  "tools": [],
+  "memories": [],
+  "confirms": [],
+  "hosts": [],
   "settle": null,
   "sites": [
     {
@@ -85,12 +99,15 @@
   "cost": {
     "min": {
       "passes": 1,
-      "completions": 0
+      "turns": 0,
+      "memory": 0
     },
     "max": {
       "passes": 1,
-      "completions": 0
+      "turns": 0,
+      "memory": 0
     },
+    "waits": 0,
     "loops": [],
     "unbounded": false,
     "text": "min 1 pass · max 1 pass"

@@ -1,0 +1,32 @@
+// Doc Q&A. Teach it with "remember: <passage>"; then ask. Recall finds the
+// passages, the chat model answers from them and cites them, and a yes/no
+// question checks that the answer stayed inside the passages.
+// Needs: the Combs model, a chat model, and a memory (the platform's, or a local file).
+
+settle({ floor: 0.6, passes: 2, turns: 1, tokens: 8000 });
+const handbook = memory("handbook");
+
+if (input.startsWith("remember:")) {
+  const id = handbook.remember(input.slice(9).trim());
+  emit("Noted ({{id}}).");
+  return;
+}
+
+const question = {{input}} as "the question";
+if (the {{question}} asks how the company works unless it is small talk) {
+  const hits = handbook.recall({{question}}, { limit: 4 });
+  if (!hits.length) { emit("The handbook has nothing on that yet."); return; }
+  const passages = hits.map((h, i) => "[" + (i + 1) + "] " + h.text).join("\n\n");
+  const answer = ask("Answer the question from the passages only, citing them as [1], [2]. If they do not cover it, say so.\n\nPassages:\n{{passages}}\n\nQuestion: {{question}}", { maxTokens: 300 });
+  const pair = "Passages:\n{{passages}}\n\nAnswer:\n{{answer}}";
+  const check = {{pair}} as "the answer with its passages";
+  if (the {{check}} has an answer that claims something the passages do not say unless the answer says the passages do not cover it) {
+    emit("The handbook does not clearly cover that. The closest passage: " + hits[0].text);
+  } else {
+    emit(answer);
+  } unsure {
+    emit(answer + "\n\n(Please check this against the handbook.)");
+  }
+} else {
+  emit("Ask me how things work here; teach me with \"remember: …\".");
+}

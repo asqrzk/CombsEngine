@@ -1,0 +1,215 @@
+{
+  "sand": "0.2",
+  "file": "support-desk.sand",
+  "hash": "<hash>",
+  "lines": 40,
+  "uses": {
+    "decide": true,
+    "ask": true,
+    "chat": true,
+    "tools": true,
+    "memory": false,
+    "confirm": true,
+    "emit": true
+  },
+  "declarations": {
+    "kinds": [
+      {
+        "name": "Topic",
+        "at": "5:7",
+        "options": [
+          "billing",
+          "outage",
+          "feature",
+          "other"
+        ],
+        "fallback": "other"
+      },
+      {
+        "name": "Urgency",
+        "at": "11:7",
+        "options": [
+          "now",
+          "soon",
+          "whenever"
+        ],
+        "fallback": "whenever"
+      }
+    ],
+    "scales": [],
+    "shapes": [
+      {
+        "name": "Details",
+        "at": "12:7",
+        "slots": {
+          "topic": "Topic",
+          "urgency": "Urgency",
+          "summary": "text"
+        }
+      },
+      {
+        "name": "TicketArgs",
+        "at": "13:7",
+        "slots": {
+          "title": "text",
+          "summary": "text",
+          "urgency": "Urgency"
+        }
+      }
+    ]
+  },
+  "chats": [
+    {
+      "name": "desk",
+      "at": "24:9",
+      "verb": "chat",
+      "turns": null
+    }
+  ],
+  "tools": [
+    {
+      "name": "createTicket",
+      "at": "17:7",
+      "net": []
+    }
+  ],
+  "memories": [],
+  "confirms": [
+    {
+      "at": "31:7",
+      "verb": "confirm",
+      "loops": [],
+      "conditional": true
+    }
+  ],
+  "hosts": [],
+  "settle": {
+    "at": "14:1",
+    "passes": true,
+    "turns": true,
+    "wait": true
+  },
+  "sites": [
+    {
+      "id": "d1",
+      "at": "22:5",
+      "text": "the {{input}} is a support issue",
+      "how": "noul",
+      "binding": "input",
+      "model": "default:decide",
+      "loops": [],
+      "batch": 1
+    },
+    {
+      "id": "d2",
+      "at": "27:7",
+      "text": "the {{reply}} promises a refund or a date",
+      "how": "noul",
+      "binding": "reply",
+      "model": "default:decide",
+      "loops": [],
+      "batch": 2
+    }
+  ],
+  "batches": [
+    {
+      "id": 1,
+      "at": "22:1",
+      "binding": "input",
+      "sites": [
+        "d1"
+      ],
+      "speculative": [
+        "Details"
+      ],
+      "speculated": false,
+      "questions": 1,
+      "loops": [],
+      "conditional": false,
+      "model": "default:decide"
+    },
+    {
+      "id": 2,
+      "at": "27:3",
+      "binding": "reply",
+      "sites": [
+        "d2"
+      ],
+      "speculative": [],
+      "speculated": false,
+      "questions": 1,
+      "loops": [],
+      "conditional": true,
+      "model": "default:decide"
+    }
+  ],
+  "calls": [
+    {
+      "at": "23:19",
+      "verb": "extract",
+      "binding": "input",
+      "spec": "Details",
+      "using": null,
+      "loops": [],
+      "conditional": true,
+      "speculative": []
+    },
+    {
+      "at": "36:8",
+      "verb": "ask",
+      "loops": [],
+      "conditional": true
+    },
+    {
+      "at": "25:15",
+      "verb": "say",
+      "on": "desk",
+      "of": "chat",
+      "loops": [],
+      "conditional": true,
+      "turns": null
+    },
+    {
+      "at": "28:13",
+      "verb": "say",
+      "on": "desk",
+      "of": "chat",
+      "loops": [],
+      "conditional": true,
+      "turns": null
+    },
+    {
+      "at": "32:20",
+      "verb": "run",
+      "on": "createTicket",
+      "of": "tool",
+      "loops": [],
+      "conditional": true,
+      "turns": null
+    },
+    {
+      "at": "31:7",
+      "verb": "confirm",
+      "loops": [],
+      "conditional": true
+    }
+  ],
+  "loops": [],
+  "cost": {
+    "min": {
+      "passes": 1,
+      "turns": 0,
+      "memory": 0
+    },
+    "max": {
+      "passes": 2,
+      "turns": 4,
+      "memory": 0
+    },
+    "waits": 1,
+    "loops": [],
+    "unbounded": false,
+    "text": "min 1 pass · max 2 passes, 4 turns · asks a person up to 1 time"
+  },
+  "warnings": []
+}

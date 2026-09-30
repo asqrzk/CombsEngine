@@ -1,6 +1,6 @@
 {
   "name": "@combs-edge/combs-sand",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "SAND — semantic abstraction of neurolinguistic determinism. TypeScript plus prose predicates decided by a model: the compiler and runtime. Zero deps; browser, Node, Deno, Cloudflare Workers.",
   "license": "MIT",
   "type": "module",

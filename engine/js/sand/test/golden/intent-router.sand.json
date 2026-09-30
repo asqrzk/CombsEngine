@@ -1,8 +1,17 @@
 {
-  "sand": "0.1",
+  "sand": "0.2",
   "file": "intent-router.sand",
   "hash": "<hash>",
   "lines": 36,
+  "uses": {
+    "decide": true,
+    "ask": false,
+    "chat": false,
+    "tools": false,
+    "memory": false,
+    "confirm": false,
+    "emit": false
+  },
   "declarations": {
     "kinds": [
       {
@@ -19,9 +28,16 @@
     "scales": [],
     "shapes": []
   },
+  "chats": [],
+  "tools": [],
+  "memories": [],
+  "confirms": [],
+  "hosts": [],
   "settle": {
     "at": "6:1",
-    "passes": true
+    "passes": true,
+    "turns": false,
+    "wait": false
   },
   "sites": [
     {
@@ -69,12 +85,15 @@
   "cost": {
     "min": {
       "passes": 0,
-      "completions": 0
+      "turns": 0,
+      "memory": 0
     },
     "max": {
       "passes": 1,
-      "completions": 0
+      "turns": 0,
+      "memory": 0
     },
+    "waits": 0,
     "loops": [],
     "unbounded": false,
     "text": "min 0 passes · max 1 pass"

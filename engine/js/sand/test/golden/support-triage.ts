@@ -1,4 +1,4 @@
-import { kind, scale, shape, text, settle, configure, decide, decideAll, classify, ask, extract, unsure, and, or, not, parallel, race, timeout, retry, using, named, log, run, trace } from "@combs/sand";
+import { kind, scale, shape, text, settle, configure, decide, decideAll, classify, ask, extract, chat, assistant, tool, memory, confirm, emit, unsure, and, or, not, parallel, race, timeout, retry, using, named, log, run, trace } from "@combs/sand";
 export default async function main(input: string) {
 const Ticket = kind("what is the person writing in about", {
   refund: "the person wants money they paid returned",

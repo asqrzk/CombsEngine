@@ -29,7 +29,7 @@ export function decisionAdapter(model, ports = {}) {
   const road = model.road ?? "seat";
   if (!ROADS[road]) throw new SandError("E-MODEL", `road ${JSON.stringify(road)} names no road; SAND knows ${Object.keys(ROADS).join(", ")}`);
   const zeroShot = road === "modernbert" || road === "deberta";
-  const caps = { batch: 16, perRequest: !zeroShot, noul: !zeroShot, abstain: zeroShot ? "client" : "wire", schema: false, logprobs: false, text: false };
+  const caps = { batch: 16, perRequest: !zeroShot, noul: !zeroShot, abstain: zeroShot ? "client" : "wire", schema: false, logprobs: false, text: false, tools: false, stream: false };
   const base = String(model.url).replace(/\/+$/, "");
 
   return {

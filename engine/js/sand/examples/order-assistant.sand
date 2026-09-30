@@ -1,0 +1,40 @@
+// Order assistant. The chat model picks the tools and their arguments; the
+// program runs them. A refund needs a person's yes. Needs: the Combs model and
+// a chat model that supports tools.
+
+const OrderArgs = shape({ orderId: text("the order number, like A-1234") });
+const RefundArgs = shape({ orderId: text("the order number"), reason: text("why, in the customer's own words") });
+settle({ floor: 0.6, passes: 4, turns: 12, tokens: 8000, wait: 600_000 });
+
+// Stand-in data; a real program would call the shop's API from these tools.
+const orders: Record<string, { status: string; total: number }> = {
+  "A-1234": { status: "shipped", total: 42 },
+  "A-2000": { status: "delivered", total: 129 },
+};
+const lookupOrder = tool("look up an order by its number", OrderArgs, ({ orderId }) => orders[orderId] ?? { error: "no such order" });
+const refundOrder = tool("refund an order in full", RefundArgs, async ({ orderId, reason }) => {
+  const order = orders[orderId];
+  if (!order) return { error: "no such order" };
+  if (order.status === "refunded") return { error: "already refunded" };
+  if (confirm("Refund {{orderId}} for {{order.total}}? Reason: {{reason}}") !== true) return { refunded: false, note: "a person did not approve this refund" };
+  order.status = "refunded";
+  return { refunded: true, total: order.total };
+});
+const bot = assistant("You are Acme's order assistant. Use the tools for any order fact; never invent one. Two sentences at most.", { tools: [lookupOrder, refundOrder], settle: { turns: 4 } });
+
+if (the {{input}} is about an existing order unless they are asking about something they have not bought yet) {
+  const reply = bot.say({{input}});
+  const refunded = reply.calls.some((c) => c.name === "refundOrder" && (c.result as { refunded?: boolean })?.refunded === true);
+  // The guardrail: the reply may not claim a refund the tool did not make.
+  if (the {{reply}} says a refund was made unless it says one was requested or declined && !refunded) {
+    emit(bot.say("Correct yourself: no refund was made. Say what actually happened."));
+  } else {
+    emit(reply);
+  } unsure {
+    emit(reply);
+  }
+} else {
+  emit("I can help with an order you have placed. What is the order number?");
+} unsure {
+  emit(bot.say({{input}}));
+}

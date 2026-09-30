@@ -1,4 +1,4 @@
-import { kind, scale, shape, text, settle, configure, decide, decideAll, classify, ask, extract, unsure, and, or, not, parallel, race, timeout, retry, using, named, log, run, trace } from "@combs/sand";
+import { kind, scale, shape, text, settle, configure, decide, decideAll, classify, ask, extract, chat, assistant, tool, memory, confirm, emit, unsure, and, or, not, parallel, race, timeout, retry, using, named, log, run, trace } from "@combs/sand";
 export default async function main(input: string) {
 const Mode = kind("what does this turn need from the assistant", {
   chat:  "a question or conversation answerable from knowledge alone",

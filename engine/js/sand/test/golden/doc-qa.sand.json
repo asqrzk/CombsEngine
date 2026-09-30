@@ -1,0 +1,132 @@
+{
+  "sand": "0.2",
+  "file": "doc-qa.sand",
+  "hash": "<hash>",
+  "lines": 33,
+  "uses": {
+    "decide": true,
+    "ask": true,
+    "chat": false,
+    "tools": false,
+    "memory": true,
+    "confirm": false,
+    "emit": true
+  },
+  "declarations": {
+    "kinds": [],
+    "scales": [],
+    "shapes": []
+  },
+  "chats": [],
+  "tools": [],
+  "memories": [
+    {
+      "name": "handbook",
+      "at": "7:7"
+    }
+  ],
+  "confirms": [],
+  "hosts": [],
+  "settle": {
+    "at": "6:1",
+    "passes": true,
+    "turns": true,
+    "wait": false
+  },
+  "sites": [
+    {
+      "id": "d1",
+      "at": "16:5",
+      "text": "the {{question}} asks how the company works",
+      "how": "noul",
+      "binding": "question",
+      "model": "default:decide",
+      "loops": [],
+      "batch": 1
+    },
+    {
+      "id": "d2",
+      "at": "23:7",
+      "text": "the {{check}} has an answer that claims something the passages do not say",
+      "how": "noul",
+      "binding": "check",
+      "model": "default:decide",
+      "loops": [],
+      "batch": 2
+    }
+  ],
+  "batches": [
+    {
+      "id": 1,
+      "at": "16:1",
+      "binding": "question",
+      "sites": [
+        "d1"
+      ],
+      "speculative": [],
+      "speculated": false,
+      "questions": 1,
+      "loops": [],
+      "conditional": false,
+      "model": "default:decide"
+    },
+    {
+      "id": 2,
+      "at": "23:3",
+      "binding": "check",
+      "sites": [
+        "d2"
+      ],
+      "speculative": [],
+      "speculated": false,
+      "questions": 1,
+      "loops": [],
+      "conditional": true,
+      "model": "default:decide"
+    }
+  ],
+  "calls": [
+    {
+      "at": "20:18",
+      "verb": "ask",
+      "loops": [],
+      "conditional": true
+    },
+    {
+      "at": "10:14",
+      "verb": "remember",
+      "on": "handbook",
+      "of": "memory",
+      "loops": [],
+      "conditional": true,
+      "turns": null
+    },
+    {
+      "at": "17:16",
+      "verb": "recall",
+      "on": "handbook",
+      "of": "memory",
+      "loops": [],
+      "conditional": true,
+      "turns": null
+    }
+  ],
+  "loops": [],
+  "cost": {
+    "min": {
+      "passes": 1,
+      "turns": 0,
+      "memory": 0
+    },
+    "max": {
+      "passes": 2,
+      "turns": 1,
+      "memory": 2
+    },
+    "waits": 0,
+    "loops": [],
+    "unbounded": false,
+    "text": "min 1 pass · max 2 passes, 1 turn, 2 memory calls"
+  },
+  "warnings": []
+}

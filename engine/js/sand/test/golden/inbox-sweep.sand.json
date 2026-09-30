@@ -1,0 +1,152 @@
+{
+  "sand": "0.2",
+  "file": "inbox-sweep.sand",
+  "hash": "<hash>",
+  "lines": 33,
+  "uses": {
+    "decide": true,
+    "ask": false,
+    "chat": false,
+    "tools": false,
+    "memory": false,
+    "confirm": false,
+    "emit": false
+  },
+  "declarations": {
+    "kinds": [
+      {
+        "name": "Category",
+        "at": "4:7",
+        "options": [
+          "complaint",
+          "question",
+          "praise",
+          "noise"
+        ],
+        "fallback": "noise"
+      }
+    ],
+    "scales": [
+      {
+        "name": "Heat",
+        "at": "10:7",
+        "levels": [
+          "calm",
+          "annoyed",
+          "furious"
+        ]
+      }
+    ],
+    "shapes": []
+  },
+  "chats": [],
+  "tools": [],
+  "memories": [],
+  "confirms": [],
+  "hosts": [],
+  "settle": {
+    "at": "11:1",
+    "passes": true,
+    "turns": false,
+    "wait": false
+  },
+  "sites": [
+    {
+      "id": "d1",
+      "at": "15:7",
+      "text": "the {{message}} is a complaint",
+      "how": "choice:Category",
+      "binding": "message",
+      "model": "default:decide",
+      "loops": [
+        "parallel"
+      ],
+      "batch": 1
+    },
+    {
+      "id": "d1",
+      "at": "17:14",
+      "text": "the {{message}} is a complaint",
+      "how": "choice:Category",
+      "binding": "message",
+      "model": "default:decide",
+      "loops": [
+        "parallel"
+      ],
+      "batch": 1
+    },
+    {
+      "id": "d1",
+      "at": "17:48",
+      "text": "the {{message}} is a question",
+      "how": "choice:Category",
+      "binding": "message",
+      "model": "default:decide",
+      "loops": [
+        "parallel"
+      ],
+      "batch": 1
+    },
+    {
+      "id": "d2",
+      "at": "15:41",
+      "text": "the {{message}} is at least annoyed on Heat",
+      "how": "score:Heat",
+      "binding": "message",
+      "model": "default:decide",
+      "loops": [
+        "parallel"
+      ],
+      "batch": 1
+    }
+  ],
+  "batches": [
+    {
+      "id": 1,
+      "at": "15:3",
+      "binding": "message",
+      "sites": [
+        "d1",
+        "d2"
+      ],
+      "speculative": [],
+      "speculated": false,
+      "questions": 2,
+      "loops": [
+        "parallel"
+      ],
+      "conditional": true,
+      "model": "default:decide"
+    }
+  ],
+  "calls": [],
+  "loops": [
+    {
+      "at": "27:1",
+      "kind": "for"
+    },
+    {
+      "at": "14:54",
+      "kind": "parallel"
+    }
+  ],
+  "cost": {
+    "min": {
+      "passes": 0,
+      "turns": 0,
+      "memory": 0
+    },
+    "max": {
+      "passes": 0,
+      "turns": 0,
+      "memory": 0
+    },
+    "waits": 0,
+    "loops": [
+      "n × 1 pass"
+    ],
+    "unbounded": false,
+    "text": "min 0 passes · max 0 passes + n × 1 pass (capped at 200 by settle)"
+  },
+  "warnings": []
+}

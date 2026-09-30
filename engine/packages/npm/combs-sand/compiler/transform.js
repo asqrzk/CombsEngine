@@ -16,14 +16,26 @@
 import { tokenize, isTrivia, pairBrackets } from "./tokenize.js";
 import { SandError } from "../runtime/errors.js";
 
-export const ASYNC_VERBS = ["decide", "decideAll", "classify", "ask", "extract", "parallel", "race", "timeout", "retry", "using"];
-export const SYNC_VERBS = ["log", "kind", "scale", "shape", "text", "settle", "configure", "named"];
+export const ASYNC_VERBS = ["decide", "decideAll", "classify", "ask", "extract", "parallel", "race", "timeout", "retry", "using", "confirm"];
+export const SYNC_VERBS = ["log", "kind", "scale", "shape", "text", "settle", "configure", "named", "chat", "assistant", "tool", "memory", "emit"];
 const RESERVED = new Set([...ASYNC_VERBS, ...SYNC_VERBS, "and", "or", "not", "unsure", "main", "run", "trace"]);
 /** index of the options argument per verb (the argument stamping targets) */
-const OPTS_INDEX = { ask: 1, extract: 2, decide: 2, decideAll: 2, classify: 1, parallel: 2, retry: 1 };
-const DECL_OPTS_INDEX = { kind: 2, scale: 2, shape: 1 };
+const OPTS_INDEX = { ask: 1, extract: 2, decide: 2, decideAll: 2, classify: 1, parallel: 2, retry: 1, confirm: 1, emit: 1 };
+const DECL_OPTS_INDEX = { kind: 2, scale: 2, shape: 1, chat: 1, assistant: 1, memory: 1, tool: 3 };
+/** the verbs that make a value the program then talks to, and what family each belongs to */
+const RECEIVER_FAMILY = { chat: "chat", assistant: "chat", memory: "memory", tool: "tool" };
+/** the methods T4b knows per family; `stream` is read but never awaited, and neither is a chat's `forget()` */
+const RECEIVER_METHODS = { chat: ["say", "stream"], memory: ["remember", "recall", "forget"], tool: ["run"] };
+const NEVER_AWAITED = new Set(["chat.stream"]);
+/** index of the options argument per method; `run` takes the model's arguments and nothing else */
+const METHOD_OPTS_INDEX = { say: 1, remember: 1, recall: 1, forget: 1 };
 const NOT_FUNCTION_HEADS = new Set(["if", "while", "for", "switch", "catch", "with"]);
-const IMPORT_NAMES = "kind, scale, shape, text, settle, configure, decide, decideAll, classify, ask, extract, unsure, and, or, not, parallel, race, timeout, retry, using, named, log, run, trace";
+const IMPORT_NAMES = "kind, scale, shape, text, settle, configure, decide, decideAll, classify, ask, extract, chat, assistant, tool, memory, confirm, emit, unsure, and, or, not, parallel, race, timeout, retry, using, named, log, run, trace";
+/** The order the ladder's `needs` reads in; `sand check` prints these and the gallery badges them. */
+export const NEEDS_ORDER = ["decide", "ask", "chat", "tools", "memory", "confirm", "emit"];
+/** What a program needs, derived from `plan.uses` — the one place the ladder's badge comes from. */
+export function needsOf(plan) { return NEEDS_ORDER.filter((k) => plan?.uses?.[k]); }
+
 export const GENERIC_CONTRARIES = ["the opposite is the case", "it is only mentioned, quoted or asked about, not the case"];
 export const PROLOGUE_LINES = 2;
 
@@ -55,6 +67,13 @@ export function transform(src, opts = {}) {
   let editOrder = 0;
   const replace = (start, end, text) => edits.push({ start, end, text, order: editOrder++ });
   const insert = (pos, text) => edits.push({ start: pos, end: pos, text, order: editOrder++ });
+  /**
+   * An argument appended before a call's own `)`. It must land to the right of
+   * every other insert at that offset — an inner call's `)` from an auto-await
+   * ends exactly where the outer call's `)` begins, and the argument belongs to
+   * the outer call: `emit(ask(x))` → `emit((await ask(x)), { at })`.
+   */
+  const append = (pos, text) => edits.push({ start: pos, end: pos, text, order: 1e9 + editOrder++ });
   const consumed = new Set(); // binding token indices already rewritten as part of a larger edit
 
   // ── T0 · refuse `export` in a program ───────────────────────────────────
@@ -67,7 +86,9 @@ export function transform(src, opts = {}) {
 
   // ── declarations: kinds, scales, shapes, nouns, settle ──────────────────
   const kinds = new Map(), scales = new Map(), shapes = new Map(), nouns = new Map([["input", "the message"]]);
-  let settleTok = null, settlePasses = false;
+  /** what the file declared and then talks to: `const desk = chat(…)`, `const notes = memory(…)`, `const file = tool(…)` */
+  const receivers = new Map();
+  let settleTok = null, settlePasses = false, settleTurns = false, settleWait = false, settlePassCap = null;
   const topKeys = (openIdx) => { // keys of an object literal at token index openIdx (the `{`)
     const out = []; const end = open.get(openIdx); let depth = 0;
     for (let k = openIdx + 1; k < end; k++) {
@@ -122,6 +143,18 @@ export function transform(src, opts = {}) {
             decl.slots[o.key] = v.kind === "ident" && v.text === "text" ? "text" : v.kind === "ident" ? v.text : "?";
           }
           shapes.set(name, decl);
+        } else if (RECEIVER_FAMILY[verb]) {
+          decl.family = RECEIVER_FAMILY[verb];
+          decl.methods = RECEIVER_METHODS[decl.family];
+          const opts = topKeys(verb === "tool" ? (args[3] && isP(args[3][0], "{") ? args[3][0] : -1) : (args[1] && isP(args[1][0], "{") ? args[1][0] : -1));
+          for (const o of opts) {
+            if (o.key === "net" && isP(o.valueStart, "[")) decl.net = arrayStrings(o.valueStart);
+            if (o.key === "tools" && isP(o.valueStart, "[")) decl.toolsAt = o.valueStart;
+            if (o.key === "settle" && isP(o.valueStart, "{")) {
+              for (const s of topKeys(o.valueStart)) if (s.key === "turns" && toks[s.valueStart].kind === "number") decl.turns = Number(toks[s.valueStart].text.replace(/_/g, ""));
+            }
+          }
+          receivers.set(name, decl);
         }
       }
       // const NAME = {{x}} as "noun"
@@ -134,7 +167,11 @@ export function transform(src, opts = {}) {
     if (t.text === "settle" && isP(sig(k), "(") && !isP(sig(k, -1), ".")) {
       settleTok = settleTok ?? t;
       const inner = slice(sig(k), open.get(sig(k)));
+      const cap = /\bpasses\s*:\s*([\d_]+)/.exec(inner);
       if (/\bpasses\s*:/.test(inner)) settlePasses = true;
+      if (cap) settlePassCap = Math.min(settlePassCap ?? Infinity, Number(cap[1].replace(/_/g, "")));
+      if (/\bturns\s*:/.test(inner)) settleTurns = true;
+      if (/\bwait\s*:/.test(inner)) settleWait = true;
     }
   }
   const nounOf = (path) => {
@@ -280,6 +317,18 @@ export function transform(src, opts = {}) {
     return pOr();
   }
   const atomBindings = (a, b) => { const out = []; for (let k = a; k <= b; k++) if (toks[k].kind === "binding") out.push(k); return out; };
+  /**
+   * T3 for `confirm`: the index of the `confirm` token when the whole condition
+   * between `(` and `)` is one `confirm(…)` call, so it compiles three-valued
+   * and may carry an `unsure` block. `-1` for anything else.
+   */
+  const wholeConfirm = (condOpen, condClose) => {
+    const a = sig(condOpen);
+    if (!isI(a, "confirm") || isP(sig(a, -1), ".")) return -1;
+    const o = sig(a);
+    if (!isP(o, "(")) return -1;
+    return sig(open.get(o)) === condClose ? a : -1;
+  };
   const wrapNot = (s, neg) => (neg ? `not(${s})` : s);
   const norm = (s) => s.toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
 
@@ -355,6 +404,7 @@ export function transform(src, opts = {}) {
 
   // find every if-chain and while with a prose condition
   const seenIf = new Set();
+  const bareConfirms = [];
   for (let k = 0; k < toks.length; k++) {
     if (isI(k, "if") && !seenIf.has(k)) {
       if (isI(sig(k, -1), "else")) continue;
@@ -363,9 +413,14 @@ export function transform(src, opts = {}) {
       while (true) {
         const co = sig(cur); const cc = open.get(co); const bo = sig(cc);
         const hasB = atomBindings(co + 1, cc - 1).length > 0;
-        if (!isP(bo, "{")) { if (hasB) throw new SandError("E-BLOCK", "this prose `if` has no `{`; SAND needs braces around its branches", toks[cur]); break; }
-        parts.push({ kind: parts.length ? "elseif" : "if", ifTok: cur, condOpen: co, condClose: cc, bodyOpen: bo, bodyClose: open.get(bo), prose: hasB });
-        any = any || hasB;
+        const conf = hasB ? -1 : wholeConfirm(co, cc);
+        if (!isP(bo, "{")) {
+          if (hasB) throw new SandError("E-BLOCK", "this prose `if` has no `{`; SAND needs braces around its branches", toks[cur]);
+          if (conf >= 0) bareConfirms.push(cc); // still three-valued: `unsure` is not `true`
+          break;
+        }
+        parts.push({ kind: parts.length ? "elseif" : "if", ifTok: cur, condOpen: co, condClose: cc, bodyOpen: bo, bodyClose: open.get(bo), prose: hasB, confirm: conf });
+        any = any || hasB || conf >= 0;
         seenIf.add(cur);
         const after = sig(open.get(bo));
         if (isI(after, "else")) {
@@ -395,10 +450,15 @@ export function transform(src, opts = {}) {
   }
 
   const chainEnd = (ch) => ch.parts[ch.parts.length - 1].bodyClose;
+  let cCounter = 0;
   for (const ch of chains) {
-    if (!ch.ctx.async) throw new SandError("E-ASYNC", "this predicate sits in a function that is not async; write async (x) => … or use parallel(items, async (x) => …)", ch.headTok);
-    const group = { entries: [], binding: null, inlineVars: [] };
+    if (!ch.ctx.async) {
+      const what = ch.parts.some((p) => p.prose) ? "this predicate" : "this `confirm`";
+      throw new SandError("E-ASYNC", `${what} sits in a function that is not async; write async (x) => … or use parallel(items, async (x) => …)`, ch.headTok);
+    }
+    const group = { entries: [], binding: null, inlineVars: [], confirmVars: [] };
     for (const part of ch.parts) {
+      if (part.confirm >= 0) { part.verdict = `c${++cCounter}`; group.confirmVars.push(part.verdict); continue; }
       if (!part.prose) continue;
       const sub = { entries: [] };
       const r = resolveTree(parseCond(part.condOpen + 1, part.condClose - 1), sub);
@@ -434,10 +494,10 @@ export function transform(src, opts = {}) {
   const explicitSites = calls.filter((c) => ["decide", "decideAll", "extract"].includes(c.verb) && c.args[0] && c.args[0][0] === c.args[0][1] && toks[c.args[0][0]].kind === "binding")
     .map((c) => ({ call: c, binding: toks[c.args[0][0]].path, spec: c.args[1] ? slice(c.args[1][0], c.args[1][1]) : null, using: c.args[2] ? (/using\s*:\s*["'](ask|decide)["']/.exec(slice(c.args[2][0], c.args[2][1])) || [])[1] ?? null : null, idx: c.idx, encl: enclosingBrace(c.idx), ctx: ctxAt[c.idx], loops: loopsAround(c.idx) }));
   for (let i = 0; i < chains.length; i++) {
-    const A = chains[i]; if (A.mergedInto) continue;
+    const A = chains[i]; if (A.mergedInto || !A.group.entries.length) continue;
     for (let j = i + 1; j < chains.length; j++) {
       const B = chains[j];
-      if (B.mergedInto || B.group.binding !== A.group.binding || B.headIdx < chainEnd(A)) continue;
+      if (B.mergedInto || !B.group.entries.length || B.group.binding !== A.group.binding || B.headIdx < chainEnd(A)) continue;
       if (enclosingBrace(A.headIdx) !== enclosingBrace(B.headIdx) || B.ctx !== A.ctx) continue;
       if (loopsAround(B.headIdx).length !== loopsAround(A.headIdx).length) continue;
       if (assignsBinding(toks[chainEnd(A)].end, toks[B.headIdx].start, A.group.binding)) break;
@@ -458,6 +518,7 @@ export function transform(src, opts = {}) {
     throw new SandError("E-SHAPE", `extract needs a shape and this file declares ${shapes.size} (${[...shapes.keys()].join(", ")}); name it: extract({{input}}, ${[...shapes.keys()][0]})`, tok);
   }
   function speculationFor(headIdx, binding, ctx, headKeys, headCallIdx = -1) {
+    if (!binding) return [];
     const encl = enclosingBrace(headIdx);
     const blockEnd = encl >= 0 ? open.get(encl) : toks.length;
     const out = []; const keys = new Set(headKeys); const covered = [];
@@ -505,18 +566,21 @@ export function transform(src, opts = {}) {
       const spec = speculationFor(ch.headIdx, g.binding, ch.ctx, g.entries.map((e) => e.specKey));
       const specOpt = spec.length ? `, speculate: [${spec.join(", ")}]` : "";
       let prefix = "";
-      if (g.inlineVars.length) prefix += `let ${[...new Set(g.inlineVars.map((e) => e.dv))].join(", ")};  `;
+      const declared = [...new Set([...g.inlineVars.map((e) => e.dv), ...g.confirmVars])];
+      if (declared.length) prefix += `let ${declared.join(", ")};  `;
       if (g.entries.length === 1) {
         prefix += `const ${g.entries[0].dv} = await ${singleCall(g.entries[0], g.binding, ch.headTok, modelOpt, specOpt)};  `;
       } else if (g.entries.length > 1) {
         if (g.entries.length > 16) warn("W-BATCH-SPLIT", ch.headTok, `${g.entries.length} questions at one site; the runtime splits them into requests of 16`);
         prefix += `const [${g.entries.map((e) => e.dv).join(", ")}] = await decideAll(${g.binding}, [${g.entries.map((e) => e.spec).join(", ")}], { at: ${q(at(ch.headTok))}${modelOpt}${specOpt} });  `;
       }
-      insert(toks[ch.headIdx].start, prefix);
-      ch.batch = { id: batches.length + 1, at: at(ch.headTok), binding: g.binding, sites: g.entries.map((e) => e.dv), speculative: spec, speculated: false, questions: g.entries.length, loops: ch.loops.map((l) => l.kind), conditional: ch.encl >= 0, model: ch.ctx.usingModel ?? "default:decide" };
-      batches.push(ch.batch);
+      if (prefix) insert(toks[ch.headIdx].start, prefix);
+      if (g.entries.length) {
+        ch.batch = { id: batches.length + 1, at: at(ch.headTok), binding: g.binding, sites: g.entries.map((e) => e.dv), speculative: spec, speculated: false, questions: g.entries.length, loops: ch.loops.map((l) => l.kind), conditional: ch.encl >= 0, model: ch.ctx.usingModel ?? "default:decide" };
+        batches.push(ch.batch);
+      }
     }
-    const proseParts = ch.parts.filter((p) => p.prose);
+    const proseParts = ch.parts.filter((p) => p.prose || p.confirm >= 0);
     const unsureTest = proseParts.map((p) => `(${p.verdict}) === unsure`).join(" || ");
     const notUnsureTest = proseParts.map((p) => `(${p.verdict}) !== unsure`).join(" && ");
     for (const part of ch.parts) {
@@ -524,6 +588,11 @@ export function transform(src, opts = {}) {
         let v = part.verdict;
         for (const e of part.inline) v = v.replace(new RegExp(`\\b${e.dv}\\b`), `(${e.dv} = await ${singleCall(e, e.binding, e.atoms[0].tok, modelOpt)})`);
         replace(toks[part.condOpen].start, toks[part.condClose].end, `((${v}) === true)`);
+      } else if (part.confirm >= 0) {
+        // T3 for confirm: one call, held in a variable so `else` and `unsure` read the same answer
+        insert(toks[part.confirm].start, `(${part.verdict} = `);
+        insert(toks[open.get(sig(part.confirm))].end, ")");
+        append(toks[part.condClose].start, " === true"); // rightmost: the auto-await closes its own paren here too
       }
       if (part.kind === "else" && ch.parts.some((p) => p.kind === "unsure")) replace(toks[part.elseTok].start, toks[part.bodyOpen].end, `else if (${notUnsureTest.replace(/\b(d\d+)\b\.value/g, (m, d) => (g.inlineVars.some((e) => e.dv === d) ? `${d}?.value` : m))}) {`);
       if (part.kind === "unsure") {
@@ -548,6 +617,9 @@ export function transform(src, opts = {}) {
     replace(toks[w.condOpen].start, toks[w.condClose].end, `((${v}) === true)`);
     batches.push({ id: batches.length + 1, at: at(w.tok), binding: w.entries[0]?.binding, sites: w.entries.map((e) => e.dv), speculative: [], questions: w.entries.length, loops: [...w.loops.map((l) => l.kind), "while"], conditional: false, model: w.ctx.usingModel ?? "default:decide" });
   }
+
+  // a braceless `if (confirm(…))` is still three-valued: `unsure` is not `true`
+  for (const cc of bareConfirms) append(toks[cc].start, " === true");
 
   for (const ch of chains) if (ch.speculated && ch.batch) ch.batch.speculated = true;
 
@@ -586,7 +658,8 @@ export function transform(src, opts = {}) {
 
   // ── T4/T5/T6/T8: verb calls ─────────────────────────────────────────────
   const declaredNames = new Map();
-  for (const d of [...kinds.values(), ...scales.values(), ...shapes.values()]) declaredNames.set(d.callOpen, d.name);
+  for (const d of [...kinds.values(), ...scales.values(), ...shapes.values()]) declaredNames.set(d.callOpen, [`name: ${q(d.name)}`]);
+  for (const d of receivers.values()) declaredNames.set(d.callOpen, [`name: ${q(d.name)}`, `at: ${q(d.at)}`]);
   function enclosingBracket(k) { let depth = 0; for (let j = k - 1; j >= 0; j--) { const t = toks[j]; if (t.kind !== "punct") continue; if (")]}".includes(t.text)) depth++; else if ("([{".includes(t.text)) { if (depth === 0) return j; depth--; } } return -1; }
   for (const c of calls) {
     const ctx = ctxAt[c.idx];
@@ -604,13 +677,13 @@ export function transform(src, opts = {}) {
         if (ctx.usingModel && ["decide", "decideAll", "classify", "ask", "extract"].includes(c.verb)) stamps.push(`model: ${q(ctx.usingModel)}`);
         if (explicitSpeculation.has(c.idx)) stamps.push(`speculate: [${explicitSpeculation.get(c.idx).join(", ")}]`);
       }
-      else if (declaredNames.has(c.open)) stamps.push(`name: ${q(declaredNames.get(c.open))}`);
+      else if (declaredNames.has(c.open)) stamps.push(...declaredNames.get(c.open));
       if (stamps.length) {
         const nargs = c.args.length;
         if (nargs === oi + 1 && c.args[oi] && isP(c.args[oi][0], "{")) {
           const o = c.args[oi][0];
           insert(toks[o].end, ` ${stamps.join(", ")}${sig(o) === open.get(o) ? " " : ","}`);
-        } else if (nargs === oi) insert(toks[c.close].start, `, { ${stamps.join(", ")} }`);
+        } else if (nargs === oi) append(toks[c.close].start, `, { ${stamps.join(", ")} }`);
       }
     }
     if (ASYNC_VERBS.includes(c.verb)) {
@@ -623,13 +696,78 @@ export function transform(src, opts = {}) {
       if (!ctx.async) { warn("W-SYNC-VERB", c.tok, `\`${c.verb}\` is called inside a function that is not async, so its promise is left unawaited`); continue; }
       insert(c.tok.start, "(await ");
       insert(toks[c.close].end, ")");
+      // T8: only a decision is a switch discriminant with a `.value`; `ask` and `confirm` answer for themselves
       const before = sig(c.idx, -1);
-      if (isP(before, "(") && isI(sig(before, -1), "switch") && open.get(before) === sig(c.close)) insert(toks[c.close].end, ".value");
+      if ((c.verb === "decide" || c.verb === "decideAll") && isP(before, "(") && isI(sig(before, -1), "switch") && open.get(before) === sig(c.close)) insert(toks[c.close].end, ".value");
     }
   }
 
+  // ── T4b: a declared receiver's own methods are awaited and stamped ───────
+  const methodCalls = [];
+  for (let k = 0; k < toks.length; k++) {
+    if (!isI(k) || !isP(sig(k), ".")) continue;
+    const recv = receivers.get(toks[k].text);
+    if (!recv || isP(sig(k, -1), ".") || isP(sig(k, -1), "?.")) continue; // `a.desk.say` is someone else's object
+    const m = sig(sig(k));
+    if (!isI(m) || !recv.methods.includes(toks[m].text)) continue;
+    const o = sig(m);
+    if (!isP(o, "(")) continue;
+    const method = toks[m].text, close2 = open.get(o), ctx = ctxAt[k];
+    const entry = { at: at(toks[k]), verb: method, on: recv.name, of: recv.verb, loops: loopsAround(k).map((l) => l.kind), conditional: enclosingBrace(k) >= 0, turns: recv.turns ?? null };
+    methodCalls.push(entry);
+    const oi = METHOD_OPTS_INDEX[method];
+    if (oi !== undefined) {
+      const args = callArgs(o);
+      if (args.length === oi + 1 && args[oi] && isP(args[oi][0], "{")) {
+        const ob = args[oi][0];
+        insert(toks[ob].end, ` at: ${q(at(toks[k]))}${sig(ob) === open.get(ob) ? " " : ","}`);
+      } else if (args.length === oi) append(toks[close2].start, `, { at: ${q(at(toks[k]))} }`);
+    }
+    if (NEVER_AWAITED.has(`${recv.family}.${method}`) || isI(sig(k, -1), "await")) continue;
+    const encl = enclosingBracket(k);
+    const callee = encl >= 0 && isP(encl, "(") ? sig(encl, -1) : -1;
+    const inCombinator = callee >= 0 && (isI(callee, "race") || isI(callee, "timeout") || (isI(callee) && isP(sig(callee, -1), ".") && isI(sig(sig(callee, -1), -1), "Promise")));
+    if ((encl >= 0 && isP(encl, "[")) || inCombinator) continue;
+    if (!ctx.async) { warn("W-SYNC-VERB", toks[k], `\`${recv.name}.${method}\` is called inside a function that is not async, so its promise is left unawaited`); continue; }
+    insert(toks[k].start, "(await ");
+    insert(toks[close2].end, ")");
+  }
+
+  // ── tools: the shape a model is shown, and who lists them ───────────────
+  const hosts = new Set();
+  const listedTools = new Set();
+  for (const c of calls) {
+    if (c.verb === "tool") {
+      const r = c.args[1];
+      const lone = r && r[0] === r[1] && isI(r[0]) ? toks[r[0]].text : null;
+      const declaredAbove = lone && shapes.has(lone) && shapes.get(lone).callOpen < c.idx;
+      const inline = r && isI(r[0], "shape") && isP(sig(r[0]), "(");
+      if (!declaredAbove && !inline) {
+        const got = r ? slice(r[0], r[1]).replace(/\s+/g, " ").slice(0, 40) : "nothing";
+        throw new SandError("E-TOOL-SHAPE", `this tool is given \`${got}\` for its arguments, and a tool takes a shape declared above it: const Args = shape({ … }); tool("…", Args, fn)`, c.tok);
+      }
+      const net = topKeys(c.args[3] && isP(c.args[3][0], "{") ? c.args[3][0] : -1).find((o) => o.key === "net");
+      if (net && isP(net.valueStart, "[")) for (const h of arrayStrings(net.valueStart)) hosts.add(h);
+    }
+    if (c.verb === "assistant") {
+      const opts = c.args[1];
+      const list = topKeys(opts && isP(opts[0], "{") ? opts[0] : -1).find((o) => o.key === "tools");
+      if (!list || !isP(list.valueStart, "[")) throw new SandError("E-TOOL-SHAPE", "this assistant needs its `tools` written as a list of the tools it may run — tools: [fileTicket, lookUp] — so the plan and the fence can read them", c.tok);
+      for (let j = list.valueStart + 1; j < open.get(list.valueStart); j++) if (isI(j) && !isP(sig(j, -1), ".")) listedTools.add(toks[j].text);
+    }
+  }
+  for (const d of receivers.values()) if (d.family === "tool" && !listedTools.has(d.name) && !methodCalls.some((m) => m.on === d.name && m.verb === "run")) {
+    warnings.push({ code: "N-TOOL-UNUSED", at: d.at, message: `\`${d.name}\` is declared and no assistant lists it and nothing runs it` });
+  }
+
   // ── whole-file warnings ─────────────────────────────────────────────────
-  if (!settleTok && (chains.length || whiles.length || explicitSites.length)) warn("W-UNSETTLED", toks[0], "no settle(); nothing can abstain and every unsure branch is dead");
+  const confirmCalls = calls.filter((c) => c.verb === "confirm");
+  if (!settleTok && (chains.length || whiles.length || explicitSites.length || methodCalls.some((m) => m.verb !== "run") || confirmCalls.length)) warn("W-UNSETTLED", toks[0], "no settle(); nothing can abstain and every unsure branch is dead");
+  if (!settleTurns) {
+    for (const m of methodCalls) if ((m.verb === "say" || m.verb === "stream") && m.loops.some((l) => l === "while" || l === "do")) warnings.push({ code: "W-UNBOUNDED-CHAT", at: m.at, message: `\`${m.on}.${m.verb}\` calls the chat model on every turn of a loop and nothing bounds it; add settle({ turns: N })` });
+    for (const c of calls) if (c.verb === "ask" && loopsAround(c.idx).some((l) => l.kind === "while" || l.kind === "do")) warn("W-UNBOUNDED-CHAT", c.tok, "`ask` calls the chat model on every turn of a loop and nothing bounds it; add settle({ turns: N })");
+  }
+  if (confirmCalls.length && !settleWait) warn("W-NO-CONFIRM-BUDGET", confirmCalls[0].tok, "this program asks a person and nothing says how long to wait; add settle({ wait: N }) so an unattended run answers unsure instead of hanging");
   for (const d of [...kinds.values(), ...scales.values()]) {
     const used = sites.some((s) => s.how.endsWith(`:${d.name}`)) || explicitSites.some((s) => s.spec === d.name) || [...shapes.values()].some((sh) => Object.values(sh.slots).includes(d.name));
     if (!used) warnings.push({ code: "N-UNUSED", at: d.at, message: `\`${d.name}\` is declared and nothing reads it` });
@@ -649,18 +787,37 @@ export function transform(src, opts = {}) {
   // ── the plan ────────────────────────────────────────────────────────────
   const explicitPlan = explicitSites.map((s) => ({ at: at(s.call.tok), verb: s.call.verb, binding: s.binding, spec: s.spec ?? (s.call.verb === "extract" && shapes.size === 1 ? [...shapes.keys()][0] : null), using: s.using, loops: s.loops.map((l) => l.kind), conditional: s.encl >= 0, speculative: explicitSpeculation.get(s.call.idx) ?? [] }));
   const askCalls = calls.filter((c) => c.verb === "ask").map((c) => ({ at: at(c.tok), verb: "ask", loops: loopsAround(c.idx).map((l) => l.kind), conditional: enclosingBrace(c.idx) >= 0 }));
-  const cost = computeCost(batches, explicitPlan, askCalls, shapes, settlePasses);
+  const confirmPlan = confirmCalls.map((c) => ({ at: at(c.tok), verb: "confirm", loops: loopsAround(c.idx).map((l) => l.kind), conditional: enclosingBrace(c.idx) >= 0 }));
+  const chatPlan = [...receivers.values()].filter((d) => d.family === "chat").map((d) => ({ name: d.name, at: d.at, verb: d.verb, turns: d.turns ?? null }));
+  const toolPlan = [...receivers.values()].filter((d) => d.family === "tool").map((d) => ({ name: d.name, at: d.at, net: d.net ?? [] }));
+  const memoryPlan = [...receivers.values()].filter((d) => d.family === "memory").map((d) => ({ name: d.name, at: d.at }));
+  const cost = computeCost({ batches, explicit: explicitPlan, asks: askCalls, methods: methodCalls, confirms: confirmPlan, shapes, settlePasses, settlePassCap });
+  const uses = {
+    decide: sites.length > 0 || explicitPlan.length > 0 || calls.some((c) => c.verb === "classify"),
+    ask: askCalls.length > 0 || explicitPlan.some((e) => e.verb === "extract" && Object.values((e.spec ? shapes.get(e.spec) : [...shapes.values()][0])?.slots ?? {}).includes("text")),
+    chat: chatPlan.length > 0,
+    tools: toolPlan.length > 0,
+    memory: memoryPlan.length > 0,
+    confirm: confirmPlan.length > 0,
+    emit: calls.some((c) => c.verb === "emit"),
+  };
   const plan = {
-    sand: "0.1", file, hash: fnv1a(src), lines: src.split("\n").length,
+    sand: "0.2", file, hash: fnv1a(src), lines: src.split("\n").length,
+    uses,
     declarations: {
       kinds: [...kinds.values()].map((d) => ({ name: d.name, at: d.at, options: d.options, fallback: d.fallback })),
       scales: [...scales.values()].map((d) => ({ name: d.name, at: d.at, levels: d.levels })),
       shapes: [...shapes.values()].map((d) => ({ name: d.name, at: d.at, slots: d.slots })),
     },
-    settle: settleTok ? { at: at(settleTok), passes: settlePasses } : null,
+    chats: chatPlan,
+    tools: toolPlan,
+    memories: memoryPlan,
+    confirms: confirmPlan,
+    hosts: [...hosts].sort(),
+    settle: settleTok ? { at: at(settleTok), passes: settlePasses, turns: settleTurns, wait: settleWait } : null,
     sites: sites.map((s) => ({ id: s.id, at: s.at, text: s.text, how: s.how, binding: s.binding, model: s.model, loops: s.loops, batch: batches.find((b) => b.sites.includes(s.id))?.id ?? null })),
     batches,
-    calls: [...explicitPlan, ...askCalls],
+    calls: [...explicitPlan, ...askCalls, ...methodCalls, ...confirmPlan],
     loops: loops.map((l) => ({ at: at(l.headTok), kind: l.kind })),
     cost,
     warnings,
@@ -668,8 +825,13 @@ export function transform(src, opts = {}) {
   return { code, plan, warnings };
 }
 
-function computeCost(batches, explicit, asks, shapes, settlePasses) {
-  let minP = 0, maxP = 0, minC = 0, maxC = 0; const loopTerms = []; let unbounded = false;
+/** What one `say` costs on a conversation: a chat is one turn, an assistant up to its own `settle({ turns })`. */
+const DEFAULT_ASSISTANT_TURNS = 8;
+
+function computeCost({ batches, explicit, asks, methods, confirms, shapes, settlePasses, settlePassCap }) {
+  let minP = 0, maxP = 0, minT = 0, maxT = 0, minM = 0, maxM = 0;
+  const waits = confirms.length;
+  const loopTerms = []; let unbounded = false;
   for (const b of batches) {
     if (b.speculated) continue;
     if (b.loops.length) { if (b.loops.includes("while") && !settlePasses) unbounded = true; loopTerms.push("n × 1 pass"); continue; }
@@ -682,15 +844,33 @@ function computeCost(batches, explicit, asks, shapes, settlePasses) {
       const sh = e.spec ? shapes.get(e.spec) : [...shapes.values()][0];
       const kinded = sh ? Object.values(sh.slots).some((t) => t !== "text") : true;
       const texts = sh ? Object.values(sh.slots).some((t) => t === "text") : false;
-      if (e.using === "ask") { maxC += 1; if (!e.conditional) minC += 1; continue; }
+      if (e.using === "ask") { maxT += 1; if (!e.conditional) minT += 1; continue; }
       if (kinded && !speculated) { maxP += 1; if (!e.conditional) minP += 1; }
-      if (texts) { maxC += 1; if (!e.conditional) minC += 1; }
+      if (texts) { maxT += 1; if (!e.conditional) minT += 1; }
     } else if (!speculated) { maxP += 1; if (!e.conditional) minP += 1; }
   }
-  for (const a of asks) { if (a.loops.length) { loopTerms.push("n × 1 completion"); continue; } maxC += 1; if (!a.conditional) minC += 1; }
-  const fmt = (p, c) => [p ? `${p} pass${p === 1 ? "" : "es"}` : null, c ? `${c} completion${c === 1 ? "" : "s"}` : null].filter(Boolean).join(", ") || "0 passes";
-  const text = `min ${fmt(minP, minC)} · max ${fmt(maxP, maxC)}${loopTerms.length ? " + " + loopTerms.join(" + ") : ""}${unbounded ? " (unbounded: a while loop asks a model with no settle({ passes }))" : ""}`;
-  return { min: { passes: minP, completions: minC }, max: { passes: maxP, completions: maxC }, loops: loopTerms, unbounded, text };
+  for (const a of asks) { if (a.loops.length) { loopTerms.push("n × 1 turn"); continue; } maxT += 1; if (!a.conditional) minT += 1; }
+  for (const m of methods) {
+    if (m.verb === "say" || m.verb === "stream") {
+      const most = m.of === "assistant" ? m.turns ?? DEFAULT_ASSISTANT_TURNS : 1;
+      if (m.loops.length) { loopTerms.push(`n × ${most} turn${most === 1 ? "" : "s"}`); continue; }
+      maxT += most; if (!m.conditional) minT += 1;
+    } else if (m.verb === "run") continue; // a tool's own body costs the model nothing
+    else {
+      if (m.loops.length) { loopTerms.push("n × 1 memory call"); continue; }
+      maxM += 1; if (!m.conditional) minM += 1;
+    }
+  }
+  const fmt = (p, t, m) => [
+    p ? `${p} pass${p === 1 ? "" : "es"}` : null,
+    t ? `${t} turn${t === 1 ? "" : "s"}` : null,
+    m ? `${m} memory call${m === 1 ? "" : "s"}` : null,
+  ].filter(Boolean).join(", ") || "0 passes";
+  const capped = loopTerms.length && settlePassCap != null ? ` (capped at ${settlePassCap} by settle)` : "";
+  const text = `min ${fmt(minP, minT, minM)} · max ${fmt(maxP, maxT, maxM)}${loopTerms.length ? " + " + loopTerms.join(" + ") : ""}${capped}`
+    + `${unbounded ? " (unbounded: a while loop asks a model with no settle({ passes }))" : ""}`
+    + `${waits ? ` · asks a person up to ${waits} time${waits === 1 ? "" : "s"}` : ""}`;
+  return { min: { passes: minP, turns: minT, memory: minM }, max: { passes: maxP, turns: maxT, memory: maxM }, waits, loops: loopTerms, unbounded, text };
 }
 
 function fnv1a(s) { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return "fnv1a:" + h.toString(16).padStart(8, "0"); }

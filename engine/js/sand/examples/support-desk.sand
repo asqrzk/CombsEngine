@@ -1,0 +1,39 @@
+// Support desk. One message comes in. The Combs model answers the yes/no
+// questions, the chat model writes the reply, a person says whether to file a
+// ticket, and the program files it. Needs: the Combs model and a chat model.
+
+const Topic = kind("what is the message about", {
+  billing: "a charge, an invoice or a payment",
+  outage: "something is down, broken or failing",
+  feature: "they want something that does not exist yet",
+  other: "none of these",
+}, { fallback: "other" });
+const Urgency = kind("how urgent is it", { now: "it must happen today", soon: "this week is fine", whenever: "no rush is expressed" }, { fallback: "whenever" });
+const Details = shape({ topic: Topic, urgency: Urgency, summary: text("what they need, in one sentence") });
+const TicketArgs = shape({ title: text("a short title for the ticket"), summary: text("what happened, in one paragraph"), urgency: Urgency });
+settle({ floor: 0.6, passes: 4, turns: 4, tokens: 6000, wait: 600_000 });
+
+// A tool is a plain function with a shape for its arguments. The program runs it, never the model.
+const createTicket = tool("file a support ticket", TicketArgs, async (args) => {
+  log("ticket filed:", args.title);
+  return { id: "T-" + Date.now().toString(36), ...args };
+});
+
+if (the {{input}} is a support issue unless they are only saying thanks or making small talk) {
+  const details = extract({{input}}, Details);
+  const desk = chat("You are Acme's support desk. Be brief and warm. Never promise a refund or a date.");
+  let reply = desk.say("Reply to this customer. What they need: {{details.summary}}. Their message: {{input}}");
+  // A guardrail is a yes/no question about the reply itself.
+  if (the {{reply}} promises a refund or a date unless it only says what happens next) {
+    reply = desk.say("Rewrite it without promising a refund or a date.");
+  }
+  emit(reply);
+  if (confirm("File a ticket for this message?") === true) {
+    const ticket = createTicket.run({ title: details.summary, summary: {{input}}, urgency: details.urgency });
+    emit("Filed as {{ticket.id}}.");
+  }
+} else {
+  emit(ask("Answer briefly and kindly: {{input}}"));
+} unsure {
+  emit("Thanks. A person will read this and get back to you.");
+}

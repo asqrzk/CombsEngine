@@ -2,10 +2,12 @@
  * @combs/sand — the verbs.
  *
  * What a program calls: the declarations (`kind`, `scale`, `shape`, `text`,
- * `settle`), the decisions (`decide`, `decideAll`, `classify`, `extract`), the
- * chat verb (`ask`), the helpers (`parallel`, `race`, `timeout`, `retry`,
- * `using`, `named`, `log`) and the entry (`run`, `trace`). A run owns one
- * context: its config, budget, batcher, memo and trace; the verbs read it.
+ * `tool`, `settle`), the decisions (`decide`, `decideAll`, `classify`,
+ * `extract`), the chat verbs (`ask`, `chat`, `assistant`), what a program
+ * remembers (`memory`), what leaves it (`emit`) and who it asks (`confirm`),
+ * the helpers (`parallel`, `race`, `timeout`, `retry`, `using`, `named`, `log`)
+ * and the entry (`run`, `trace`). A run owns one context: its config, budget,
+ * batcher, memo, session and trace; the verbs read it.
  */
 
 import { SandError } from "./errors.js";
@@ -17,24 +19,23 @@ import { resolveConfig, mergeConfig, kindRegistry, registerKind } from "./config
 import { questionOf, normalizeSpec, idsOf, shapeSchema } from "./wires/schema.js";
 import { decisionAdapter } from "./wires/decision.js";
 import { chatAdapter } from "./wires/chat.js";
+import { memoryAdapter } from "./wires/memory.js";
+import { ctxNow, getCurrent, setCurrent, pick, ports, setPorts, resolveModel, warnOnce } from "./context.js";
+import { emit, confirm, flushOutput } from "./effects.js";
+import { chat, assistant, Conversation, Reply } from "./conversation.js";
+import { tool, Tool } from "./tools.js";
 
 registerKind("decision", decisionAdapter);
 registerKind("chat", chatAdapter);
+registerKind("memory", memoryAdapter);
 
-// ── module state ──────────────────────────────────────────────────────────
+// ── module state ───────────────────────────────────────────────────────────────
 let explicitConfig = null;
-let ports = { env: () => undefined, readFile: async () => null, fetchImpl: null, layers: [], log: null };
-let current = null;
 const pendingSettle = {};
 
 /** Programmatic sand.json: what the playground or a host passes instead of a file. */
 export function configure(cfg) { explicitConfig = mergeConfig(explicitConfig ?? {}, cfg ?? {}); }
-/** How the runtime reaches its host: env, files, fetch, the log line sink, config layers. */
-export function setPorts(p) { ports = { ...ports, ...p }; }
-export { registerKind };
-
-const ctxNow = (at) => { if (!current) throw new SandError("E-STATE", "no run is active; call run(main, { input })", { at }); return current; };
-const pick = (o, ...ks) => Object.fromEntries(ks.filter((k) => o && o[k] !== undefined).map((k) => [k, o[k]]));
+export { registerKind, setPorts, emit, confirm, chat, assistant, Conversation, Reply, tool, Tool };
 
 // ── declarations ──────────────────────────────────────────────────────────
 export function kind(instructions, options, opts = {}) {
@@ -65,10 +66,11 @@ export function named(txt, noun) { return { text: String(txt), noun: String(noun
 export function settle(opts = {}) {
   const thresholds = pick(opts, "floor", "gap", "confidence");
   for (const [k, v] of Object.entries(thresholds)) if (typeof v !== "number" || v < 0 || v > 1) throw new SandError("E-OPTION", `settle({ ${k}: ${v} }) is not a number in [0, 1]`);
-  const target = current ? current.settle : pendingSettle;
+  const target = getCurrent() ? getCurrent().settle : pendingSettle;
   Object.assign(target, thresholds);
-  if (current) current.budget.narrow(pick(opts, "passes", "tokens", "ms"));
-  else Object.assign(pendingSettle, pick(opts, "passes", "tokens", "ms"));
+  const current = getCurrent();
+  if (current) current.budget.narrow(pick(opts, "passes", "tokens", "ms", "turns", "wait"));
+  else Object.assign(pendingSettle, pick(opts, "passes", "tokens", "ms", "turns", "wait"));
 }
 
 // ── the decision ──────────────────────────────────────────────────────────
@@ -113,16 +115,19 @@ async function createContext(opts) {
     config: cfg, traceId, bus: em.bus, emit: em.emit, signal: opts.signal ?? null,
     settle: { ...(cfg.settle ?? {}), ...pick(pendingSettle, "floor", "gap", "confidence") },
     adapters: new Map(), fetchImpl: opts.fetchImpl ?? ports.fetchImpl, usingModel: null, log: opts.log ?? ports.log,
+    readFile: opts.readFile ?? ports.readFile, writeFile: opts.writeFile ?? ports.writeFile,
     file: opts.file ?? null,
+    chats: new Map(), session: opts.session === false ? null : opts.session ?? null,
+    confirmPort: opts.confirm ?? null, outputPort: opts.output ?? null, output: { buffer: [], timer: null, at: null },
   };
   ctx.budget = new Budget(cfg.limits, (name, kind, attrs) => ctx.emit(name, kind, attrs));
-  ctx.budget.narrow(pick(pendingSettle, "passes", "tokens", "ms"));
+  ctx.budget.narrow(pick(pendingSettle, "passes", "tokens", "ms", "turns", "wait"));
   ctx.batcher = new Batcher(ctx);
   ctx.adapter = (name) => {
     if (ctx.adapters.has(name)) return ctx.adapters.get(name);
     const m = cfg.models[name];
     if (!m) throw new SandError("E-MODEL", `${JSON.stringify(name)} names no model; sand.json knows ${Object.keys(cfg.models).join(", ") || "none"}`);
-    const a = kindRegistry.get(m.kind)(m, { fetchImpl: ctx.fetchImpl ?? undefined, bus: ctx.bus });
+    const a = kindRegistry.get(m.kind)(m, { fetchImpl: ctx.fetchImpl ?? undefined, bus: ctx.bus, readFile: ctx.readFile ?? undefined, writeFile: ctx.writeFile ?? undefined });
     ctx.adapters.set(name, a);
     return a;
   };
@@ -141,17 +146,25 @@ export async function run(main, opts) {
   }
   if (typeof main !== "function") throw new SandError("E-STATE", "run(main, { input }) needs the program's main function");
   const ctx = await createContext(opts ?? {});
-  const prev = current; current = ctx;
+  const prev = setCurrent(ctx);
   ctx.emit("sand.run", "span.start", { file: ctx.file ?? "", decide: ctx.config.default.decide ?? "", ask: ctx.config.default.ask ?? "" });
   let result, status = "ok", error = null;
-  try { result = await main(opts.input); } catch (e) { status = "error"; error = e; } finally { current = prev; }
+  try { result = await main(opts.input); } catch (e) { status = "error"; error = e; } finally { flushOutput(ctx); setCurrent(prev); }
   const snap = ctx.budget.snapshot();
-  ctx.emit("sand.run", "span.end", { passes: snap.spent.passes, tokens: snap.spent.tokens, requests: snap.spent.requests, ms: snap.ms, status }, { status, error: error ? String(error?.message ?? error) : undefined });
+  ctx.emit("sand.run", "span.end", { passes: snap.spent.passes, tokens: snap.spent.tokens, turns: snap.spent.turns, requests: snap.spent.requests, ms: snap.ms, status }, { status, error: error ? String(error?.message ?? error) : undefined });
   const trace = ctx.trace();
-  if (error) { try { error.trace = trace; } catch { /* frozen */ } throw error; }
-  return { result, trace };
+  const session = sessionOf(ctx, opts);
+  if (error) { try { error.trace = trace; error.session = session; } catch { /* frozen */ } throw error; }
+  return { result, trace, session };
 }
-export function trace() { return current ? current.trace() : null; }
+/** What the conversations of this run hold, to be handed back to the next one. */
+function sessionOf(ctx, opts) {
+  if (opts.session === false) return null;
+  const chats = {};
+  for (const [name, conv] of ctx.chats) chats[name] = conv.history;
+  return { ...(opts.session && typeof opts.session === "object" ? opts.session : {}), state: { ...(opts.session?.state ?? {}), v: 1, chats } };
+}
+export function trace() { return getCurrent() ? getCurrent().trace() : null; }
 
 // ── helpers ───────────────────────────────────────────────────────────────
 const stateOf = (state, at) => {
@@ -160,15 +173,6 @@ const stateOf = (state, at) => {
   if (!s.trim()) throw new SandError("E-STATE", "the state is empty; there is nothing to decide on", { at });
   return s;
 };
-function resolveModel(ctx, opts, klass) {
-  const name = opts.model ?? ctx.usingModel ?? ctx.config.default[klass];
-  if (!name || name === "none") {
-    throw new SandError("E-MODEL", klass === "ask" ? "ask needs a chat model and none is configured; set OPENAI_API_KEY or name one in sand.json" : "no decision model: set COMBS_API_KEY or write sand.json", { at: opts.at });
-  }
-  const adapter = ctx.adapter(name);
-  if (klass === "ask" && !adapter.ask) throw new SandError("E-MODEL", `ask needs a chat model; \`${name}\` is a ${adapter.kind} model`, { at: opts.at });
-  return { name, adapter };
-}
 const specQuestions = (s, settle) => {
   const sp = s?.spec ?? s;
   if (sp?.type === "shape") return Object.values(sp.slots).map((x) => x.spec ?? x).filter((x) => x.type === "kind" || x.type === "scale").map((x) => questionOf(x, settle));
@@ -228,6 +232,7 @@ export async function ask(prompt, opts = {}) {
   ctx.budget.check({ tokens: 0 }, opts.at);
   const r = await ctx.budget.gate.run(() => adapter.ask({ messages, schema, maxTokens: opts.maxTokens, temperature: opts.temperature }, { at: opts.at, signal: ctx.signal }));
   ctx.budget.record({ tokens: r.tokens ?? 0, completions: 1 });
+  if (r.estimated) warnOnce(ctx, `unmetered:${name}`, `W-UNMETERED: ${name} reported no usage; tokens are estimated at one per four characters`);
   ctx.emit("sand.request", "event", { status: "ok", model: name, road: "", questions: 0, tokens: r.tokens ?? 0, ms: r.ms, verb: "ask", at: opts.at }, { input: messages, output: r.text });
   if (opts.as) return coerceRecord(opts.as.spec, r.json);
   return r.text;
@@ -251,6 +256,7 @@ export async function extract(state, shapeObj, opts = {}) {
     ctx.budget.check({ tokens: 0 }, opts.at);
     const r = await ctx.budget.gate.run(() => adapter.extract(st, sp, only, { at: opts.at, signal: ctx.signal }));
     ctx.budget.record({ tokens: r.tokens ?? 0, completions: 1 });
+    if (r.estimated) warnOnce(ctx, `unmetered:${name}`, `W-UNMETERED: ${name} reported no usage; tokens are estimated at one per four characters`);
     ctx.emit("sand.request", "event", { status: "ok", model: name, road: "", questions: 0, tokens: r.tokens ?? 0, ms: r.ms, verb: "extract", at: opts.at }, { input: { state: st, slots: only ?? Object.keys(sp.slots) }, output: r.record });
     return r.record;
   };
@@ -273,16 +279,81 @@ export async function extract(state, shapeObj, opts = {}) {
   return record;
 }
 
+// ── memory ────────────────────────────────────────────────────────────────
+/** What a program remembers between runs: a named store, platform or local. */
+export class Memory {
+  constructor(name, opts = {}) {
+    if (typeof name !== "string" || !name.trim()) throw new SandError("E-MEMORY", "memory(name) needs a name for the store", { at: opts.at });
+    this.name = name.trim();
+    this.at = opts.at ?? null;
+    this.model = opts.model ?? null;
+  }
+  #wire(at) {
+    const ctx = ctxNow(at ?? this.at);
+    const { name, adapter } = resolveModel(ctx, { model: this.model, at: at ?? this.at }, "memory");
+    return { ctx, modelName: name, adapter };
+  }
+  #done(ctx, modelName, adapter, op, res, at, extra = {}) {
+    if (adapter.metered) {
+      ctx.budget.record({ passes: res.passes ?? 0 });
+      ctx.emit("sand.request", "event", { status: "ok", model: modelName, road: "", questions: 0, passes: res.passes ?? 0, balance: res.balance ?? undefined, ms: res.ms, verb: op }, { spanId: res.requestId ?? undefined, input: { memory: this.name, op, ...extra }, output: res.json ?? null });
+    }
+    ctx.emit("sand.memory", "event", { at: at ?? this.at ?? undefined, memory: this.name, op, hits: extra.hits, ms: res.ms, model: modelName }, { input: extra.input, output: extra.output });
+  }
+  /** Keeps one text (or a Reply, or a record with its own text) and answers its id. */
+  async remember(what, opts = {}) {
+    const at = opts.at ?? this.at;
+    const { ctx, modelName, adapter } = this.#wire(at);
+    const list = (Array.isArray(what) ? what : [what]).map((w) => {
+      if (typeof w === "string") return { text: w, record: null };
+      if (w && typeof w === "object" && typeof w.text === "string") return { text: w.text, record: w.record ?? null };
+      if (w && typeof w === "object") { try { return { text: JSON.stringify(w, (_k, v) => (v === unsure ? "unsure" : v)), record: w }; } catch { /* falls through */ } }
+      return { text: String(w ?? ""), record: null };
+    }).filter((i) => i.text.trim());
+    if (!list.length) throw new SandError("E-MEMORY", "remember needs something to remember", { at });
+    if (adapter.metered) ctx.budget.check({ passes: list.length }, at);
+    const res = await ctx.budget.gate.run(() => adapter.remember(this.name, list, { at, signal: ctx.signal }));
+    this.#done(ctx, modelName, adapter, "remember", res, at, { input: list, output: res.ids, hits: list.length });
+    return Array.isArray(what) ? res.ids : res.ids[0];
+  }
+  /** The items nearest the query: `[{ id, text, record, score, at }]`. */
+  async recall(query, opts = {}) {
+    const at = opts.at ?? this.at;
+    const { ctx, modelName, adapter } = this.#wire(at);
+    const q = typeof query === "string" ? query : String(query?.text ?? query ?? "");
+    if (!q.trim()) throw new SandError("E-MEMORY", "recall needs a query to look for", { at });
+    const limit = opts.limit ?? 5;
+    if (adapter.metered) ctx.budget.check({ passes: 1 }, at);
+    const res = await ctx.budget.gate.run(() => adapter.recall(this.name, q, limit, { at, signal: ctx.signal }));
+    this.#done(ctx, modelName, adapter, "recall", res, at, { input: { query: q, limit }, output: res.hits, hits: res.hits.length });
+    return res.hits;
+  }
+  /** Drops items by id (`"*"` drops the store); answers how many went. */
+  async forget(ids, opts = {}) {
+    const at = opts.at ?? this.at;
+    const { ctx, modelName, adapter } = this.#wire(at);
+    const list = (Array.isArray(ids) ? ids : [ids]).map(String).filter(Boolean);
+    if (!list.length) throw new SandError("E-MEMORY", "forget needs an id, a list of ids, or \"*\"", { at });
+    const res = await ctx.budget.gate.run(() => adapter.forget(this.name, list, { at, signal: ctx.signal }));
+    this.#done(ctx, modelName, adapter, "forget", res, at, { input: list, output: res.forgotten, hits: res.forgotten });
+    return res.forgotten;
+  }
+  toString() { return this.name; }
+  toJSON() { return { memory: this.name }; }
+}
+/** Declares a memory store. Sync: the first call reaches the store. */
+export function memory(name, opts = {}) { return new Memory(name, opts); }
+
 // ── control ───────────────────────────────────────────────────────────────
 export function log(...parts) {
   const line = parts.map((p) => (typeof p === "string" ? p : p === unsure ? "unsure" : (() => { try { return JSON.stringify(p, (k, v) => (v === unsure ? "unsure" : v)); } catch { return String(p); } })())).join(" ");
-  const ctx = current;
+  const ctx = getCurrent();
   ctx?.emit("sand.log", "log", { level: "info" }, { output: line, severity: "info" });
   const sink = ctx?.log ?? ports.log ?? ((l) => (typeof Deno !== "undefined" ? console.error(l) : console.log(l)));
   sink(line);
 }
 export async function parallel(items, fn, opts = {}) {
-  const ctx = current;
+  const ctx = getCurrent();
   const limit = Math.max(1, opts.limit ?? 8), tolerate = !!opts.tolerate;
   const list = Array.from(items ?? []);
   const results = new Array(list.length);

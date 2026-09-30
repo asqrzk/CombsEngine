@@ -1,0 +1,164 @@
+{
+  "sand": "0.2",
+  "file": "moderator.sand",
+  "hash": "<hash>",
+  "lines": 25,
+  "uses": {
+    "decide": true,
+    "ask": false,
+    "chat": false,
+    "tools": false,
+    "memory": true,
+    "confirm": true,
+    "emit": true
+  },
+  "declarations": {
+    "kinds": [],
+    "scales": [],
+    "shapes": []
+  },
+  "chats": [],
+  "tools": [],
+  "memories": [
+    {
+      "name": "queue",
+      "at": "6:7"
+    },
+    {
+      "name": "tally",
+      "at": "7:7"
+    }
+  ],
+  "confirms": [
+    {
+      "at": "16:18",
+      "verb": "confirm",
+      "loops": [],
+      "conditional": true
+    }
+  ],
+  "hosts": [],
+  "settle": {
+    "at": "5:1",
+    "passes": true,
+    "turns": false,
+    "wait": true
+  },
+  "sites": [
+    {
+      "id": "d1",
+      "at": "9:5",
+      "text": "the {{input}} attacks a person or a group",
+      "how": "noul",
+      "binding": "input",
+      "model": "default:decide",
+      "loops": [],
+      "batch": 1
+    }
+  ],
+  "batches": [
+    {
+      "id": 1,
+      "at": "9:1",
+      "binding": "input",
+      "sites": [
+        "d1"
+      ],
+      "speculative": [],
+      "speculated": false,
+      "questions": 1,
+      "loops": [],
+      "conditional": false,
+      "model": "default:decide"
+    }
+  ],
+  "calls": [
+    {
+      "at": "11:3",
+      "verb": "remember",
+      "on": "tally",
+      "of": "memory",
+      "loops": [],
+      "conditional": true,
+      "turns": null
+    },
+    {
+      "at": "14:3",
+      "verb": "remember",
+      "on": "tally",
+      "of": "memory",
+      "loops": [],
+      "conditional": true,
+      "turns": null
+    },
+    {
+      "at": "17:55",
+      "verb": "remember",
+      "on": "tally",
+      "of": "memory",
+      "loops": [],
+      "conditional": true,
+      "turns": null
+    },
+    {
+      "at": "18:58",
+      "verb": "remember",
+      "on": "tally",
+      "of": "memory",
+      "loops": [],
+      "conditional": true,
+      "turns": null
+    },
+    {
+      "at": "19:10",
+      "verb": "remember",
+      "on": "queue",
+      "of": "memory",
+      "loops": [],
+      "conditional": true,
+      "turns": null
+    },
+    {
+      "at": "22:17",
+      "verb": "recall",
+      "on": "queue",
+      "of": "memory",
+      "loops": [],
+      "conditional": false,
+      "turns": null
+    },
+    {
+      "at": "23:17",
+      "verb": "recall",
+      "on": "tally",
+      "of": "memory",
+      "loops": [],
+      "conditional": false,
+      "turns": null
+    },
+    {
+      "at": "16:18",
+      "verb": "confirm",
+      "loops": [],
+      "conditional": true
+    }
+  ],
+  "loops": [],
+  "cost": {
+    "min": {
+      "passes": 1,
+      "turns": 0,
+      "memory": 2
+    },
+    "max": {
+      "passes": 1,
+      "turns": 0,
+      "memory": 7
+    },
+    "waits": 1,
+    "loops": [],
+    "unbounded": false,
+    "text": "min 1 pass, 2 memory calls · max 1 pass, 7 memory calls · asks a person up to 1 time"
+  },
+  "warnings": []
+}

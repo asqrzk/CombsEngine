@@ -142,23 +142,25 @@ Deno.test("extract: kinded slots by decision, text slots by chat, one request ea
   assertEquals(chatCalls[1].response_format.json_schema.schema.properties.topic.enum, ["a", "b", "unsure"]);
   const err = await assertRejects(() => run(async (i) => extract(i, S, { using: "decide" }), { input: "text", fetchImpl: both, env: env(COMBS), config: cfg }), SandError) as SandError;
   assertEquals(err.code, "E-MODEL");
-  const none = await assertRejects(() => run(async (i) => extract(i, S), { input: "text", fetchImpl: both, env: env(COMBS) }), SandError) as SandError;
+  const none = await assertRejects(() => run(async (i) => extract(i, S), { input: "text", fetchImpl: both, env: env(COMBS), config: { default: { ask: "none" } } }), SandError) as SandError;
   assert(none.message.includes('slot "summary" needs a chat model'), none.message);
 });
 
 Deno.test("ask needs a chat model; classify passes the wire through", async () => {
   const s = seat();
-  const err = await assertRejects(() => runWith(async () => ask("hello"), s.fetch), SandError) as SandError;
+  const err = await assertRejects(() => runWith(async () => ask("hello"), s.fetch, {}, { default: { ask: "none" } }), SandError) as SandError;
   assertEquals(err.code, "E-MODEL"); assert(err.message.includes("set OPENAI_API_KEY"));
 });
 
 Deno.test("config: zero from env, layers merge per model, $NAME resolves or names the variable, net derives and only narrows", () => {
   const z = resolveConfig({ env: env({ COMBS_API_KEY: "k" }) });
-  assertEquals(Object.keys(z.models), ["combs"]); assertEquals(z.default, { decide: "combs", ask: "none" }); assertEquals(z.net, ["api.combs.network"]);
+  assertEquals(Object.keys(z.models), ["combs", "combs-chat", "combs-memory"]);
+  assertEquals(z.default, { decide: "combs", ask: "combs-chat", memory: "combs-memory" });
+  assertEquals(z.models["combs-chat"].url, "https://api.combs.network/v1"); assertEquals(z.net, ["api.combs.network"]);
   const b = resolveConfig({ env: env({ COMBS_API_KEY: "k", OPENAI_API_KEY: "s" }) });
-  assertEquals(b.default, { decide: "combs", ask: "openai" }); assertEquals(b.models.openai.model, "gpt-4o-mini");
+  assertEquals(b.default, { decide: "combs", ask: "openai", memory: "combs-memory" }); assertEquals(b.models.openai.model, "gpt-4o-mini");
   const n = resolveConfig({ env: env({}) });
-  assertEquals(n.default.decide, null);
+  assertEquals(n.default.decide, null); assertEquals(n.default.memory, "none");
   const layered = resolveConfig({ env: env({ COMBS_API_KEY: "k", MY_KEY: "zz" }), layers: [{ models: { combs: { road: "label-anchors" }, mine: { kind: "chat", url: "http://127.0.0.1:8080/v1", key: "$MY_KEY" } }, default: { ask: "mine" } }] });
   assertEquals(layered.models.combs.road, "label-anchors"); assertEquals(layered.models.mine.key, "zz"); assertEquals(layered.net.sort(), ["127.0.0.1:8080", "api.combs.network"]);
   const missing = resolveConfig({ env: env({ COMBS_API_KEY: "k" }), layers: [{ models: { mine: { kind: "chat", url: "http://x/v1", key: "$MISSING" } } }] });

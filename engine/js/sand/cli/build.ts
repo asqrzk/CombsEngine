@@ -13,7 +13,7 @@ export interface BuildResult { dir: string; ts: string; plan: string; js: string
 
 export function importTarget(): string {
   const local = Deno.env.get("SAND_IMPORT");
-  if (!local) return "jsr:@combs/sand@^0.3.0";
+  if (!local) return "jsr:@combs/sand@^0.4.0";
   return local.startsWith("file://") || local.startsWith("http") ? local : `file://${local.startsWith("/") ? local : `${Deno.cwd()}/${local}`}`;
 }
 

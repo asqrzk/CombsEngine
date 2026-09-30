@@ -49,6 +49,13 @@ export function emitter(bus, traceId) {
   };
 }
 
+/** One short line of a body, for the human render. */
+const short = (v, n = 72) => {
+  const s = typeof v === "string" ? v : (() => { try { return JSON.stringify(v); } catch { return String(v); } })();
+  const one = String(s ?? "").replace(/\s+/g, " ").trim();
+  return one.length > n ? one.slice(0, n - 1) + "…" : one;
+};
+
 /** A human line per event (what `sand log` and the playground print). */
 export function traceLines(events) {
   const out = [];
@@ -56,12 +63,17 @@ export function traceLines(events) {
     const a = e.attrs ?? {};
     const t = new Date(e.ts).toISOString().slice(11, 23);
     switch (e.name) {
-      case "sand.run": out.push(`${t}  run       ${e.kind === "span.start" ? "start" : `end · ${a.status ?? ""} · ${a.passes ?? 0} pass${a.passes === "1" ? "" : "es"} · ${a.tokens ?? 0} tokens · ${a.ms ?? ""} ms`}`); break;
+      case "sand.run": out.push(`${t}  run       ${e.kind === "span.start" ? "start" : `end · ${a.status ?? ""} · ${a.passes ?? 0} pass${a.passes === "1" ? "" : "es"} · ${a.tokens ?? 0} tokens${a.turns && a.turns !== "0" ? ` · ${a.turns} turn${a.turns === "1" ? "" : "s"}` : ""} · ${a.ms ?? ""} ms`}`); break;
       case "sand.request": out.push(`${t}  request   ${a.model ?? ""}${a.road ? "/" + a.road : ""} · ${a.questions ?? ""}q · ${a.passes != null ? a.passes + " pass" + (a.passes === "1" ? "" : "es") : (a.tokens ?? "") + " tokens"} · ${a.ms ?? ""} ms${a.balance ? " · balance " + a.balance : ""}${a.status !== "ok" && a.status ? " · " + a.status : ""}`); break;
       case "sand.decision": out.push(`${t}  decision  ${a.at ?? ""} · ${a.how ?? ""} ${a.top ?? ""}${a.p_top ? " " + a.p_top : ""} · ${a.decision ?? ""}${a.reason ? " (" + a.reason + ")" : ""}${a.memo === "true" ? " · memo" : ""}`); break;
       case "sand.effect": out.push(`${t}  effect    ${a.at ?? ""} · ${a.effect ?? ""} ${a.name ?? ""}${a.value ? " = " + a.value : ""}`); break;
       case "sand.budget": out.push(`${t}  budget    ${a.limit} ${a.used}/${a.max} · ${a.action}`); break;
       case "sand.log": out.push(`${t}  log       ${a.at ? a.at + " · " : ""}${typeof e.output === "string" ? e.output : a.message ?? ""}`); break;
+      case "sand.turn": out.push(`${t}  turn      ${a.chat ?? ""} #${a.turn ?? ""} · ${a.model ?? ""} · ${a.stop ?? ""} · ${a.tokens ?? 0} tokens${a.calls && a.calls !== "0" ? ` · ${a.calls} call${a.calls === "1" ? "" : "s"}` : ""} · ${a.ms ?? ""} ms`); break;
+      case "sand.tool": out.push(`${t}  tool      ${a.tool ?? ""}${a.chat ? " (" + a.chat + ")" : ""} · ${e.kind === "span.start" ? "running" : `${a.status ?? ""} · ${a.ms ?? ""} ms`}${e.kind === "span.end" && e.output !== undefined ? " = " + short(e.output) : ""}`); break;
+      case "sand.memory": out.push(`${t}  memory    ${a.memory ?? ""} · ${a.op ?? ""}${a.hits != null ? " · " + a.hits + " hit" + (a.hits === "1" ? "" : "s") : ""} · ${a.ms ?? ""} ms${a.model ? " · " + a.model : ""}`); break;
+      case "sand.output": out.push(`${t}  output    ${a.chars ?? 0} chars${typeof e.output === "string" ? " · " + short(e.output) : ""}`); break;
+      case "sand.confirm": out.push(`${t}  confirm   ${e.kind === "span.start" ? `asking · ${short(e.input)}` : `${a.answer ?? ""} · by ${a.by ?? ""} · waited ${a.waited ?? 0} ms`}`); break;
       default: out.push(`${t}  ${e.name}`);
     }
   }

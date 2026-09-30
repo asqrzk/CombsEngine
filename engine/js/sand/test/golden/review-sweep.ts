@@ -1,4 +1,4 @@
-import { kind, scale, shape, text, settle, configure, decide, decideAll, classify, ask, extract, unsure, and, or, not, parallel, race, timeout, retry, using, named, log, run, trace } from "@combs/sand";
+import { kind, scale, shape, text, settle, configure, decide, decideAll, classify, ask, extract, chat, assistant, tool, memory, confirm, emit, unsure, and, or, not, parallel, race, timeout, retry, using, named, log, run, trace } from "@combs/sand";
 export default async function main(input: string) {
 const Sentiment = scale("how does the review sound", { hostile: "angry, demanding a remedy", cold: "disappointed", warm: "satisfied", glowing: "delighted and says so" }, { name: "Sentiment" });
 settle({ passes: 100, ms: 20_000 });
