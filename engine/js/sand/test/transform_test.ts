@@ -26,14 +26,35 @@ Deno.test("examples: golden .ts and .sand.json", () => {
   }
 });
 
+/** The first program as it was first written: bare condition, bare extract, under the three declarations. */
+const FIRST_PROGRAM = `const Urgency = kind("how urgent is this", { now: "it must happen today", soon: "this week is fine", whenever: "no rush is expressed" });
+const Channel = kind("how do they want to be reached", { email: "they ask for a written reply", phone: "they ask for a call", any: "no preference is expressed" });
+const ServiceRequest = shape({ urgency: Urgency, channel: Channel });
+
+if(the {{input}} is a service request )
+{
+extract ({{input}})
+}
+`;
+
 Deno.test("first-program-verbatim: the four lines under three declarations cost one pass and speculate the shape", () => {
-  const src = read("../examples/service-request.sand");
-  const { code, plan, warnings } = transform(src);
+  const { code, plan, warnings } = transform(FIRST_PROGRAM);
   assertStringIncludes(code, 'const d1 = await decide(input, "the message is a service request"');
   assertStringIncludes(code, "speculate: [ServiceRequest]");
   assertStringIncludes(code, "(await extract (input, ServiceRequest, { at: \"7:1\" }))");
   assertEquals(plan.cost.min.passes, 1); assertEquals(plan.cost.max.passes, 1);
   assert(warnings.some((w) => w.code === "W-GENERIC-CONTRARY" && w.at === "5:4"));
+  assert(warnings.some((w) => w.code === "N-EXTRACT-SHAPE" && w.at === "7:1"));
+  assert(warnings.some((w) => w.code === "W-UNSETTLED"));
+});
+
+Deno.test("service-request example: unless names the contrary and extract names the shape; still one pass", () => {
+  const { code, plan, warnings } = transform(read("../examples/service-request.sand"));
+  assertStringIncludes(code, 'not: ["they are describing something that already happened"]');
+  assertStringIncludes(code, "speculate: [ServiceRequest]");
+  assertStringIncludes(code, "(await extract(input, ServiceRequest, { at: \"7:1\" }))");
+  assertEquals(plan.cost.min.passes, 1); assertEquals(plan.cost.max.passes, 1);
+  assert(!warnings.some((w) => w.code === "W-GENERIC-CONTRARY" || w.code === "N-EXTRACT-SHAPE"));
   assert(warnings.some((w) => w.code === "W-UNSETTLED"));
 });
 

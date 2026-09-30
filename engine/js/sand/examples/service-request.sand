@@ -2,7 +2,7 @@ const Urgency = kind("how urgent is this", { now: "it must happen today", soon: 
 const Channel = kind("how do they want to be reached", { email: "they ask for a written reply", phone: "they ask for a call", any: "no preference is expressed" });
 const ServiceRequest = shape({ urgency: Urgency, channel: Channel });
 
-if(the {{input}} is a service request )
+if (the {{input}} is a service request unless they are describing something that already happened)
 {
-extract ({{input}})
+extract({{input}}, ServiceRequest)
 }

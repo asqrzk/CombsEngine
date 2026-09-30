@@ -7,11 +7,13 @@ const Urgency = kind("how urgent is this", { now: "it must happen today", soon: 
 const Channel = kind("how do they want to be reached", { email: "they ask for a written reply", phone: "they ask for a call", any: "no preference is expressed" });
 const ServiceRequest = shape({ urgency: Urgency, channel: Channel });
 
-if(the {{input}} is a service request )
+if (the {{input}} is a service request unless they are describing something that already happened)
 {
-extract ({{input}})
+extract({{input}}, ServiceRequest)
 }
 ```
+
+Under the same three declarations the bare form runs too: `if (the {{input}} is a service request) { extract({{input}}) }` is a whole program; the compiler supplies a generic contrary and says so with `W-GENERIC-CONTRARY`, and `extract` takes the one shape in scope.
 
 ```sh
 export COMBS_API_KEY=cmb_…          # from https://api.combs.network/account
@@ -119,7 +121,7 @@ sand run   <file.sand> (--input "…" | --stdin | --jsonl in.jsonl) [--workers N
 sand log   <trace.ndjson>
 ```
 
-`sand run` spawns `deno run --no-prompt --allow-net=<the model hosts> --allow-env=<the variables the config reads>` and nothing else; keys travel in the environment, never on the command line. The child speaks JSON lines: one output per input on stdout, the trace on stderr. Exit codes: 0 ok · 1 compile or type error · 2 usage · 3 budget stop or a failed input · 4 refused by the API · 5 timeout.
+`sand run` spawns `deno run --no-prompt --allow-net=<the model hosts> --allow-env=<the variables the config reads>` and nothing else; keys travel in the environment, never on the command line. The child speaks JSON lines: one output per input on stdout, the trace on stderr. `sand run` exits 0 ok · 1 a compile error · 2 usage (no input, no decision model, an unknown road) · 3 a failed input or a budget stop, each written to stdout as `{error: {code, message, at}}`; `--timeout` kills the child and its signal status (143) is the exit. Types are checked by `sand check`, not by `sand run`: it exits 1 on a type error or a refusal, and under `--strict` on a warning. The built program run on its own, `deno run <built>.ts "text"`, exits 3 on a budget stop, 4 when the API refused it (`E-AUTH`, `E-PASSES`, `E-SUSPENDED`), 5 on `E-TIMEOUT` and 1 on anything else.
 
 ## The trace
 
@@ -127,7 +129,7 @@ Every event is `{id, ts, source: "sand", kind, name, traceId, attrs, input?, out
 
 ## Errors
 
-Every refusal reads `CODE line:col · what the program carries, then the fix`. Compile time: `E-BINDING` (two bindings in one predicate), `E-OPTION` (an id of no kind, or of two), `E-UNLESS` (contraries on a kind or scale test), `E-UNSURE` (an `unsure` after a plain condition), `E-SHAPE` (`extract` with no shape, or several), `E-ASYNC` (a predicate in a function that is not async), `E-BLOCK` (a prose `if` without braces), `E-PROSE-PLACE` (a predicate outside a condition), `E-RESERVED` (`export`, or a SAND name redeclared), `E-PARSE`. Run time: `E-MODEL`, `E-STATE`, `E-WIRE` (the provider's message, verbatim), `E-AUTH`, `E-PASSES`, `E-SUSPENDED`, `E-HOST`, `E-ANSWER-SHAPE`, `E-BUDGET`, `E-TIMEOUT`. Warnings never stop a run: `W-GENERIC-CONTRARY`, `W-UNSETTLED`, `W-UNBOUNDED-LOOP`, `W-NEAR-OPTION`, `W-BATCH-SPLIT`, `W-SYNC-VERB`, `W-ROAD`, `W-UNCALIBRATED`, `W-CUT`.
+Every refusal reads `CODE line:col · what the program carries, then the fix`. Compile time: `E-BINDING` (two bindings in one predicate), `E-OPTION` (an id of no kind, or of two), `E-UNLESS` (contraries on a kind or scale test), `E-UNSURE` (an `unsure` after a plain condition), `E-SHAPE` (`extract` with no shape, or several), `E-ASYNC` (a predicate in a function that is not async), `E-BLOCK` (a prose `if` without braces), `E-PROSE-PLACE` (a predicate outside a condition), `E-RESERVED` (`export`, or a SAND name redeclared), `E-PARSE`. Run time: `E-MODEL`, `E-STATE`, `E-WIRE` (the provider's message, verbatim), `E-AUTH`, `E-PASSES`, `E-SUSPENDED`, `E-HOST`, `E-ANSWER-SHAPE`, `E-BUDGET`, `E-TIMEOUT`, `E-RUNTIME` (an error of the program's own, carrying no code, as a `sand run` child or a worker reports it) and `E-NO-MODEL` (`sand run` with no decision model configured; exit 2). Warnings never stop a run: `W-GENERIC-CONTRARY`, `W-UNSETTLED`, `W-UNBOUNDED-LOOP`, `W-NEAR-OPTION`, `W-BATCH-SPLIT`, `W-SYNC-VERB`, `W-ROAD` (from `sand check`, when the default decide model's road cannot answer a prose predicate). Notes are printed by `sand check` and never fail `--strict`: `N-EXTRACT-SHAPE` (`extract` named no shape and the one in scope was used), `N-UNUSED` (a kind or scale that nothing reads). A chat model that returns no logprobs is said once per model as a `sand.log` warning, `W-UNCALIBRATED: <model> returned no logprobs; p is null and the floor is not applied`; that is a log line, not a code.
 
 ## Compile target
 

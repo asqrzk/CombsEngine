@@ -42,7 +42,7 @@
   "sites": [
     {
       "id": "d1",
-      "at": "5:4",
+      "at": "5:5",
       "text": "the {{input}} is a service request",
       "how": "noul",
       "binding": "input",
@@ -96,16 +96,6 @@
     "text": "min 1 pass · max 1 pass"
   },
   "warnings": [
-    {
-      "code": "W-GENERIC-CONTRARY",
-      "at": "5:4",
-      "message": "no contrary given; the decision will be weak. Add `unless <what this can be mistaken for>`"
-    },
-    {
-      "code": "N-EXTRACT-SHAPE",
-      "at": "7:1",
-      "message": "`extract` names no shape; the one in scope, `ServiceRequest`, was used"
-    },
     {
       "code": "W-UNSETTLED",
       "at": "1:1",
