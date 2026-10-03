@@ -72,6 +72,7 @@ export function traceLines(events) {
       case "sand.turn": out.push(`${t}  turn      ${a.chat ?? ""} #${a.turn ?? ""} · ${a.model ?? ""} · ${a.stop ?? ""} · ${a.tokens ?? 0} tokens${a.calls && a.calls !== "0" ? ` · ${a.calls} call${a.calls === "1" ? "" : "s"}` : ""} · ${a.ms ?? ""} ms`); break;
       case "sand.tool": out.push(`${t}  tool      ${a.tool ?? ""}${a.chat ? " (" + a.chat + ")" : ""} · ${e.kind === "span.start" ? "running" : `${a.status ?? ""} · ${a.ms ?? ""} ms`}${e.kind === "span.end" && e.output !== undefined ? " = " + short(e.output) : ""}`); break;
       case "sand.memory": out.push(`${t}  memory    ${a.memory ?? ""} · ${a.op ?? ""}${a.hits != null ? " · " + a.hits + " hit" + (a.hits === "1" ? "" : "s") : ""} · ${a.ms ?? ""} ms${a.model ? " · " + a.model : ""}`); break;
+      case "sand.thinking": out.push(`${t}  thinking  ${a.chars ?? 0} chars${typeof e.output === "string" ? " · " + short(e.output) : ""}`); break;
       case "sand.output": out.push(`${t}  output    ${a.chars ?? 0} chars${typeof e.output === "string" ? " · " + short(e.output) : ""}`); break;
       case "sand.confirm": out.push(`${t}  confirm   ${e.kind === "span.start" ? `asking · ${short(e.input)}` : `${a.answer ?? ""} · by ${a.by ?? ""} · waited ${a.waited ?? 0} ms`}`); break;
       default: out.push(`${t}  ${e.name}`);

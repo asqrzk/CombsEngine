@@ -21,7 +21,7 @@ import { decisionAdapter } from "./wires/decision.js";
 import { chatAdapter } from "./wires/chat.js";
 import { memoryAdapter } from "./wires/memory.js";
 import { ctxNow, getCurrent, setCurrent, pick, ports, setPorts, resolveModel, warnOnce } from "./context.js";
-import { emit, confirm, flushOutput } from "./effects.js";
+import { emit, confirm, flushOutput, flushThinking } from "./effects.js";
 import { chat, assistant, Conversation, Reply } from "./conversation.js";
 import { tool, Tool } from "./tools.js";
 
@@ -149,7 +149,7 @@ export async function run(main, opts) {
   const prev = setCurrent(ctx);
   ctx.emit("sand.run", "span.start", { file: ctx.file ?? "", decide: ctx.config.default.decide ?? "", ask: ctx.config.default.ask ?? "" });
   let result, status = "ok", error = null;
-  try { result = await main(opts.input); } catch (e) { status = "error"; error = e; } finally { flushOutput(ctx); setCurrent(prev); }
+  try { result = await main(opts.input); } catch (e) { status = "error"; error = e; } finally { flushThinking(ctx); flushOutput(ctx); setCurrent(prev); }
   const snap = ctx.budget.snapshot();
   ctx.emit("sand.run", "span.end", { passes: snap.spent.passes, tokens: snap.spent.tokens, turns: snap.spent.turns, requests: snap.spent.requests, ms: snap.ms, status }, { status, error: error ? String(error?.message ?? error) : undefined });
   const trace = ctx.trace();

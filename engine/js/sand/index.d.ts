@@ -97,12 +97,16 @@ export declare class Reply {
   readonly reason: string | null;
   readonly finish: string | null;
   readonly model: string | null;
+  /** What the model thought before it answered, apart from the answer; empty when it did not think. Never in the history. */
+  readonly thinking: string;
+  /** How long it thought, in milliseconds: from its first piece of reasoning to its first piece of answer or tool call. */
+  readonly thinkingMs: number;
   toString(): string;
   toJSON(): string;
 }
 export interface ChatOpts { keep?: number; model?: string; name?: string; at?: string; maxTokens?: number; temperature?: number; settle?: { turns?: number } }
 export interface AssistantOpts extends ChatOpts { tools: Tool<any>[] }
-export interface SayOpts { emit?: boolean; model?: string; maxTokens?: number; temperature?: number; signal?: AbortSignal; at?: string; settle?: { turns?: number }; onDelta?: (piece: string) => void; stream?: boolean }
+export interface SayOpts { emit?: boolean; model?: string; maxTokens?: number; temperature?: number; signal?: AbortSignal; at?: string; settle?: { turns?: number }; onDelta?: (piece: string) => void; onThinking?: (piece: string) => void; stream?: boolean }
 export declare class Conversation {
   readonly system: string;
   name: string | null;

@@ -10,6 +10,12 @@
  * provider's own words on an in-stream `error` frame. When nothing reports
  * usage, tokens are estimated at chars/4 and the run says so once (`W-UNMETERED`).
  *
+ * A model that thinks first sends its reasoning in `delta.reasoning_content`
+ * (`reasoning` on some hosts), apart from the answer in `delta.content`. The
+ * two are never mixed: `text` is the answer, `thinking` is the reasoning and
+ * `thinkingMs` how long it took (from the first reasoning piece to the first
+ * answer piece or tool call), and `onThinking` hears each piece as it comes.
+ *
  * `decide`, `ask` and `extract` are thin wrappers over it: one completion per
  * question with `response_format: json_schema` so the model can only answer
  * with an option id (or "unsure"), `temperature: 0`, and `logprobs` when the
@@ -42,11 +48,11 @@ export function chatAdapter(model, ports = {}) {
   /**
    * One completion, buffered or streamed.
    * @param {{messages: object[], tools?: object[]|null, schema?: object|null, schemaName?: string, stream?: boolean, maxTokens?: number, temperature?: number, logprobs?: boolean}} req
-   * @param {{at?: string|null, signal?: AbortSignal|null, onDelta?: (piece: string) => void}} ctx
+   * @param {{at?: string|null, signal?: AbortSignal|null, onDelta?: (piece: string) => void, onThinking?: (piece: string) => void}} ctx
    */
   async function complete(req, ctx = {}) {
     const { messages, tools = null, schema = null, schemaName = "decision", stream = false, maxTokens = 512, temperature = 0, logprobs = false } = req;
-    const { signal = null, at = null, onDelta = null } = ctx;
+    const { signal = null, at = null, onDelta = null, onThinking = null } = ctx;
     if (model.unavailable) throw new SandError("E-MODEL", `model ${model.name} reads $${model.unavailable}, which is not set in the environment`, { at });
     const key = typeof model.key === "function" ? await model.key() : model.key;
     const url = base + "/chat/completions";
@@ -82,6 +88,7 @@ export function chatAdapter(model, ports = {}) {
         text, toolCalls, finish: choice.finish_reason ?? null,
         tokens: reported ?? estimateTokens(messages, text), usage: json.usage ?? null, estimated: reported == null,
         logprobs: choice.logprobs?.content ?? null, raw: json, ms: ms0, status: res.status,
+        thinking: reasoningOf(message), thinkingMs: 0,
       };
     }
     if (!res.ok) {
@@ -89,12 +96,13 @@ export function chatAdapter(model, ports = {}) {
       let json = null; try { json = JSON.parse(raw); } catch { /* not JSON */ }
       throw refusal(model.name, res.status, json, raw, { at });
     }
-    const r = await readStream(res, { model, signal, at, onDelta });
+    const r = await readStream(res, { model, signal, at, onDelta, onThinking });
     const reported = r.usage?.total_tokens ?? null;
     return {
       text: r.text, toolCalls: r.toolCalls, finish: r.finish,
       tokens: reported ?? estimateTokens(messages, r.text), usage: r.usage, estimated: reported == null,
       logprobs: r.logprobs, raw: r.last, ms: Date.now() - t0, status: res.status,
+      thinking: r.thinking, thinkingMs: r.thinkingMs,
     };
   }
 
@@ -136,6 +144,12 @@ export function chatAdapter(model, ports = {}) {
   };
 }
 
+/** The reasoning a buffered message carries, apart from its content. */
+function reasoningOf(message) {
+  const r = message?.reasoning_content ?? message?.reasoning;
+  return typeof r === "string" ? r : "";
+}
+
 /** One tool call off the wire: the name once, `arguments` a JSON string. */
 function toolCallOf(c, i) {
   const args = c?.function?.arguments ?? "";
@@ -148,12 +162,14 @@ function toolCallOf(c, i) {
  * The SSE reader: `\n`-split buffer, `:` comments ignored, `[DONE]` ends it,
  * tool calls accumulated by index, usage from whichever frame carries it.
  */
-async function readStream(res, { model, signal, at, onDelta }) {
+async function readStream(res, { model, signal, at, onDelta, onThinking }) {
   if (!res.body || typeof res.body.getReader !== "function") throw new SandError("E-STREAM", `${model.name} answered a stream with no body to read`, { at });
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   const calls = new Map();
   let text = "", buf = "", finish = null, usage = null, last = null, logprobs = null, done = false;
+  let thinking = "", thinkFrom = null, thinkTo = null;
+  const endThought = () => { if (thinkFrom != null && thinkTo == null) thinkTo = Date.now(); };
   const stop = () => { try { reader.cancel(); } catch { /* already gone */ } };
   const onAbort = () => stop();
   signal?.addEventListener?.("abort", onAbort, { once: true });
@@ -179,8 +195,11 @@ async function readStream(res, { model, signal, at, onDelta }) {
     const choice = json.choices?.[0];
     if (!choice) return false;
     const delta = choice.delta ?? {};
-    if (typeof delta.content === "string" && delta.content) { text += delta.content; try { onDelta?.(delta.content); } catch { /* a listener's fault is never the model's */ } }
+    const thought = typeof delta.reasoning_content === "string" ? delta.reasoning_content : typeof delta.reasoning === "string" ? delta.reasoning : "";
+    if (thought) { thinkFrom ??= Date.now(); thinking += thought; try { onThinking?.(thought); } catch { /* a listener's fault is never the model's */ } }
+    if (typeof delta.content === "string" && delta.content) { endThought(); text += delta.content; try { onDelta?.(delta.content); } catch { /* a listener's fault is never the model's */ } }
     for (const c of delta.tool_calls ?? []) {
+      endThought();
       const i = c.index ?? calls.size;
       const cur = calls.get(i) ?? { id: null, index: i, name: "", arguments: "" };
       if (c.id) cur.id = c.id;
@@ -217,7 +236,8 @@ async function readStream(res, { model, signal, at, onDelta }) {
     if (!done) stop();
   }
   const toolCalls = [...calls.values()].sort((a, b) => a.index - b.index).map((c, i) => toolCallOf({ id: c.id, index: c.index, function: { name: c.name, arguments: c.arguments } }, i));
-  return { text, toolCalls, finish: finish ?? (toolCalls.length ? "tool_calls" : null), usage, logprobs, last };
+  const thinkingMs = thinkFrom == null ? 0 : (thinkTo ?? Date.now()) - thinkFrom;
+  return { text, toolCalls, finish: finish ?? (toolCalls.length ? "tool_calls" : null), usage, logprobs, last, thinking, thinkingMs };
 }
 
 /** Builds a decision-wire answer from a completion. */

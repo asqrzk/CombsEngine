@@ -39,6 +39,32 @@ export function flushOutput(ctx) {
   ctx.emit("sand.output", "event", { at: at ?? undefined, chars: text.length }, { output: text });
 }
 
+/** Sends what the model's reasoning has piled up as one `sand.thinking` event. */
+export function flushThinking(ctx) {
+  if (!ctx?.thinking) return;
+  const { buffer, timer, at } = ctx.thinking;
+  if (timer != null) { clearTimeout(timer); ctx.thinking.timer = null; }
+  if (!buffer.length) return;
+  const text = buffer.join("");
+  ctx.thinking.buffer = [];
+  ctx.emit("sand.thinking", "event", { at: at ?? undefined, chars: text.length }, { output: text });
+}
+
+/**
+ * A piece of the model's reasoning, coalesced like output and never mixed with it: the pieces of an answer are sent
+ * first, so the record reads in the order things happened. Sync; never fails.
+ */
+export function emitThinking(piece, opts = {}) {
+  const text = typeof piece === "string" ? piece : "";
+  const ctx = getCurrent();
+  if (!ctx || !text) return;
+  flushOutput(ctx);
+  ctx.thinking ??= { buffer: [], timer: null, at: null };
+  ctx.thinking.at = opts.at ?? ctx.thinking.at;
+  ctx.thinking.buffer.push(text);
+  if (ctx.thinking.timer == null) ctx.thinking.timer = setTimeout(() => { ctx.thinking.timer = null; flushThinking(ctx); }, COALESCE_MS);
+}
+
 /** A piece of output. Sync; never fails. */
 export function emit(piece, opts = {}) {
   const text = pieceText(piece);
@@ -48,6 +74,7 @@ export function emit(piece, opts = {}) {
   if (!ctx) return;
   ctx.output ??= { buffer: [], timer: null, at: null };
   if (!text) return;
+  flushThinking(ctx);
   ctx.output.at = opts.at ?? ctx.output.at;
   ctx.output.buffer.push(text);
   if (ctx.output.timer == null) ctx.output.timer = setTimeout(() => { ctx.output.timer = null; flushOutput(ctx); }, COALESCE_MS);

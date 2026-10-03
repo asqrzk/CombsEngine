@@ -274,3 +274,82 @@ Deno.test("emit: pieces reach the output port and coalesce into sand.output", as
   const out = trace.events.filter((e) => e.name === "sand.output");
   assertEquals(out.map((e) => e.output), ["one two", " three"]);
 });
+
+Deno.test("stream: reasoning arrives apart from the answer, is its own event ahead of the output, and stays out of the history", async () => {
+  const frames = [
+    chunk({ role: "assistant" }),
+    chunk({ reasoning_content: "The user wants " }),
+    chunk({ reasoning_content: "a greeting." }),
+    chunk({ content: "Hello" }),
+    chunk({ content: " there." }),
+    `data: ${JSON.stringify({ id: "c1", choices: [], usage: { total_tokens: 30 } })}\n\n`,
+    "data: [DONE]\n\n",
+  ];
+  const h = host([() => sse(frames, { chunk: 9 }), () => sse([chunk({ content: "Fine." }), "data: [DONE]\n\n"])]);
+  const { result, trace } = await run(async () => {
+    const desk = chat("you are a desk", { name: "desk" });
+    const first = await desk.say("hi", { emit: true });
+    await desk.say("how are you", { emit: true });
+    return { text: first.text, thinking: first.thinking, timed: first.thinkingMs >= 0, history: desk.history.map((m) => [m.role, m.content]) };
+  }, { input: "x", fetchImpl: h.fetch, env: env(), config: CFG });
+  const out = result as Record<string, unknown>;
+  assertEquals(out.text, "Hello there.");
+  assertEquals(out.thinking, "The user wants a greeting.");
+  assertEquals(out.timed, true);
+  // what the model thought is not part of what it said: the history, and so the next request, holds answers only
+  assertEquals(out.history, [["user", "hi"], ["assistant", "Hello there."], ["user", "how are you"], ["assistant", "Fine."]]);
+  assertEquals(JSON.stringify(h.calls[1].messages).includes("greeting"), false);
+  assertEquals(trace.events.filter((e) => e.name === "sand.thinking").map((e) => e.output).join(""), "The user wants a greeting.");
+  assertEquals(trace.events.filter((e) => e.name === "sand.output").map((e) => e.output).join(""), "Hello there.Fine.");
+  const order = trace.events.map((e) => e.name).filter((n) => n === "sand.thinking" || n === "sand.output");
+  assertEquals(order[0], "sand.thinking");
+  assertEquals(order.indexOf("sand.output") > order.lastIndexOf("sand.thinking"), true);
+});
+
+Deno.test("buffered: a reply's reasoning_content is read apart from its content", async () => {
+  const h = host([() => json({ choices: [{ index: 0, message: { role: "assistant", content: "42", reasoning_content: "six times seven" }, finish_reason: "stop" }], usage: { total_tokens: 9 } })]);
+  const { result } = await run(async () => {
+    const desk = chat("you are a desk", { name: "desk" });
+    const r = await desk.say("6 x 7?");
+    return { text: r.text, thinking: r.thinking, value: r.value };
+  }, { input: "x", fetchImpl: h.fetch, env: env(), config: CFG });
+  assertEquals(result, { text: "42", thinking: "six times seven", value: "42" });
+});
+
+Deno.test("stream: a model that spends its tokens thinking has said nothing, and the reply says so with its thinking kept", async () => {
+  const frames = [
+    chunk({ reasoning_content: "Let me think about this at length. " }),
+    chunk({ reasoning_content: "And a little more." }),
+    `data: ${JSON.stringify({ id: "c1", choices: [{ index: 0, delta: {}, finish_reason: "length" }], usage: { total_tokens: 64 } })}\n\n`,
+    "data: [DONE]\n\n",
+  ];
+  const h = host([() => sse(frames, { chunk: 13 })]);
+  const { result } = await run(async () => {
+    const desk = chat("you are a desk", { name: "desk" });
+    const r = await desk.say("hard question", { emit: true, maxTokens: 64 });
+    return { text: r.text, stopped: r.stopped, thinking: r.thinking, isUnsure: r.value === unsure };
+  }, { input: "x", fetchImpl: h.fetch, env: env(), config: CFG });
+  const out = result as Record<string, unknown>;
+  assertEquals(out.text, "");
+  assertEquals(out.stopped, "length");
+  assertEquals(out.thinking, "Let me think about this at length. And a little more.");
+  assertEquals(out.isUnsure, false); // the reply is empty and stopped at the ceiling; `stopped` is what says why
+});
+
+Deno.test("stream: a tool call ends the thinking, and a stop in the middle of it keeps what was thought", async () => {
+  const frames = [
+    chunk({ reasoning_content: "I should draw it." }),
+    chunk({ tool_calls: [{ index: 0, id: "call_a", type: "function", function: { name: "draw", arguments: "{}" } }] }),
+    `data: ${JSON.stringify({ id: "c1", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { total_tokens: 20 } })}\n\n`,
+    "data: [DONE]\n\n",
+  ];
+  const Draw = shape({}, { name: "Draw" });
+  const draw = tool("draw", Draw, () => "done", { name: "draw" });
+  const h = host([() => sse(frames, { chunk: 11 }), () => sse([chunk({ content: "Drawn." }), "data: [DONE]\n\n"])]);
+  const { result } = await run(async () => {
+    const painter = assistant("you paint", { tools: [draw], name: "p" });
+    const r = await painter.say("draw", { emit: true });
+    return { text: r.text, thinking: r.thinking, calls: r.calls.length };
+  }, { input: "x", fetchImpl: h.fetch, env: env(), config: CFG });
+  assertEquals(result, { text: "Drawn.", thinking: "I should draw it.", calls: 1 });
+});

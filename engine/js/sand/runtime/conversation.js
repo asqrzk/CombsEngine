@@ -8,6 +8,12 @@
  * a person — the result goes back as a `tool` message, and the round repeats up
  * to `settle.turns`. Past that bound the answer is `unsure`, `stopped: "turns"`.
  *
+ * A model that thinks first hands its reasoning over apart from its answer: the
+ * `Reply` carries it as `thinking` (and how long it took as `thinkingMs`), a
+ * streamed `say` sends it as `sand.thinking` events ahead of the answer's
+ * `sand.output`, and it is never put in the history, so a later turn does not
+ * read the model's earlier thoughts back as if they were things said.
+ *
  * A `Reply` is an object as a `Decision` is: `text` and `value`, plus what it
  * took. `toString()` and `toJSON()` are the text, so `"…{{reply}}…"`,
  * `emit(reply)`, `log(reply)` and a prose predicate on `{{reply}}` all read it.
@@ -16,14 +22,14 @@
 import { SandError } from "./errors.js";
 import { unsure } from "./kleene.js";
 import { ctxNow, resolveModel, warnOnce } from "./context.js";
-import { emit as emitPiece } from "./effects.js";
+import { emit as emitPiece, emitThinking } from "./effects.js";
 import { toolsOf } from "./tools.js";
 
 const DEFAULT_KEEP = 40;
 const DEFAULT_TURNS = 8;
 
 export class Reply {
-  constructor({ text = "", stopped = null, turns = 0, tokens = 0, calls = [], reason = null, finish = null, model = null } = {}) {
+  constructor({ text = "", stopped = null, turns = 0, tokens = 0, calls = [], reason = null, finish = null, model = null, thinking = "", thinkingMs = 0 } = {}) {
     this.text = text;
     this.stopped = stopped;
     this.value = stopped === "turns" || stopped === "empty" || stopped === "aborted" ? unsure : text;
@@ -33,6 +39,8 @@ export class Reply {
     this.reason = reason;
     this.finish = finish;
     this.model = model;
+    this.thinking = thinking;
+    this.thinkingMs = thinkingMs;
   }
   toString() { return this.text; }
   toJSON() { return this.text; }
@@ -101,12 +109,15 @@ export class Conversation {
     const calls = [];
     let tokens = 0, turns = 0, answer = "", finish = null, stopped = null, reason = null, partial = "";
     const keepPartial = (piece) => { partial += piece; };
+    let thinking = "", thinkingMs = 0, thoughtNow = "";
+    const onThought = streaming ? (piece) => { thoughtNow += piece; if (opts.emit) emitThinking(piece, { at }); opts.onThinking?.(piece); } : null;
 
     for (let round = 0; round < (this.tools ? maxTurns : 1); round++) {
       ctx.budget.check({ turns: 1, tokens: 0 }, at);
       const wire = onWire(this.system, [...this.#messages, ...pending], this.keep);
       const t0 = Date.now();
       let r;
+      thoughtNow = "";
       try {
         r = await ctx.budget.gate.run(() => adapter.complete({
           messages: wire,
@@ -114,16 +125,19 @@ export class Conversation {
           stream: streaming,
           maxTokens: opts.maxTokens ?? this.maxTokens ?? 1024,
           temperature: opts.temperature ?? this.temperature ?? 0.2,
-        }, { at, signal: opts.signal ?? ctx.signal, onDelta: onDelta ? (p) => { keepPartial(p); onDelta(p); } : null }));
+        }, { at, signal: opts.signal ?? ctx.signal, onDelta: onDelta ? (p) => { keepPartial(p); onDelta(p); } : null, onThinking: onThought }));
       } catch (e) {
         ctx.emit("sand.request", "event", { status: "error", model: name, road: "", questions: 0, ms: Date.now() - t0, verb: "say", at }, { input: wire, status: "error", error: String(e?.message ?? e) });
         if (opts.abortIsAnswer && (e?.code === "E-TIMEOUT" || e?.name === "AbortError")) {
           answer = partial; stopped = "aborted"; reason = "the reply was stopped before it finished"; turns++;
+          thinking += (thinking && thoughtNow ? "\n\n" : "") + thoughtNow;
           break;
         }
         throw e;
       }
       turns++;
+      thinking += (thinking && r.thinking ? "\n\n" : "") + (r.thinking ?? "");
+      thinkingMs += r.thinkingMs ?? 0;
       tokens += r.tokens ?? 0;
       ctx.budget.record({ turns: 1, tokens: r.tokens ?? 0, completions: 1 });
       if (r.estimated) warnOnce(ctx, `unmetered:${name}`, `W-UNMETERED: ${name} reported no usage; tokens are estimated at one per four characters`);
@@ -151,7 +165,7 @@ export class Conversation {
     if (!stopped && !answer.trim()) { stopped = "empty"; reason = "the model answered with nothing"; }
     if (answer) pending.push({ role: "assistant", content: answer });
     this.#messages.push(...pending);
-    const reply = new Reply({ text: answer, stopped, turns, tokens, calls, reason, finish, model: name });
+    const reply = new Reply({ text: answer, stopped, turns, tokens, calls, reason, finish, model: name, thinking, thinkingMs });
     this.#last = reply;
     return reply;
   }
