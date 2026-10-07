@@ -43,6 +43,8 @@ export function mergeConfig(...layers) {
     for (const [name, m] of Object.entries(layer.models ?? {})) out.models[name] = { ...(out.models[name] ?? {}), ...m };
     for (const k of ["default", "settle", "limits"]) for (const [kk, v] of Object.entries(layer[k] ?? {})) if (v !== undefined) out[k][kk] = v;
     if (layer.net) out.net = layer.net;
+    // the environment a program's own tools read (a token for a local door): names, kept in order, each once
+    if (Array.isArray(layer.env)) out.env = [...new Set([...(out.env ?? []), ...layer.env.map((n) => String(n).replace(/^[$]/, ""))])];
   }
   return out;
 }

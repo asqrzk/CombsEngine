@@ -3,7 +3,7 @@
  *
  * The fence is built from the plan and the config and from nothing else:
  * `--allow-net=` the model hosts plus every host a tool's `net` declares,
- * `--allow-env=` the variables the config reads, `--allow-read/write=` the
+ * `--allow-env=` the variables the config reads and the names its `env` list adds, `--allow-read/write=` the
  * memory directory when there is one. If a flag is refused, `deno` is missing,
  * or the child dies before it acknowledges the preamble, the run ends `E-FENCE`
  * and exit 2 — **it is never retried wider**. Secrets never touch argv: the
@@ -77,7 +77,7 @@ export async function runCommand(file: string, flags: RunFlags): Promise<number>
 
   // ── the fence, built from the plan and the config, and from nothing else ──
   const hosts = [...new Set([...resolved.net, ...plan.hosts])].filter(Boolean);
-  const names = new Set([...envNamesOf(unresolved), "SAND_CHILD"]);
+  const names = new Set([...envNamesOf(unresolved), ...((unresolved as { env?: string[] }).env ?? []), "SAND_CHILD"]);
   for (const n of ["COMBS_API_KEY", "COMBS_API_URL", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"]) if (env(n)) names.add(n);
   const memoryDirs = [...new Set([
     ...(flags.memory ? [flags.memory] : []),

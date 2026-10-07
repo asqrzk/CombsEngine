@@ -190,3 +190,9 @@ Deno.test("registerKind: a new wire is one function", async () => {
   const { result } = await run(async (i) => decide(i, "it is nice", { not: ["no"] }), { input: "x", env: env({}), config: { models: { e: { kind: "echo", url: "http://e" } }, default: { decide: "e" } } });
   assertEquals((result as any).value, false);
 });
+
+Deno.test("config: an env list names the variables a program's own tools read, kept once each across layers", () => {
+  const merged = mergeConfig({ env: ["COMBS_LINK_TOKEN", "$COMBS_LINK_FILES_TOKEN"] }, { env: ["COMBS_LINK_TOKEN", "OTHER"] }) as { env?: string[] };
+  assertEquals(merged.env, ["COMBS_LINK_TOKEN", "COMBS_LINK_FILES_TOKEN", "OTHER"]);
+  assertEquals((mergeConfig({ models: {} }) as { env?: string[] }).env, undefined);
+});
