@@ -8,6 +8,7 @@
  */
 import { assert, assertEquals, assertRejects } from "jsr:@std/assert";
 import { assistant, chat, emit, kind, run, SandError, shape, text, tool, unsure } from "../mod.ts";
+import { billable } from "../runtime/wires/chat.js";
 
 const enc = new TextEncoder();
 const env = (vars: Record<string, string> = {}) => (n: string) => vars[n];
@@ -352,4 +353,47 @@ Deno.test("stream: a tool call ends the thinking, and a stop in the middle of it
     return { text: r.text, thinking: r.thinking, calls: r.calls.length };
   }, { input: "x", fetchImpl: h.fetch, env: env(), config: CFG });
   assertEquals(result, { text: "Drawn.", thinking: "I should draw it.", calls: 1 });
+});
+
+Deno.test("assistant: past the budget the person is asked; a yes carries the reply on, nobody keeps what was said", async () => {
+  const order = { id: "call_b", type: "function", function: { name: "look", arguments: "{}" } };
+  const call = () => json({ choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: [{ ...order }] }, finish_reason: "tool_calls" }], usage: { total_tokens: 5 } });
+  const Empty = shape({ why: text("why") }, { name: "Empty" });
+  const look = tool("look", Empty, async () => "seen", { name: "look" });
+  const tight = { ...CFG, limits: { turns: 1 } };
+  // nobody there to answer: the turn stops at the limit, after a round, and says so
+  const h1 = host([call, () => said("done")]);
+  const r1 = await run(async () => {
+    const desk = assistant("you are a desk", { tools: [look], settle: { turns: 4 }, name: "desk" });
+    const r = await desk.say("go");
+    return { value: r.value === unsure ? "unsure" : r.value, stopped: r.stopped, turns: r.turns, reason: r.reason };
+  }, { input: "x", fetchImpl: h1.fetch, env: env(), config: tight });
+  assertEquals((r1.result as any).stopped, "budget");
+  assertEquals((r1.result as any).value, "unsure");
+  assertEquals((r1.result as any).turns, 1);
+  assert(String((r1.result as any).reason).includes("turns 2/1"), String((r1.result as any).reason));
+  assert(r1.trace.events.some((e) => e.name === "sand.confirm" && e.kind === "span.start" && e.attrs?.kind === "budget"), "the budget asked, as a confirm of kind budget");
+  assertEquals(h1.calls.length, 1);
+  // the person says go on: the limits grow by their first size, and the reply finishes
+  const asked: { kind?: string; args?: { block?: { turns?: number } } }[] = [];
+  const h2 = host([call, () => said("done")]);
+  const r2 = await run(async () => {
+    const desk = assistant("you are a desk", { tools: [look], settle: { turns: 4 }, name: "desk" });
+    const r = await desk.say("go");
+    return { text: r.text, stopped: r.stopped, turns: r.turns };
+  }, { input: "x", fetchImpl: h2.fetch, env: env(), config: tight, confirm: (_q: string, ctx: { kind?: string | null; args?: unknown }) => { asked.push(ctx as any); return true; } });
+  assertEquals((r2.result as any), { text: "done", stopped: null, turns: 2 });
+  assertEquals(asked.length, 1);
+  assertEquals(asked[0].kind, "budget");
+  assertEquals(asked[0].args?.block?.turns, 1);
+  assertEquals(r2.trace.budget.limits.turns, 2);
+  assertEquals(r2.trace.budget.extensions, 1);
+});
+
+Deno.test("usage: a cached prompt token counts a tenth against the budget, the rest whole", () => {
+  assertEquals(billable({ total_tokens: 1000, prompt_tokens: 900, completion_tokens: 100, prompt_tokens_details: { cached_tokens: 800 } }), 280);
+  assertEquals(billable({ total_tokens: 1000, prompt_tokens: 900, completion_tokens: 100 }), 1000);
+  assertEquals(billable({ total_tokens: 100, prompt_tokens: 50, completion_tokens: 50, prompt_tokens_details: { cached_tokens: 500 } }), 55);
+  assertEquals(billable(null), null);
+  assertEquals(billable({}), null);
 });

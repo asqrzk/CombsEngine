@@ -150,3 +150,21 @@ export async function confirm(question, opts = {}) {
   return kind === null ? answer : { answer, data, by };
 }
 const TIMED_OUT = Symbol("sand.confirm.timeout");
+
+/**
+ * The budget's question, a `confirm` of kind `budget`: the person sees what
+ * was used and what one more block holds, and answers whether to go on.
+ * @param {{limit: string, used: number, max: number, spent: object, block: object, extensions: number}} info
+ */
+export async function askToContinue(info, at = null) {
+  const n = (v) => (typeof v === "number" ? v.toLocaleString("en-US") : String(v ?? "?"));
+  const what = info.limit === "ms" ? `${Math.round(info.used / 1000)} of ${Math.round(info.max / 1000)} seconds` : `${n(info.used)} of ${n(info.max)} ${info.limit}`;
+  const more = [
+    info.block.tokens != null ? `${n(info.block.tokens)} tokens` : null,
+    info.block.turns != null ? `${n(info.block.turns)} turns` : null,
+    info.block.ms != null ? `${Math.round(info.block.ms / 1000)} seconds` : null,
+  ].filter(Boolean).join(", ");
+  const q = `This run has used its budget (${what}). Go on with as much again${more ? ` (${more})` : ""}?`;
+  const got = await confirm(q, { kind: "budget", args: info, at: at ?? undefined });
+  return got && typeof got === "object" ? got.answer === true : got === true;
+}

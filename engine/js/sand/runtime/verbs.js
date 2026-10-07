@@ -21,7 +21,7 @@ import { decisionAdapter } from "./wires/decision.js";
 import { chatAdapter } from "./wires/chat.js";
 import { memoryAdapter } from "./wires/memory.js";
 import { ctxNow, getCurrent, setCurrent, pick, ports, setPorts, resolveModel, warnOnce } from "./context.js";
-import { emit, confirm, flushOutput, flushThinking } from "./effects.js";
+import { emit, confirm, askToContinue, flushOutput, flushThinking } from "./effects.js";
 import { chat, assistant, Conversation, Reply } from "./conversation.js";
 import { tool, Tool } from "./tools.js";
 
@@ -121,6 +121,8 @@ async function createContext(opts) {
     confirmPort: opts.confirm ?? null, outputPort: opts.output ?? null, output: { buffer: [], timer: null, at: null },
   };
   ctx.budget = new Budget(cfg.limits, (name, kind, attrs) => ctx.emit(name, kind, attrs));
+  // at a limit the person is asked whether to go on, through the same door every confirm uses
+  ctx.budget.asker = (info, at) => askToContinue(info, at);
   ctx.budget.narrow(pick(pendingSettle, "passes", "tokens", "ms", "turns", "wait"));
   ctx.batcher = new Batcher(ctx);
   ctx.adapter = (name) => {
@@ -204,7 +206,7 @@ export async function classify(req, opts = {}) {
   const ctx = ctxNow(opts.at);
   const { name, adapter } = resolveModel(ctx, opts, "decide");
   if (adapter.kind !== "decision") throw new SandError("E-MODEL", `classify needs a decision model; \`${name}\` is a ${adapter.kind} model`, { at: opts.at });
-  ctx.budget.check({ passes: adapter.caps.perRequest ? 1 : (req.questions ?? []).reduce((n, q) => n + (q.options?.length ?? q.levels?.length ?? 2), 0) }, opts.at);
+  await ctx.budget.check({ passes: adapter.caps.perRequest ? 1 : (req.questions ?? []).reduce((n, q) => n + (q.options?.length ?? q.levels?.length ?? 2), 0) }, opts.at);
   const res = await ctx.budget.gate.run(() => adapter.decide({ state: req.state, questions: req.questions, thresholds: req.thresholds }, { at: opts.at, signal: ctx.signal }));
   ctx.budget.record({ passes: res.passes ?? 0 });
   ctx.emit("sand.request", "event", { status: "ok", model: name, road: adapter.road ?? "", questions: (req.questions ?? []).length, passes: res.passes ?? 0, balance: res.balance ?? undefined, ms: res.ms, verb: "classify" }, { spanId: res.requestId ?? undefined, input: req, output: res.raw });
@@ -229,7 +231,7 @@ export async function ask(prompt, opts = {}) {
   const { name, adapter } = resolveModel(ctx, opts, "ask");
   const messages = [...(opts.system ? [{ role: "system", content: opts.system }] : []), { role: "user", content: prompt }];
   const schema = opts.as ? shapeSchema(opts.as.spec) : null;
-  ctx.budget.check({ tokens: 0 }, opts.at);
+  await ctx.budget.check({ tokens: 0 }, opts.at);
   const r = await ctx.budget.gate.run(() => adapter.ask({ messages, schema, maxTokens: opts.maxTokens, temperature: opts.temperature }, { at: opts.at, signal: ctx.signal }));
   ctx.budget.record({ tokens: r.tokens ?? 0, completions: 1 });
   if (r.estimated) warnOnce(ctx, `unmetered:${name}`, `W-UNMETERED: ${name} reported no usage; tokens are estimated at one per four characters`);
@@ -253,7 +255,7 @@ export async function extract(state, shapeObj, opts = {}) {
   const viaChat = async (only) => {
     const { name, adapter } = resolveModel(ctx, { ...opts, model: opts.askModel ?? (using === "ask" ? opts.model : undefined) }, "ask");
     if (!adapter.extract) throw new SandError("E-MODEL", `\`${name}\` cannot extract; it is a ${adapter.kind} model`, { at: opts.at });
-    ctx.budget.check({ tokens: 0 }, opts.at);
+    await ctx.budget.check({ tokens: 0 }, opts.at);
     const r = await ctx.budget.gate.run(() => adapter.extract(st, sp, only, { at: opts.at, signal: ctx.signal }));
     ctx.budget.record({ tokens: r.tokens ?? 0, completions: 1 });
     if (r.estimated) warnOnce(ctx, `unmetered:${name}`, `W-UNMETERED: ${name} reported no usage; tokens are estimated at one per four characters`);
@@ -311,7 +313,7 @@ export class Memory {
       return { text: String(w ?? ""), record: null };
     }).filter((i) => i.text.trim());
     if (!list.length) throw new SandError("E-MEMORY", "remember needs something to remember", { at });
-    if (adapter.metered) ctx.budget.check({ passes: list.length }, at);
+    if (adapter.metered) await ctx.budget.check({ passes: list.length }, at);
     const res = await ctx.budget.gate.run(() => adapter.remember(this.name, list, { at, signal: ctx.signal }));
     this.#done(ctx, modelName, adapter, "remember", res, at, { input: list, output: res.ids, hits: list.length });
     return Array.isArray(what) ? res.ids : res.ids[0];
@@ -323,7 +325,7 @@ export class Memory {
     const q = typeof query === "string" ? query : String(query?.text ?? query ?? "");
     if (!q.trim()) throw new SandError("E-MEMORY", "recall needs a query to look for", { at });
     const limit = opts.limit ?? 5;
-    if (adapter.metered) ctx.budget.check({ passes: 1 }, at);
+    if (adapter.metered) await ctx.budget.check({ passes: 1 }, at);
     const res = await ctx.budget.gate.run(() => adapter.recall(this.name, q, limit, { at, signal: ctx.signal }));
     this.#done(ctx, modelName, adapter, "recall", res, at, { input: { query: q, limit }, output: res.hits, hits: res.hits.length });
     return res.hits;

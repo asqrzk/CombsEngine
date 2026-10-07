@@ -33,6 +33,17 @@ import { promptOf, extractionPrompt, shapeSchema } from "./schema.js";
 import { refusal } from "./decision.js";
 
 /** Tokens when the provider metered nothing: the usual four characters each. */
+/** A token the host read from its cache counts this much: the platform bills it so (packages/pricing CACHED_TOKEN_WEIGHT). */
+export const CACHED_TOKEN_WEIGHT = 0.1;
+/** The tokens a usage report bills: the whole count, with the cached part of the prompt at its weight; null when none is reported. */
+export function billable(usage) {
+  const total = usage?.total_tokens;
+  if (typeof total !== "number" || !Number.isFinite(total)) return null;
+  const prompt = typeof usage.prompt_tokens === "number" ? usage.prompt_tokens : total;
+  const cached = Math.min(Math.max(0, Number(usage.prompt_tokens_details?.cached_tokens) || 0), prompt);
+  return total - cached + Math.ceil(cached * CACHED_TOKEN_WEIGHT);
+}
+
 export const estimateTokens = (messages, text) => {
   const chars = (messages ?? []).reduce((n, m) => n + String(typeof m?.content === "string" ? m.content : JSON.stringify(m?.content ?? "")).length, 0) + String(text ?? "").length;
   return Math.max(1, Math.ceil(chars / 4));
@@ -83,7 +94,7 @@ export function chatAdapter(model, ports = {}) {
       const message = choice.message ?? {};
       const text = typeof message.content === "string" ? message.content : Array.isArray(message.content) ? message.content.map((p) => p.text ?? "").join("") : "";
       const toolCalls = (message.tool_calls ?? []).map((c, i) => toolCallOf(c, i));
-      const reported = json.usage?.total_tokens ?? null;
+      const reported = billable(json.usage);
       return {
         text, toolCalls, finish: choice.finish_reason ?? null,
         tokens: reported ?? estimateTokens(messages, text), usage: json.usage ?? null, estimated: reported == null,
@@ -97,7 +108,7 @@ export function chatAdapter(model, ports = {}) {
       throw refusal(model.name, res.status, json, raw, { at });
     }
     const r = await readStream(res, { model, signal, at, onDelta, onThinking });
-    const reported = r.usage?.total_tokens ?? null;
+    const reported = billable(r.usage);
     return {
       text: r.text, toolCalls: r.toolCalls, finish: r.finish,
       tokens: reported ?? estimateTokens(messages, r.text), usage: r.usage, estimated: reported == null,

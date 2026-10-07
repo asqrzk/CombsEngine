@@ -6,7 +6,8 @@
  * { tools })` is the same with a tool loop inside every `say`: the model asks
  * for a tool, the program's own function runs — sequentially, so a tool may ask
  * a person — the result goes back as a `tool` message, and the round repeats up
- * to `settle.turns`. Past that bound the answer is `unsure`, `stopped: "turns"`.
+ * to `settle.turns`. Past that bound the answer is `unsure`, `stopped: "turns"`;
+ * a budget the person did not carry on ends the turn with what was said so far, `stopped: "budget"`.
  *
  * A model that thinks first hands its reasoning over apart from its answer: the
  * `Reply` carries it as `thinking` (and how long it took as `thinkingMs`), a
@@ -32,7 +33,7 @@ export class Reply {
   constructor({ text = "", stopped = null, turns = 0, tokens = 0, calls = [], reason = null, finish = null, model = null, thinking = "", thinkingMs = 0 } = {}) {
     this.text = text;
     this.stopped = stopped;
-    this.value = stopped === "turns" || stopped === "empty" || stopped === "aborted" ? unsure : text;
+    this.value = stopped === "turns" || stopped === "empty" || stopped === "aborted" || (stopped === "budget" && !text) ? unsure : text;
     this.turns = turns;
     this.tokens = tokens;
     this.calls = calls;
@@ -113,7 +114,13 @@ export class Conversation {
     const onThought = streaming ? (piece) => { thoughtNow += piece; if (opts.emit) emitThinking(piece, { at }); opts.onThinking?.(piece); } : null;
 
     for (let round = 0; round < (this.tools ? maxTurns : 1); round++) {
-      ctx.budget.check({ turns: 1, tokens: 0 }, at);
+      try {
+        await ctx.budget.check({ turns: 1, tokens: 0 }, at);
+      } catch (e) {
+        // past the budget after a round or more: what was paid for is kept, and the reply says it stopped
+        if (e?.code === "E-BUDGET" && turns > 0) { answer = answer || partial; stopped = "budget"; reason = e.message; break; }
+        throw e;
+      }
       const wire = onWire(this.system, [...this.#messages, ...pending], this.keep);
       const t0 = Date.now();
       let r;

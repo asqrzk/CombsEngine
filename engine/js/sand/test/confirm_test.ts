@@ -73,12 +73,12 @@ Deno.test("budget: pause and resume take the human wait out of elapsed(), and tu
   b.resume();
   assert(b.elapsed() < 30, `elapsed ${b.elapsed()}`);
   assert(b.waited >= 55, `waited ${b.waited}`);
-  b.check();                        // the ms limit is not crossed: the wait was not ours
+  await b.check();                  // the ms limit is not crossed: the wait was not ours
   b.record({ turns: 1 }); b.record({ turns: 1 });
   assertEquals(b.snapshot().spent.turns, 2);
   assertEquals(b.snapshot().waited, b.waited);
   let stopped: SandError | null = null;
-  try { b.check({ turns: 1 }); } catch (e) { stopped = e as SandError; }
+  try { await b.check({ turns: 1 }); } catch (e) { stopped = e as SandError; }
   assertEquals(stopped?.code, "E-BUDGET");
   assert(stopped!.message.includes("turns 3/2"), stopped!.message);
   // nested waits are counted once
@@ -178,4 +178,36 @@ Deno.test("confirm with a kind: nobody, or a port that gives no data, answers wi
     SandError,
     "args",
   );
+});
+
+Deno.test("budget: at a limit the person is asked, and a yes gives every limit its first size again", async () => {
+  const asked: { limit: string; used: number; max: number; block: Record<string, number | null>; extensions: number }[] = [];
+  const events: Record<string, unknown>[] = [];
+  const b = new Budget({ tokens: 100, turns: 2, ms: 60_000 }, (_name: string, _kind: string, attrs: Record<string, unknown>) => events.push(attrs));
+  let say = true;
+  b.asker = async (info: typeof asked[number]) => { asked.push(info); return say; };
+  b.record({ tokens: 90, turns: 1 });
+  await b.check({ tokens: 20 });                       // 110 > 100: asked, yes: tokens 200, turns 4, ms 120 s
+  assertEquals(asked.length, 1);
+  assertEquals(asked[0].limit, "tokens");
+  assertEquals(asked[0].block, { passes: null, tokens: 100, turns: 2, ms: 60_000 });
+  assertEquals(b.limits.tokens, 200);
+  assertEquals(b.limits.turns, 4);
+  assertEquals(b.limits.ms, 120_000);
+  assertEquals(b.snapshot().extensions, 1);
+  assertEquals(events.filter((e) => e.action === "ask").length, 1);
+  assertEquals(events.filter((e) => e.action === "extended").length, 1);
+  // a no stops it as before, with the person named in the message
+  say = false;
+  b.record({ tokens: 120 });
+  let stopped: SandError | null = null;
+  try { await b.check({ tokens: 1 }); } catch (e) { stopped = e as SandError; }
+  assertEquals(stopped?.code, "E-BUDGET");
+  assert(stopped!.message.includes("tokens 211/200") && stopped!.message.includes("did not carry it on"), stopped!.message);
+  assertEquals(asked.length, 2);
+  // an asker that throws is a no
+  b.asker = async () => { throw new Error("gone"); };
+  stopped = null;
+  try { await b.check({ tokens: 1 }); } catch (e) { stopped = e as SandError; }
+  assertEquals(stopped?.code, "E-BUDGET");
 });

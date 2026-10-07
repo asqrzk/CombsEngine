@@ -71,7 +71,7 @@ export class Batcher {
       const estimate = b.adapter.kind === "decision"
         ? { passes: b.adapter.caps.perRequest ? 1 : chunk.reduce((n, q) => n + (q.options?.length ?? q.levels?.length ?? 2), 0) }
         : { tokens: 0 };
-      try { this.ctx.budget.check(estimate, at); } catch (e) { for (const it of items) it.reject(e); continue; }
+      try { await this.ctx.budget.check(estimate, at); } catch (e) { for (const it of items) it.reject(e); continue; }
       let res;
       const t0 = Date.now();
       try {
