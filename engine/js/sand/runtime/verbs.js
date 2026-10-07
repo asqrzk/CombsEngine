@@ -120,9 +120,8 @@ async function createContext(opts) {
     chats: new Map(), session: opts.session === false ? null : opts.session ?? null,
     confirmPort: opts.confirm ?? null, outputPort: opts.output ?? null, output: { buffer: [], timer: null, at: null },
   };
-  ctx.budget = new Budget(cfg.limits, (name, kind, attrs) => ctx.emit(name, kind, attrs));
   // at a limit the person is asked whether to go on, through the same door every confirm uses
-  ctx.budget.asker = (info, at) => askToContinue(info, at);
+  ctx.budget = new Budget(cfg.limits, (name, kind, attrs) => ctx.emit(name, kind, attrs), askToContinue);
   ctx.budget.narrow(pick(pendingSettle, "passes", "tokens", "ms", "turns", "wait"));
   ctx.batcher = new Batcher(ctx);
   ctx.adapter = (name) => {

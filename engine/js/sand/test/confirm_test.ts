@@ -183,9 +183,8 @@ Deno.test("confirm with a kind: nobody, or a port that gives no data, answers wi
 Deno.test("budget: at a limit the person is asked, and a yes gives every limit its first size again", async () => {
   const asked: { limit: string; used: number; max: number; block: Record<string, number | null>; extensions: number }[] = [];
   const events: Record<string, unknown>[] = [];
-  const b = new Budget({ tokens: 100, turns: 2, ms: 60_000 }, (_name: string, _kind: string, attrs: Record<string, unknown>) => events.push(attrs));
-  let say = true;
-  b.asker = async (info: typeof asked[number]) => { asked.push(info); return say; };
+  let say: boolean | null = true;
+  const b = new Budget({ tokens: 100, turns: 2, ms: 60_000 }, (_name: string, _kind: string, attrs: Record<string, unknown>) => events.push(attrs), async (info: typeof asked[number]) => { asked.push(info); return say; });
   b.record({ tokens: 90, turns: 1 });
   await b.check({ tokens: 20 });                       // 110 > 100: asked, yes: tokens 200, turns 4, ms 120 s
   assertEquals(asked.length, 1);
@@ -205,9 +204,61 @@ Deno.test("budget: at a limit the person is asked, and a yes gives every limit i
   assertEquals(stopped?.code, "E-BUDGET");
   assert(stopped!.message.includes("tokens 211/200") && stopped!.message.includes("did not carry it on"), stopped!.message);
   assertEquals(asked.length, 2);
-  // an asker that throws is a no
-  b.asker = async () => { throw new Error("gone"); };
+  // a no sticks: nothing is asked again
+  say = true;
   stopped = null;
   try { await b.check({ tokens: 1 }); } catch (e) { stopped = e as SandError; }
   assertEquals(stopped?.code, "E-BUDGET");
+  assertEquals(asked.length, 2);
+  // an asker that throws is a no
+  const c = new Budget({ tokens: 10 }, null, async () => { throw new Error("gone"); });
+  c.record({ tokens: 10 });
+  stopped = null;
+  try { await c.check({ tokens: 1 }); } catch (e) { stopped = e as SandError; }
+  assertEquals(stopped?.code, "E-BUDGET");
+  // nobody (null) is the plain stop, not a no: the next call may ask again
+  let calls = 0;
+  const d = new Budget({ tokens: 10 }, null, async () => { calls++; return null; });
+  d.record({ tokens: 10 });
+  stopped = null;
+  try { await d.check({ tokens: 1 }); } catch (e) { stopped = e as SandError; }
+  assert(stopped!.message.endsWith("bound the loop"), stopped!.message);
+  assertEquals(d.declined, false);
+});
+
+Deno.test("budget: two calls at the limit raise one question, and a limit set after the first ask gets a block of its own", async () => {
+  let resolve: ((v: boolean) => void) | null = null;
+  let asks = 0;
+  const b = new Budget({ tokens: 10 }, null, () => new Promise<boolean>((r) => { asks++; resolve = r; }));
+  b.record({ tokens: 10 });
+  const first = b.check({ tokens: 1 });
+  const second = b.check({ tokens: 2 });
+  await new Promise((r) => setTimeout(r, 5));
+  assertEquals(asks, 1, "one question for both");
+  resolve!(true);
+  await first; await second;
+  assertEquals(b.limits.tokens, 20);
+  assertEquals(b.extensions, 1);
+  // turns had no limit at the first ask; settle() sets one later, and a yes at that limit buys as much again of it
+  b.narrow({ turns: 2 });
+  b.record({ turns: 2 });
+  const third = b.check({ turns: 1 });
+  await new Promise((r) => setTimeout(r, 5));
+  assertEquals(asks, 2);
+  resolve!(true);
+  await third;
+  assertEquals(b.limits.turns, 4);
+  assertEquals(b.block!.turns, 2);
+  // narrowing after an extension lowers the block with the limits
+  b.narrow({ tokens: 5 });
+  assertEquals(b.limits.tokens, 5);
+  assertEquals(b.block!.tokens, 5);
+});
+
+Deno.test("confirm: the kind budget is the runtime's own", async () => {
+  const { result, trace } = await run(async () => {
+    try { await confirm("go on?", { kind: "budget" }); return "allowed"; } catch (e) { return (e as SandError).code; }
+  }, { input: "x", env: () => undefined, config: { models: {}, default: {} } as never });
+  assertEquals(result, "E-STATE");
+  assert(!trace.events.some((e) => e.name === "sand.confirm"));
 });

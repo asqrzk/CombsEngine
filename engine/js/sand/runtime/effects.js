@@ -96,6 +96,8 @@ export function verdictOf(answer) {
 
 /** A kind names what a `confirm` asks for beyond a verdict: a short name of letters, digits and underscores. */
 const KIND = /^[a-z][a-z0-9_]{0,63}$/;
+/** marks the runtime's own asks (the budget's question), which a program cannot raise under that kind */
+const OWN = Symbol("sand.confirm.own");
 /** The most an ask's arguments may weigh, as JSON: they travel to the person as one trace line. */
 const ARGS_MAX = 48 * 1024;
 
@@ -113,6 +115,7 @@ export async function confirm(question, opts = {}) {
   if (!q) throw new SandError("E-STATE", "confirm needs a question to ask", { at: opts.at });
   const kind = opts.kind === undefined || opts.kind === null ? null : String(opts.kind);
   if (kind !== null && !KIND.test(kind)) throw new SandError("E-STATE", "confirm's kind is a short name of letters, digits and underscores, like link_reading", { at: opts.at });
+  if (kind === "budget" && opts[OWN] !== true) throw new SandError("E-STATE", "the kind budget is the runtime's own question; a program names another kind", { at: opts.at });
   const args = kind === null ? undefined : opts.args === undefined ? null : opts.args;
   if (kind !== null && JSON.stringify(args).length > ARGS_MAX) throw new SandError("E-STATE", `confirm's args are at most ${ARGS_MAX} bytes of JSON`, { at: opts.at });
   const port = ctx.confirmPort ?? ports.confirm ?? null;
@@ -167,6 +170,6 @@ export async function askToContinue(info, at = null) {
     info.block.ms != null ? `${Math.round(info.block.ms / 1000)} seconds` : null,
   ].filter(Boolean).join(", ");
   const q = `This run has used its budget (${what}). Go on with as much again${more ? ` (${more})` : ""}?`;
-  const got = await confirm(q, { kind: "budget", args: info, at: at ?? undefined });
+  const got = await confirm(q, { kind: "budget", args: info, at: at ?? undefined, [OWN]: true });
   return got && typeof got === "object" && got.answer === true;
 }

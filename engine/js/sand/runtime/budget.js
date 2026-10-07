@@ -37,7 +37,12 @@ export class Budget {
   #pausedAt = null;
   #depth = 0;
   /** @param {{passes?: number|null, tokens?: number|null, ms?: number|null, turns?: number|null, wait?: number|null, concurrency?: number}} limits */
-  constructor(limits = {}, emit = null) {
+  /**
+   * @param {{passes?: number|null, tokens?: number|null, ms?: number|null, turns?: number|null, wait?: number|null, concurrency?: number}} limits
+   * @param {((name: string, kind: string, attrs: object) => void) | null} emit
+   * @param {((info: object, at: string|null) => Promise<boolean|null>) | null} asker  asks the person to go on: true, false, or null for nobody
+   */
+  constructor(limits = {}, emit = null, asker = null) {
     this.limits = { passes: limits.passes ?? null, tokens: limits.tokens ?? null, ms: limits.ms ?? null, turns: limits.turns ?? null, wait: limits.wait ?? null, concurrency: limits.concurrency ?? 4 };
     this.spent = { passes: 0, tokens: 0, requests: 0, completions: 0, turns: 0 };
     this.started = Date.now();
@@ -45,14 +50,17 @@ export class Budget {
     this.gate = new Semaphore(this.limits.concurrency);
     this.emit = emit;
     this.stopped = null;
-    /** asks the person whether to go on: `(info, at) => Promise<boolean>`; nobody by default */
-    this.asker = null;
+    /** asks the person whether to go on: `(info, at) => Promise<boolean|null>`; nobody by default */
+    this.asker = typeof asker === "function" ? asker : null;
     /** the limits as they first stood, the block each extension adds */
     this.block = null;
     this.extensions = 0;
     /** the person said no once: nothing is asked again this run */
     this.declined = false;
+    /** the question in flight, so two calls at a limit raise one question and both read its answer */
+    this.#asking = null;
   }
+  #asking;
   /** Narrows the limits from a program's settle(); a program can only lower them. */
   narrow({ passes, tokens, ms, turns, wait } = {}) {
     const lower = (a, b) => (b == null ? a : a == null ? b : Math.min(a, b));
@@ -61,6 +69,7 @@ export class Budget {
     this.limits.ms = lower(this.limits.ms, ms);
     this.limits.turns = lower(this.limits.turns, turns);
     this.limits.wait = lower(this.limits.wait, wait);
+    if (this.block) for (const k of ["passes", "tokens", "ms", "turns"]) this.block[k] = lower(this.block[k], { passes, tokens, ms, turns }[k]);
   }
   /** Stops the clock while a person is being asked; nested waits are counted once. */
   pause() { if (this.#depth++ === 0) this.#pausedAt = Date.now(); }
@@ -90,7 +99,11 @@ export class Budget {
     let hit = this.#over(estimate);
     let nobody = false;
     while (hit && this.asker && !this.declined) {
+      // one question at a time: a second call that meets the limit waits for the first's answer, then looks again
+      if (this.#asking) { await this.#asking; hit = this.#over(estimate); continue; }
       const block = this.block ??= { passes: this.limits.passes, tokens: this.limits.tokens, ms: this.limits.ms, turns: this.limits.turns };
+      // a limit that was unset at the first ask (set by settle() since) gets a block of its own size, so a yes always buys something
+      if (block[hit.limit] == null && this.limits[hit.limit] != null) block[hit.limit] = this.limits[hit.limit];
       const info = {
         limit: hit.limit, used: hit.used, max: hit.max,
         spent: { ...this.spent, ms: this.elapsed() },
@@ -98,8 +111,9 @@ export class Budget {
         extensions: this.extensions,
       };
       this.emit?.("sand.budget", "event", { limit: hit.limit, used: String(hit.used), max: String(hit.max), action: "ask", at: at ?? "" });
-      let got = false;
-      try { got = await this.asker(info, at); } catch { got = false; }
+      this.#asking = (async () => { try { return await this.asker(info, at); } catch { return false; } })();
+      let got;
+      try { got = await this.#asking; } finally { this.#asking = null; }
       if (got === null) { nobody = true; break; }   // no one could be asked: the plain stop, as without an asker
       if (got !== true) { this.declined = true; break; }
       for (const name of ["passes", "tokens", "ms", "turns"]) {
