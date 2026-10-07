@@ -189,7 +189,7 @@ Deno.test("budget: at a limit the person is asked, and a yes gives every limit i
   await b.check({ tokens: 20 });                       // 110 > 100: asked, yes: tokens 200, turns 4, ms 120 s
   assertEquals(asked.length, 1);
   assertEquals(asked[0].limit, "tokens");
-  assertEquals(asked[0].block, { passes: null, tokens: 100, turns: 2, ms: 60_000, credits: null });
+  assertEquals(asked[0].block, { passes: null, tokens: 100, turns: 2, ms: 60_000 });
   assertEquals(b.limits.tokens, 200);
   assertEquals(b.limits.turns, 4);
   assertEquals(b.limits.ms, 120_000);
@@ -279,7 +279,7 @@ Deno.test("budget: credits are counted at each model's rate, and the questions f
   assertEquals(asked[0].limit, "credits");
   assertEquals(asked[0].used, 52);
   assertEquals(asked[0].max, 50);
-  assertEquals(asked[0].block.credits, 100, "the next step is named");
+  assertEquals(asked[0].block, { credits: 100 }, "the next step is named, and nothing else: no clock, no other cap");
   assertEquals(b.limits.credits, 100);
   b.record({ tokens: 256 * 60, model: "careful", completions: 1 }); // 112
   await b.check({ tokens: 0 });
@@ -311,4 +311,26 @@ Deno.test("budget: askMore asks the same question for another cap, once at a tim
   assertEquals(asked.length, 2, "a no is not asked twice");
   const nobody = new Budget({ tokens: 1000 });
   assertEquals(await nobody.askMore({ limit: "rounds", used: 1, max: 1 }), false);
+});
+
+Deno.test("budget: a no is remembered per limit, a chat call bills at least one credit, and a warning comes once per cap", async () => {
+  let say = false;
+  const asked: { limit: string }[] = [];
+  const events: Record<string, unknown>[] = [];
+  const b = new Budget({ credits: 10, creditSteps: [20], rates: { quick: 768 }, rate: null, turns: 2 }, (_n: string, _k: string, attrs: Record<string, unknown>) => events.push(attrs), async (info: { limit: string }) => { asked.push(info); return say; });
+  // a small call is a whole credit
+  b.record({ tokens: 10, model: "quick", completions: 1, turns: 1 });
+  assertEquals(b.spent.credits, 1);
+  // no to more rounds does not refuse the credits question later
+  assertEquals(await b.askMore({ limit: "rounds", used: 2, max: 2, block: { rounds: 2 } }), false);
+  say = true;
+  b.record({ tokens: 768 * 12, model: "quick", completions: 1 });
+  await b.check({ tokens: 0 });
+  assertEquals(asked.map((a) => a.limit), ["rounds", "credits"]);
+  assertEquals(b.limits.credits, 20);
+  // the warning for a cap comes once, however many calls sit in its last fifth
+  b.record({ tokens: 768 * 4, model: "quick", completions: 1 }); // 17
+  b.record({ tokens: 768, model: "quick", completions: 1 }); // 18
+  b.record({ tokens: 768, model: "quick", completions: 1 }); // 19
+  assertEquals(events.filter((e) => e.action === "warn" && e.limit === "credits").length, 1);
 });

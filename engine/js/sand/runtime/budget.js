@@ -47,7 +47,7 @@ export class Budget {
     // credits, when the platform says what a token costs: the first question at `credits`, the next ones at each
     // of `creditSteps`, then at double the last; `rates` maps a model to its tokens per credit, `rate` is the rest's
     this.limits.credits = limits.credits ?? null;
-    this.limits.creditSteps = Array.isArray(limits.creditSteps) ? limits.creditSteps.filter((n) => typeof n === "number" && n > 0) : [];
+    this.limits.creditSteps = Array.isArray(limits.creditSteps) ? [...limits.creditSteps].filter((n) => typeof n === "number" && n > 0).sort((a, b) => a - b) : [];
     this.limits.rates = limits.rates && typeof limits.rates === "object" ? { ...limits.rates } : {};
     this.limits.rate = typeof limits.rate === "number" && limits.rate > 0 ? limits.rate : null;
     this.spent = { passes: 0, tokens: 0, requests: 0, completions: 0, turns: 0, credits: 0 };
@@ -61,12 +61,16 @@ export class Budget {
     /** the limits as they first stood, the block each extension adds */
     this.block = null;
     this.extensions = 0;
-    /** the person said no once: nothing is asked again this run */
+    /** the person said no once: that limit is not asked again this run (another limit still may be) */
     this.declined = false;
+    this.#noTo = new Set();
+    this.#warned = new Set();
     /** the question in flight, so two calls at a limit raise one question and both read its answer */
     this.#asking = null;
   }
   #asking;
+  #noTo;
+  #warned;
   /** Narrows the limits from a program's settle(); a program can only lower them. */
   narrow({ passes, tokens, ms, turns, wait } = {}) {
     const lower = (a, b) => (b == null ? a : a == null ? b : Math.min(a, b));
@@ -116,15 +120,15 @@ export class Budget {
    * question, the same single flight, the same memory of a no. Answers whether to go on; the caller extends its cap.
    */
   async askMore(info, at = null) {
-    if (!this.asker || this.declined) return false;
-    if (this.#asking) await this.#asking;
-    if (this.declined) return false;
+    if (!this.asker || this.#noTo.has(info.limit)) return false;
+    while (this.#asking) await this.#asking;
+    if (this.#noTo.has(info.limit)) return false;
     this.emit?.("sand.budget", "event", { limit: info.limit, used: String(info.used), max: String(info.max), action: "ask", at: at ?? "" });
     this.#asking = (async () => { try { return await this.asker({ ...info, spent: { ...this.spent, ms: this.elapsed() }, extensions: this.extensions }, at); } catch { return false; } })();
     let got;
     try { got = await this.#asking; } finally { this.#asking = null; }
     if (got === null) return false;
-    if (got !== true) { this.declined = true; return false; }
+    if (got !== true) { this.declined = true; this.#noTo.add(info.limit); return false; }
     this.extensions += 1;
     this.emit?.("sand.budget", "event", { limit: info.limit, used: String(info.used), max: String(info.max + (info.block?.[info.limit] ?? 0)), action: "extended", at: at ?? "" });
     return true;
@@ -136,16 +140,18 @@ export class Budget {
   async check(estimate = {}, at = null) {
     let hit = this.#over(estimate);
     let nobody = false;
-    while (hit && this.asker && !this.declined) {
+    while (hit && this.asker && !this.#noTo.has(hit.limit)) {
       // one question at a time: a second call that meets the limit waits for the first's answer, then looks again
       if (this.#asking) { await this.#asking; hit = this.#over(estimate); continue; }
       const block = this.block ??= { passes: this.limits.passes, tokens: this.limits.tokens, ms: this.limits.ms, turns: this.limits.turns };
       // a limit that was unset at the first ask (set by settle() since) gets a block of its own size, so a yes always buys something
-      if (block[hit.limit] == null && this.limits[hit.limit] != null) block[hit.limit] = this.limits[hit.limit];
+      if (hit.limit !== "credits" && block[hit.limit] == null && this.limits[hit.limit] != null) block[hit.limit] = this.limits[hit.limit];
+      // a credits question names the next step and nothing else: a yes to it moves no other cap, and no clock
+      const next = hit.limit === "credits" ? this.#nextCredits() : null;
       const info = {
         limit: hit.limit, used: hit.used, max: hit.max,
         spent: { ...this.spent, ms: this.elapsed() },
-        block: { passes: block.passes, tokens: block.tokens, turns: block.turns, ms: block.ms, credits: hit.limit === "credits" ? this.#nextCredits() : null },
+        block: next !== null ? { credits: next } : { passes: block.passes, tokens: block.tokens, turns: block.turns, ms: block.ms },
         extensions: this.extensions,
       };
       this.emit?.("sand.budget", "event", { limit: hit.limit, used: String(hit.used), max: String(hit.max), action: "ask", at: at ?? "" });
@@ -153,10 +159,11 @@ export class Budget {
       let got;
       try { got = await this.#asking; } finally { this.#asking = null; }
       if (got === null) { nobody = true; break; }   // no one could be asked: the plain stop, as without an asker
-      if (got !== true) { this.declined = true; break; }
-      if (hit.limit === "credits") {
-        // the schedule: the next step, not another block; the other caps stand where they are
-        this.limits.credits = this.#nextCredits();
+      if (got !== true) { this.declined = true; this.#noTo.add(hit.limit); break; }
+      this.#warned.delete(hit.limit);
+      if (next !== null) {
+        // the schedule: the step the person was told, not another block; the other caps stand where they are
+        this.limits.credits = next;
       } else {
         for (const name of ["passes", "tokens", "ms", "turns"]) {
           if (this.limits[name] != null && block[name] != null) this.limits[name] += block[name];
@@ -169,7 +176,11 @@ export class Budget {
     if (!hit) return;
     this.stopped = { limit: hit.limit, used: hit.used, max: hit.max };
     this.emit?.("sand.budget", "event", { limit: hit.limit, used: String(hit.used), max: String(hit.max), action: "stop", at: at ?? "" });
-    const how = hit.limit === "ms" ? `ms ${hit.used}/${hit.max} elapsed; raise settle({ ms }) or do less` : `${hit.limit} ${hit.used}/${hit.max} spent; raise settle({ ${hit.limit} }) or bound the loop`;
+    const how = hit.limit === "ms"
+      ? `ms ${hit.used}/${hit.max} elapsed; raise settle({ ms }) or do less`
+      : hit.limit === "credits"
+      ? `credits ${hit.used}/${hit.max} spent`
+      : `${hit.limit} ${hit.used}/${hit.max} spent; raise settle({ ${hit.limit} }) or bound the loop`;
     throw new SandError("E-BUDGET", how + (this.asker && !nobody ? " (the person did not carry it on)" : ""), { at: at ?? undefined });
   }
   /** The tokens one credit buys from a model, when the platform said; null when credits are not counted. */
@@ -179,10 +190,15 @@ export class Budget {
   }
   record({ passes = 0, tokens = 0, completions = 0, turns = 0, model = null, credits = 0 } = {}) {
     this.spent.passes += passes; this.spent.tokens += tokens; this.spent.requests += 1; this.spent.completions += completions; this.spent.turns += turns;
-    // a decision or a memory call is a credit a pass; a chat call is its tokens at the model's rate
+    // a decision or a memory call is a credit a pass; a chat call is its tokens at the model's rate, whole and at
+    // least one, as the platform bills it
     const rate = this.rateFor(model);
-    this.spent.credits += passes + credits + (rate ? tokens / rate : 0);
-    const warnAt = (name, v, cap) => { if (cap != null && v > cap * 0.8 && v <= cap) this.emit?.("sand.budget", "event", { limit: name, used: String(v), max: String(cap), action: "warn" }); };
+    this.spent.credits += passes + credits + (rate && tokens > 0 ? Math.max(1, Math.ceil(tokens / rate)) : 0);
+    const warnAt = (name, v, cap) => {
+      if (cap == null || !(v > cap * 0.8 && v <= cap) || this.#warned.has(name)) return;
+      this.#warned.add(name);
+      this.emit?.("sand.budget", "event", { limit: name, used: String(v), max: String(cap), action: "warn" });
+    };
     warnAt("passes", this.spent.passes, this.limits.passes); warnAt("tokens", this.spent.tokens, this.limits.tokens); warnAt("turns", this.spent.turns, this.limits.turns);
     warnAt("credits", Math.round(this.spent.credits), this.limits.credits);
   }
