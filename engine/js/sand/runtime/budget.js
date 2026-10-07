@@ -12,7 +12,7 @@
  * When a limit is reached and someone can be asked (`asker`, set by the
  * runtime to a `confirm` of kind `budget`), the person is offered the same
  * budget again, every limit by its first size; on yes the run goes on, on no
- * or no answer it stops as before. Tokens are counted as billed: a token the
+ * or no answer it stops as before, and a no is not asked twice. Tokens are counted as billed: a token the
  * host read from its cache counts a tenth (see wires/chat.js).
  */
 
@@ -50,6 +50,8 @@ export class Budget {
     /** the limits as they first stood, the block each extension adds */
     this.block = null;
     this.extensions = 0;
+    /** the person said no once: nothing is asked again this run */
+    this.declined = false;
   }
   /** Narrows the limits from a program's settle(); a program can only lower them. */
   narrow({ passes, tokens, ms, turns, wait } = {}) {
@@ -86,7 +88,8 @@ export class Budget {
    */
   async check(estimate = {}, at = null) {
     let hit = this.#over(estimate);
-    while (hit && this.asker) {
+    let nobody = false;
+    while (hit && this.asker && !this.declined) {
       const block = this.block ??= { passes: this.limits.passes, tokens: this.limits.tokens, ms: this.limits.ms, turns: this.limits.turns };
       const info = {
         limit: hit.limit, used: hit.used, max: hit.max,
@@ -95,9 +98,10 @@ export class Budget {
         extensions: this.extensions,
       };
       this.emit?.("sand.budget", "event", { limit: hit.limit, used: String(hit.used), max: String(hit.max), action: "ask", at: at ?? "" });
-      let yes = false;
-      try { yes = (await this.asker(info, at)) === true; } catch { yes = false; }
-      if (!yes) break;
+      let got = false;
+      try { got = await this.asker(info, at); } catch { got = false; }
+      if (got === null) { nobody = true; break; }   // no one could be asked: the plain stop, as without an asker
+      if (got !== true) { this.declined = true; break; }
       for (const name of ["passes", "tokens", "ms", "turns"]) {
         if (this.limits[name] != null && block[name] != null) this.limits[name] += block[name];
       }
@@ -109,12 +113,12 @@ export class Budget {
     this.stopped = { limit: hit.limit, used: hit.used, max: hit.max };
     this.emit?.("sand.budget", "event", { limit: hit.limit, used: String(hit.used), max: String(hit.max), action: "stop", at: at ?? "" });
     const how = hit.limit === "ms" ? `ms ${hit.used}/${hit.max} elapsed; raise settle({ ms }) or do less` : `${hit.limit} ${hit.used}/${hit.max} spent; raise settle({ ${hit.limit} }) or bound the loop`;
-    throw new SandError("E-BUDGET", how + (this.asker ? " (the person did not carry it on)" : ""), { at: at ?? undefined });
+    throw new SandError("E-BUDGET", how + (this.asker && !nobody ? " (the person did not carry it on)" : ""), { at: at ?? undefined });
   }
   record({ passes = 0, tokens = 0, completions = 0, turns = 0 } = {}) {
     this.spent.passes += passes; this.spent.tokens += tokens; this.spent.requests += 1; this.spent.completions += completions; this.spent.turns += turns;
     const warnAt = (name, v, cap) => { if (cap != null && v > cap * 0.8 && v <= cap) this.emit?.("sand.budget", "event", { limit: name, used: String(v), max: String(cap), action: "warn" }); };
     warnAt("passes", this.spent.passes, this.limits.passes); warnAt("tokens", this.spent.tokens, this.limits.tokens); warnAt("turns", this.spent.turns, this.limits.turns);
   }
-  snapshot() { return { limits: { ...this.limits }, spent: { ...this.spent }, ms: this.elapsed(), waited: this.waited, stopped: this.stopped, extensions: this.extensions }; }
+  snapshot() { return { limits: { ...this.limits }, spent: { ...this.spent }, ms: this.elapsed(), waited: this.waited, stopped: this.stopped, extensions: this.extensions, declined: this.declined }; }
 }

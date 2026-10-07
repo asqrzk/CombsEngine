@@ -85,7 +85,7 @@ export declare function extract<S extends ShapeSlots>(state: State, shape: Shape
 // ── conversations: chat, assistant, tools ─────────────────────────────────
 export interface Message { role: "system" | "user" | "assistant" | "tool"; content: string | null; name?: string; tool_calls?: { id: string; type: "function"; function: { name: string; arguments: string } }[]; tool_call_id?: string }
 export interface ToolRun { id: string; name: string; args: Record<string, unknown> | null; result: unknown; error: string | null; ms: number }
-export type Stopped = null | "turns" | "length" | "empty" | "aborted";
+export type Stopped = null | "turns" | "length" | "empty" | "aborted" | "budget" | "tool_call";
 export declare class Reply {
   readonly text: string;
   /** The text, or `unsure` when the turns ran out, the answer was empty, or it was stopped. */
@@ -179,7 +179,7 @@ export declare function using<T>(model: string, fn: () => Promise<T> | T): Promi
 
 // ── the run ───────────────────────────────────────────────────────────────
 export interface TraceEvent { id: string; ts: number; source: string; kind: string; name: string; traceId?: string; attrs?: Record<string, string>; input?: unknown; output?: unknown; status?: string; error?: string; severity?: string }
-export interface BudgetSnapshot { limits: { passes: number | null; tokens: number | null; ms: number | null; turns: number | null; wait: number | null; concurrency: number }; spent: { passes: number; tokens: number; requests: number; completions: number; turns: number }; ms: number; waited: number; stopped: { limit: string; used: number; max: number } | null; extensions: number }
+export interface BudgetSnapshot { limits: { passes: number | null; tokens: number | null; ms: number | null; turns: number | null; wait: number | null; concurrency: number }; spent: { passes: number; tokens: number; requests: number; completions: number; turns: number }; ms: number; waited: number; stopped: { limit: string; used: number; max: number } | null; extensions: number; declined: boolean }
 /** What the budget tells the person when a limit is reached: the limit hit, what was spent, and the block a yes adds. */
 export interface BudgetAskInfo { limit: string; used: number; max: number; spent: BudgetSnapshot["spent"] & { ms: number }; block: { passes: number | null; tokens: number | null; turns: number | null; ms: number | null }; extensions: number }
 export interface Trace { traceId: string; file: string | null; events: TraceEvent[]; budget: BudgetSnapshot; models: { decide: string | null; ask: string | null; memory: string | null } }
@@ -219,7 +219,7 @@ export declare function slug(s: string): string;
 /** What a wire is handed: the host's fetch, the trace bus, and the two file ports a local store needs. */
 export interface AdapterPorts { fetchImpl?: typeof fetch; bus?: Bus; readFile?: (path: string) => Promise<string | null>; writeFile?: (path: string, text: string) => Promise<void> | void }
 export declare const kindRegistry: Map<string, (model: ModelConfig & { name: string }, ports: AdapterPorts) => ModelAdapter>;
-export declare class Budget { constructor(limits?: Partial<BudgetSnapshot["limits"]>, emit?: ((name: string, kind: string, attrs: Record<string, unknown>) => void) | null); limits: BudgetSnapshot["limits"]; spent: BudgetSnapshot["spent"]; waited: number; narrow(opts: { passes?: number; tokens?: number; ms?: number; turns?: number; wait?: number }): void; check(estimate?: { passes?: number; tokens?: number; turns?: number }, at?: string | null): Promise<void>; record(spent?: { passes?: number; tokens?: number; completions?: number; turns?: number }): void; pause(): void; resume(): void; elapsed(): number; snapshot(): BudgetSnapshot; asker: ((info: BudgetAskInfo, at?: string | null) => Promise<boolean>) | null; block: BudgetAskInfo["block"] | null; extensions: number }
+export declare class Budget { constructor(limits?: Partial<BudgetSnapshot["limits"]>, emit?: ((name: string, kind: string, attrs: Record<string, unknown>) => void) | null); limits: BudgetSnapshot["limits"]; spent: BudgetSnapshot["spent"]; waited: number; narrow(opts: { passes?: number; tokens?: number; ms?: number; turns?: number; wait?: number }): void; check(estimate?: { passes?: number; tokens?: number; turns?: number }, at?: string | null): Promise<void>; record(spent?: { passes?: number; tokens?: number; completions?: number; turns?: number }): void; pause(): void; resume(): void; elapsed(): number; snapshot(): BudgetSnapshot; asker: ((info: BudgetAskInfo, at?: string | null) => Promise<boolean>) | null; block: BudgetAskInfo["block"] | null; extensions: number; declined: boolean }
 export declare class Semaphore { constructor(permits: number); acquire(): Promise<void>; release(): void; run<T>(fn: () => Promise<T>): Promise<T> }
 export declare function clampAttrs(attrs?: Record<string, unknown>): Record<string, string>;
 export declare function refusal(modelName: string, status: number, json: unknown, text: string, ctx?: { at?: string }): SandError;

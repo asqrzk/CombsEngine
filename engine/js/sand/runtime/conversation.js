@@ -118,19 +118,22 @@ export class Conversation {
     // a tool call the host could not read (its arguments were not JSON) is told to the model once, on the wire of the
     // next round only: the note is never part of the conversation
     let nudge = null, badCalls = 0;
+    // what the last finished round said (already in the history when it asked for tools): a stop keeps it, once
+    let lastText = "", kept = false;
 
     for (let round = 0; round < (this.tools ? maxTurns : 1); round++) {
       try {
         await ctx.budget.check({ turns: 1, tokens: 0 }, at);
       } catch (e) {
         // past the budget after a round or more: what was paid for is kept, and the reply says it stopped
-        if (e?.code === "E-BUDGET" && turns > 0) { answer = answer || partial; stopped = "budget"; reason = e.message; break; }
+        if (e?.code === "E-BUDGET" && turns > 0) { answer = lastText; kept = true; stopped = "budget"; reason = e.message; break; }
         throw e;
       }
       const wire = onWire(this.system, [...this.#messages, ...pending, ...(nudge ? [nudge] : [])], this.keep);
       const t0 = Date.now();
       let r;
       thoughtNow = "";
+      partial = "";
       try {
         r = await ctx.budget.gate.run(() => adapter.complete({
           messages: wire,
@@ -155,7 +158,7 @@ export class Conversation {
             continue;
           }
           // told once already and wrong again: the reply ends with what it has, and says why, instead of failing the run
-          answer = answer || partial; stopped = "tool_call"; reason = `the model wrote a tool call the host could not read, twice: ${said}`;
+          answer = lastText; kept = true; stopped = "tool_call"; reason = `the model wrote a tool call the host could not read, twice: ${said}`;
           break;
         }
         throw e;
@@ -170,6 +173,7 @@ export class Conversation {
       ctx.emit("sand.request", "event", { status: "ok", model: name, road: "", questions: 0, tokens: r.tokens ?? 0, ms: r.ms, verb: "say", at }, { input: wire, output: r.text });
       ctx.emit("sand.turn", "event", { at, chat: this.name ?? "", turn: turns, model: name, stop: r.finish ?? "", tokens: r.tokens ?? 0, ms: r.ms, calls: r.toolCalls?.length ?? 0 }, { output: r.text });
       finish = r.finish ?? null;
+      lastText = r.text ?? "";
       if (this.tools && r.toolCalls?.length) {
         pending.push({ role: "assistant", content: r.text || null, tool_calls: r.toolCalls.map((c) => ({ id: c.id, type: "function", function: { name: c.name, arguments: c.arguments } })) });
         for (const call of r.toolCalls) {
@@ -189,7 +193,7 @@ export class Conversation {
     }
     if (!stopped && finish === "length") { stopped = "length"; reason = "the model reached its token ceiling; raise maxTokens"; }
     if (!stopped && !answer.trim()) { stopped = "empty"; reason = "the model answered with nothing"; }
-    if (answer) pending.push({ role: "assistant", content: answer });
+    if (answer && !kept) pending.push({ role: "assistant", content: answer });
     this.#messages.push(...pending);
     const reply = new Reply({ text: answer, stopped, turns, tokens, calls, reason, finish, model: name, thinking, thinkingMs });
     this.#last = reply;

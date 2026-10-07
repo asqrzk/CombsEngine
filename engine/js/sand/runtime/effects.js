@@ -157,6 +157,8 @@ const TIMED_OUT = Symbol("sand.confirm.timeout");
  * @param {{limit: string, used: number, max: number, spent: object, block: object, extensions: number}} info
  */
 export async function askToContinue(info, at = null) {
+  const ctx = ctxNow(at);
+  if (!(ctx.confirmPort ?? ports.confirm ?? null)) return null;   // nobody is here: not a no, just nobody
   const n = (v) => (typeof v === "number" ? v.toLocaleString("en-US") : String(v ?? "?"));
   const what = info.limit === "ms" ? `${Math.round(info.used / 1000)} of ${Math.round(info.max / 1000)} seconds` : `${n(info.used)} of ${n(info.max)} ${info.limit}`;
   const more = [
@@ -166,5 +168,5 @@ export async function askToContinue(info, at = null) {
   ].filter(Boolean).join(", ");
   const q = `This run has used its budget (${what}). Go on with as much again${more ? ` (${more})` : ""}?`;
   const got = await confirm(q, { kind: "budget", args: info, at: at ?? undefined });
-  return got && typeof got === "object" ? got.answer === true : got === true;
+  return got && typeof got === "object" && got.answer === true;
 }

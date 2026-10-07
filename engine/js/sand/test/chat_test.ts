@@ -361,19 +361,29 @@ Deno.test("assistant: past the budget the person is asked; a yes carries the rep
   const Empty = shape({ why: text("why") }, { name: "Empty" });
   const look = tool("look", Empty, async () => "seen", { name: "look" });
   const tight = { ...CFG, limits: { turns: 1 } };
-  // nobody there to answer: the turn stops at the limit, after a round, and says so
-  const h1 = host([call, () => said("done")]);
+  // nobody there to answer: no question is raised, the turn stops at the limit after a round, and keeps what the
+  // last round said, once (it is already in the history, beside its tool call)
+  const spoke = () => json({ choices: [{ index: 0, message: { role: "assistant", content: "Let me look.", tool_calls: [{ ...order }] }, finish_reason: "tool_calls" }], usage: { total_tokens: 5 } });
+  const h1 = host([spoke, () => said("done")]);
   const r1 = await run(async () => {
     const desk = assistant("you are a desk", { tools: [look], settle: { turns: 4 }, name: "desk" });
     const r = await desk.say("go");
-    return { value: r.value === unsure ? "unsure" : r.value, stopped: r.stopped, turns: r.turns, reason: r.reason };
+    // a fresh say past the limit has nothing to keep: it fails as a budget always did
+    let again: string | null = null;
+    try { await desk.say("and?"); } catch (e) { again = (e as { code?: string }).code ?? "thrown"; }
+    return { text: r.text, stopped: r.stopped, turns: r.turns, reason: r.reason, again };
   }, { input: "x", fetchImpl: h1.fetch, env: env(), config: tight });
   assertEquals((r1.result as any).stopped, "budget");
-  assertEquals((r1.result as any).value, "unsure");
+  assertEquals((r1.result as any).text, "Let me look.");
   assertEquals((r1.result as any).turns, 1);
-  assert(String((r1.result as any).reason).includes("turns 2/1"), String((r1.result as any).reason));
-  assert(r1.trace.events.some((e) => e.name === "sand.confirm" && e.kind === "span.start" && e.attrs?.kind === "budget"), "the budget asked, as a confirm of kind budget");
+  assert(String((r1.result as any).reason).includes("turns 2/1") && !String((r1.result as any).reason).includes("carry it on"), String((r1.result as any).reason));
+  assert(!r1.trace.events.some((e) => e.name === "sand.confirm"), "nobody to ask: no question was raised");
+  assertEquals((r1.result as any).again, "E-BUDGET");
   assertEquals(h1.calls.length, 1);
+  // the history holds the round once: the question, the assistant's words beside its call, the tool's answer
+  const desk = (r1.session?.state?.chats ?? {})["desk"] ?? [];
+  assertEquals(desk.map((m: { role: string }) => m.role), ["user", "assistant", "tool", "user"].slice(0, desk.length), JSON.stringify(desk).slice(0, 300));
+  assertEquals(desk.filter((m: { role: string; content?: unknown }) => m.role === "assistant" && String(m.content ?? "").startsWith("Let me look")).length, 1);
   // the person says go on: the limits grow by their first size, and the reply finishes
   const asked: { kind?: string; args?: { block?: { turns?: number } } }[] = [];
   const h2 = host([call, () => said("done")]);
@@ -388,6 +398,19 @@ Deno.test("assistant: past the budget the person is asked; a yes carries the rep
   assertEquals(asked[0].args?.block?.turns, 1);
   assertEquals(r2.trace.budget.limits.turns, 2);
   assertEquals(r2.trace.budget.extensions, 1);
+  // a no sticks: the next check throws without asking again
+  let asks = 0;
+  const h3 = host([call, () => said("done")]);
+  const r3 = await run(async () => {
+    const desk = assistant("you are a desk", { tools: [look], settle: { turns: 4 }, name: "desk" });
+    const r = await desk.say("go");
+    let second: string | null = null;
+    try { await desk.say("more"); } catch (e) { second = (e as { code?: string }).code ?? "thrown"; }
+    return { stopped: r.stopped, second };
+  }, { input: "x", fetchImpl: h3.fetch, env: env(), config: tight, confirm: () => { asks++; return false; } });
+  assertEquals(r3.result as any, { stopped: "budget", second: "E-BUDGET" });
+  assertEquals(asks, 1);
+  assertEquals(r3.trace.budget.declined, true);
 });
 
 Deno.test("usage: a cached prompt token counts a tenth against the budget, the rest whole", () => {
