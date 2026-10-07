@@ -14,7 +14,7 @@
  * shape, or is not reachable from this host), `E-FENCE` (the fence a run asked
  * for could not be built, so the run did not happen), `E-ANSWER-SHAPE`,
  * `E-BUDGET`, `E-TIMEOUT`, `E-RUNTIME`, `E-NO-MODEL`. Warnings are `sand.log`
- * lines, never codes: `W-UNCALIBRATED`, `W-UNMETERED`, `W-NOBODY`.
+ * lines, never codes: `W-UNCALIBRATED`, `W-UNMETERED`, `W-NOBODY`, `W-TOOL-CALL`.
  */
 
 export class SandError extends Error {

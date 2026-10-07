@@ -397,3 +397,46 @@ Deno.test("usage: a cached prompt token counts a tenth against the budget, the r
   assertEquals(billable(null), null);
   assertEquals(billable({}), null);
 });
+
+Deno.test("assistant: a tool call the host could not read is told to the model once, off the record; twice ends the reply, not the run", async () => {
+  const bad = () => new Response(JSON.stringify({ error: { code: 500, message: "Failed to parse tool call arguments as JSON: [json.exception.parse_error.101] parse error at line 1, column 1655: syntax error while parsing value - invalid string: missing closing quote; last read: '\"cat >" } }), { status: 500, headers: { "content-type": "application/json" } });
+  const Why = shape({ why: text("why") }, { name: "Why" });
+  const look = tool("look", Why, async () => "seen", { name: "look" });
+  // once: the model is told, on the wire only, and answers
+  const h = host([bad, () => said("done"), () => said("again")]);
+  const r = await run(async () => {
+    const desk = assistant("you are a desk", { tools: [look], settle: { turns: 4 }, name: "desk" });
+    const a = await desk.say("go");
+    const b = await desk.say("more");
+    return { text: a.text, stopped: a.stopped, turns: a.turns, later: b.text };
+  }, { input: "x", fetchImpl: h.fetch, env: env(), config: CFG });
+  assertEquals(r.result as any, { text: "done", stopped: null, turns: 1, later: "again" });
+  assertEquals(h.calls.length, 3);
+  const nudge = h.calls[1].messages.at(-1);
+  assertEquals(nudge.role, "user");
+  assert(String(nudge.content).includes("could not be read by the host") && String(nudge.content).includes("missing closing quote"), String(nudge.content));
+  assert(!String(nudge.content).includes("Nothing was charged"), "the host's tail is not repeated to the model");
+  assertEquals(h.calls[1].messages.length, h.calls[0].messages.length + 1);
+  // the note never entered the conversation: the next turn's wire holds the question, the answer and the new question
+  assert(!h.calls[2].messages.some((m: { content?: unknown }) => String(m.content ?? "").includes("could not be read")), "off the record");
+  assertEquals(h.calls[2].messages.slice(-3).map((m: { role: string }) => m.role), ["user", "assistant", "user"]);
+  assert(r.trace.events.some((e) => e.name === "sand.log" && String(e.output).includes("W-TOOL-CALL")));
+  // twice: the reply ends with what it has and says why; the run goes on
+  const h2 = host([bad, bad]);
+  const r2 = await run(async () => {
+    const desk = assistant("you are a desk", { tools: [look], settle: { turns: 4 }, name: "desk" });
+    const a = await desk.say("go");
+    return { value: a.value === unsure ? "unsure" : a.value, stopped: a.stopped, reason: a.reason };
+  }, { input: "x", fetchImpl: h2.fetch, env: env(), config: CFG });
+  assertEquals((r2.result as any).stopped, "tool_call");
+  assertEquals((r2.result as any).value, "unsure");
+  assert(String((r2.result as any).reason).includes("twice"), String((r2.result as any).reason));
+  assertEquals(h2.calls.length, 2);
+  // any other host error still fails the turn as before
+  const h3 = host([() => new Response(JSON.stringify({ error: { message: "the model host is on fire" } }), { status: 500, headers: { "content-type": "application/json" } })]);
+  const err = await assertRejects(() => run(async () => {
+    const desk = assistant("you are a desk", { tools: [look], name: "desk" });
+    return desk.say("go");
+  }, { input: "x", fetchImpl: h3.fetch, env: env(), config: CFG }), SandError) as SandError;
+  assertEquals(err.code, "E-HOST");
+});

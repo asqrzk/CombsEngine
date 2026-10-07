@@ -27,13 +27,16 @@ import { emit as emitPiece, emitThinking } from "./effects.js";
 import { toolsOf } from "./tools.js";
 
 const DEFAULT_KEEP = 40;
+/** A host's refusal of the model's own tool call: its arguments were not JSON it could read. */
+const BAD_CALL = /tool[ _-]?call[\s\S]{0,80}(parse|json)|(parse|json)[\s\S]{0,80}tool[ _-]?call/i;
+
 const DEFAULT_TURNS = 8;
 
 export class Reply {
   constructor({ text = "", stopped = null, turns = 0, tokens = 0, calls = [], reason = null, finish = null, model = null, thinking = "", thinkingMs = 0 } = {}) {
     this.text = text;
     this.stopped = stopped;
-    this.value = stopped === "turns" || stopped === "empty" || stopped === "aborted" || (stopped === "budget" && !text) ? unsure : text;
+    this.value = stopped === "turns" || stopped === "empty" || stopped === "aborted" || ((stopped === "budget" || stopped === "tool_call") && !text) ? unsure : text;
     this.turns = turns;
     this.tokens = tokens;
     this.calls = calls;
@@ -112,6 +115,9 @@ export class Conversation {
     const keepPartial = (piece) => { partial += piece; };
     let thinking = "", thinkingMs = 0, thoughtNow = "";
     const onThought = streaming ? (piece) => { thoughtNow += piece; if (opts.emit) emitThinking(piece, { at }); opts.onThinking?.(piece); } : null;
+    // a tool call the host could not read (its arguments were not JSON) is told to the model once, on the wire of the
+    // next round only: the note is never part of the conversation
+    let nudge = null, badCalls = 0;
 
     for (let round = 0; round < (this.tools ? maxTurns : 1); round++) {
       try {
@@ -121,7 +127,7 @@ export class Conversation {
         if (e?.code === "E-BUDGET" && turns > 0) { answer = answer || partial; stopped = "budget"; reason = e.message; break; }
         throw e;
       }
-      const wire = onWire(this.system, [...this.#messages, ...pending], this.keep);
+      const wire = onWire(this.system, [...this.#messages, ...pending, ...(nudge ? [nudge] : [])], this.keep);
       const t0 = Date.now();
       let r;
       thoughtNow = "";
@@ -140,8 +146,21 @@ export class Conversation {
           thinking += (thinking && thoughtNow ? "\n\n" : "") + thoughtNow;
           break;
         }
+        if (this.tools && BAD_CALL.test(String(e?.message ?? ""))) {
+          const said = String(e?.message ?? "").replace(/\s*Nothing was charged\.\s*$/, "").slice(0, 300);
+          if (badCalls === 0 && round + 1 < maxTurns) {
+            badCalls++;
+            nudge = { role: "user", content: `Your last tool call could not be read by the host: ${said}. Call the tool again with arguments that are valid JSON: one string per argument, quotes escaped, line breaks written as \\n and never raw, nothing outside the JSON; or answer without the tool.` };
+            warnOnce(ctx, `badcall:${at ?? ""}`, `W-TOOL-CALL: ${name}'s tool call could not be read by the host (${said.slice(0, 120)}); it was asked once more`);
+            continue;
+          }
+          // told once already and wrong again: the reply ends with what it has, and says why, instead of failing the run
+          answer = answer || partial; stopped = "tool_call"; reason = `the model wrote a tool call the host could not read, twice: ${said}`;
+          break;
+        }
         throw e;
       }
+      nudge = null;
       turns++;
       thinking += (thinking && r.thinking ? "\n\n" : "") + (r.thinking ?? "");
       thinkingMs += r.thinkingMs ?? 0;
