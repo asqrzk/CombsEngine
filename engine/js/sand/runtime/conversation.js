@@ -29,6 +29,12 @@ import { toolsOf } from "./tools.js";
 const DEFAULT_KEEP = 40;
 /** A host's refusal of the model's own tool call: its arguments were not JSON it could read. */
 const BAD_CALL = /tool[ _-]?call[\s\S]{0,80}(parse|json)|(parse|json)[\s\S]{0,80}tool[ _-]?call/i;
+/** The error codes a host's refusal of a tool call arrives under: a plain answer, a stream, or a 4xx. */
+const HOST_CODES = new Set(["E-HOST", "E-STREAM", "E-WIRE"]);
+/** Was this error the host refusing the model's own tool call? */
+const refusedCall = (e) => HOST_CODES.has(e?.code) && BAD_CALL.test(String(e?.message ?? ""));
+/** A stop that keeps the last round's words rather than the usual unsure. */
+const KEEPS_TEXT = new Set(["budget", "tool_call"]);
 
 const DEFAULT_TURNS = 8;
 
@@ -36,7 +42,8 @@ export class Reply {
   constructor({ text = "", stopped = null, turns = 0, tokens = 0, calls = [], reason = null, finish = null, model = null, thinking = "", thinkingMs = 0 } = {}) {
     this.text = text;
     this.stopped = stopped;
-    this.value = stopped === "turns" || stopped === "empty" || stopped === "aborted" || ((stopped === "budget" || stopped === "tool_call") && !text) ? unsure : text;
+    // a stopped reply is unsure, unless the stop keeps what was said and something was
+    this.value = stopped === null || stopped === "length" || (KEEPS_TEXT.has(stopped) && text) ? text : unsure;
     this.turns = turns;
     this.tokens = tokens;
     this.calls = calls;
@@ -111,29 +118,26 @@ export class Conversation {
     const maxTurns = Math.max(1, opts.settle?.turns ?? this.settle.turns ?? DEFAULT_TURNS);
     const pending = [{ role: "user", content: said }];
     const calls = [];
-    let tokens = 0, turns = 0, answer = "", finish = null, stopped = null, reason = null, partial = "";
-    const keepPartial = (piece) => { partial += piece; };
-    let thinking = "", thinkingMs = 0, thoughtNow = "";
+    // the turn's state, in one place: what was said, what stopped it, and what each round leaves behind
+    const turn = { tokens: 0, turns: 0, answer: "", finish: null, stopped: null, reason: null, partial: "", thinking: "", thinkingMs: 0, lastText: "", kept: false, nudge: null, nudged: false };
+    let thoughtNow = "";
     const onThought = streaming ? (piece) => { thoughtNow += piece; if (opts.emit) emitThinking(piece, { at }); opts.onThinking?.(piece); } : null;
-    // a tool call the host could not read (its arguments were not JSON) is told to the model once, on the wire of the
-    // next round only: the note is never part of the conversation
-    let nudge = null, badCalls = 0;
-    // what the last finished round said (already in the history when it asked for tools): a stop keeps it, once
-    let lastText = "", kept = false;
+    // a stop that keeps the last finished round's words (already in the history beside its tool call) keeps them once
+    const stop = (stopped, reason, text) => { turn.stopped = stopped; turn.reason = reason; turn.answer = text; turn.kept = KEEPS_TEXT.has(stopped); };
 
     for (let round = 0; round < (this.tools ? maxTurns : 1); round++) {
       try {
         await ctx.budget.check({ turns: 1, tokens: 0 }, at);
       } catch (e) {
         // past the budget after a round or more: what was paid for is kept, and the reply says it stopped
-        if (e?.code === "E-BUDGET" && turns > 0) { answer = lastText; kept = true; stopped = "budget"; reason = e.message; break; }
+        if (e?.code === "E-BUDGET" && turn.turns > 0) { stop("budget", e.message, turn.lastText); break; }
         throw e;
       }
-      const wire = onWire(this.system, [...this.#messages, ...pending, ...(nudge ? [nudge] : [])], this.keep);
+      const wire = onWire(this.system, [...this.#messages, ...pending, ...(turn.nudge ? [turn.nudge] : [])], this.keep);
       const t0 = Date.now();
       let r;
       thoughtNow = "";
-      partial = "";
+      turn.partial = "";
       try {
         r = await ctx.budget.gate.run(() => adapter.complete({
           messages: wire,
@@ -141,41 +145,27 @@ export class Conversation {
           stream: streaming,
           maxTokens: opts.maxTokens ?? this.maxTokens ?? 1024,
           temperature: opts.temperature ?? this.temperature ?? 0.2,
-        }, { at, signal: opts.signal ?? ctx.signal, onDelta: onDelta ? (p) => { keepPartial(p); onDelta(p); } : null, onThinking: onThought }));
+        }, { at, signal: opts.signal ?? ctx.signal, onDelta: onDelta ? (p) => { turn.partial += p; onDelta(p); } : null, onThinking: onThought }));
       } catch (e) {
-        ctx.emit("sand.request", "event", { status: "error", model: name, road: "", questions: 0, ms: Date.now() - t0, verb: "say", at }, { input: wire, status: "error", error: String(e?.message ?? e) });
-        if (opts.abortIsAnswer && (e?.code === "E-TIMEOUT" || e?.name === "AbortError")) {
-          answer = partial; stopped = "aborted"; reason = "the reply was stopped before it finished"; turns++;
-          thinking += (thinking && thoughtNow ? "\n\n" : "") + thoughtNow;
-          break;
-        }
-        if (this.tools && BAD_CALL.test(String(e?.message ?? ""))) {
-          const said = String(e?.message ?? "").replace(/\s*Nothing was charged\.\s*$/, "").slice(0, 300);
-          if (badCalls === 0 && round + 1 < maxTurns) {
-            badCalls++;
-            nudge = { role: "user", content: `Your last tool call could not be read by the host: ${said}. Call the tool again with arguments that are valid JSON: one string per argument, quotes escaped, line breaks written as \\n and never raw, nothing outside the JSON; or answer without the tool.` };
-            warnOnce(ctx, `badcall:${at ?? ""}`, `W-TOOL-CALL: ${name}'s tool call could not be read by the host (${said.slice(0, 120)}); it was asked once more`);
-            continue;
-          }
-          // told once already and wrong again: the reply ends with what it has, and says why, instead of failing the run
-          answer = lastText; kept = true; stopped = "tool_call"; reason = `the model wrote a tool call the host could not read, twice: ${said}`;
-          break;
-        }
+        ctx.emit("sand.request", "event", { status: "error", model: name, road: "", questions: 0, ms: Date.now() - t0, verb: "say", at }, { input: wire, status: "error", error: e?.message ?? String(e) });
+        const next = this.#afterError(ctx, e, turn, { name, at, round, maxTurns, abortIsAnswer: !!opts.abortIsAnswer, thoughtNow });
+        if (next === "retry") continue;
+        if (next === "stop") break;
         throw e;
       }
-      nudge = null;
-      turns++;
-      thinking += (thinking && r.thinking ? "\n\n" : "") + (r.thinking ?? "");
-      thinkingMs += r.thinkingMs ?? 0;
-      tokens += r.tokens ?? 0;
+      turn.nudge = null;
+      turn.turns++;
+      turn.thinking += (turn.thinking && r.thinking ? "\n\n" : "") + (r.thinking ?? "");
+      turn.thinkingMs += r.thinkingMs ?? 0;
+      turn.tokens += r.tokens ?? 0;
       ctx.budget.record({ turns: 1, tokens: r.tokens ?? 0, completions: 1 });
       if (r.estimated) warnOnce(ctx, `unmetered:${name}`, `W-UNMETERED: ${name} reported no usage; tokens are estimated at one per four characters`);
-      ctx.emit("sand.request", "event", { status: "ok", model: name, road: "", questions: 0, tokens: r.tokens ?? 0, ms: r.ms, verb: "say", at }, { input: wire, output: r.text });
-      ctx.emit("sand.turn", "event", { at, chat: this.name ?? "", turn: turns, model: name, stop: r.finish ?? "", tokens: r.tokens ?? 0, ms: r.ms, calls: r.toolCalls?.length ?? 0 }, { output: r.text });
-      finish = r.finish ?? null;
-      lastText = r.text ?? "";
+      ctx.emit("sand.request", "event", { status: "ok", model: name, road: "", questions: 0, tokens: r.tokens ?? 0, ms: r.ms, verb: "say", at }, { input: wire, output: r.text ?? "", tools: r.toolCalls?.length ?? 0 });
+      ctx.emit("sand.turn", "event", { at, chat: this.name ?? "", turn: turn.turns, model: name, stop: r.finish ?? "", tokens: r.tokens ?? 0, ms: r.ms, calls: r.toolCalls?.length ?? 0 });
+      turn.finish = r.finish ?? null;
+      turn.lastText = r.text ?? "";
       if (this.tools && r.toolCalls?.length) {
-        pending.push({ role: "assistant", content: r.text || null, tool_calls: r.toolCalls.map((c) => ({ id: c.id, type: "function", function: { name: c.name, arguments: c.arguments } })) });
+        pending.push({ role: "assistant", content: r.text || null, tool_calls: r.toolCalls.map((c) => ({ id: c.id, type: "function", function: { name: c.name, arguments: JSON.stringify(c.args ?? {}) } })) });
         for (const call of r.toolCalls) {
           const done = await this.#runTool(ctx, call, at);
           calls.push(done.record);
@@ -183,21 +173,44 @@ export class Conversation {
         }
         continue;
       }
-      answer = r.text ?? "";
+      turn.answer = r.text ?? "";
       break;
     }
 
-    if (!stopped && this.tools && !answer && calls.length && turns >= maxTurns) {
-      stopped = "turns";
-      reason = `the assistant asked for a tool ${turns} times without answering; raise settle({ turns })`;
+    if (!turn.stopped && this.tools && !turn.answer && calls.length && turn.turns >= maxTurns) {
+      stop("turns", `the assistant asked for a tool ${turn.turns} times without answering; raise settle({ turns })`, turn.answer);
     }
-    if (!stopped && finish === "length") { stopped = "length"; reason = "the model reached its token ceiling; raise maxTokens"; }
-    if (!stopped && !answer.trim()) { stopped = "empty"; reason = "the model answered with nothing"; }
-    if (answer && !kept) pending.push({ role: "assistant", content: answer });
+    if (!turn.stopped && turn.finish === "length") stop("length", "the model reached its token ceiling; raise maxTokens", turn.answer);
+    if (!turn.stopped && !turn.answer.trim()) stop("empty", "the model answered with nothing", turn.answer);
+    if (turn.answer && !turn.kept) pending.push({ role: "assistant", content: turn.answer });
     this.#messages.push(...pending);
-    const reply = new Reply({ text: answer, stopped, turns, tokens, calls, reason, finish, model: name, thinking, thinkingMs });
+    const reply = new Reply({ text: turn.answer, stopped: turn.stopped, turns: turn.turns, tokens: turn.tokens, calls, reason: turn.reason, finish: turn.finish, model: name, thinking: turn.thinking, thinkingMs: turn.thinkingMs });
     this.#last = reply;
     return reply;
+  }
+
+  /**
+   * What a round's failure means for the turn: "retry" (the model is told once that the host could not read its
+   * tool call, on the next wire only), "stop" (the turn ends with what it has), or "throw" (the error is the run's).
+   */
+  #afterError(ctx, e, turn, { name, at, round, maxTurns, abortIsAnswer, thoughtNow }) {
+    if (abortIsAnswer && (e?.code === "E-TIMEOUT" || e?.name === "AbortError")) {
+      turn.turns++;
+      turn.thinking += (turn.thinking && thoughtNow ? "\n\n" : "") + thoughtNow;
+      turn.stopped = "aborted"; turn.reason = "the reply was stopped before it finished"; turn.answer = turn.partial;
+      return "stop";
+    }
+    if (!this.tools || !refusedCall(e)) return "throw";
+    const refusal = String(e?.message ?? "").replace(/\s*Nothing was charged\.\s*$/, "").slice(0, 300);
+    if (!turn.nudged && round + 1 < maxTurns) {
+      turn.nudged = true;
+      turn.nudge = { role: "user", content: `Your last tool call could not be read by the host: ${refusal}. Call the tool again with arguments that are valid JSON: one string per argument, quotes escaped, line breaks written as \\n and never raw, nothing outside the JSON; or answer without the tool.` };
+      warnOnce(ctx, `badcall:${at ?? ""}`, `W-TOOL-CALL: ${name}'s tool call could not be read by the host (${refusal.slice(0, 120)}); it was asked once more`);
+      return "retry";
+    }
+    // told once already and wrong again: the reply ends with what it has, and says why, instead of failing the run
+    turn.stopped = "tool_call"; turn.reason = `the model wrote a tool call the host could not read, twice: ${refusal}`; turn.answer = turn.lastText; turn.kept = true;
+    return "stop";
   }
 
   /** The reply as it arrives. Breaking the loop stops the model. */
