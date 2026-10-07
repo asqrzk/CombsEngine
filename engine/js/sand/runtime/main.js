@@ -67,7 +67,13 @@ async function childMain(main, opts) {
     confirm: (question, ctx = {}) => new Promise((resolve) => {
       const id = `c${++confirmSeq}`;
       pending.set(id, resolve);
-      writeLine(Deno.stderr, { id, ts: Date.now(), source: "sand", kind: "ask", name: "sand.confirm", traceId, attrs: { id, at: ctx.at ?? "", wait: ctx.wait ?? "" }, input: question });
+      // an ask with a kind carries its arguments out, as the one thing the person's side needs to act on
+      const kind = typeof ctx.kind === "string" && ctx.kind ? ctx.kind : null;
+      writeLine(Deno.stderr, {
+        id, ts: Date.now(), source: "sand", kind: "ask", name: "sand.confirm", traceId,
+        attrs: { id, at: ctx.at ?? "", wait: ctx.wait ?? "", ...(kind ? { kind } : {}) },
+        input: kind ? { question, kind, args: ctx.args ?? null } : question,
+      });
     }),
   });
 
@@ -85,7 +91,12 @@ async function childMain(main, opts) {
       }
       if (msg && typeof msg === "object" && msg.confirm) {
         const key = msg.confirm.id ?? pending.keys().next().value; // no id: the question being asked
-        if (key != null && pending.has(key)) { const resolve = pending.get(key); pending.delete(key); resolve(msg.confirm.answer); }
+        if (key != null && pending.has(key)) {
+          const resolve = pending.get(key);
+          pending.delete(key);
+          // an answer may carry data for an ask that named a kind; a bare answer is what it always was
+          resolve("data" in msg.confirm ? { answer: msg.confirm.answer, data: msg.confirm.data, by: msg.confirm.by ?? "port" } : msg.confirm.answer);
+        }
         continue;
       }
       queue.push(typeof msg === "string" ? { input: msg } : msg && typeof msg === "object" ? msg : { input: line });

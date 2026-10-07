@@ -94,27 +94,39 @@ export function verdictOf(answer) {
   return verdict(answer);
 }
 
+/** A kind names what a `confirm` asks for beyond a verdict: a short name of letters, digits and underscores. */
+const KIND = /^[a-z][a-z0-9_]{0,63}$/;
+/** The most an ask's arguments may weigh, as JSON: they travel to the person as one trace line. */
+const ARGS_MAX = 48 * 1024;
+
 /**
  * Asks a person. `true`, `false`, or `unsure` when nobody was there or the
- * wait elapsed. The budget clock pauses for the whole wait.
- * @param {string} question @param {{wait?: number, at?: string}} opts
+ * wait elapsed. The budget clock pauses for the whole wait. With a `kind`,
+ * the ask is for something, not only a verdict: the answer is then
+ * `{answer, data?, by}`, `data` being what the person gave with it (a
+ * reading from their computer, a command's result), never kept in the trace.
+ * @param {string} question @param {{wait?: number, at?: string, kind?: string, args?: unknown}} opts
  */
 export async function confirm(question, opts = {}) {
   const ctx = ctxNow(opts.at);
   const q = String(question ?? "").trim();
   if (!q) throw new SandError("E-STATE", "confirm needs a question to ask", { at: opts.at });
+  const kind = opts.kind === undefined || opts.kind === null ? null : String(opts.kind);
+  if (kind !== null && !KIND.test(kind)) throw new SandError("E-STATE", "confirm's kind is a short name of letters, digits and underscores, like link_reading", { at: opts.at });
+  const args = kind === null ? undefined : opts.args === undefined ? null : opts.args;
+  if (kind !== null && JSON.stringify(args).length > ARGS_MAX) throw new SandError("E-STATE", `confirm's args are at most ${ARGS_MAX} bytes of JSON`, { at: opts.at });
   const port = ctx.confirmPort ?? ports.confirm ?? null;
   const wait = opts.wait ?? ctx.budget.limits.wait ?? null;
-  ctx.emit("sand.confirm", "span.start", { at: opts.at ?? undefined }, { input: q });
+  ctx.emit("sand.confirm", "span.start", { at: opts.at ?? undefined, ...(kind === null ? {} : { kind }) }, { input: kind === null ? q : { question: q, kind, args } });
   const t0 = Date.now();
-  let answer = unsure, by = "nobody";
+  let answer = unsure, by = "nobody", data;
   ctx.budget.pause();
   try {
     if (!port) {
       warnOnce(ctx, `nobody:${opts.at ?? q}`, `W-NOBODY: nobody is here to answer "${q.slice(0, 80)}"; it is unsure. Answer it with sand run --yes/--no/--unsure, or give the run a confirm port.`);
     } else {
       let timer = null;
-      const asked = Promise.resolve().then(() => port(q, { wait, at: opts.at ?? null, signal: ctx.signal ?? null }));
+      const asked = Promise.resolve().then(() => port(q, { wait, at: opts.at ?? null, signal: ctx.signal ?? null, ...(kind === null ? {} : { kind, args }) }));
       const raced = wait == null ? asked : Promise.race([asked, new Promise((r) => { timer = setTimeout(() => r(TIMED_OUT), wait); })]);
       let got;
       try { got = await raced; } finally { if (timer != null) clearTimeout(timer); }
@@ -123,13 +135,18 @@ export async function confirm(question, opts = {}) {
       } else {
         answer = verdictOf(got);
         by = (got && typeof got === "object" && typeof got.by === "string" ? got.by : null) ?? "port";
+        if (kind !== null && got && typeof got === "object" && "data" in got) data = got.data;
       }
     }
   } finally {
     ctx.budget.resume();
   }
   const waited = Date.now() - t0;
-  ctx.emit("sand.confirm", "span.end", { at: opts.at ?? undefined, answer: answer === unsure ? "unsure" : String(answer), waited, by }, { input: q, output: answer === unsure ? "unsure" : answer });
-  return answer;
+  const dataBytes = data === undefined ? undefined : JSON.stringify(data).length;
+  ctx.emit("sand.confirm", "span.end", {
+    at: opts.at ?? undefined, answer: answer === unsure ? "unsure" : String(answer), waited, by,
+    ...(kind === null ? {} : { kind }), ...(dataBytes === undefined ? {} : { data_bytes: dataBytes }),
+  }, { input: q, output: answer === unsure ? "unsure" : answer });
+  return kind === null ? answer : { answer, data, by };
 }
 const TIMED_OUT = Symbol("sand.confirm.timeout");

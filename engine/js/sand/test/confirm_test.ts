@@ -125,3 +125,57 @@ Deno.test("confirm: an empty question is refused", async () => {
   const err = await assertRejects(() => run(async () => confirm("  "), { input: "x", env: env() }), SandError) as SandError;
   assertEquals(err.code, "E-STATE");
 });
+
+Deno.test("confirm with a kind: the port is told what is asked for, and the answer carries data back", async () => {
+  const seen: unknown[] = [];
+  const { result, trace } = await run(async () => {
+    const got = await confirm("Read the open ports from your computer?", { kind: "link_reading", args: { tool: "listening_ports" }, at: "5:1" });
+    const plain = await confirm("and a plain question?", { at: "6:1" });
+    return { answer: got.answer === unsure ? "unsure" : got.answer, data: got.data, by: got.by, plain: plain === unsure ? "unsure" : plain };
+  }, {
+    input: "x", env: env(),
+    confirm: (q: string, ctx: Record<string, unknown>) => {
+      seen.push({ q, kind: ctx.kind, args: ctx.args });
+      return (ctx.kind ? { answer: true, data: { block: "Listening ports, read from this computer:\n```json\n{}\n```" }, by: "page" } : "no") as never;
+    },
+  });
+  assertEquals(result, { answer: true, data: { block: "Listening ports, read from this computer:\n```json\n{}\n```" }, by: "page", plain: false });
+  assertEquals(seen, [
+    { q: "Read the open ports from your computer?", kind: "link_reading", args: { tool: "listening_ports" } },
+    { q: "and a plain question?", kind: undefined, args: undefined },
+  ]);
+  const asks = trace.events.filter((e) => e.name === "sand.confirm" && e.kind === "span.start");
+  assertEquals(asks[0].attrs?.kind, "link_reading");
+  assertEquals(asks[0].input, { question: "Read the open ports from your computer?", kind: "link_reading", args: { tool: "listening_ports" } });
+  assertEquals(asks[1].input, "and a plain question?");
+  assertEquals(asks[1].attrs?.kind, undefined);
+  const ends = trace.events.filter((e) => e.name === "sand.confirm" && e.kind === "span.end");
+  assertEquals(ends[0].attrs?.kind, "link_reading");
+  assertEquals(ends[0].attrs?.answer, "true");
+  assertEquals(ends[0].output, true, "the data is the program's, never the trace's");
+  assert(Number(ends[0].attrs?.data_bytes) > 10, String(ends[0].attrs?.data_bytes));
+});
+
+Deno.test("confirm with a kind: nobody, or a port that gives no data, answers with no data; a bad kind or oversize args are refused", async () => {
+  setPorts({ confirm: null });
+  const { result } = await run(async () => {
+    const got = await confirm("may I read?", { kind: "link_reading", args: { tool: "dns" }, at: "7:1" });
+    return { answer: got.answer === unsure ? "unsure" : got.answer, data: got.data };
+  }, { input: "x", env: env() });
+  assertEquals(result, { answer: "unsure", data: undefined });
+  const { result: r2 } = await run(async () => {
+    const got = await confirm("may I read?", { kind: "link_reading", at: "8:1" });
+    return { answer: got.answer, data: got.data };
+  }, { input: "x", env: env(), confirm: () => "yes" as never });
+  assertEquals(r2, { answer: true, data: undefined });
+  await assertRejects(
+    () => run(async () => await confirm("x?", { kind: "Not A Kind", at: "9:1" }), { input: "x", env: env(), confirm: () => true as never }),
+    SandError,
+    "kind",
+  );
+  await assertRejects(
+    () => run(async () => await confirm("x?", { kind: "link_files", args: { content: "x".repeat(60_000) }, at: "10:1" }), { input: "x", env: env(), confirm: () => true as never }),
+    SandError,
+    "args",
+  );
+});

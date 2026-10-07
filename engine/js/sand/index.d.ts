@@ -156,6 +156,13 @@ export declare function memory(name: string, opts?: { model?: string; name?: str
 // ── output, and asking a person ───────────────────────────────────────────
 /** A piece of output for whoever listens. Sync; never fails. */
 export declare function emit(piece: unknown, opts?: { at?: string }): void;
+/** What a person gives with their answer when a `confirm` asked for something: the verdict, the data, and who answered. */
+export interface Given<D = unknown> { answer: Verdict; data?: D; by?: string }
+/**
+ * Asks a person for something: with a `kind` (a short name such as `link_reading`) and `args` (48 KiB of JSON at
+ * most), the answer is `{answer, data?}`, the data what they gave with it; the trace keeps the size, never the data.
+ */
+export declare function confirm<D = unknown>(question: string, opts: { kind: string; args?: unknown; wait?: number; at?: string }): Promise<Given<D>>;
 /** Asks a person; `unsure` when nobody was there or the wait elapsed. The clock pauses. */
 export declare function confirm(question: string, opts?: { wait?: number; at?: string }): Promise<Verdict>;
 export declare function pieceText(piece: unknown): string;

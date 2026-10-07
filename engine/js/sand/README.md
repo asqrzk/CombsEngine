@@ -142,11 +142,14 @@ A memory is a named store that outlives the run: the platform's (`POST {url}/v1/
 
 ```ts
 confirm(question, { wait? })    → true | false | unsure
+confirm(question, { kind, args?, wait? }) → { answer, data? }   asks for something; the data is what the person gave
 parallel(items, fn, { limit?, tolerate? }) · race(…) · timeout(ms, p) · retry(fn, { times?, on? })
 using(model, fn) · named(text, noun) · log(…parts)
 ```
 
 `confirm` asks a person and answers a verdict, so `and`/`or`/`not` compose and an `unsure` block catches "nobody was there". At a terminal `sand run` prompts `[y/n/?]`; with several workers or no terminal, `--yes`, `--no` or `--unsure` answers for everyone; in a page it is the `confirm` port; hosted, the run pauses and a resume answers it. Nobody, or a `wait` that elapses, is `unsure` and one `W-NOBODY` line. **The budget clock stops for the whole wait**, so a slow answer never spends the `ms` limit; what it took is `waited` in the trace.
+
+With a `kind`, `confirm` asks for something, not only a verdict: `confirm("Read the open ports from your computer?", { kind: "link_reading", args: { tool: "listening_ports" } })` answers `{ answer, data? }`, the data being what the person's side gave back (a reading, a command's result; 64 KiB at most through a host), and the ask line carries `kind` and `args` (48 KiB of JSON at most) for whoever answers. The trace keeps the question, the kind and the data's size, never the data. At a terminal there is no data to give, so `data` is absent; nobody, or a wait that runs out, is `{ answer: unsure }`.
 
 `settle({ passes, tokens, ms, turns, wait })` is the budget: a call that would cross it rejects with `E-BUDGET` and the trace shows what was spent. A program can lower what `sand.json` allows, never raise it. One `say` is one **turn** (32 by default); `wait` bounds how long a `confirm` waits for a person.
 
@@ -219,7 +222,7 @@ Exit codes: 0 ok · 1 a compile or type error · 2 usage, no decision model, or 
 | in | `{sand:"1", config, limits, file?, memoryDir?, traceId?}` — the preamble, first and once |
 | out | `{sand:"1", ready:true}` — it read the preamble and the fence held |
 | in | `{input, session?, traceId?}` — one run (a bare JSON string is still an input) |
-| in | `{confirm:{id, answer}}` — at any time: a person's answer |
+| in | `{confirm:{id, answer, data?}}` — at any time: a person's answer, with what they gave when the ask named a kind |
 | out | `{result, session?}` or `{error:{code,message,at}, session?}` — one envelope per input, in order |
 | err | one trace event per line, including the `sand.confirm` ask that carries the `id` |
 

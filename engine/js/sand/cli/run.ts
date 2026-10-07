@@ -191,7 +191,7 @@ export async function runCommand(file: string, flags: RunFlags): Promise<number>
       if (ev.name === "sand.turn") totals.turns++;
       if (ev.name === "sand.output" && !flags.quiet && typeof ev.output === "string") { wrotePieces = true; Deno.stderr.writeSync(enc.encode(ev.output)); return; }
       if (ev.name === "sand.confirm" && ev.kind === "ask") {
-        const question = typeof ev.input === "string" ? ev.input : "may I?";
+        const question = typeof ev.input === "string" ? ev.input : typeof ev.input?.question === "string" ? ev.input.question : "may I?";
         if (canAsk) { hold(); const said = askAtTerminal(question); arm(); tell({ confirm: { id: ev.attrs?.id, answer: { answer: said, by: "tty" } } }); return; }
         if (flagAnswer !== undefined) { tell({ confirm: { id: ev.attrs?.id, answer: { answer: flagAnswer, by: "tty" } } }); return; }
         if (!saidNobody) { saidNobody = true; console.error(`W-NOBODY · nobody is here to answer "${question.slice(0, 80)}"; it is unsure. Answer with --yes, --no or --unsure, or run one input from a terminal.`); }

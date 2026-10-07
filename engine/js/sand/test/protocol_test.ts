@@ -177,3 +177,44 @@ Deno.test("sand run: a bogus permission flag ends the command with E-FENCE and e
   assert(!dec.decode(bad.stdout).includes('"q"'), "a refused fence never runs the program");
   await Deno.remove(dir, { recursive: true });
 });
+
+Deno.test("protocol: an ask with a kind carries its arguments out, and the answer's data comes back in", async () => {
+  const api = fakeApi();
+  const src = `settle({ wait: 5000 });
+const got = confirm("Read the ports?", { kind: "link_reading", args: { tool: "listening_ports" } });
+return { answer: got.answer === unsure ? "unsure" : got.answer, block: got.data?.block ?? null };
+`;
+  const built = await buildInto(src, "asker");
+  const config = {
+    models: { combs: { kind: "decision", url: `http://${api.host}`, key: "k", road: "seat" } },
+    default: { decide: "combs", ask: "none", memory: "none" },
+  };
+  const child = spawn(built.ts, built.dir, [`--allow-net=${api.host}`, "--allow-env=SAND_CHILD"]);
+  const writer = child.stdin.getWriter();
+  const tell = (o: unknown) => writer.write(enc.encode(JSON.stringify(o) + "\n"));
+  const envelopes: any[] = [];
+  const events: any[] = [];
+  let ready: any = null;
+  const outDone = pump(child.stdout, (l) => { const j = JSON.parse(l); if (ready === null) ready = j; else envelopes.push(j); });
+  const errDone = pump(child.stderr, (l) => {
+    let ev: any = null;
+    try { ev = JSON.parse(l); } catch { return; }
+    events.push(ev);
+    if (ev.name === "sand.confirm" && ev.kind === "ask") tell({ confirm: { id: ev.attrs.id, answer: true, data: { block: "the block" } } });
+  });
+  await tell({ sand: "1", config, limits: { passes: 2, tokens: 1000, ms: 20_000, turns: 2, wait: 5000 }, file: "asker.sand", traceId: "t-ask" });
+  await tell({ input: "x" });
+  while (envelopes.length < 1) await new Promise((r) => setTimeout(r, 20));
+  await writer.close();
+  const status = await child.status;
+  await Promise.all([outDone, errDone]);
+  api.server.shutdown();
+  assertEquals(status.code, 0);
+  assertEquals(envelopes[0].result, { answer: true, block: "the block" });
+  const ask = events.find((e) => e.name === "sand.confirm" && e.kind === "ask");
+  assertEquals(ask?.attrs?.kind, "link_reading");
+  assertEquals(ask?.input, { question: "Read the ports?", kind: "link_reading", args: { tool: "listening_ports" } });
+  const end = events.find((e) => e.name === "sand.confirm" && e.kind === "span.end");
+  assertEquals(String(end?.attrs?.data_bytes), String(JSON.stringify({ block: "the block" }).length)); // attrs travel as text
+  assert(!JSON.stringify(events).includes("the block"), "the data never enters the trace");
+});
