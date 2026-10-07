@@ -189,7 +189,7 @@ Deno.test("budget: at a limit the person is asked, and a yes gives every limit i
   await b.check({ tokens: 20 });                       // 110 > 100: asked, yes: tokens 200, turns 4, ms 120 s
   assertEquals(asked.length, 1);
   assertEquals(asked[0].limit, "tokens");
-  assertEquals(asked[0].block, { passes: null, tokens: 100, turns: 2, ms: 60_000 });
+  assertEquals(asked[0].block, { passes: null, tokens: 100, turns: 2, ms: 60_000, credits: null });
   assertEquals(b.limits.tokens, 200);
   assertEquals(b.limits.turns, 4);
   assertEquals(b.limits.ms, 120_000);
@@ -261,4 +261,54 @@ Deno.test("confirm: the kind budget is the runtime's own", async () => {
   }, { input: "x", env: () => undefined, config: { models: {}, default: {} } as never });
   assertEquals(result, "E-STATE");
   assert(!trace.events.some((e) => e.name === "sand.confirm"));
+});
+
+Deno.test("budget: credits are counted at each model's rate, and the questions follow the schedule, then double", async () => {
+  const asked: { limit: string; used: number; max: number; block: Record<string, number | null> }[] = [];
+  const b = new Budget({ credits: 50, creditSteps: [100, 500, 1000, 5000], rates: { quick: 768, careful: 256 }, rate: null }, null, async (info: typeof asked[number]) => { asked.push(info); return true; });
+  b.record({ passes: 2 });                                   // two decisions: 2 credits
+  b.record({ tokens: 7680, model: "quick", completions: 1 }); // 10 credits
+  b.record({ tokens: 2560, model: "careful", completions: 1 }); // 10 credits
+  b.record({ tokens: 1000, model: "unknown", completions: 1 }); // no rate: not counted
+  assertEquals(Math.round(b.spent.credits), 22);
+  await b.check({ tokens: 0 });
+  assertEquals(asked.length, 0, "under the first step: no question");
+  b.record({ tokens: 256 * 30, model: "careful", completions: 1 }); // 52 credits now
+  await b.check({ tokens: 0 });
+  assertEquals(asked.length, 1);
+  assertEquals(asked[0].limit, "credits");
+  assertEquals(asked[0].used, 52);
+  assertEquals(asked[0].max, 50);
+  assertEquals(asked[0].block.credits, 100, "the next step is named");
+  assertEquals(b.limits.credits, 100);
+  b.record({ tokens: 256 * 60, model: "careful", completions: 1 }); // 112
+  await b.check({ tokens: 0 });
+  assertEquals(b.limits.credits, 500);
+  b.record({ tokens: 256 * 1000, model: "careful", completions: 1 }); // 1112: past two steps at once
+  await b.check({ tokens: 0 });
+  assertEquals(asked.length, 3, "one question for the jump");
+  assertEquals(asked[2].block.credits, 5000);
+  assertEquals(b.limits.credits, 5000, "the first step above what is spent");
+  await b.check({ tokens: 0 });
+  assertEquals(asked.length, 3, "under the new cap: nothing asked");
+  b.record({ tokens: 256 * 4000, model: "careful", completions: 1 }); // 5112: past the schedule's last step
+  await b.check({ tokens: 0 });
+  assertEquals(asked.length, 4);
+  assertEquals(b.limits.credits, 10_000, "after the schedule, double until above");
+});
+
+Deno.test("budget: askMore asks the same question for another cap, once at a time, and a no sticks", async () => {
+  let say: boolean | null = true;
+  const asked: { limit: string }[] = [];
+  const b = new Budget({ tokens: 1000 }, null, async (info: { limit: string }) => { asked.push(info); return say; });
+  assertEquals(await b.askMore({ limit: "rounds", used: 8, max: 8, block: { rounds: 8 } }), true);
+  assertEquals(asked.map((a) => a.limit), ["rounds"]);
+  assertEquals(b.extensions, 1);
+  say = false;
+  assertEquals(await b.askMore({ limit: "rounds", used: 16, max: 16, block: { rounds: 8 } }), false);
+  assertEquals(b.declined, true);
+  assertEquals(await b.askMore({ limit: "rounds", used: 16, max: 16, block: { rounds: 8 } }), false);
+  assertEquals(asked.length, 2, "a no is not asked twice");
+  const nobody = new Budget({ tokens: 1000 });
+  assertEquals(await nobody.askMore({ limit: "rounds", used: 1, max: 1 }), false);
 });

@@ -463,3 +463,32 @@ Deno.test("assistant: a tool call the host could not read is told to the model o
   }, { input: "x", fetchImpl: h3.fetch, env: env(), config: CFG }), SandError) as SandError;
   assertEquals(err.code, "E-HOST");
 });
+
+Deno.test("assistant: when its rounds are spent and it still wants tools, the person is asked; a yes gives more rounds, nobody ends it", async () => {
+  const order = { id: "call_r", type: "function", function: { name: "look", arguments: "{}" } };
+  const call = () => json({ choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: [{ ...order }] }, finish_reason: "tool_calls" }], usage: { total_tokens: 5 } });
+  const Empty = shape({ why: text("why") }, { name: "Empty" });
+  const look = tool("look", Empty, async () => "seen", { name: "look" });
+  // nobody: two rounds of tools, then the usual stop
+  const h1 = host([call, call, () => said("done")]);
+  const r1 = await run(async () => {
+    const desk = assistant("you are a desk", { tools: [look], settle: { turns: 2 }, name: "desk" });
+    const r = await desk.say("go");
+    return { stopped: r.stopped, turns: r.turns, value: r.value === unsure ? "unsure" : r.value };
+  }, { input: "x", fetchImpl: h1.fetch, env: env(), config: CFG });
+  assertEquals(r1.result as any, { stopped: "turns", turns: 2, value: "unsure" });
+  assertEquals(h1.calls.length, 2);
+  // the person says go on: two more rounds, and the answer comes
+  const asked: { kind?: string; args?: { limit?: string; block?: { rounds?: number } } }[] = [];
+  const h2 = host([call, call, () => said("done")]);
+  const r2 = await run(async () => {
+    const desk = assistant("you are a desk", { tools: [look], settle: { turns: 2 }, name: "desk" });
+    const r = await desk.say("go");
+    return { text: r.text, stopped: r.stopped, turns: r.turns };
+  }, { input: "x", fetchImpl: h2.fetch, env: env(), config: CFG, confirm: (_q: string, ctx: { kind?: string | null; args?: unknown }) => { asked.push(ctx as any); return true; } });
+  assertEquals(r2.result as any, { text: "done", stopped: null, turns: 3 });
+  assertEquals(asked.length, 1);
+  assertEquals(asked[0].kind, "budget");
+  assertEquals(asked[0].args?.limit, "rounds");
+  assertEquals(asked[0].args?.block?.rounds, 2);
+});

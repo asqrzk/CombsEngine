@@ -232,7 +232,7 @@ export async function ask(prompt, opts = {}) {
   const schema = opts.as ? shapeSchema(opts.as.spec) : null;
   await ctx.budget.check({ tokens: 0 }, opts.at);
   const r = await ctx.budget.gate.run(() => adapter.ask({ messages, schema, maxTokens: opts.maxTokens, temperature: opts.temperature }, { at: opts.at, signal: ctx.signal }));
-  ctx.budget.record({ tokens: r.tokens ?? 0, completions: 1 });
+  ctx.budget.record({ tokens: r.tokens ?? 0, completions: 1, model: name });
   if (r.estimated) warnOnce(ctx, `unmetered:${name}`, `W-UNMETERED: ${name} reported no usage; tokens are estimated at one per four characters`);
   ctx.emit("sand.request", "event", { status: "ok", model: name, road: "", questions: 0, tokens: r.tokens ?? 0, ms: r.ms, verb: "ask", at: opts.at }, { input: messages, output: r.text });
   if (opts.as) return coerceRecord(opts.as.spec, r.json);
@@ -256,7 +256,7 @@ export async function extract(state, shapeObj, opts = {}) {
     if (!adapter.extract) throw new SandError("E-MODEL", `\`${name}\` cannot extract; it is a ${adapter.kind} model`, { at: opts.at });
     await ctx.budget.check({ tokens: 0 }, opts.at);
     const r = await ctx.budget.gate.run(() => adapter.extract(st, sp, only, { at: opts.at, signal: ctx.signal }));
-    ctx.budget.record({ tokens: r.tokens ?? 0, completions: 1 });
+    ctx.budget.record({ tokens: r.tokens ?? 0, completions: 1, model: name });
     if (r.estimated) warnOnce(ctx, `unmetered:${name}`, `W-UNMETERED: ${name} reported no usage; tokens are estimated at one per four characters`);
     ctx.emit("sand.request", "event", { status: "ok", model: name, road: "", questions: 0, tokens: r.tokens ?? 0, ms: r.ms, verb: "extract", at: opts.at }, { input: { state: st, slots: only ?? Object.keys(sp.slots) }, output: r.record });
     return r.record;

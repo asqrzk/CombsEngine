@@ -164,12 +164,16 @@ export async function askToContinue(info, at = null) {
   if (!(ctx.confirmPort ?? ports.confirm ?? null)) return null;   // nobody is here: not a no, just nobody
   const n = (v) => (typeof v === "number" ? v.toLocaleString("en-US") : String(v ?? "?"));
   const what = info.limit === "ms" ? `${Math.round(info.used / 1000)} of ${Math.round(info.max / 1000)} seconds` : `${n(info.used)} of ${n(info.max)} ${info.limit}`;
+  const block = info.block ?? {};
   const more = [
-    info.block.tokens != null ? `${n(info.block.tokens)} tokens` : null,
-    info.block.turns != null ? `${n(info.block.turns)} turns` : null,
-    info.block.ms != null ? `${Math.round(info.block.ms / 1000)} seconds` : null,
+    block.tokens != null ? `${n(block.tokens)} tokens` : null,
+    block.turns != null ? `${n(block.turns)} turns` : null,
+    block.rounds != null ? `${n(block.rounds)} rounds` : null,
+    block.ms != null ? `${Math.round(block.ms / 1000)} seconds` : null,
   ].filter(Boolean).join(", ");
-  const q = `This run has used its budget (${what}). Go on with as much again${more ? ` (${more})` : ""}?`;
+  const q = info.limit === "credits"
+    ? `This run has used ${n(info.used)} credits. Go on? It asks again at ${n(block.credits ?? info.max * 2)}.`
+    : `This run has used its budget (${what}). Go on with as much again${more ? ` (${more})` : ""}?`;
   const got = await confirm(q, { kind: "budget", args: info, at: at ?? undefined, [OWN]: true });
   return got && typeof got === "object" && got.answer === true;
 }

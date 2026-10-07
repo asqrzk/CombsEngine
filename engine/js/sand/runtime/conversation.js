@@ -115,7 +115,6 @@ export class Conversation {
     if (typeof adapter.complete !== "function") throw new SandError("E-MODEL", `\`${name}\` cannot hold a conversation; it is a ${adapter.kind} model`, { at });
     const streaming = !!(opts.emit || opts.onDelta || opts.stream) && adapter.caps?.stream !== false;
     const onDelta = streaming ? (piece) => { if (opts.emit) emitPiece(piece, { at }); opts.onDelta?.(piece); } : null;
-    const maxTurns = Math.max(1, opts.settle?.turns ?? this.settle.turns ?? DEFAULT_TURNS);
     const pending = [{ role: "user", content: said }];
     const calls = [];
     // the turn's state, in one place: what was said, what stopped it, and what each round leaves behind
@@ -125,7 +124,16 @@ export class Conversation {
     // a stop that keeps the last finished round's words (already in the history beside its tool call) keeps them once
     const stop = (stopped, reason, text) => { turn.stopped = stopped; turn.reason = reason; turn.answer = text; turn.kept = KEEPS_TEXT.has(stopped); };
 
-    for (let round = 0; round < (this.tools ? maxTurns : 1); round++) {
+    let maxTurns = Math.max(1, opts.settle?.turns ?? this.settle.turns ?? DEFAULT_TURNS);
+    const roundsBlock = maxTurns;
+    for (let round = 0; ; round++) {
+      if (round >= (this.tools ? maxTurns : 1)) {
+        // the rounds are spent and the model still wants tools: the person may let it go on, as with any cap
+        if (!this.tools) break;
+        const more = await ctx.budget.askMore({ limit: "rounds", used: round, max: maxTurns, block: { rounds: roundsBlock } }, at);
+        if (!more) break;
+        maxTurns += roundsBlock;
+      }
       try {
         await ctx.budget.check({ turns: 1, tokens: 0 }, at);
       } catch (e) {
@@ -158,7 +166,7 @@ export class Conversation {
       turn.thinking += (turn.thinking && r.thinking ? "\n\n" : "") + (r.thinking ?? "");
       turn.thinkingMs += r.thinkingMs ?? 0;
       turn.tokens += r.tokens ?? 0;
-      ctx.budget.record({ turns: 1, tokens: r.tokens ?? 0, completions: 1 });
+      ctx.budget.record({ turns: 1, tokens: r.tokens ?? 0, completions: 1, model: name });
       if (r.estimated) warnOnce(ctx, `unmetered:${name}`, `W-UNMETERED: ${name} reported no usage; tokens are estimated at one per four characters`);
       ctx.emit("sand.request", "event", { status: "ok", model: name, road: "", questions: 0, tokens: r.tokens ?? 0, ms: r.ms, verb: "say", at }, { input: wire, output: r.text ?? "", tools: r.toolCalls?.length ?? 0 });
       ctx.emit("sand.turn", "event", { at, chat: this.name ?? "", turn: turn.turns, model: name, stop: r.finish ?? "", tokens: r.tokens ?? 0, ms: r.ms, calls: r.toolCalls?.length ?? 0 });
