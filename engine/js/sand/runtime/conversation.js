@@ -6,8 +6,11 @@
  * { tools })` is the same with a tool loop inside every `say`: the model asks
  * for a tool, the program's own function runs — sequentially, so a tool may ask
  * a person — the result goes back as a `tool` message, and the round repeats up
- * to `settle.turns`. Past that bound the answer is `unsure`, `stopped: "turns"`;
- * a budget the person did not carry on ends the turn with what was said so far, `stopped: "budget"`.
+ * to `settle.turns`. At that bound, when the model still wants tools, the person
+ * is asked whether to go on (the budget's question); a no, or nobody, ends the
+ * turn as `unsure`, `stopped: "turns"`. A budget the person did not carry on ends
+ * the turn with what the last round said, `stopped: "budget"`; a tool call the
+ * host could not read twice ends it the same way, `stopped: "tool_call"`.
  *
  * A model that thinks first hands its reasoning over apart from its answer: the
  * `Reply` carries it as `thinking` (and how long it took as `thinkingMs`), a

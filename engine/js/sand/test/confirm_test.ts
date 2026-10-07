@@ -334,3 +334,42 @@ Deno.test("budget: a no is remembered per limit, a chat call bills at least one 
   b.record({ tokens: 768, model: "quick", completions: 1 }); // 19
   assertEquals(events.filter((e) => e.action === "warn" && e.limit === "credits").length, 1);
 });
+
+Deno.test("budget: the default rate, credits recorded outright, an unsorted schedule, and two callers at one question", async () => {
+  const asked: { limit: string; block: Record<string, number | null> }[] = [];
+  let answer: ((v: boolean) => void) | null = null;
+  const b = new Budget({ credits: 5, creditSteps: [40, 10, 20], rates: { quick: 768 }, rate: 256 }, null, (info: typeof asked[number]) => new Promise<boolean>((r) => { asked.push(info); answer = r; }));
+  assertEquals(b.limits.creditSteps, [10, 20, 40], "the schedule is sorted however it was written");
+  b.record({ tokens: 512, model: "other", completions: 1 }); // a model the platform did not name: the default rate, 2 credits
+  b.record({ credits: 8 });                                  // a picture, say: credits recorded outright
+  assertEquals(b.spent.credits, 10);
+  const first = b.check({ tokens: 0 });  // over the first step: asks
+  const second = b.check({ tokens: 0 }); // meets the same limit: waits for the first's answer
+  await new Promise((r) => setTimeout(r, 5));
+  assertEquals(asked.length, 1, "one question for two callers");
+  assertEquals(asked[0].block, { credits: 20 }, "the first step above what is spent, not above the cap");
+  answer!(true);
+  await Promise.all([first, second]);
+  assertEquals(asked.length, 1, "the second looked again under the new cap and asked nothing");
+  assertEquals(b.limits.credits, 20);
+});
+
+Deno.test("the budget's question in words: credits name the next step, any other limit names the block", async () => {
+  const { askToContinue } = await import("../runtime/effects.js");
+  const questions: string[] = [];
+  const { result } = await run(async () => {
+    const credits = await askToContinue({ limit: "credits", used: 52, max: 50, spent: {}, block: { credits: 100 }, extensions: 0 });
+    const rounds = await askToContinue({ limit: "rounds", used: 12, max: 12, spent: {}, block: { rounds: 12 }, extensions: 1 });
+    const time = await askToContinue({ limit: "ms", used: 900_400, max: 900_000, spent: {}, block: { tokens: 1_000_000, ms: 900_000 }, extensions: 2 });
+    return { credits, rounds, time };
+  }, {
+    input: "x", env: env(),
+    confirm: (q: string) => { questions.push(q); return { answer: true } as never; },
+  });
+  assertEquals(result, { credits: true, rounds: true, time: true });
+  assertEquals(questions, [
+    "This run has used 52 credits. Go on? It asks again at 100.",
+    "This run has used its budget (12 of 12 rounds). Go on with as much again (12 rounds)?",
+    "This run has used its budget (900 of 900 seconds). Go on with as much again (1,000,000 tokens, 900 seconds)?",
+  ]);
+});

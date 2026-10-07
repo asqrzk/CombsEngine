@@ -111,6 +111,9 @@ export async function runCommand(file: string, flags: RunFlags): Promise<number>
   const flagAnswer = flags.yes ? true : flags.no ? false : flags.unsure ? null : undefined;
   const canAsk = flagAnswer === undefined && workers === 1 && !stdinIsInput && Deno.stdin.isTerminal();
   let saidNobody = false, wrotePieces = false;
+  // --yes carries a budget's question on ten times; the eleventh is a no, so a loop under --yes stays bounded
+  const YES_TO_BUDGET = 10;
+  let yesToBudget = 0;
 
   const traceFile = flags.trace ? await Deno.open(flags.trace, { write: true, create: true, truncate: true }) : null;
   const results: (string | null)[] = new Array(inputs.length).fill(null);
@@ -193,7 +196,12 @@ export async function runCommand(file: string, flags: RunFlags): Promise<number>
       if (ev.name === "sand.confirm" && ev.kind === "ask") {
         const question = typeof ev.input === "string" ? ev.input : typeof ev.input?.question === "string" ? ev.input.question : "may I?";
         if (canAsk) { hold(); const said = askAtTerminal(question); arm(); tell({ confirm: { id: ev.attrs?.id, answer: { answer: said, by: "tty" } } }); return; }
-        if (flagAnswer !== undefined) { tell({ confirm: { id: ev.attrs?.id, answer: { answer: flagAnswer, by: "tty" } } }); return; }
+        if (flagAnswer !== undefined) {
+          const refused = ev.attrs?.kind === "budget" && flagAnswer === true && ++yesToBudget > YES_TO_BUDGET;
+          if (refused && yesToBudget === YES_TO_BUDGET + 1) console.error(`W-BUDGET · the budget's question was answered yes ${YES_TO_BUDGET} times under --yes; from here it is a no`);
+          tell({ confirm: { id: ev.attrs?.id, answer: { answer: refused ? false : flagAnswer, by: "tty" } } });
+          return;
+        }
         if (!saidNobody) { saidNobody = true; console.error(`W-NOBODY · nobody is here to answer "${question.slice(0, 80)}"; it is unsure. Answer with --yes, --no or --unsure, or run one input from a terminal.`); }
         tell({ confirm: { id: ev.attrs?.id, answer: { answer: null, by: "nobody" } } });
         return;

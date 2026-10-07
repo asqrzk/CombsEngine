@@ -9,11 +9,18 @@
  * being asked the clock is paused (`pause()`/`resume()`), so a slow human never
  * spends the `ms` limit; what they took is reported as `waited`.
  *
- * When a limit is reached and someone can be asked (`asker`, set by the
- * runtime to a `confirm` of kind `budget`), the person is offered the same
- * budget again, every limit by its first size; on yes the run goes on, on no
- * or no answer it stops as before, and a no is not asked twice. Tokens are counted as billed: a token the
- * host read from its cache counts a tenth (see wires/chat.js).
+ * Tokens are counted as billed: a token the host read from its cache counts a
+ * tenth (see wires/chat.js). Credits are counted when the platform says what a
+ * token costs (`limits.rates` per model, `limits.rate` for the rest): a pass is
+ * a credit, a chat call its tokens at the rate, whole and at least one.
+ *
+ * When a limit is reached and someone can be asked (`asker`, given with the
+ * budget: a `confirm` of kind `budget`), the person is asked whether to go on.
+ * A yes to a credits question moves the credits cap to the next step of
+ * `creditSteps` above what is spent (then double), and nothing else; a yes to
+ * any other limit gives every limit its first size again. A no is remembered for
+ * that limit alone; nobody to ask is the plain stop. `askMore()` lets another
+ * cap, such as a conversation's rounds, raise the same question.
  */
 
 import { SandError } from "./errors.js";
